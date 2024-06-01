@@ -3,7 +3,7 @@
 This is a variant of the [Python GPT-2 trainer](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo. It both:
 * Trains 35% more efficiently than the original.
-* Has simpler code: 421 lines instead of 858.
+* Has simpler code: 419 lines instead of 858.
 
 To run it:
 ```
@@ -11,7 +11,7 @@ python data/fineweb.py
 ./run.sh
 ```
 
-This will produce a 124-parameter transformer trained on 6.44B tokens, which has has 3.2798 validation loss on the Fineweb validation set.
+This will produce a 124M-parameter transformer trained on 6.44B tokens, which has has 3.2798 validation loss on the Fineweb validation set.
 
 For comparison, the original llm.c trainer yields 3.2847 perplexity after training for 10B tokens. (1.55x more)
 
