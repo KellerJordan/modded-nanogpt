@@ -13,7 +13,7 @@ python data/fineweb.py
 
 This will produce a 124M-parameter transformer trained on 6.44B tokens, which has has 3.2798 validation loss on the Fineweb validation set.
 
-For comparison, the original llm.c trainer yields 3.2847 perplexity after training for 10B tokens. (1.55x more)
+For comparison, the original llm.c trainer yields 3.2847 perplexity after training for 10B tokens. (1.55x more tokens)
 
 This speedup is due to the following changes:
 - Increased learning rate by 2.5x
