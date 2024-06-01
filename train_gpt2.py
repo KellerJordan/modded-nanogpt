@@ -376,7 +376,7 @@ if __name__ == "__main__":
         # backward pass
         loss.backward()
         for p in model.parameters():
-            p.grad = p.grad / p.grad.norm()
+            p.grad = p.grad / (p.grad.norm() + 1e-6)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         # determine and set the learning rate for this iteration
         lr = get_lr(step)
