@@ -18,7 +18,7 @@ For comparison, the original llm.c trainer yields 3.2847 perplexity after traini
 This speedup is due to the following changes:
 - Increased learning rate by 2.5x
 - Halved batch size (but ~same training speed)
-- Improved learning rate schedule (we use a 256-step linear rampup, then a linear rampdown to 0.1 * lr_max)
+- Improved learning rate schedule (a 256-step linear rampup, then a linear rampdown to 0.1 * lr_max)
 - Normalized the gradient for each parameter to have unit norm
 - Removed all affine scale and bias parameters from the architecture, and switched to RMSNorm (actually this causes a slight slowdown, and I just did it to reduce code complexity)
 
