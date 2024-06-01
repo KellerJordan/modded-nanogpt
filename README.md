@@ -16,7 +16,7 @@ This will produce a 124M-parameter transformer trained on 6.44B tokens, which ha
 For comparison, the original llm.c trainer yields 3.2847 perplexity after training for 10B tokens. (1.55x more tokens)
 
 This speedup is due to the following changes:
-- Increased learning rate by 2.5x
+- Increased learning rate by 2.5x (this is the main thing)
 - Halved batch size (but ~same training speed)
 - Improved learning rate schedule (a 256-step linear rampup, then a linear rampdown to 0.1 * lr_max)
 - Normalized the gradient for each parameter to have unit norm
