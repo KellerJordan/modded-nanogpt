@@ -335,7 +335,6 @@ if __name__ == "__main__":
             pass
 
     timings = []
-    norm = -1.0   # dummy value to print in inference-only mode
     for step in range(args.num_iterations + 1):
         t0 = time.time()
         last_step = (step == args.num_iterations)
@@ -377,7 +376,6 @@ if __name__ == "__main__":
         loss.backward()
         for p in model.parameters():
             p.grad = p.grad / (p.grad.norm() + 1e-6)
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         # determine and set the learning rate for this iteration
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
@@ -394,7 +392,7 @@ if __name__ == "__main__":
         # the 0th iteration is often an outlier (much slower) => skip logging it
         tokens_per_second = ddp_world_size * B * T / (t1-t0)
         lossf = loss.item() # keep track of the mean loss
-        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
+        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
         # log to logile
         if master_process and logfile is not None:
             with open(logfile, "a") as f:
