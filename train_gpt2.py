@@ -49,7 +49,6 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
-        y = y / math.sqrt(24)
         return y
 
 class MLP(nn.Module):
@@ -71,8 +70,10 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
+        self.attn_scale = (1 / math.sqrt(2 * config.n_layer))
 
     def forward(self, x):
+        x = x + self.attn_scale * self.attn(rmsnorm(x))
         x = x + self.attn(rmsnorm(x))
         x = x + self.mlp(rmsnorm(x))
         return x
