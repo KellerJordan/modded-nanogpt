@@ -230,7 +230,6 @@ def print0(*args, **kwargs):
 if __name__ == "__main__":
     import time
     import argparse
-    import tiktoken
     print0(f"Running pytorch {torch.version.__version__}")
 
     parser = argparse.ArgumentParser()
@@ -277,9 +276,6 @@ if __name__ == "__main__":
 
     # set up a context manager following the desired dtype and device
     ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
-
-    # init (and write) the tokenizer
-    enc = tiktoken.get_encoding("gpt2")
 
     # init the model from scratch
     model_config = {
