@@ -5,6 +5,9 @@ Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo. It both:
 * Trains 35% more efficiently (6.44B tokens instead of 10B to reach the same validation loss).
 * Has simpler code (414 lines instead of 858).
 
+To simplify the code, some features were removed, like text generation. And to obtain a training speed improvement, we have diverged
+a bit architecturally and in terms of hyperparameters from being a strict reproduction of the GPT-2 paper.
+
 To run it:
 ```
 python data/fineweb.py
