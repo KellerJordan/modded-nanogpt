@@ -11,7 +11,7 @@ python data/fineweb.py
 
 It yields 3.2798 perplexity on the Fineweb validation set after training a 124M-parameter transformer for 6.44B tokens.
 
-For comparison, the llm.c trainer yields 3.2847 perplexity on the same after training for 10B tokens. (1.55x more)
+For comparison, the original llm.c trainer yields 3.2847 perplexity after training for 10B tokens. (1.55x more)
 
 The speedup of this trainer over the original are due to the following changes:
 - Increased learning rate
