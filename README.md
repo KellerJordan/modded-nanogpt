@@ -2,8 +2,8 @@
 
 This is a variant of the [Python GPT-2 trainer](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo. It both:
-* Trains 35% more efficiently than the original.
-* Has simpler code: 414 lines instead of 858.
+* Trains 35% more efficiently than the original (6.44B tokens to reach the same val loss as the original reached in 10B).
+* Has simpler code (414 lines instead of 858).
 
 To run it:
 ```
