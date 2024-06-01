@@ -74,7 +74,6 @@ class Block(nn.Module):
 
     def forward(self, x):
         x = x + self.attn_scale * self.attn(rmsnorm(x))
-        x = x + self.attn(rmsnorm(x))
         x = x + self.mlp(rmsnorm(x))
         return x
 
