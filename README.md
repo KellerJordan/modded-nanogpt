@@ -1,7 +1,7 @@
 # Tuned-NanoGPT
 
 This is a variant of the [Python GPT-2 trainer](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py) from
-Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which:
+Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo. It both:
 * Trains 35% more efficiently than the original.
 * Has simpler code: 421 lines instead of 858.
 
