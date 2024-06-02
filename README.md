@@ -14,7 +14,7 @@ python data/fineweb.py
 ./run.sh
 ```
 
-This will produce a 124M-parameter transformer trained on 6.44B tokens, which has has 3.2798 validation loss on the Fineweb validation set.
+This will produce a 124M-parameter transformer trained on 6.44B tokens, which has has 3.2816 validation loss on the Fineweb validation set.
 
 For comparison, the original llm.c trainer yields 3.2847 validation loss after training for 10B tokens.
 
