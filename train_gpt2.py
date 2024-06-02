@@ -307,7 +307,7 @@ if __name__ == "__main__":
                                                learning_rate=args.learning_rate, betas=(0.9, 0.95),
                                                device_type=device)
 
-    # learning rate decay scheduler (cosine with warmup)
+    # learning rate decay scheduler
     def get_lr(it):
         assert it <= args.num_iterations
         # 1) linear warmup for warmup_iters steps
