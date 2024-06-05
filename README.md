@@ -20,7 +20,7 @@ For comparison, the original llm.c trainer yields 3.2847 validation loss after t
 
 This speedup is due to the following changes:
 - Increased learning rate by 3x (this is the main thing)
-- Improved learning rate schedule (a 256-step linear rampup, then a linear rampdown to 0.1 * lr_max)
+- Improved learning rate schedule (a 256-step linear rampup, then constant, then 2048-step linear warmdown following [2405.18392](https://arxiv.org/abs/2405.18392))
 - Normalized the gradient for each parameter to have unit norm
 - Removed all affine scale and bias parameters from the architecture, and switched to RMSNorm (actually this causes a slight slowdown, and I just did it to reduce code complexity)
 - Removed the special initialization for linear layers before residuals. Instead, just scale down the output of the attention block by a fixed scalar.
