@@ -247,6 +247,7 @@ if __name__ == "__main__":
     # optimization
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
     parser.add_argument("--warmup_iters", type=int, default=0, help="learning rate warmup iterations")
+    parser.add_argument("--warmdown_iters", type=int, default=0, help="learning rate warmdown iterations")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
     # evaluation
     parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
@@ -307,16 +308,19 @@ if __name__ == "__main__":
                                                learning_rate=args.learning_rate, betas=(0.9, 0.95),
                                                device_type=device)
 
-    # learning rate decay scheduler
+    # learning rate decay scheduler (linear warmup and warmdown)
     def get_lr(it):
         assert it <= args.num_iterations
         # 1) linear warmup for warmup_iters steps
         if it < args.warmup_iters:
             return args.learning_rate * (it+1) / args.warmup_iters
-        # 2) linear decay down to min learning rate
-        decay_ratio = (it - args.warmup_iters) / (args.num_iterations - args.warmup_iters)
-        assert 0 <= decay_ratio <= 1
-        return (0.1 + (1 - decay_ratio)) / (0.1 + 1) * args.learning_rate
+        # 2) constant lr for a while
+        elif it < args.num_iterations - args.warmdown_iters:
+            return args.learning_rate
+        # 3) linear warmdown
+        else:
+            decay_ratio = (args.num_iterations - it) / args.warmdown_iters
+            return args.learning_rate * decay_ratio
 
     run_id = str(uuid.uuid4())
 
