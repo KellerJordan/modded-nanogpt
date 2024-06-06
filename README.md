@@ -2,7 +2,7 @@
 
 This is a variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo. It both:
-* Trains 35% more efficiently (6.44B tokens instead of 10B to reach the same validation loss).
+* Trains 2x more efficiently (5B tokens instead of 10B to reach the same validation loss).
 * Has simpler code (446 lines instead of 858).
 
 To simplify the code, some features were removed, like text generation. And to obtain a training speed improvement, we have diverged
@@ -14,7 +14,7 @@ python data/fineweb.py
 ./run.sh
 ```
 
-This will produce a 124M-parameter transformer trained on 6.44B tokens, which has has 3.2624 validation loss on the Fineweb validation set.
+This will produce a 124M-parameter transformer trained on 5B tokens, which has has 3.2818 validation loss on the Fineweb validation set.
 
 For comparison, the original llm.c trainer yields 3.2847 validation loss after training for 10B tokens.
 
