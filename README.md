@@ -18,6 +18,8 @@ This will produce a 124M-parameter transformer trained on 5B tokens, which has h
 
 For comparison, the original llm.c trainer yields 3.2847 validation loss after training for 10B tokens.
 
+![upgrade](img/fig_tuned_nanogpt.png)
+
 This speedup is due to the following changes:
 - Increased learning rate by 3x (this is the main thing)
 - Improved learning rate schedule (a 256-step linear rampup, then constant, then 2048-step linear warmdown following [2405.18392](https://arxiv.org/abs/2405.18392))
@@ -27,6 +29,4 @@ This speedup is due to the following changes:
 - Removed the special initialization for linear layers before residuals. Instead, just scale down the output of the attention block by a fixed scalar.
 
 Note: running this trainer for the full 10B tokens yields a validation loss of ≤ 3.2236.
-
-![upgrade](img/fig_tuned_nanogpt.png)
 
