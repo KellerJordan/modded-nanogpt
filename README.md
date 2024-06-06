@@ -21,10 +21,10 @@ To simplify the code, some features have been removed, including text generation
 a bit architecturally and in terms of hyperparameters from being a strict reproduction of the GPT-2 paper.
 
 The speedup is due to the following changes:
-- Increased learning rate by 3x (this is the main thing)
-- Improved learning rate schedule (a 256-step linear rampup, then constant, then 2048-step linear warmdown following [2405.18392](https://arxiv.org/abs/2405.18392))
+- Increased learning rate by 3x
+- Switched to trapezoidal learning rate schedule following [2405.18392](https://arxiv.org/abs/2405.18392)
 - Switched to rotary embeddings
+- Removed the special initialization for linear layers before residuals. Instead, just scale down the output of the attention block by a fixed scalar.
 - Normalized the gradient for each parameter to have unit norm
 - Removed all affine scale and bias parameters from the architecture, and switched to RMSNorm (actually this causes a slight slowdown, and I just did it to reduce code complexity)
-- Removed the special initialization for linear layers before residuals. Instead, just scale down the output of the attention block by a fixed scalar.
 
