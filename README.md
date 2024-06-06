@@ -26,5 +26,5 @@ This speedup is due to the following changes:
 - Removed all affine scale and bias parameters from the architecture, and switched to RMSNorm (actually this causes a slight slowdown, and I just did it to reduce code complexity)
 - Removed the special initialization for linear layers before residuals. Instead, just scale down the output of the attention block by a fixed scalar.
 
-Note: running this trainer for the full 10B tokens yields a validation loss of ≤ 3.2267.
+Note: running this trainer for the full 10B tokens yields a validation loss of ≤ 3.2236.
 
