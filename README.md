@@ -28,3 +28,5 @@ This speedup is due to the following changes:
 
 Note: running this trainer for the full 10B tokens yields a validation loss of ≤ 3.2236.
 
+![upgrade](img/fig_tuned_nanogpt.png)
+
