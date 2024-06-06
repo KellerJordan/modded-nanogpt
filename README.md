@@ -1,4 +1,4 @@
-# Upgrade-NanoGPT
+# Super-NanoGPT
 
 This is a variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo. It both:
