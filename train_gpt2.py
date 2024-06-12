@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from torch import nn
+import torch.distributed as dist
 import torch.nn.functional as F
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -114,7 +115,6 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
     vocab_size: int = 50257
     n_layer: int = 12
     n_head: int = 12
@@ -135,7 +135,6 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None, return_logits=True):
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device) # shape (t)
 
         # forward the GPT model itself
@@ -263,7 +262,6 @@ if __name__ == "__main__":
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
-    parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
     # workload (number of steps)
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
     # optimization
@@ -279,7 +277,6 @@ if __name__ == "__main__":
 
     # args error checking and convenience variables
     B, T = args.batch_size, args.sequence_length
-    assert 1 <= T <= 1024
     assert args.model in {"d12", "d24", "d36", "d48"}
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -296,24 +293,9 @@ if __name__ == "__main__":
     print(f"using device: {device}")
 
     tokens_per_fwdbwd = B * T * ddp_world_size
-    assert args.total_batch_size == tokens_per_fwdbwd
 
     # set up a context manager following the desired dtype and device
     ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
-
-    # init the model from scratch
-    model_config = {
-        "d12": GPTConfig(block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768),
-        "d24": GPTConfig(block_size=1024, vocab_size=50257, n_layer=24, n_head=16, n_embd=1024),
-        "d36": GPTConfig(block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280),
-        "d48": GPTConfig(block_size=1024, vocab_size=50257, n_layer=48, n_head=25, n_embd=1600),
-    }[args.model]
-    model = GPT(model_config)
-    model = model.train().cuda()
-    if hasattr(config, "coordinate_descent_tuning"):
-        config.coordinate_descent_tuning = True # suggested by @Chillee
-    print0("compiling the model...")
-    model = torch.compile(model)
 
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
@@ -321,6 +303,21 @@ if __name__ == "__main__":
     if args.input_val_bin:
         val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
     x, y = train_loader.next_batch()
+
+    # init the model from scratch
+    num_vocab = 50257
+    model_config = {
+        "d12": GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768),
+        "d24": GPTConfig(vocab_size=num_vocab, n_layer=24, n_head=16, n_embd=1024),
+        "d36": GPTConfig(vocab_size=num_vocab, n_layer=36, n_head=20, n_embd=1280),
+        "d48": GPTConfig(vocab_size=num_vocab, n_layer=48, n_head=25, n_embd=1600),
+    }[args.model]
+    model = GPT(model_config)
+    model = model.train().cuda()
+    if hasattr(config, "coordinate_descent_tuning"):
+        config.coordinate_descent_tuning = True # suggested by @Chillee
+    print0("compiling the model...")
+    model = torch.compile(model)
 
     # here we wrap model into DDP container
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -372,7 +369,8 @@ if __name__ == "__main__":
                 for _ in range(args.val_max_steps):
                     x_val, y_val = val_loader.next_batch()
                     _, loss = model(x_val, y_val, return_logits=False)
-                    val_loss += loss.item()
+                    val_loss += loss
+                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
                 val_loss /= args.val_max_steps
             # log to console and to file
             print0(f"val loss {val_loss}")
@@ -392,6 +390,7 @@ if __name__ == "__main__":
         # forward pass
         with ctx:
             _, loss = model(x, y, return_logits=False)
+            train_loss = loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
         # backward pass
@@ -413,7 +412,8 @@ if __name__ == "__main__":
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
         tokens_per_second = ddp_world_size * B * T / (t1-t0)
-        lossf = loss.item() # keep track of the mean loss
+        dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
+        lossf = train_loss.item() # keep track of the mean loss
         print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
         # log to logile
         if master_process and logfile is not None:
