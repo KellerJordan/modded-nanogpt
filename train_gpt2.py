@@ -289,7 +289,6 @@ if __name__ == "__main__":
     device = f'cuda:{ddp_local_rank}'
     torch.cuda.set_device(device)
     master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-    seed_offset = 0 # each process gets the exact same seed
     print(f"using device: {device}")
 
     tokens_per_fwdbwd = B * T * ddp_world_size
