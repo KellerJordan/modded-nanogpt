@@ -395,8 +395,6 @@ if __name__ == "__main__":
         x, y = train_loader.next_batch()
         # backward pass
         loss.backward()
-        for p in model.parameters():
-            p.grad = p.grad / (p.grad.norm() + 1e-6)
         # determine and set the learning rate for this iteration
         lr = get_lr(step)
         for param_group in optimizer.param_groups:

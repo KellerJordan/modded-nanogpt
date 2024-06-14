@@ -25,6 +25,5 @@ The speedup is due to the following changes:
 - Switched to trapezoidal learning rate schedule following [2405.18392](https://arxiv.org/abs/2405.18392)
 - Switched to rotary embeddings
 - Removed the special initialization for linear layers before residuals. Instead, just scale down the output of the attention block by a fixed scalar.
-- Normalized the gradient for each parameter to have unit norm
 - Removed all affine scale and bias parameters from the architecture, and switched to RMSNorm (actually this causes a slight slowdown, and I just did it to reduce code complexity)
 
