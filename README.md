@@ -10,7 +10,7 @@ Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo. It:
 
 To run it:
 ```
-python data/fineweb.py
+python data/cached_fineweb10B.py
 ./run.sh
 ```
 
