@@ -110,7 +110,7 @@ def cast_tensor(x, M, E, A):
     y = x.sign() * 2**exponent * mantissa
     return y + (x - x.detach())
 
-MEA = (2, 5, -14)
+MEA_weights = (2, 5, -14)
 class CastedLinear(nn.Linear):
 
     def __init__(self, *args, **kwargs):
@@ -121,9 +121,9 @@ class CastedLinear(nn.Linear):
     def forward(self, x):
         #s = self.weight.size(1)**0.5
         s = self.weight.data.abs().mean()
-        w = s * cast_tensor(self.weight / s, *MEA)
-        #return cast_tensor(F.linear(x, w, padding=self.padding, bias=None), *hyp['net']['MEA_activ'])
-        return F.linear(x, w, bias=None)
+        w = s * cast_tensor(self.weight / s, *MEA_weights)
+        return F.linear(x, w)
+        #return cast_tensor(F.linear(x, w), *MEA_activ) # if you wanna cast the activations too
 
 class CausalSelfAttention(nn.Module):
 
