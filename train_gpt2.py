@@ -110,7 +110,7 @@ def cast_tensor(x, M, E, A):
     y = x.sign() * 2**exponent * mantissa
     return y + (x - x.detach())
 
-MEA = (10, 5, -14)
+MEA = (2, 5, -14)
 class CastedLinear(nn.Linear):
 
     def __init__(self, *args, **kwargs):
@@ -123,7 +123,7 @@ class CastedLinear(nn.Linear):
         s = self.weight.data.abs().mean()
         w = s * cast_tensor(self.weight / s, *MEA)
         #return cast_tensor(F.linear(x, w, padding=self.padding, bias=None), *hyp['net']['MEA_activ'])
-        return F.linear(x, w, padding=self.padding, bias=None)
+        return F.linear(x, w, bias=None)
 
 class CausalSelfAttention(nn.Module):
 
