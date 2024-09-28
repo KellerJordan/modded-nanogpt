@@ -53,6 +53,78 @@ def rmsnorm(x0, eps=1e-6):
     x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
     return x.type_as(x0)
 
+def cast_tensor(x, M, E, A):
+    """
+    Rounds every value in the tensor x to the nearest representable floating point number.
+    Where the floating point representation has M mantissa bits, smallest exponent A, and E exponent bits.
+
+    Therefore (only considering positive numbers):
+    * The subnormal numbers will be {0, 2**-M * 2**A), 2 * 2**-M * 2**A, ..., (2**M - 1) * 2**-M * 2**A}
+    * The smallest denormal number will be 2**A
+    * The largest denormal number will be 2**(A+2**E-2) * (2 - 2**-M)
+        (So the (largest / smallest) denormal number ratio is roughly 2**(2**E-1))
+
+    Examples:
+    * torch.half is M, E, A = 10, 5, -14; (modulo that the real format uses max exponent for NaN)
+    * torch.float8_e5m2 is M, E, A = 2, 5, -14 (also modulo that the real format uses max exponent for NaN)
+    * torch.float8_e4m3fn is M, E, A = 3, 4, -6 (modulo that the real format uses max denormal for NaN)
+    * int8 is M, E, A = 7, 0, 7; this represents ±{0, 1, ..., 127}. (modulo that real int8 also has -128)
+    * ternary weights are M, E, A = 0, 1, 0, this represents {-1, 0, +1}.
+    * you could even have M, E, A = 0, 3, -2; this represents ±{0, 0.25, 0.5, 1, 2, 4, 8, 16}.
+
+    In every case, the number of represented positive numbers is 2**(M+E).
+    """
+
+    xp = x.detach().abs()
+    mantissa, exponent = torch.frexp(xp)
+    mantissa *= 2 # bring mantissa into the range [1, 2) instead of [0.5, 1)
+    exponent -= 1
+    sign = mantissa.sign()
+    mantissa = mantissa.abs()
+    exponent = exponent.to(x.dtype)
+    assert (2**exponent * mantissa == xp).all(), x[2**exponent * mantissa != xp]
+
+    # Round mantissa to given precision
+    mantissa = (1 + 2**-M * ((mantissa - 1) * 2**M).round())
+
+    # Handle subnormals separately
+    mask = (exponent < A)
+    mantissa[mask] = (xp[mask] * 2**(M-A)).round() / 2**M
+    exponent[mask] = A
+
+    mask = (mantissa == 2)
+    mantissa[mask] = 1
+    exponent[mask] = exponent[mask] + 1
+
+    # Truncate top of range
+    if E > 0:
+        B = A+2**E-2
+        mask = (exponent > B)
+        mantissa[mask] = 2 - 2**-M
+        exponent[mask] = B
+    else: # zero-bit exponent case: so we have only subnormal numbers (like an int8)
+        mask = (mantissa >= 1)
+        mantissa[mask] = 1 - 2**-M
+        exponent[mask] = A
+
+    y = x.sign() * 2**exponent * mantissa
+    return y + (x - x.detach())
+
+MEA = (10, 5, -14)
+class CastedLinear(nn.Linear):
+
+    def __init__(self, *args, **kwargs):
+        assert not kwargs.get('bias', False)
+        kwargs['bias'] = False
+        super().__init__(*args, **kwargs)
+
+    def forward(self, x):
+        #s = self.weight.size(1)**0.5
+        s = self.weight.data.abs().mean()
+        w = s * cast_tensor(self.weight / s, *MEA)
+        #return cast_tensor(F.linear(x, w, padding=self.padding, bias=None), *hyp['net']['MEA_activ'])
+        return F.linear(x, w, padding=self.padding, bias=None)
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -62,9 +134,9 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd, bias=False)
+        self.c_attn = CastedLinear(self.n_embd, 3 * self.n_embd, bias=False)
         # output projection
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.rotary = Rotary(self.head_dim)
 
     def forward(self, x):
@@ -88,8 +160,8 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
