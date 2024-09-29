@@ -108,7 +108,7 @@ def cast_tensor(x, M, E, A):
         exponent[mask] = A
 
     y = x.sign() * 2**exponent * mantissa
-    return y + (x - x.detach())
+    return x + (y - x).detach()
 
 MEA_weights = (2, 5, -14)
 class CastedLinear(nn.Linear):
