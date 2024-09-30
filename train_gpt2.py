@@ -256,7 +256,6 @@ if __name__ == "__main__":
     # file system input / output
     parser.add_argument("--input_bin", type=str, help="input .bin to train on")
     parser.add_argument("--input_val_bin", type=str, help="input .bin to eval validation loss on")
-    parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
     parser.add_argument("--model", type=str, default="d12", help="d12|d24|d36|d48")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
@@ -338,14 +337,10 @@ if __name__ == "__main__":
             return args.learning_rate * decay_ratio
 
     run_id = str(uuid.uuid4())
-    os.makedirs('logs/%s' % run_id, exist_ok=True)
-
-    # create the logging directory if it does not exist
-    logfile = None
-    if master_process and args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-        logfile = os.path.join(args.output_dir, "%s.log" % run_id)
-        # create the log file "main.log" inside it, and wipe it clean
+    if master_process:
+        os.makedirs('logs/%s' % run_id, exist_ok=True)
+        logfile = 'logs/%s/log.txt' % run_id
+        # create the empty log file
         with open(logfile, "w") as f:
             pass
 
@@ -364,11 +359,16 @@ if __name__ == "__main__":
                     val_loss += loss
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
                 val_loss /= args.val_max_steps
-            # log to console and to file
+            # log val loss to console and to logfile
             print0(f"val loss {val_loss}")
             if master_process and logfile is not None:
                 with open(logfile, "a") as f:
                     f.write("s:%d tel:%f\n" % (step, val_loss))
+
+        # save the state of the training process
+        if master_process and (last_step or (args.save_every > 0 and (step + 1) % args.save_every == 0)):
+            log = dict(step=step, args=args.__dict__, code=code, model=raw_model.state_dict(), optimizer=optimizer.state_dict())
+            torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
 
         # bit confusing: we want to make sure to eval on 0th iteration
         # but also after the very last iteration. so we loop for step <= num_iterations
@@ -377,8 +377,9 @@ if __name__ == "__main__":
         if last_step:
             break
 
-        # --------------- TRAINING SECTION BEGIN -----------------
+        torch.cuda.synchronize()
         t0 = time.time()
+        # --------------- TRAINING SECTION BEGIN -----------------
         model.train()
         # forward pass
         with ctx:
@@ -397,31 +398,20 @@ if __name__ == "__main__":
         optimizer.zero_grad(set_to_none=True)
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
-
         torch.cuda.synchronize()
-        # time and print
         t1 = time.time()
+
         # the 0th iteration is often an outlier (much slower) => skip logging it
         tokens_per_second = ddp_world_size * B * T / (t1-t0)
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
         lossf = train_loss.item() # keep track of the mean loss
         print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
-        # log to logile
-        if master_process and logfile is not None:
+        # log training loss to logfile
+        if master_process:
             with open(logfile, "a") as f:
                 f.write("s:%d trl:%f\n" % (step, lossf))
 
-        if master_process and (args.save_every > 0 and (step + 1) % args.save_every == 0):
-            log = dict(step=step, args=args.__dict__, code=code, model=raw_model.state_dict(), optimizer=optimizer.state_dict())
-            torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
-
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
-
-    # -------------------------------------------------------------------------
-
-    if master_process:
-        log = dict(step=step, args=args.__dict__, code=code, model=raw_model.state_dict(), optimizer=optimizer.state_dict())
-        torch.save(log, 'logs/%s/state_final.pt' % run_id)
 
     # -------------------------------------------------------------------------
     # clean up nice
