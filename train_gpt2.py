@@ -159,7 +159,7 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas):
         optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=betas)
         return optimizer
 
@@ -322,8 +322,7 @@ if __name__ == "__main__":
 
     # init the optimizer
     optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
-                                               learning_rate=args.learning_rate, betas=(0.9, 0.95),
-                                               device_type=device)
+                                               learning_rate=args.learning_rate, betas=(0.9, 0.95))
 
     # learning rate decay scheduler (linear warmup and warmdown)
     def get_lr(it):
