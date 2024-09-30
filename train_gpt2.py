@@ -1,15 +1,14 @@
 import os
 import sys
 import uuid
-import math
 import glob
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 from torch import nn
-import torch.distributed as dist
 import torch.nn.functional as F
+import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
@@ -103,7 +102,7 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
-        self.attn_scale = (1 / math.sqrt(2 * config.n_layer))
+        self.attn_scale = (1 / (2 * config.n_layer)**0.5)
 
     def forward(self, x):
         x = x + self.attn_scale * self.attn(rmsnorm(x))
