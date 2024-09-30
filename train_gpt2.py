@@ -349,7 +349,6 @@ if __name__ == "__main__":
         with open(logfile, "w") as f:
             pass
 
-    timings = []
     for step in range(args.num_iterations + 1):
         last_step = (step == args.num_iterations)
 
@@ -412,17 +411,10 @@ if __name__ == "__main__":
             with open(logfile, "a") as f:
                 f.write("s:%d trl:%f\n" % (step, lossf))
 
-        # keep track of smooth timings, last 20 iterations
-        if step > 0 and step > args.num_iterations - 20:
-            timings.append(t1-t0)
-
         if master_process and (args.save_every > 0 and (step + 1) % args.save_every == 0):
             log = dict(step=step, args=args.__dict__, code=code, model=raw_model.state_dict(), optimizer=optimizer.state_dict())
             torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
 
-    # print the average of the last 20 timings, to get something smooth-ish
-    timings = timings[-20:]
-    print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
     # -------------------------------------------------------------------------
