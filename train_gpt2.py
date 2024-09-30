@@ -347,7 +347,7 @@ if __name__ == "__main__":
         if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
             model.eval()
             val_loader.reset()
-            with torch.no_grad():
+            with torch.no_grad(), ctx:
                 val_loss = 0.0
                 for _ in range(args.val_max_steps):
                     x_val, y_val = val_loader.next_batch()
