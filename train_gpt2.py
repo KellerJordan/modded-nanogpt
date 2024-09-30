@@ -267,7 +267,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmdown_iters", type=int, default=0, help="learning rate warmdown iterations")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
     # evaluation
-    parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
+    parser.add_argument("--val_loss_every", type=int, default=0, help="every how many steps to evaluate val loss?")
     parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
     parser.add_argument("--save_every", type=int, default=0, help="every how many steps to save the checkpoint")
     args = parser.parse_args()
@@ -397,11 +397,9 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         t1 = time.time()
 
-        # the 0th iteration is often an outlier (much slower) => skip logging it
-        tokens_per_second = ddp_world_size * B * T / (t1-t0)
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
-        lossf = train_loss.item() # keep track of the mean loss
-        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
+        tokens_per_second = ddp_world_size * B * T / (t1 - t0)
+        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {train_loss.item():.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
         # log training loss to logfile
         if master_process:
             with open(logfile, "a") as f:
