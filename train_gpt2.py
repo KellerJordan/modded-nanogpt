@@ -339,6 +339,7 @@ if __name__ == "__main__":
             return args.learning_rate * decay_ratio
 
     run_id = str(uuid.uuid4())
+    os.makedirs('logs/%s' % run_id, exist_ok=True)
 
     # create the logging directory if it does not exist
     logfile = None
@@ -419,9 +420,8 @@ if __name__ == "__main__":
             timings.append(t1-t0)
 
         if master_process and (step + 1) % args.save_every == 0:
-            log = dict(model=raw_model.state_dict(), code=code, args=args.__dict__)
-            os.makedirs('logs/%s' % run_id, exist_ok=True)
-            torch.save(log, 'logs/%s/model_step%06d.pt' % (run_id, step))
+            log = dict(step=step, args=args.__dict__, code=code, model=raw_model.state_dict(), optimizer=optimizer.state_dict())
+            torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
 
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
@@ -431,9 +431,8 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
 
     if master_process:
-        log = dict(model=raw_model.state_dict(), code=code, args=args.__dict__)
-        os.makedirs('logs/%s' % run_id, exist_ok=True)
-        torch.save(log, 'logs/%s/final.pt' % run_id)
+        log = dict(step=step, args=args.__dict__, code=code, model=raw_model.state_dict(), optimizer=optimizer.state_dict())
+        torch.save(log, 'logs/%s/state_final.pt' % run_id)
 
     # -------------------------------------------------------------------------
     # clean up nice
