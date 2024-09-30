@@ -271,7 +271,7 @@ if __name__ == "__main__":
     # evaluation
     parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
     parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
-    parser.add_argument("--save_every", type=int, default=5000, help="every how many steps to save the checkpoint")
+    parser.add_argument("--save_every", type=int, default=0, help="every how many steps to save the checkpoint")
     args = parser.parse_args()
 
     # args error checking and convenience variables
@@ -416,7 +416,7 @@ if __name__ == "__main__":
         if step > 0 and step > args.num_iterations - 20:
             timings.append(t1-t0)
 
-        if master_process and (step + 1) % args.save_every == 0:
+        if master_process and (args.save_every > 0 and (step + 1) % args.save_every == 0):
             log = dict(step=step, args=args.__dict__, code=code, model=raw_model.state_dict(), optimizer=optimizer.state_dict())
             torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
 
