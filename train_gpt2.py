@@ -304,7 +304,7 @@ if __name__ == "__main__":
         "d48": GPTConfig(vocab_size=num_vocab, n_layer=48, n_head=25, n_embd=1600),
     }[args.model]
     model = GPT(model_config)
-    model = model.bfloat16().cuda()
+    model = model.cuda()
     if hasattr(config, "coordinate_descent_tuning"):
         config.coordinate_descent_tuning = True # suggested by @Chillee
     print0("compiling the model...")
@@ -313,6 +313,9 @@ if __name__ == "__main__":
     # here we wrap model into DDP container
     model = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module # always contains the "raw" unwrapped model
+
+    # set up a context manager following the desired dtype and device
+    ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
     # init the optimizer
     optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
@@ -349,7 +352,7 @@ if __name__ == "__main__":
             val_loader.reset()
             val_loss = 0.0
             for _ in range(args.val_max_steps):
-                with torch.no_grad():
+                with torch.no_grad(): # I want to use ctx here but it causes a torch.compile error
                     x_val, y_val = val_loader.next_batch()
                     _, loss = model(x_val, y_val, return_logits=False)
                     val_loss += loss
@@ -378,8 +381,9 @@ if __name__ == "__main__":
         # --------------- TRAINING SECTION BEGIN -----------------
         model.train()
         # forward pass
-        _, loss = model(x, y, return_logits=False)
-        train_loss = loss.detach()
+        with ctx:
+            _, loss = model(x, y, return_logits=False)
+            train_loss = loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
         # backward pass
