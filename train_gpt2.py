@@ -209,8 +209,7 @@ class DistributedDataLoader:
         for fname in self.files:
             shard_ntok = _peek_data_shard(fname)
             assert shard_ntok >= num_processes * B * T + 1
-            ntok_total += shard_ntok
-        self.ntok_total = ntok_total
+            ntok_total += int(shard_ntok)
         print0(f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files")
 
         # kick things off
@@ -352,13 +351,10 @@ if __name__ == "__main__":
 
     timings = []
     for step in range(args.num_iterations + 1):
-        t0 = time.time()
         last_step = (step == args.num_iterations)
 
         # once in a while evaluate the validation dataset
-        if (args.val_loss_every > 0 \
-            and (step % args.val_loss_every == 0 or last_step)) \
-            and (val_loader is not None):
+        if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
             model.eval()
             val_loader.reset()
             with torch.no_grad():
@@ -383,6 +379,7 @@ if __name__ == "__main__":
             break
 
         # --------------- TRAINING SECTION BEGIN -----------------
+        t0 = time.time()
         model.train()
         # forward pass
         with ctx:
