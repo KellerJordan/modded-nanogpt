@@ -3,7 +3,7 @@
 This is a variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo. It:
 * Trains 2x more efficiently (taking only 5B tokens instead of 10B to reach the same validation loss).
-* Has simpler code (418 lines instead of 858).
+* Has simpler code (414 lines instead of 858).
 * Implements modernizations like rotary embeddings.
 
 ![upgrade](img/fig_tuned_nanogpt.png)
