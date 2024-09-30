@@ -348,14 +348,14 @@ if __name__ == "__main__":
         if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
             model.eval()
             val_loader.reset()
-            with torch.no_grad(): # I want to use ctx here too but it causes a torch compile error for some reason
-                val_loss = 0.0
-                for _ in range(args.val_max_steps):
+            val_loss = 0.0
+            for _ in range(args.val_max_steps):
+                with torch.no_grad(): # I want to use ctx here too but it causes a torch compile error for some reason
                     x_val, y_val = val_loader.next_batch()
                     _, loss = model(x_val, y_val, return_logits=False)
                     val_loss += loss
-                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-                val_loss /= args.val_max_steps
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            val_loss /= args.val_max_steps
             # log val loss to console and to logfile
             print0(f"val loss {val_loss}")
             if master_process and logfile is not None:
@@ -363,7 +363,7 @@ if __name__ == "__main__":
                     f.write("s:%d tel:%f\n" % (step, val_loss))
 
         # save the state of the training process
-        if master_process and (last_step or (args.save_every > 0 and (step + 1) % args.save_every == 0)):
+        if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
             log = dict(step=step, args=args.__dict__, code=code, model=raw_model.state_dict(), optimizer=optimizer.state_dict())
             torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
 
