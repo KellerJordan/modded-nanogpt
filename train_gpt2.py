@@ -208,7 +208,7 @@ class DistributedDataLoader:
             shard_ntok = _peek_data_shard(fname)
             assert shard_ntok >= num_processes * B * T + 1
             ntok_total += int(shard_ntok)
-        print0(f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files")
+        self.ntok_total = ntok_total
 
         # kick things off
         self.reset()
@@ -291,7 +291,9 @@ if __name__ == "__main__":
 
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
     val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+    print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
     x, y = train_loader.next_batch()
 
     # init the model from scratch
