@@ -302,7 +302,7 @@ if __name__ == "__main__":
         "d48": GPTConfig(vocab_size=num_vocab, n_layer=48, n_head=25, n_embd=1600),
     }[args.model]
     model = GPT(model_config)
-    model = model.train().cuda()
+    model = model.bfloat16().cuda()
     if hasattr(config, "coordinate_descent_tuning"):
         config.coordinate_descent_tuning = True # suggested by @Chillee
     print0("compiling the model...")
