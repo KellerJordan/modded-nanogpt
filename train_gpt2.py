@@ -286,9 +286,6 @@ if __name__ == "__main__":
     print(f"using device: {device}")
     master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
-    # set up a context manager following the desired dtype and device
-    ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
-
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
     print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
@@ -350,7 +347,7 @@ if __name__ == "__main__":
             val_loader.reset()
             val_loss = 0.0
             for _ in range(args.val_max_steps):
-                with torch.no_grad(): # I want to use ctx here too but it causes a torch compile error for some reason
+                with torch.no_grad():
                     x_val, y_val = val_loader.next_batch()
                     _, loss = model(x_val, y_val, return_logits=False)
                     val_loss += loss
@@ -379,9 +376,8 @@ if __name__ == "__main__":
         # --------------- TRAINING SECTION BEGIN -----------------
         model.train()
         # forward pass
-        with ctx:
-            _, loss = model(x, y, return_logits=False)
-            train_loss = loss.detach()
+        _, loss = model(x, y, return_logits=False)
+        train_loss = loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
         # backward pass
