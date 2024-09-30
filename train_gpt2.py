@@ -404,7 +404,7 @@ if __name__ == "__main__":
         # log training loss to logfile
         if master_process:
             with open(logfile, "a") as f:
-                f.write("s:%d trl:%f\n" % (step, lossf))
+                f.write("s:%d trl:%f\n" % (step, train_loss.item()))
 
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
