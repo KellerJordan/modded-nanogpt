@@ -11,7 +11,6 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
 
 with open(sys.argv[0]) as f:
     code = f.read()
@@ -278,7 +277,7 @@ if __name__ == "__main__":
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     assert torch.cuda.is_available()
-    init_process_group(backend='nccl')
+    dist.init_process_group(backend='nccl')
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     ddp_world_size = int(os.environ['WORLD_SIZE'])
@@ -409,4 +408,4 @@ if __name__ == "__main__":
 
     # -------------------------------------------------------------------------
     # clean up nice
-    destroy_process_group()
+    dist.destroy_process_group()
