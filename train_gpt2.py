@@ -320,7 +320,7 @@ if __name__ == "__main__":
 
     # init the optimizer
     optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
-                                               learning_rate=args.learning_rate, betas=(0.9, 0.95))
+                                               learning_rate=args.learning_rate, betas=(0.9, 0.98))
 
     # learning rate decay scheduler (linear warmup and warmdown)
     def get_lr(it):
