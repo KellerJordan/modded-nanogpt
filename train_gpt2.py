@@ -65,7 +65,7 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.rotary = Rotary(self.head_dim)
 
-    def forward(self, x):
+    def forward(self, x, mask):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         qkv = self.c_attn(x)
@@ -76,7 +76,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(q)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -103,8 +103,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         self.attn_scale = (1 / (2 * config.n_layer)**0.5)
 
-    def forward(self, x):
-        x = x + self.attn_scale * self.attn(rmsnorm(x))
+    def forward(self, x, mask):
+        x = x + self.attn_scale * self.attn(rmsnorm(x), mask)
         x = x + self.mlp(rmsnorm(x))
         return x
 
@@ -131,26 +131,49 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
+    def attention_mask(self, idx, just_causal=True):
+        """
+        Assumes that the eos token is vocab_size-1
+        """
+        B, S = idx.shape
+        ii = torch.arange(S, device='cuda')
+        causal_mask = ii[None, :] <= ii[:, None]
+        if just_causal:
+            return causal_mask[None]
+
+        eos_token = self.config.vocab_size-1
+        m = (idx == eos_token)
+        block_mask = torch.zeros(B, S, S, device='cuda', dtype=torch.bool)
+        for i in range(len(m)):
+            pp = ii[m[i]].tolist()+[S]
+            p0 = 0
+            for p1 in pp:
+                block_mask[i, p0:p1, p0:p1] = True
+                p0 = p1
+
+        return causal_mask & block_mask
+
     def forward(self, idx, targets=None, return_logits=True):
         b, t = idx.size()
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device) # shape (t)
+
+        mask = self.attention_mask(idx)
+        mask =  mask[:, None] # unsqueeze dim 1 for multihead attn
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
 
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, mask)
         x = rmsnorm(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            logits = logits.float() # use tf32/fp32 for logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            logits = logits.float() # use tf32/fp32 for logits
             loss = None
 
         # there are performance reasons why not returning logits is prudent, if not needed
@@ -258,7 +281,8 @@ if __name__ == "__main__":
     parser.add_argument("--input_val_bin", type=str, help="input .bin to eval validation loss on")
     parser.add_argument("--model", type=str, default="d12", help="d12|d24|d36|d48")
     # token layout for each step of the optimization
-    parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
+    parser.add_argument("--batch_size", type=int, default=4, help="microbatch size, in units of #batch dimensions")
+    parser.add_argument("--accumulation", type=int, default=1, help="number of microbatches to accumulate each minibatch")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
     # workload (number of steps)
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
@@ -298,7 +322,7 @@ if __name__ == "__main__":
     # init the model from scratch
     num_vocab = 50257
     model_config = {
-        "d12": GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768),
+        "d12": GPTConfig(vocab_size=num_vocab, n_layer=4, n_head=8, n_embd=512),
         "d24": GPTConfig(vocab_size=num_vocab, n_layer=24, n_head=16, n_embd=1024),
         "d36": GPTConfig(vocab_size=num_vocab, n_layer=36, n_head=20, n_embd=1280),
         "d48": GPTConfig(vocab_size=num_vocab, n_layer=48, n_head=25, n_embd=1600),
@@ -380,14 +404,17 @@ if __name__ == "__main__":
         t0 = time.time()
         # --------------- TRAINING SECTION BEGIN -----------------
         model.train()
-        # forward pass
-        with ctx:
-            _, loss = model(x, y, return_logits=False)
-            train_loss = loss.detach()
-        # advance the dataset for the next batch
-        x, y = train_loader.next_batch()
-        # backward pass
-        loss.backward()
+        for _ in range(args.accumulation):
+            # forward pass
+            with ctx:
+                _, loss = model(x, y, return_logits=False)
+                train_loss = loss.detach()
+            # advance the dataset for the next batch
+            x, y = train_loader.next_batch()
+            # backward pass
+            loss.backward()
+        for p in model.parameters():
+            p.grad /= args.accumulation
         # determine and set the learning rate for this iteration
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
@@ -401,7 +428,7 @@ if __name__ == "__main__":
         t1 = time.time()
 
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
-        tokens_per_second = ddp_world_size * B * T / (t1 - t0)
+        tokens_per_second = args.accumulation * ddp_world_size * B * T / (t1 - t0)
         print0(f"step {step+1:4d}/{args.num_iterations} | train loss {train_loss.item():.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
         # log training loss to logfile
         if master_process:
