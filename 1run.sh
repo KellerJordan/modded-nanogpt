@@ -10,5 +10,5 @@ torchrun --standalone --nproc_per_node=1 train_gpt2.py \
     --num_iterations 4000 \
     --weight_decay 0.0 \
     --learning_rate 0.0024 \
-    --warmup_iters 250 \
+    --warmup_iters 500 \
     --warmdown_iters 1000
