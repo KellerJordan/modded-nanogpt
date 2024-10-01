@@ -76,8 +76,8 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(q)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        #y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask)
+        #y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -132,15 +132,13 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
-    def attention_mask(self, idx, just_causal=True):
+    def attention_mask(self, idx):
         """
         Assumes that the eos token is vocab_size-1
         """
         B, S = idx.shape
         ii = torch.arange(S, device='cuda')
         causal_mask = ii[None, :] <= ii[:, None]
-        if just_causal:
-            return causal_mask[None]
 
         eos_token = self.config.vocab_size-1
         m = (idx == eos_token)
@@ -158,9 +156,8 @@ class GPT(nn.Module):
         b, t = idx.size()
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device) # shape (t)
 
-        #mask = self.attention_mask(idx)
-        #mask =  mask[:, None] # unsqueeze dim 1 for multihead attn
-        mask = None
+        mask = self.attention_mask(idx)
+        mask =  mask[:, None] # unsqueeze dim 1 for multihead attn
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
