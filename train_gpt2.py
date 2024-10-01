@@ -76,7 +76,8 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(q)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask)
+        #y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -157,8 +158,9 @@ class GPT(nn.Module):
         b, t = idx.size()
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device) # shape (t)
 
-        mask = self.attention_mask(idx)
-        mask =  mask[:, None] # unsqueeze dim 1 for multihead attn
+        #mask = self.attention_mask(idx)
+        #mask =  mask[:, None] # unsqueeze dim 1 for multihead attn
+        mask = None
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
