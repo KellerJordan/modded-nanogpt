@@ -160,7 +160,8 @@ class GPT(nn.Module):
         return logits, loss
 
     def configure_optimizers(self, weight_decay, learning_rate, betas):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=betas)
+        #optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=betas)
+        optimizer = Adam(self.parameters(), lr=learning_rate, betas=betas)
         return optimizer
 
 # -----------------------------------------------------------------------------
@@ -237,6 +238,44 @@ class DistributedDataLoader:
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
         return x.cuda(), y.cuda()
+
+
+from torch.optim.optimizer import Optimizer
+class Adam(Optimizer):
+    def __init__(self, params, lr=0.0018, betas=(0.9, 0.95)):
+        defaults = dict(lr=lr, betas=betas)
+        super().__init__(params, defaults)
+        self.steps = 0
+
+    def step(self):
+        self.steps += 1
+        for group in self.param_groups:
+            lr = group['lr']
+            beta1, beta2 = group['betas']
+            for i, p in enumerate(group['params']):
+                g = p.grad
+                if g is None:
+                    continue
+
+                buf1 = self.state[p].get('exp_avg')
+                buf2 = self.state[p].get('exp_avg_sq')
+                if buf1 is None:
+                    buf1 = torch.zeros_like(g)
+                    self.state[p]['exp_avg'] = buf1
+                if buf2 is None:
+                    buf2 = torch.zeros_like(g)
+                    self.state[p]['exp_avg_sq'] = buf2
+
+                buf1.mul_(beta1).add_(g, alpha=1-beta1)
+                buf2.mul_(beta2).add_(g.square(), alpha=1-beta2)
+
+                t = self.steps
+                correct_buf1 = buf1 / (1 - beta1**t)
+                correct_buf2 = buf2 / (1 - beta2**t)
+
+                eps = 1e-8
+                update = correct_buf1 / (eps + correct_buf2.sqrt())
+                p.data.add_(update, alpha=-lr)
 
 # -----------------------------------------------------------------------------
 # int main
