@@ -16,9 +16,9 @@ with open(sys.argv[0]) as f:
     code = f.read()
 
 # -----------------------------------------------------------------------------
-# Proposed optimizer - as yet unnamed
+# OrthgonalNesterov optimizer
 
-class ProposedOptimizer(torch.optim.Optimizer):
+class OrthogonalNesterov(torch.optim.Optimizer):
     def __init__(self, params, lr=0.02, momentum=0.9, nesterov=True, zeropower_iters=5):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, zeropower_iters=zeropower_iters)
         super().__init__(params, defaults)
@@ -236,7 +236,7 @@ class GPT(nn.Module):
     def configure_optimizers(self, weight_decay, learning_rate, betas):
         optimizer = CombinedOptimizer([
             torch.optim.AdamW(self.lm_head.parameters(), lr=learning_rate, betas=betas, weight_decay=0),
-            ProposedOptimizer(self.transformer.h.parameters(), lr=10 * learning_rate, momentum=0.95)
+            OrthogonalNesterov(self.transformer.h.parameters(), lr=10 * learning_rate, momentum=0.95)
         ])
         return optimizer
 
