@@ -16,9 +16,83 @@ with open(sys.argv[0]) as f:
     code = f.read()
 
 # -----------------------------------------------------------------------------
+# Proposed optimizer
+
+class ProposedOptimizer(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, momentum=0.9, nesterov=True, zeropower_iters=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, zeropower_iters=zeropower_iters)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            for p in group['params']:
+                g = p.grad
+                if g is None:
+                    continue
+                state = self.state[p]
+                state['steps'] = state.get('steps', 0) + 1
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
+                g = g.add(buf, alpha=momentum) if group['nesterov'] else buf
+                update = zeroth_power_via_newtonschulz5(g, steps=group['zeropower_iters'])
+                p.data.add_(update, alpha=-lr)
+
+@torch.compile
+def zeroth_power_via_newtonschulz5(G, steps=5, eps=1e-7):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. It turns out
+    to be empirically effective to keep increasing the slope of the quintic at zero even beyond the
+    point where it no longer converges to one everywhere after repeated application (so long as it
+    stays relatively close to 1 across the interval). Our usage of a Newton-Schulz iteration as the
+    orthogonalization method traces to Bernstein & Newhouse (2024) https://arxiv.org/abs/2409.20325
+    who suggested its use for computing the preconditioners of Shampoo.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16() / (G.norm() + eps) # ensure top singular value <= 1
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = A @ X
+        X = a * X + b * B + c * A @ B
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X.to(G.dtype)
+
+class CombinedOptimizer:
+
+    def __init__(self, optimizers):
+        assert all(len(opt.param_groups) == 1 for opt in optimizers)
+        self.optimizers = optimizers
+        self.param_groups = [pg for opt in self.optimizers for pg in opt.param_groups]
+        self.base_lrs = [opt.param_groups[0]['lr'] for opt in self.optimizers]
+
+    def step(self):
+        for opt in self.optimizers:
+            opt.step()
+
+    def zero_grad(self, **kwargs):
+        for opt in self.optimizers:
+            opt.zero_grad(**kwargs)
+
+    def scale_lrs(self, lr_scale):
+        for base_lr, opt in zip(self.base_lrs, self.optimizers):
+            opt.param_groups[0]['lr'] = base_lr * lr_scale
+
+    def state_dict(self):
+        return [opt.state_dict() for opt in self.optimizers]
+
+# -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
 class Rotary(torch.nn.Module):
+
     def __init__(self, dim, base=10000):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
@@ -160,8 +234,10 @@ class GPT(nn.Module):
         return logits, loss
 
     def configure_optimizers(self, weight_decay, learning_rate, betas):
-        #optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=betas)
-        optimizer = Adam(self.parameters(), lr=learning_rate, betas=betas)
+        optimizer = CombinedOptimizer([
+            torch.optim.AdamW(self.lm_head.parameters(), lr=learning_rate, betas=betas, weight_decay=0),
+            ProposedOptimizer(self.transformer.h.parameters(), lr=10 * learning_rate, momentum=0.95)
+        ])
         return optimizer
 
 # -----------------------------------------------------------------------------
@@ -239,44 +315,6 @@ class DistributedDataLoader:
             self.advance()
         return x.cuda(), y.cuda()
 
-
-from torch.optim.optimizer import Optimizer
-class Adam(Optimizer):
-    def __init__(self, params, lr=0.0018, betas=(0.9, 0.95)):
-        defaults = dict(lr=lr, betas=betas)
-        super().__init__(params, defaults)
-        self.steps = 0
-
-    def step(self):
-        self.steps += 1
-        for group in self.param_groups:
-            lr = group['lr']
-            beta1, beta2 = group['betas']
-            for i, p in enumerate(group['params']):
-                g = p.grad
-                if g is None:
-                    continue
-
-                buf1 = self.state[p].get('exp_avg')
-                buf2 = self.state[p].get('exp_avg_sq')
-                if buf1 is None:
-                    buf1 = torch.zeros_like(g)
-                    self.state[p]['exp_avg'] = buf1
-                if buf2 is None:
-                    buf2 = torch.zeros_like(g)
-                    self.state[p]['exp_avg_sq'] = buf2
-
-                buf1.mul_(beta1).add_(g, alpha=1-beta1)
-                buf2.mul_(beta2).add_(g.square(), alpha=1-beta2)
-
-                t = self.steps
-                correct_buf1 = buf1 / (1 - beta1**t)
-                correct_buf2 = buf2 / (1 - beta2**t)
-
-                eps = 1e-8
-                update = correct_buf1 / (eps + correct_buf2.sqrt())
-                p.data.add_(update, alpha=-lr)
-
 # -----------------------------------------------------------------------------
 # int main
 
@@ -331,14 +369,14 @@ if __name__ == "__main__":
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
     print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
-    val_loader = DistributedDataLoader(args.input_val_bin, 32, T, ddp_rank, ddp_world_size)
+    val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
     print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
     x, y = train_loader.next_batch()
 
     # init the model from scratch
     num_vocab = 50257
     model_config = {
-        "d12": GPTConfig(vocab_size=num_vocab, n_layer=4, n_head=6, n_embd=384),
+        "d12": GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768),
         "d24": GPTConfig(vocab_size=num_vocab, n_layer=24, n_head=16, n_embd=1024),
         "d36": GPTConfig(vocab_size=num_vocab, n_layer=36, n_head=20, n_embd=1280),
         "d48": GPTConfig(vocab_size=num_vocab, n_layer=48, n_head=25, n_embd=1600),
@@ -359,21 +397,21 @@ if __name__ == "__main__":
 
     # init the optimizer
     optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
-                                               learning_rate=args.learning_rate, betas=(0.9, 0.98))
+                                               learning_rate=args.learning_rate, betas=(0.9, 0.95))
 
     # learning rate decay scheduler (linear warmup and warmdown)
     def get_lr(it):
         assert it <= args.num_iterations
         # 1) linear warmup for warmup_iters steps
         if it < args.warmup_iters:
-            return args.learning_rate * (it+1) / args.warmup_iters
+            return (it+1) / args.warmup_iters
         # 2) constant lr for a while
         elif it < args.num_iterations - args.warmdown_iters:
-            return args.learning_rate
+            return 1.0
         # 3) linear warmdown
         else:
             decay_ratio = (args.num_iterations - it) / args.warmdown_iters
-            return args.learning_rate * decay_ratio
+            return decay_ratio
 
     run_id = str(uuid.uuid4())
     if master_process:
@@ -432,9 +470,8 @@ if __name__ == "__main__":
         for p in model.parameters():
             p.grad /= args.accumulation
         # determine and set the learning rate for this iteration
-        lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+        lr_scale = get_lr(step)
+        optimizer.scale_lrs(lr_scale)
         # step the optimizer
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -445,7 +482,7 @@ if __name__ == "__main__":
 
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
         tokens_per_second = ddp_world_size * B * T / (t1 - t0)
-        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {train_loss.item():.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
+        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {train_loss.item():.4f} | lr_scale {lr_scale:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
         # log training loss to logfile
         if master_process:
             with open(logfile, "a") as f:
