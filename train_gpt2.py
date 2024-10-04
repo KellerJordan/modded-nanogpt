@@ -16,7 +16,7 @@ with open(sys.argv[0]) as f:
     code = f.read()
 
 # -----------------------------------------------------------------------------
-# Proposed optimizer
+# Proposed optimizer - as yet unnamed
 
 class ProposedOptimizer(torch.optim.Optimizer):
     def __init__(self, params, lr=0.02, momentum=0.9, nesterov=True, zeropower_iters=5):
