@@ -38,6 +38,8 @@ class OrthogonalNesterov(torch.optim.Optimizer):
                 buf = state['momentum_buffer']
                 buf.mul_(momentum).add_(g)
                 g = g.add(buf, alpha=momentum) if group['nesterov'] else buf
+                # unbiased smooth version of the gradient
+                g = g*(1-momentum)/(1-torch.pow(momentum,state['steps']))
                 update = zeroth_power_via_newtonschulz5(g, steps=group['zeropower_iters'])
                 p.data.add_(update, alpha=-lr)
 
