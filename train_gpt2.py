@@ -32,14 +32,14 @@ class OrthogonalNesterov(torch.optim.Optimizer):
                 if g is None:
                     continue
                 state = self.state[p]
-                state['steps'] = state.get('steps', 0) + 1
                 if 'momentum_buffer' not in state:
                     state['momentum_buffer'] = torch.zeros_like(g)
                 buf = state['momentum_buffer']
                 buf.mul_(momentum).add_(g)
                 g = g.add(buf, alpha=momentum) if group['nesterov'] else buf
                 update = zeroth_power_via_newtonschulz5(g, steps=group['zeropower_iters'])
-                p.data.add_(update, alpha=-lr)
+                scale = update.numel()**0.5 / update.norm()
+                p.data.add_(update, alpha=-lr * scale)
 
 @torch.compile
 def zeroth_power_via_newtonschulz5(G, steps=5, eps=1e-7):
@@ -235,8 +235,8 @@ class GPT(nn.Module):
 
     def configure_optimizers(self, weight_decay, learning_rate, betas):
         optimizer = CombinedOptimizer([
-            torch.optim.AdamW(self.lm_head.parameters(), lr=learning_rate, betas=betas, weight_decay=0),
-            OrthogonalNesterov(self.transformer.h.parameters(), lr=10 * learning_rate, momentum=0.95)
+            torch.optim.AdamW(self.lm_head.parameters(), lr=2*learning_rate, betas=betas, weight_decay=0, fused=True),
+            OrthogonalNesterov(self.transformer.h.parameters(), lr=0.2*learning_rate, momentum=0.95)
         ])
         return optimizer
 
