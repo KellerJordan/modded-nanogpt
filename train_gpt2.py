@@ -20,7 +20,7 @@ with open(sys.argv[0]) as f:
 
 class OrthogonalNesterov(torch.optim.Optimizer):
     """
-    Notes: This optimizer assumes that all parameters passed in are 2D.
+    Some warnings: This optimizer assumes that all parameters passed in are 2D.
     It shouldn't be used for the embedding layer, the final fully connected layer, or {0,1}-D
     parameters; those should be optimized by a standard method (e.g., AdamW).
     To use it with 4D convolutional filters, it works well to flatten their last 3 dimensions.
