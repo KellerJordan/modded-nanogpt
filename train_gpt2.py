@@ -429,7 +429,7 @@ if __name__ == "__main__":
             model.eval()
             val_loader.reset()
             val_loss = 0.0
-            for _ in range(args.val_max_steps):
+            for _ in range(args.accumulation * args.val_max_steps):
                 with torch.no_grad(): # I want to use ctx here but it causes a torch.compile error
                     x_val, y_val = val_loader.next_batch()
                     _, loss = model(x_val, y_val, return_logits=False)
