@@ -276,6 +276,7 @@ class DistributedDataLoader:
         self.num_processes = num_processes
         self.B = B
         self.T = T
+        self.microbatch_size = B * T * num_processes
 
         # glob files that match the pattern
         self.files = sorted(glob.glob(filename_pattern))
@@ -347,7 +348,8 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
     # evaluation
     parser.add_argument("--val_loss_every", type=int, default=0, help="every how many steps to evaluate val loss?")
-    parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
+    parser.add_argument("--val_tokens", type=int, default=8*20*2**19,
+                        help="how many tokens of validation data? it's important to keep this invariant to other hparams when measuring small differences")
     parser.add_argument("--save_every", type=int, default=0, help="every how many steps to save the checkpoint")
     args = parser.parse_args()
 
@@ -429,8 +431,9 @@ if __name__ == "__main__":
             model.eval()
             val_loader.reset()
             val_loss = 0.0
-            for _ in range(args.accumulation * args.val_max_steps):
-                with torch.no_grad(): # I want to use ctx here but it causes a torch.compile error
+            assert args.val_tokens % val_loader.microbatch_size == 0
+            for _ in range(args.val_max_steps // val_loader.microbatch_size):
+                with torch.no_grad(): # I want to use ctx here too but it causes a torch.compile error
                     x_val, y_val = val_loader.next_batch()
                     _, loss = model(x_val, y_val, return_logits=False)
                     val_loss += loss
@@ -481,7 +484,7 @@ if __name__ == "__main__":
         t1 = time.time()
 
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
-        tokens_per_second = args.accumulation * ddp_world_size * B * T / (t1 - t0)
+        tokens_per_second = args.accumulation * train_loader.microbatch_size / (t1 - t0)
         print0(f"step {step+1:4d}/{args.num_iterations} | train loss {train_loss.item():.4f} | lr_scale {lr_scale:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
         # log training loss to logfile
         if master_process:
