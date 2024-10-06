@@ -2,8 +2,8 @@
 
 This is a variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo. It:
-* Trains 2.7x more efficiently (taking only 3.67B tokens instead of 10B to reach the same validation loss).
-* Has shorter code (497 lines instead of 860).
+* Trains 2.8x more efficiently (taking only 3.5B tokens instead of 10B to reach the same validation loss).
+* Has shorter code (499 lines instead of 860).
 * Implements architectural modernizations (rotary embeddings and RMSNorm).
 * Implements a new optimizer.
 
@@ -15,7 +15,7 @@ python data/cached_fineweb10B.py
 ./run.sh
 ```
 
-This will train a 124M-parameter transformer for 7000 steps on 3.67B tokens of Fineweb [1], achieving ~3.280 validation
+This will train a 124M-parameter transformer for 7000 steps on 3.5B tokens of Fineweb [1], achieving ~3.275 validation
 loss.
 For comparison, the default llm.c PyTorch trainer yields [~3.285 validation loss after training for 10B tokens](https://github.com/karpathy/llm.c/discussions/481).
 
@@ -32,8 +32,8 @@ Figure 1. Proposed optimizer vs. a well-tuned AdamW.
 
 For this training scenario, the proposed optimizer has the following properties:
 * Half the memory usage of Adam
-* 1.36x faster training
-* <3% wallclock overhead
+* 1.43x faster training
+* <7% wallclock overhead
 
 It is defined as follows:
 
@@ -89,7 +89,7 @@ The speedup is due to the following changes:
 - Switched to rotary embeddings
 - Removed the special initialization for linear layers before residuals. Instead, just scale down the output of the attention block by a fixed scalar.
 - Removed all affine scale and bias parameters from the architecture, and switched to RMSNorm (actually this causes a slight slowdown, and I just did it to reduce code complexity)
-- Switched from AdamW to new optimizer
+- Switched from AdamW to new optimizer, and removed learning rate warmup
 
 ---
 
