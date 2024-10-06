@@ -432,13 +432,14 @@ if __name__ == "__main__":
             val_loader.reset()
             val_loss = 0.0
             assert args.val_tokens % val_loader.microbatch_size == 0
-            for _ in range(args.val_max_steps // val_loader.microbatch_size):
+            val_steps_per_device = args.val_tokens // val_loader.microbatch_size
+            for _ in range(val_steps_per_device):
                 with torch.no_grad(): # I want to use ctx here too but it causes a torch.compile error
                     x_val, y_val = val_loader.next_batch()
                     _, loss = model(x_val, y_val, return_logits=False)
                     val_loss += loss
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-            val_loss /= args.val_max_steps
+            val_loss /= val_steps_per_device
             # log val loss to console and to logfile
             print0(f"val loss {val_loss}")
             if master_process and logfile is not None:
