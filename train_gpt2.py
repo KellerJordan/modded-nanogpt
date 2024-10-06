@@ -348,7 +348,7 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
     # evaluation
     parser.add_argument("--val_loss_every", type=int, default=0, help="every how many steps to evaluate val loss?")
-    parser.add_argument("--val_tokens", type=int, default=8*20*2**19,
+    parser.add_argument("--val_tokens", type=int, default=20*2**19,
                         help="how many tokens of validation data? it's important to keep this invariant to other hparams when measuring small differences")
     parser.add_argument("--save_every", type=int, default=0, help="every how many steps to save the checkpoint")
     args = parser.parse_args()
