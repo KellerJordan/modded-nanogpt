@@ -481,7 +481,7 @@ if __name__ == "__main__":
         t1 = time.time()
 
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
-        tokens_per_second = ddp_world_size * B * T / (t1 - t0)
+        tokens_per_second = args.accumulation * ddp_world_size * B * T / (t1 - t0)
         print0(f"step {step+1:4d}/{args.num_iterations} | train loss {train_loss.item():.4f} | lr_scale {lr_scale:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
         # log training loss to logfile
         if master_process:
