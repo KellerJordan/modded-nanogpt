@@ -16,7 +16,7 @@ python data/cached_fineweb10B.py
 ```
 
 This will train a 124M-parameter transformer for 6200 steps on 3.25B tokens of Fineweb [1], achieving ~3.278 validation loss.
-For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 10B tokens](https://github.com/karpathy/llm.c/discussions/481).
+For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
 ---
 
