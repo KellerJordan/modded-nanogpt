@@ -104,8 +104,6 @@ The speedup is due to the following changes:
 
 ![dofa](img/dofa.jpg)
 
-### Citation
-
 ```
 @software{moddednanogpt2024,
     author={Jordan, Keller},
