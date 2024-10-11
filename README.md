@@ -5,7 +5,7 @@ Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo. It:
 * Trains 3x more efficiently (taking only 3.25B tokens instead of 10B to reach the same validation loss).
 * Has shorter code (524 lines instead of 860).
 * Implements architectural modernizations (rotary embeddings and RMSNorm).
-* Implements a new optimizer (Muon).
+* Implements a new optimizer (Muon - Momentum Orthogonalized by Newton-schulz).
 
 To execute the training, run the following three commands on an 8xA100 or 8xH100 node.
 They complete in <45min on an 8xH100 with decent internet connection.
