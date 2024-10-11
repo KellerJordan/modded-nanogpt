@@ -2,10 +2,10 @@
 
 This is a variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo. It:
-* Trains 2.8x more efficiently (taking only 3.5B tokens instead of 10B to reach the same validation loss).
-* Has shorter code (499 lines instead of 860).
+* Trains 3x more efficiently (taking only 3.25B tokens instead of 10B to reach the same validation loss).
+* Has shorter code (524 lines instead of 860).
 * Implements architectural modernizations (rotary embeddings and RMSNorm).
-* Implements a new optimizer.
+* Implements a new optimizer (Muon).
 
 To execute the training, run the following three commands on an 8xA100 or 8xH100 node.
 They complete in <45min on an 8xH100 with decent internet connection.
@@ -15,9 +15,8 @@ python data/cached_fineweb10B.py
 ./run.sh
 ```
 
-This will train a 124M-parameter transformer for 6676 steps on 3.5B tokens of Fineweb [1], achieving ~3.275 validation
-loss.
-For comparison, the default llm.c PyTorch trainer yields [~3.285 validation loss after training for 10B tokens](https://github.com/karpathy/llm.c/discussions/481).
+This will train a 124M-parameter transformer for 6200 steps on 3.25B tokens of Fineweb [1], achieving ~3.278 validation loss.
+For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 10B tokens](https://github.com/karpathy/llm.c/discussions/481).
 
 ---
 
@@ -32,8 +31,8 @@ Figure 1. Proposed optimizer vs. a well-tuned AdamW.
 
 For this training scenario, the proposed optimizer has the following properties:
 * Half the memory usage of Adam
-* 1.43x faster training
-* <7% wallclock overhead
+* 1.5x faster training
+* <9% wallclock overhead (which can be further brought down by distributing the overhead; it's currently performed redundantly on all 8 GPUs)
 
 It is defined as follows:
 
