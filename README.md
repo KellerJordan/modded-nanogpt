@@ -31,7 +31,7 @@ Figure 1. Proposed optimizer vs. a well-tuned AdamW.
 
 For this training scenario, the proposed optimizer has the following properties:
 * Half the memory usage of Adam
-* 1.5x faster training
+* 1.5x faster training in terms of tokens to any fixed level of performance
 * <9% wallclock overhead (which can be further brought down by distributing the overhead; it's currently performed redundantly on all 8 GPUs)
 
 The optimizer is defined as follows:
