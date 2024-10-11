@@ -104,13 +104,3 @@ The speedup is due to the following changes:
 
 <img src="img/dofa.jpg" alt="itsover_wereback" style="width:100%;">
 
-```
-@software{moddednanogpt2024,
-    author={Jordan, Keller},
-    title={Modded-NanoGPT},
-    url={https://github.com/KellerJordan/Modded-NanoGPT},
-    version={0.1.0},
-    year = {2024}
-}
-```
-
