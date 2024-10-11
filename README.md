@@ -63,7 +63,7 @@ In particular, we experimentally obtained the following practices:
 * Using Nesterov momentum inside the update, with orthogonalization applied after momentum.
 * Using a specifically quintic Newton-Schulz iteration as the method of orthogonalization.
 * Using non-convergent coefficients for the quintic polynomial in order to maximize slope at zero, and thereby minimize the number of necessary Newton-Schulz iterations.
-* Running the Newton-Schulz iteration in bfloat16 (whereas Shampoo implementations often compute the preconditioners in fp32 or fp64).
+* Running the Newton-Schulz iteration in bfloat16 (whereas Shampoo implementations often compute the preconditioners via inverse-pth-roots in fp32 or fp64).
 
 Our use of a Newton-Schulz iteration for orthogonalization traces to [Bernstein & Newhouse (2024)](https://arxiv.org/abs/2409.20325),
 who suggested it as a way to compute Shampoo [5, 6] preconditioners, and theoretically explored Shampoo without preconditioner accumulation.
