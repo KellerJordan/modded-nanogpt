@@ -34,7 +34,7 @@ For this training scenario, the proposed optimizer has the following properties:
 * 1.5x faster training
 * <9% wallclock overhead (which can be further brought down by distributing the overhead; it's currently performed redundantly on all 8 GPUs)
 
-It is defined as follows:
+The optimizer is defined as follows:
 
 ![](img/algo_optimizer.png)
 
