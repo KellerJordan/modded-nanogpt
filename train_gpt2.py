@@ -50,7 +50,7 @@ zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_new
 
 class Muon(torch.optim.Optimizer):
     """
-    Muon: MomentUm Orthogonalized by Newton-schulz
+    Muon - MomentUm Orthogonalized by Newton-schulz
 
     Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
     processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
