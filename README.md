@@ -2,9 +2,9 @@
 
 This is a variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo. It:
-* Trains 3x more efficiently (taking only 3.25B tokens instead of 10B to reach the same validation loss).
+* Trains 3x more efficiently (taking only 3.15B tokens instead of 10B to reach the same validation loss).
 * Has shorter code (524 lines instead of 860).
-* Implements architectural modernizations (rotary embeddings and RMSNorm).
+* Implements architectural modernizations (rotary embeddings, RMSNorm, ReLU^2).
 * Implements a new optimizer (Muon - Momentum Orthogonalized by Newton-schulz).
 
 To execute the training, run the following three commands on an 8xA100 or 8xH100 node.
@@ -15,7 +15,7 @@ python data/cached_fineweb10B.py 35 # downloads the first 3.5B tokens
 ./run.sh
 ```
 
-This will train a 124M-parameter transformer for 6200 steps on 3.25B tokens of Fineweb [1], achieving ~3.278 validation loss.
+This will train a 124M-parameter transformer for 6000 steps on 3.15B tokens of Fineweb [1], achieving ~3.275 validation loss.
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
 ---
@@ -85,7 +85,7 @@ And to obtain a training speed improvement, we have diverged from being a strict
 The speedup is due to the following changes:
 - Increased learning rate by 3x
 - Switched to trapezoidal learning rate schedule following [7]
-- Switched to rotary embeddings
+- Switched to rotary embeddings and ReLU^2 activation
 - Removed the special initialization for linear layers before residuals. Instead, just scale down the output of the attention block by a fixed scalar.
 - Removed all affine scale and bias parameters from the architecture, and switched to RMSNorm (actually this causes a slight slowdown, and I just did it to reduce code complexity)
 - Switched from AdamW to new optimizer, and removed learning rate warmup
