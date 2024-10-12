@@ -178,7 +178,7 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.gelu(x)
+        x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
@@ -333,10 +333,11 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 6200 # number of iterations to run
+    num_iterations : int = 6000 # number of iterations to run
     learning_rate : float = 0.0036
     warmup_iters : int = 0
     warmdown_iters : int = 1800 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    final_lr : float = 0.05 # the final learning rate after the warmdown (as a scale times the max lr)
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -401,7 +402,7 @@ def get_lr(it):
     # 3) linear warmdown
     else:
         decay_ratio = (args.num_iterations - it) / args.warmdown_iters
-        return decay_ratio
+        return decay_ratio + (1 - decay_ratio) * args.final_lr
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
 # begin logging
