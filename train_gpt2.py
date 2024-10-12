@@ -200,7 +200,7 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    vocab_size : int = 50257
+    vocab_size : int = 50304
     n_layer : int = 12
     n_head : int = 12
     n_embd : int = 768
@@ -373,8 +373,9 @@ if master_process:
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 x, y = train_loader.next_batch()
 
-# init the model from scratch
-num_vocab = 50257
+# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
+# this originates from Karpathy's experiments.
+num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
