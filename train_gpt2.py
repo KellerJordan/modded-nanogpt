@@ -93,7 +93,7 @@ class Muon(torch.optim.Optimizer):
                 buf.mul_(momentum).add_(g)
                 if group['nesterov']:
                     g = g.add(buf, alpha=momentum)
-                if g.size(0) == 3 * g.size(1): # split grouped QKV parameters
+                if g.size(0) == 3 * g.size(1): # split grouped QKV parameters; following @bozavlado's finding
                     g = torch.cat([zeropower_backend(g1, steps=group['backend_steps']) for g1 in g.split(g.size(1))])
                     scale = g.size(1)**0.5
                 else:
@@ -178,7 +178,7 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.relu(x).square()
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; suggested to me by @Grad62304977
         x = self.c_proj(x)
         return x
 
