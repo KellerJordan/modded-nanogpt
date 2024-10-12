@@ -11,7 +11,7 @@ To execute the training, run the following three commands on an 8xA100 or 8xH100
 They complete in <45min on an 8xH100 with decent internet connection.
 ```bash
 pip install -r requirements.txt
-python data/cached_fineweb10B.py
+python data/cached_fineweb10B.py 35 # downloads the first 3.5B tokens
 ./run.sh
 ```
 
