@@ -73,29 +73,51 @@ class Muon(torch.optim.Optimizer):
         backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
         backend_steps: The number of iteration steps to use in the backend, if it is iterative.
     """
-    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, backend='newtonschulz5', backend_steps=5):
+    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True,
+                 backend='newtonschulz5', backend_steps=5,
+                 rank=0, world_size=1):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
         super().__init__(params, defaults)
+        self.rank = rank
+        self.world_size = world_size
 
     def step(self):
+        # generate weight updates in distributed fashion
+        updates = {}
         for group in self.param_groups:
             lr = group['lr']
             momentum = group['momentum']
             zeropower_backend = zeropower_backends[group['backend']]
-            for p in group['params']:
-                g = p.grad
-                if g is None:
-                    continue
-                state = self.state[p]
-                if 'momentum_buffer' not in state:
-                    state['momentum_buffer'] = torch.zeros_like(g)
-                buf = state['momentum_buffer']
-                buf.mul_(momentum).add_(g)
-                if group['nesterov']:
-                    g = g.add(buf, alpha=momentum)
-                g = zeropower_backend(g, steps=group['backend_steps'])
-                scale = max(g.size(0), g.size(1))**0.5 # scale to have update.square().mean() == 1
-                p.data.add_(g, alpha=-lr * scale)
+            for i, p in enumerate(group['params']):
+                if i % self.world_size == self.rank:
+                    g = p.grad
+                    if g is None:
+                        continue
+                    state = self.state[p]
+                    if 'momentum_buffer' not in state:
+                        state['momentum_buffer'] = torch.zeros_like(g)
+                    buf = state['momentum_buffer']
+                    buf.mul_(momentum).add_(g)
+                    if group['nesterov']:
+                        g = g.add(buf, alpha=momentum)
+                    g = zeropower_backend(g, steps=group['backend_steps'])
+                    g *= max(g.size(0), g.size(1))**0.5 # scale to have update.square().mean() == 1
+                else:
+                    g = torch.zeros_like(p.data)
+                updates[p] = g
+
+        # sync updates across devices. we are not memory-constrained so can do this simple deserialization
+        updates_flat = torch.cat([g.flatten() for g in updates.values()])
+        dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+        curr_idx = 0
+        for p in list(updates.keys()):
+            param_size = updates[p].numel()
+            updates[p] = updates_flat[curr_idx:curr_idx+param_size].view_as(updates[p])
+            curr_idx += param_size
+
+        # apply updates
+        for p, g in updates.items():
+            p.data.add_(g, alpha=-lr)
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -382,7 +404,8 @@ ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 # init the optimizer(s)
 optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
                                weight_decay=args.weight_decay, fused=True)
-optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95)
+optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95,
+                  rank=ddp_rank, world_size=ddp_world_size)
 optimizers = [optimizer1, optimizer2]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
