@@ -93,12 +93,8 @@ class Muon(torch.optim.Optimizer):
                 buf.mul_(momentum).add_(g)
                 if group['nesterov']:
                     g = g.add(buf, alpha=momentum)
-                if g.size(0) == 3 * g.size(1): # split grouped QKV parameters; following @bozavlado's finding
-                    g = torch.cat([zeropower_backend(g1, steps=group['backend_steps']) for g1 in g.split(g.size(1))])
-                    scale = g.size(1)**0.5
-                else:
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    scale = max(g.size(0), g.size(1))**0.5 # scale to have update.square().mean() == 1
+                g = zeropower_backend(g, steps=group['backend_steps'])
+                scale = max(g.size(0), g.size(1))**0.5 # scale to have update.square().mean() == 1
                 p.data.add_(g, alpha=-lr * scale)
 
 # -----------------------------------------------------------------------------
@@ -131,7 +127,7 @@ def apply_rotary_emb(x, cos, sin):
     x2 = x[..., d:]
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
+    return torch.cat([y1, y2], 3).type_as(x)
 
 def rmsnorm(x0, eps=1e-6):
     x = x0.float()
@@ -146,8 +142,9 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd, bias=False)
+        self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
         # output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
@@ -155,18 +152,14 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, self.head_dim)
-        q = q.view(B, T, self.n_head, self.head_dim)
-        v = v.view(B, T, self.n_head, self.head_dim)
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
         cos, sin = self.rotary(q)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-        # output projection
+        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
 
