@@ -44,7 +44,7 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
         X = a * X + b * B + c * A @ B
     if G.size(0) > G.size(1):
         X = X.T
-    return X.to(G.dtype)
+    return X
 
 zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
 
@@ -82,13 +82,19 @@ class Muon(torch.optim.Optimizer):
         self.world_size = world_size
 
     def step(self):
-        # generate weight updates in distributed fashion
-        updates = {}
+
         for group in self.param_groups:
+
             lr = group['lr']
             momentum = group['momentum']
             zeropower_backend = zeropower_backends[group['backend']]
+
+            # generate weight updates in distributed fashion
+            total_params = sum(p.numel() for p in group['params'])
+            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
+            curr_idx = 0
             for i, p in enumerate(group['params']):
+                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
                 if i % self.world_size == self.rank:
                     g = p.grad
                     if g is None:
@@ -102,22 +108,18 @@ class Muon(torch.optim.Optimizer):
                         g = g.add(buf, alpha=momentum)
                     g = zeropower_backend(g, steps=group['backend_steps'])
                     g *= max(g.size(0), g.size(1))**0.5 # scale to have update.square().mean() == 1
-                else:
-                    g = torch.zeros_like(p.data)
-                updates[p] = g
+                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
+                curr_idx += p.numel()
 
-        # sync updates across devices. we are not memory-constrained so can do this simple deserialization
-        updates_flat = torch.cat([g.flatten() for g in updates.values()])
-        dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
-        curr_idx = 0
-        for p in list(updates.keys()):
-            param_size = updates[p].numel()
-            updates[p] = updates_flat[curr_idx:curr_idx+param_size].view_as(updates[p])
-            curr_idx += param_size
+            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
+            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
-        # apply updates
-        for p, g in updates.items():
-            p.data.add_(g, alpha=-lr)
+            # deserialize and apply updates
+            curr_idx = 0
+            for p in group['params']:
+                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
+                p.data.add_(g, alpha=-lr)
+                curr_idx += p.numel()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
