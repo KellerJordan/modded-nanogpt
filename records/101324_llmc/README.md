@@ -3,7 +3,7 @@ This is a log produced by running the current version of Andrej Karpathy's [llm.
 It was run on a node with 8x H100 HBM3 according to the instructions [here](https://github.com/karpathy/llm.c/discussions/481).
 The median per-step time was 139ms. The total number of training tokens is 10.26B. The final validation loss was **3.2722**.
 
-This is better than the quoted result of **3.29** val loss in
+This is (significantly) better than the quoted result of **3.29** val loss in
 [Andrej Karpathy's May 28th GPT-2 replication discussion](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 So it appears that there have been some improvements to the training algorithm used by llm.c since then.
 
