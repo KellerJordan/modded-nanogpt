@@ -8,7 +8,7 @@ Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo. It:
 * Implements a new optimizer (Muon - Momentum Orthogonalized by Newton-schulz).
 
 To execute the training, run the following three commands on an 8xA100 or 8xH100 node.
-They complete in <45min on an 8xH100 with decent internet connection.
+They complete in <30min on an 8xH100 with decent internet connection.
 ```bash
 pip install -r requirements.txt
 python data/cached_fineweb10B.py 30 # downloads only the first 3.0B training tokens to save time
