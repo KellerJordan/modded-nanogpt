@@ -330,7 +330,7 @@ class Hyperparameters:
     num_iterations : int = 5400 # number of iterations to run
     learning_rate : float = 0.0036
     warmup_iters : int = 0
-    warmdown_iters : int = 1800 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 1600 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
