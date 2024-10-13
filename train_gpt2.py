@@ -448,7 +448,8 @@ for step in range(args.num_iterations + 1):
             x_val, y_val = val_loader.next_batch()
             with torch.no_grad(): # of course, we'd like to use ctx here too, but that creates a torch.compile error for some reason
                 _, loss = model(x_val, y_val, return_logits=False)
-                val_loss += loss.item()
+                val_loss += loss.detach()
+                del loss
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
