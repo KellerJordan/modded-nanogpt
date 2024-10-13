@@ -2,20 +2,20 @@
 
 This is a variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo. It:
-* Trains 3x more efficiently (taking only 3.15B tokens instead of 10B to reach the same validation loss).
-* Has shorter code (524 lines instead of 860).
-* Implements architectural modernizations (rotary embeddings, RMSNorm, ReLU^2).
+* Trains 3.3x more efficiently (taking only 3.00B tokens instead of 10B to reach the same validation loss).
+* Has shorter code (526 lines instead of 860).
+* Implements architectural modernizations (rotary embeddings, RMSNorm, ReLU^2, projection zero-init).
 * Implements a new optimizer (Muon - Momentum Orthogonalized by Newton-schulz).
 
 To execute the training, run the following three commands on an 8xA100 or 8xH100 node.
 They complete in <45min on an 8xH100 with decent internet connection.
 ```bash
 pip install -r requirements.txt
-python data/cached_fineweb10B.py 35 # downloads the first 3.5B tokens
+python data/cached_fineweb10B.py 30 # downloads only the first 3.0B training tokens to save time
 ./run.sh
 ```
 
-This will train a 124M-parameter transformer for 6000 steps on 3.15B tokens of Fineweb [1], achieving ~3.275 validation loss.
+This will train a 124M-parameter transformer for 5600 steps on 3.00B tokens of Fineweb [1], achieving ~3.272 validation loss.
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
 ---
@@ -89,6 +89,26 @@ The speedup is due to the following changes:
 - Removed the special initialization for linear layers before residuals. Instead, just scale down the output of the attention block by a fixed scalar.
 - Removed all affine scale and bias parameters from the architecture, and switched to RMSNorm (actually this causes a slight slowdown, and I just did it to reduce code complexity)
 - Switched from AdamW to new optimizer, and removed learning rate warmup
+
+---
+
+## More info
+
+Here's a good startup script for a fresh instance. If you get `torchrun not found` after this upon running then just close and reopen your tmux tab.
+
+```
+sudo apt-get update
+sudo apt-get install vim tmux python3-pip python-is-python3 -y
+echo "set sts=4 ts=4 sw=4 number paste" >> ~/.vimrc
+echo "set expandtab" >> ~/.vimrc
+git clone https://github.com/KellerJordan/modded-nanogpt.git
+cd modded-nanogpt
+tmux
+
+pip install numpy==1.23.5 huggingface-hub tqdm
+pip install --upgrade torch &
+python data/cached_fineweb10B.py 30
+```
 
 ---
 
