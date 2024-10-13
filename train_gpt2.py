@@ -35,7 +35,8 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     """
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750,  2.0315)
-    X = G.bfloat16() / (G.norm() + eps) # ensure top singular value <= 1
+    X = G.bfloat16()
+    X /= (X.norm() + eps) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
     for _ in range(steps):
