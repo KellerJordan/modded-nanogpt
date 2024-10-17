@@ -99,8 +99,6 @@ Here's a good startup script for a fresh instance. If you get `torchrun not foun
 ```
 sudo apt-get update
 sudo apt-get install vim tmux python3-pip python-is-python3 -y
-echo "set sts=4 ts=4 sw=4 number paste" >> ~/.vimrc
-echo "set expandtab" >> ~/.vimrc
 git clone https://github.com/KellerJordan/modded-nanogpt.git
 cd modded-nanogpt
 tmux
