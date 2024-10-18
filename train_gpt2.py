@@ -81,17 +81,21 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MLP(nn.Module):
-
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.gelu    = NewGELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+        d_ff = (8/3) * config.n_embd
+
+        self.c_fc = nn.Linear(config.n_embd, d_ff, bias=False)
+        self.c_fc2 = nn.Linear(config.n_embd, d_ff, bias=False)
+        self.c_proj = nn.Linear(d_ff, config.n_embd, bias=False)
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
+        x1 = self.c_fc(x)
+        x2 = self.c_fc2(x)
+        x2 = F.silu(x2)
+        x = x1 * x2
         x = self.c_proj(x)
         return x
 
