@@ -104,8 +104,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
-        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
+        x = x + self.attn(x)
+        x = x + self.mlp(x)
         return x
 
 # -----------------------------------------------------------------------------
@@ -143,7 +143,6 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         for block in self.transformer.h:
             x = block(x)
-        x = F.rms_norm(x, (x.size(-1),))
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -278,7 +277,7 @@ class Hyperparameters:
 args = Hyperparameters()
 
 if args.log_wandb:
-    wandb.init(project="modded_gpt", config={**vars(args)})
+    wandb.init(project="ngpt", config={**vars(args)})
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
