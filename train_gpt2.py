@@ -126,6 +126,7 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 12
     n_embd : int = 768
+    mup_width_mult : float = 1
 
 class GPT(nn.Module):
 
@@ -147,7 +148,7 @@ class GPT(nn.Module):
         # init all weights, use a torch rng object to be very careful
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(seed or 42)
-        if args.use_mup:
+        if config.mup_width_mult != 1:
             self.apply(self._init_weights_mup)
         else:
             self.apply(self._init_weights)
@@ -160,8 +161,8 @@ class GPT(nn.Module):
             x = block(x)
         x = F.rms_norm(x, (x.size(-1),))
 
-        if args.use_mup:
-            x = x / mup_width_mult
+        if self.config.mup_width_mult != 1:
+            x = x / self.config.mup_width_mult
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -199,7 +200,7 @@ class GPT(nn.Module):
         if hasattr(module, 'WEIGHT_INPUT'):
             torch.nn.init.normal_(module.weight, mean=0.0, std=std, generator=self.init_rng)
         elif hasattr(module, 'WEIGHT_HIDDEN'):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std / math.sqrt(mup_width_mult), generator=self.init_rng)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std / math.sqrt(self.config.mup_width_mult), generator=self.init_rng)
         elif hasattr(module, 'WEIGHT_OUTPUT'):
             torch.nn.init.zeros_(module.weight)
         else:
@@ -209,7 +210,10 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(module.bias)
 
     def configure_optimizer(self, learning_rate, weight_decay, betas):
-        # Collect parameters into two groups
+        optimizer = torch.optim.AdamW(self.parameters(), betas=betas, fused=True)
+        return optimizer
+
+    def configure_optimizer_mup(self, learning_rate, weight_decay, betas):
         params_INPUT_OUTPUT = []
         params_HIDDEN = []
         params_bias = []
@@ -242,8 +246,8 @@ class GPT(nn.Module):
             },
             {
                 'params': params_HIDDEN,
-                'lr': learning_rate / mup_width_mult,
-                'weight_decay': weight_decay * mup_width_mult
+                'lr': learning_rate / self.config.mup_width_mult,
+                'weight_decay': weight_decay * self.config.mup_width_mult
             },
             {
                 'params': params_bias,
@@ -253,7 +257,6 @@ class GPT(nn.Module):
         ]
 
         optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=True)
-
         return optimizer
 
 # -----------------------------------------------------------------------------
@@ -408,14 +411,17 @@ raw_model = model.module # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 if args.use_mup:
-    mup_width_mult = gptconfig.n_embd / args.mup_base_width
+    gptconfig.mup_width_mult = gptconfig.n_embd / args.mup_base_width
 
 torch.manual_seed(args.seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(args.seed)
 
 # init the optimizer(s)
-optimizer = raw_model.configure_optimizer(learning_rate=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+if not args.use_mup:
+    optimizer = raw_model.configure_optimizer(learning_rate=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+else:
+    optimizer = raw_model.configure_optimizer_mup(learning_rate=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95))
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations

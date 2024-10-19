@@ -21,13 +21,12 @@ import torch
 import torch.optim.lr_scheduler as lr_scheduler
 import torch._inductor.config as torch_ind_config
 
-from lr_schedules import wsd_schedule, cosine_warmup_schedule
-from model import GPT, GPTConfig
+from train_gpt2 import GPT, GPTConfig
 
 # --------------------------
 
-filename = "transformer_mup.results.json"
-fig_name = "transformer_mup.png"
+filename = "gpt2_mup.results.json"
+fig_name = "gpt2_mup.png"
 
 type_to_lr_range = {
     "SP": [2**n for n in range(-6, -5 + 1)],
@@ -37,8 +36,6 @@ type_to_lr_range = {
 ctx_length = 256
 
 # --- model parameters ---
-architecture = "Transformer"
-
 base_width = 64
 widths = [64, 256, 768] # check that for all these widths are divisible by d_head
 n_layers = 4
@@ -46,17 +43,11 @@ d_head = 64
 
 batch_size = 32
 
+vocab_size = 256
+
 num_iters = 4000
-lr_warmup_iters = 100
-lr_warmdown_iters = 0
-
-schedule = "wsd"
-
-adam_b1 = 0.9
-adam_b2 = 0.95
-
-max_grad_norm = 1.0
-weight_decay = 0.
+lr_warmup_iters = 200
+lr_warmdown_iters = 800
 
 device = "cuda"
 dtype = "bfloat16"
@@ -65,8 +56,6 @@ use_torch_compile = False
 # --------------------------
 
 seed = 123456789 + 0
-
-vocab_size = 256
 
 random.seed(seed)
 torch.manual_seed(seed)
@@ -86,22 +75,17 @@ if use_torch_compile:
     if hasattr(torch_ind_config, "coordinate_descent_tuning"):
         torch_ind_config.coordinate_descent_tuning = True
 
-# WSD paper, eq 1
 def wsd_schedule(warmup_iters, decay_iters, num_iters, start_iter=0):
     def schedule(iter):
         iter = start_iter + iter
-        
         if iter > num_iters:
             return 0.
-        
         # linear warmup
         if iter < warmup_iters:
             return iter/warmup_iters
-        
         # hold
         elif iter < (num_iters - decay_iters):
             return 1.
-        
         # decay (with 1-sqrt)
         else:
             if decay_iters==0:
@@ -126,22 +110,20 @@ def run_experiment(type_: Literal["SP", "μP"], width: int, lr: float) -> List[D
     elif type_ == "SP":
         use_mup = False
 
-    if architecture == "Transformer":
-        config = GPTConfig(block_size=ctx_length, vocab_size=vocab_size, n_layer=n_layers, n_head=width//d_head, n_embd=width,
-                           bias=False, mup_enabled=use_mup, mup_width_multiplier=width/base_width)
-    else:
-        raise NotImplementedError
+    config = GPTConfig(vocab_size=vocab_size, n_layer=n_layers, n_head=width//d_head, n_embd=width)
+    if use_mup:
+        config.mup_width_mult = 1
 
     model = GPT(config).to(device)
     model = torch.compile(model)
     model.train()
 
-    optim = model.configure_optimizers(weight_decay=weight_decay, learning_rate=lr, betas=(adam_b1, adam_b2), device_type=device)
-
-    if schedule == "wsd":
-        scheduler = lr_scheduler.LambdaLR(optim, wsd_schedule(warmup_iters=lr_warmup_iters, decay_iters=lr_warmdown_iters, num_iters=num_iters, start_iter=0))
+    if not use_mup:
+        optim = model.configure_optimizer(learning_rate=lr, weight_decay=0., betas=(0.9, 0.95))
     else:
-        raise NotImplementedError
+        optim = model.configure_optimizer_mup(learning_rate=lr, weight_decay=0., betas=(0.9, 0.95))
+    
+    scheduler = lr_scheduler.LambdaLR(optim, wsd_schedule(warmup_iters=lr_warmup_iters, decay_iters=lr_warmdown_iters, num_iters=num_iters, start_iter=0))
 
     def run_step(batch):
         x = batch[:, :-1]
@@ -149,17 +131,15 @@ def run_experiment(type_: Literal["SP", "μP"], width: int, lr: float) -> List[D
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
         with dtype_ctx:
-            _, loss = model(x, y)
+            _, loss = model(x, y, return_logits=False)
 
         loss.backward()
 
-        _ = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        _ = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
 
         optim.step()
-        optim.zero_grad()
-
         scheduler.step()
-
+        optim.zero_grad()
         return loss
 
     log = []
