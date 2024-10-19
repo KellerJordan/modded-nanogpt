@@ -148,9 +148,9 @@ class Block(nn.Module):
 
     def forward(self, x):
         hA = F.normalize(self.attn(x), dim=-1)
-        x = F.normalize(x + self.attn_scaler() * (hA - x), dim=-1)
+        x = F.normalize(x + torch.abs(self.attn_scaler()) * (hA - x), dim=-1)
         hM = F.normalize(self.mlp(x), dim=-1)
-        x = F.normalize(x + self.mlp_scaler() * (hM - x), dim=-1)
+        x = F.normalize(x + torch.abs(self.mlp_scaler()) * (hM - x), dim=-1)
         return x
 
 # -----------------------------------------------------------------------------
@@ -331,7 +331,7 @@ class Hyperparameters:
     weight_decay : float = 0
     grad_norm_clip : float = 1
     # evaluation and logging hyperparams
-    log_wandb: bool = False
+    log_wandb: bool = True
     log_wandb_every: int = 12
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
