@@ -194,6 +194,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
 
+    # todo : no else ????
     def _init_weights_mup(self, module):
         base_std = 0.02
         std = base_std if not hasattr(module, 'RESIDUAL_SCALE_FLAG') else 0.02/math.sqrt(2 * self.config.n_layer)
@@ -203,10 +204,8 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=std / math.sqrt(self.config.mup_width_mult), generator=self.init_rng)
         elif hasattr(module, 'WEIGHT_OUTPUT'):
             torch.nn.init.zeros_(module.weight)
-        else:
-            raise NotImplementedError
         
-        if module.bias is not None:
+        if hasattr(module, 'bias') and module.bias is not None:
             torch.nn.init.zeros_(module.bias)
 
     def configure_optimizer(self, learning_rate, weight_decay, betas):
@@ -227,8 +226,6 @@ class GPT(nn.Module):
                 params_HIDDEN.append(module.weight)
                 if module.bias is not None:
                     params_bias.append(module.bias)
-            else:
-                pass
 
         all_params = set(p for p in self.parameters() if p.requires_grad)
         params_in_groups = set(params_INPUT_OUTPUT + params_HIDDEN + params_bias)
@@ -366,214 +363,215 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 1000 # every how many steps to save the checkpoint? 0 for only at the end
-args = Hyperparameters()
 
-if args.log_wandb:
-    wandb.init(project="modded_gpt", config={**vars(args)})
+if __name__ == "__main__":
+    args = Hyperparameters()
 
-# set up DDP (distributed data parallel). torchrun sets this env variable
-assert torch.cuda.is_available()
-dist.init_process_group(backend='nccl')
-ddp_rank = int(os.environ['RANK'])
-ddp_local_rank = int(os.environ['LOCAL_RANK'])
-ddp_world_size = int(os.environ['WORLD_SIZE'])
-device = f'cuda:{ddp_local_rank}'
-torch.cuda.set_device(device)
-print(f"using device: {device}")
-master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
-
-# convenience variables
-B, T = args.device_batch_size, args.sequence_length
-# calculate the number of steps to take in the val loop.
-assert args.val_tokens % (B * T * ddp_world_size) == 0
-val_steps = args.val_tokens // (B * T * ddp_world_size)
-# calculate the steps of gradient accumulation required to attain the desired global batch size.
-assert args.batch_size % (B * ddp_world_size) == 0
-train_accumulation_steps = args.batch_size // (B * ddp_world_size)
-
-# load tokens
-train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
-if master_process:
-    print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
-    print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
-x, y = train_loader.next_batch()
-
-# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
-# this originates from Karpathy's experiments.
-num_vocab = 50304
-gptconfig = GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=1, n_embd=64)
-model = GPT(gptconfig, seed=args.seed)
-model = model.cuda()
-print(f"Model initialized. Number of parameters : {sum([p.numel() for p in model.parameters()])}.")
-if hasattr(config, "coordinate_descent_tuning"):
-    config.coordinate_descent_tuning = True # suggested by @Chillee
-model = torch.compile(model)
-# here we wrap model into DDP container
-model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module # always contains the "raw" unwrapped model
-ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
-
-if args.use_mup:
-    gptconfig.mup_width_mult = gptconfig.n_embd / args.mup_base_width
-
-torch.manual_seed(args.seed)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(args.seed)
-
-# init the optimizer(s)
-if not args.use_mup:
-    optimizer = raw_model.configure_optimizer(learning_rate=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95))
-else:
-    optimizer = raw_model.configure_optimizer_mup(learning_rate=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95))
-# learning rate decay scheduler (linear warmup and warmdown)
-def get_lr(it):
-    assert it <= args.num_iterations
-    # 1) linear warmup for warmup_iters steps
-    if it < args.warmup_iters:
-        return (it+1) / args.warmup_iters
-    # 2) constant lr for a while
-    elif it < args.num_iterations - args.warmdown_iters:
-        return 1.0
-    # 3) linear warmdown
-    else:
-        decay_ratio = (args.num_iterations - it) / args.warmdown_iters
-        return decay_ratio
-scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
-
-# begin logging
-if master_process:
     if args.log_wandb:
-        run_id = wandb.run.name
-    else:
-        run_id = str(uuid.uuid4())
-    logdir = 'logs/%s/' % run_id
-    os.makedirs(logdir, exist_ok=True)
-    logfile = 'logs/%s.txt' % run_id
-    # create the log file
-    with open(logfile, "w") as f:
-        # begin the log by printing this file (the Python code)
-        f.write('='*100 + '\n')
-        f.write(code)
-        f.write('='*100 + '\n')
-        # log information about the hardware/software environment this is running on
-        # and print the full `nvidia-smi` to file
-        f.write(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:\n")
-        import subprocess
-        result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        f.write(f'{result.stdout}\n')
-        f.write('='*100 + '\n')
-        # log hyperparameters and config
-        if args.log_wandb:
-            f.write(f"wandb run {wandb.run.name}\n")
-        f.write("Hyperparameters:\n")
-        f.write(f"{dataclasses.asdict(args)}\n")
-        f.write("Model config:\n")
-        f.write(f"{dataclasses.asdict(gptconfig)}\n")
-        f.write('='*100 + '\n')
+        wandb.init(project="modded_gpt", config={**vars(args)})
 
-training_time_ms = 0
-# start the clock
-torch.cuda.synchronize()
-t0 = time.time()
-# begin training
-train_loader.reset()
-for step in range(args.num_iterations + 1):
-    last_step = (step == args.num_iterations)
-    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
-    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
-    # steps with dummy data first, and then re-initialize the model and reset the loader.
-    if step == 10:
-        training_time_ms = 0
-        t0 = time.time()
-    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+    # set up DDP (distributed data parallel). torchrun sets this env variable
+    assert torch.cuda.is_available()
+    dist.init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    print(f"using device: {device}")
+    master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
-    # once in a while evaluate the validation dataset
-    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
-        # stop the clock
-        torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.time() - t0)
-        # run validation batches
-        model.eval()
-        val_loader.reset()
-        val_loss = 0.0
-        for _ in range(val_steps):
-            x_val, y_val = val_loader.next_batch()
-            with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
-                _, loss = model(x_val, y_val, return_logits=False)
-                val_loss += loss.detach()
-                del loss
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        val_loss /= val_steps
-        # log val loss to console, logfile and wandb
-        if master_process:
-            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
-            with open(logfile, "a") as f:
-                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
-            if args.log_wandb:
-                wandb.log({"val_loss": val_loss}, step=step)
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.time()
+    # convenience variables
+    B, T = args.device_batch_size, args.sequence_length
+    # calculate the number of steps to take in the val loop.
+    assert args.val_tokens % (B * T * ddp_world_size) == 0
+    val_steps = args.val_tokens // (B * T * ddp_world_size)
+    # calculate the steps of gradient accumulation required to attain the desired global batch size.
+    assert args.batch_size % (B * ddp_world_size) == 0
+    train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 
-    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
-        # stop the clock
-        torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.time() - t0)
-        # save the state of the training process
-        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizer=optimizer.state_dict())
-        torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.time()
-
-    # bit confusing: we want to make sure to eval on 0th iteration
-    # but also after the very last iteration. so we loop for step <= num_iterations
-    # instead of just < num_iterations (one extra due to <=), only to do
-    # the validation/sampling one last time, and then we break right here as we're done.
-    if last_step:
-        break
-
-    # --------------- TRAINING SECTION BEGIN -----------------
-    model.train()
-    for i in range(1, train_accumulation_steps+1):
-        # forward pass
-        with ctx:
-            _, loss = model(x, y, return_logits=False)
-            train_loss = loss.detach()
-        # advance the dataset for the next batch
-        x, y = train_loader.next_batch()
-        # backward pass
-        if i < train_accumulation_steps:
-            with model.no_sync(): # there's no need to sync gradients every accumulation step
-                loss.backward()
-        else:
-            loss.backward() # just sync on the last step
-    for p in model.parameters():
-        p.grad /= train_accumulation_steps
-
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_norm_clip, foreach=True)
-
-    # step the optimizers and schedulers
-    optimizer.step()
-    scheduler.step()
-    # null the gradients
-    model.zero_grad(set_to_none=True)
-    # --------------- TRAINING SECTION END -------------------
-    # everything that follows now is just diagnostics, prints, logging, etc.
-
-    #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+    # load tokens
+    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
     if master_process:
-        approx_time = training_time_ms + 1000 * (time.time() - t0)
-        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
-        with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
-        if args.log_wandb and (step % args.log_wandb_every == 0):
-            wandb.log({"train_loss": train_loss.item(), "lr": optimizer.param_groups[0]['lr'], "grad_norm": grad_norm.item(), "step_avg_ms": approx_time/timed_steps}, step=step)
+        print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+        print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+    x, y = train_loader.next_batch()
 
-if master_process:
-    print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
+    # this originates from Karpathy's experiments.
+    num_vocab = 50304
+    gptconfig = GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=1, n_embd=64)
+    if args.use_mup:
+        gptconfig.mup_width_mult = gptconfig.n_embd / args.mup_base_width
+    model = GPT(gptconfig, seed=args.seed)
+    model = model.cuda()
+    print(f"Model initialized. Number of parameters : {sum([p.numel() for p in model.parameters()])}.")
+    if hasattr(config, "coordinate_descent_tuning"):
+        config.coordinate_descent_tuning = True # suggested by @Chillee
+    model = torch.compile(model)
+    # here we wrap model into DDP container
+    model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module # always contains the "raw" unwrapped model
+    ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
-# -------------------------------------------------------------------------
-# clean up nice
-dist.destroy_process_group()
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+
+    # init the optimizer(s)
+    if not args.use_mup:
+        optimizer = raw_model.configure_optimizer(learning_rate=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+    else:
+        optimizer = raw_model.configure_optimizer_mup(learning_rate=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+    # learning rate decay scheduler (linear warmup and warmdown)
+    def get_lr(it):
+        assert it <= args.num_iterations
+        # 1) linear warmup for warmup_iters steps
+        if it < args.warmup_iters:
+            return (it+1) / args.warmup_iters
+        # 2) constant lr for a while
+        elif it < args.num_iterations - args.warmdown_iters:
+            return 1.0
+        # 3) linear warmdown
+        else:
+            decay_ratio = (args.num_iterations - it) / args.warmdown_iters
+            return decay_ratio
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
+
+    # begin logging
+    if master_process:
+        if args.log_wandb:
+            run_id = wandb.run.name
+        else:
+            run_id = str(uuid.uuid4())
+        logdir = 'logs/%s/' % run_id
+        os.makedirs(logdir, exist_ok=True)
+        logfile = 'logs/%s.txt' % run_id
+        # create the log file
+        with open(logfile, "w") as f:
+            # begin the log by printing this file (the Python code)
+            f.write('='*100 + '\n')
+            f.write(code)
+            f.write('='*100 + '\n')
+            # log information about the hardware/software environment this is running on
+            # and print the full `nvidia-smi` to file
+            f.write(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:\n")
+            import subprocess
+            result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            f.write(f'{result.stdout}\n')
+            f.write('='*100 + '\n')
+            # log hyperparameters and config
+            if args.log_wandb:
+                f.write(f"wandb run {wandb.run.name}\n")
+            f.write("Hyperparameters:\n")
+            f.write(f"{dataclasses.asdict(args)}\n")
+            f.write("Model config:\n")
+            f.write(f"{dataclasses.asdict(gptconfig)}\n")
+            f.write('='*100 + '\n')
+
+    training_time_ms = 0
+    # start the clock
+    torch.cuda.synchronize()
+    t0 = time.time()
+    # begin training
+    train_loader.reset()
+    for step in range(args.num_iterations + 1):
+        last_step = (step == args.num_iterations)
+        # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+        # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+        # steps with dummy data first, and then re-initialize the model and reset the loader.
+        if step == 10:
+            training_time_ms = 0
+            t0 = time.time()
+        timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+
+        # once in a while evaluate the validation dataset
+        if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.time() - t0)
+            # run validation batches
+            model.eval()
+            val_loader.reset()
+            val_loss = 0.0
+            for _ in range(val_steps):
+                x_val, y_val = val_loader.next_batch()
+                with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
+                    _, loss = model(x_val, y_val, return_logits=False)
+                    val_loss += loss.detach()
+                    del loss
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            val_loss /= val_steps
+            # log val loss to console, logfile and wandb
+            if master_process:
+                print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+                with open(logfile, "a") as f:
+                    f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+                if args.log_wandb:
+                    wandb.log({"val_loss": val_loss}, step=step)
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.time()
+
+        if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.time() - t0)
+            # save the state of the training process
+            log = dict(step=step, code=code, model=raw_model.state_dict(), optimizer=optimizer.state_dict())
+            torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.time()
+
+        # bit confusing: we want to make sure to eval on 0th iteration
+        # but also after the very last iteration. so we loop for step <= num_iterations
+        # instead of just < num_iterations (one extra due to <=), only to do
+        # the validation/sampling one last time, and then we break right here as we're done.
+        if last_step:
+            break
+
+        # --------------- TRAINING SECTION BEGIN -----------------
+        model.train()
+        for i in range(1, train_accumulation_steps+1):
+            # forward pass
+            with ctx:
+                _, loss = model(x, y, return_logits=False)
+                train_loss = loss.detach()
+            # advance the dataset for the next batch
+            x, y = train_loader.next_batch()
+            # backward pass
+            if i < train_accumulation_steps:
+                with model.no_sync(): # there's no need to sync gradients every accumulation step
+                    loss.backward()
+            else:
+                loss.backward() # just sync on the last step
+        for p in model.parameters():
+            p.grad /= train_accumulation_steps
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_norm_clip, foreach=True)
+
+        # step the optimizers and schedulers
+        optimizer.step()
+        scheduler.step()
+        # null the gradients
+        model.zero_grad(set_to_none=True)
+        # --------------- TRAINING SECTION END -------------------
+        # everything that follows now is just diagnostics, prints, logging, etc.
+
+        #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+        if master_process:
+            approx_time = training_time_ms + 1000 * (time.time() - t0)
+            print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+            with open(logfile, "a") as f:
+                f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+            if args.log_wandb and (step % args.log_wandb_every == 0):
+                wandb.log({"train_loss": train_loss.item(), "lr": optimizer.param_groups[0]['lr'], "grad_norm": grad_norm.item(), "step_avg_ms": approx_time/timed_steps}, step=step)
+
+    if master_process:
+        print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+    # -------------------------------------------------------------------------
+    # clean up nice
+    dist.destroy_process_group()

@@ -29,14 +29,14 @@ filename = "gpt2_mup.results.json"
 fig_name = "gpt2_mup.png"
 
 type_to_lr_range = {
-    "SP": [2**n for n in range(-6, -5 + 1)],
-    "μP": [2**n for n in range(-6, -5 + 1)],
+    "SP": [2**n for n in range(-13, -11 + 1)],
+    "μP": [2**n for n in range(-13, -11 + 1)],
 }
 
 ctx_length = 256
 
 # --- model parameters ---
-base_width = 64
+mup_base_width = 64
 widths = [64, 256, 768] # check that for all these widths are divisible by d_head
 n_layers = 4
 d_head = 64
@@ -111,8 +111,10 @@ def run_experiment(type_: Literal["SP", "μP"], width: int, lr: float) -> List[D
         use_mup = False
 
     config = GPTConfig(vocab_size=vocab_size, n_layer=n_layers, n_head=width//d_head, n_embd=width)
-    if use_mup:
+    if not use_mup:
         config.mup_width_mult = 1
+    else:
+        config.mup_width_mult = width / mup_base_width
 
     model = GPT(config).to(device)
     model = torch.compile(model)

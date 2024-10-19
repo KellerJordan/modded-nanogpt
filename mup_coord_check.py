@@ -19,7 +19,7 @@ from train_gpt2 import GPT, GPTConfig
 
 output_dir = ""
 
-use_mup = True
+use_mup = False
 widths = [64, 128, 256, 512, 768] # check that for all these widths, d_model is divisible by d_head
 mup_base_width = 64
 n_layers = 4
@@ -67,10 +67,11 @@ class RandomDataset(Dataset):
 
 def lazy_model(width):
     config = GPTConfig(vocab_size=max_value, n_layer=n_layers, n_head=width//d_head, n_embd=width)
-    config.mup_width_mult = width / mup_base_width
+    if use_mup:
+        config.mup_width_mult = width / mup_base_width
     return GPT(config).to(device)
 
-models = {width: lazy_model(width) for width in widths}
+models = {width: (lambda: lazy_model(width)) for width in widths}
 
 dataset = RandomDataset()
 loader = DataLoader(dataset, batch_size=None, shuffle=True)
@@ -79,7 +80,7 @@ iter_ = iter(loader)
 if not use_mup:
     optcls = lambda model: model.configure_optimizer(lr, weight_decay=0., betas=(0.9, 0.95))
 else:
-    optcls = lambda model: model.configure_optimizer(lr, weight_decay=0., betas=(0.9, 0.95))
+    optcls = lambda model: model.configure_optimizer_mup(lr, weight_decay=0., betas=(0.9, 0.95))
 
 df = get_coord_data(models, iter_, optcls, dtype_ctx, nsteps=10)
 

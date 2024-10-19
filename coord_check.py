@@ -274,7 +274,7 @@ def _get_coord_data(models, dataloader, optcls, dtype_ctx, nsteps=5,
                     data, target = data.cuda(), target.cuda()
 
                     with dtype_ctx:
-                        loss = model(data, target)
+                        _, loss = model(data, target, return_logits=False)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
