@@ -7,6 +7,7 @@ import glob
 import time
 import math
 from dataclasses import dataclass
+import dataclasses
 
 import numpy as np
 import torch
@@ -353,6 +354,12 @@ if master_process:
         import subprocess
         result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         f.write(f'{result.stdout}\n')
+        f.write('='*100 + '\n')
+        # log hyperparameters and config
+        f.write("Hyperparameters:\n")
+        f.write(f"{dataclasses.asdict(args)}\n")
+        f.write("Model config:\n")
+        f.write(f"{dataclasses.asdict(config)}\n")
         f.write('='*100 + '\n')
 
 training_time_ms = 0
