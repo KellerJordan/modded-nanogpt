@@ -20,11 +20,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 # TODO rename "LLMC" from name of the flag
 # TODO move these
+# TODO add missing (even if 1)
 SCALER_ATTN_INIT = 0.08 # 1 / n_layers
 SCALER_ATTN_SCALE = 0.125 # 1 / sqrt(d_model)
 SCALER_MLP_INIT = 0.08
 SCALER_MLP_SCALE = 0.125
 SCALER_QK_SCALE = 0.125 # 1 / sqrt(d_model)
+SCALER_LOGITS_SCALE = 0.125 # 1 / sqrt(d_model)
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -173,6 +175,8 @@ class GPT(nn.Module):
         ))
         self.transformer.wte.NORMALIZE = 1
 
+        self.logits_scaler = Scaler(dim=config.vocab_size, init=1, scale=SCALER_LOGITS_SCALE)
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.NORMALIZE = 1
         #self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
@@ -194,12 +198,12 @@ class GPT(nn.Module):
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            logits = self.logits_scaler() * self.lm_head(x)
             logits = logits.float() # use tf32/fp32 for logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.logits_scaler() * self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             logits = logits.float() # use tf32/fp32 for logits
             loss = None
 
