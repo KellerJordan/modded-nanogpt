@@ -62,7 +62,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
         # output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+        self.c_proj.RESIDUAL_SCALE_FLAG = 1
         self.rotary = Rotary(self.head_dim)
 
     def forward(self, x):
@@ -86,7 +86,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, d_ff, bias=False)
         self.c_fc2 = nn.Linear(config.n_embd, d_ff, bias=False)
         self.c_proj = nn.Linear(d_ff, config.n_embd, bias=False)
-        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+        self.c_proj.RESIDUAL_SCALE_FLAG = 1
 
     def forward(self, x):
         x1 = self.c_fc(x)
@@ -129,7 +129,7 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        #self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
+        #self.lm_head.SKIP_INIT = 1 # don't init this one, we will tie weights
         #self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights, use a torch rng object to be very careful
@@ -165,10 +165,10 @@ class GPT(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             # apply special scaled init to the residual projections, per GPT-2 paper
-            std = 0.02 if not hasattr(module, 'LLMC_RESIDUAL_SCALE_FLAG') else 0.02/math.sqrt(2 * self.config.n_layer)
+            std = 0.02 if not hasattr(module, 'RESIDUAL_SCALE_FLAG') else 0.02/math.sqrt(2 * self.config.n_layer)
             # we want to skip initializing lm_head, which shares parameters with wte
             # and wte was already initialized down below during the Embedding init
-            if not hasattr(module, 'LLMC_SKIP_INIT'):
+            if not hasattr(module, 'SKIP_INIT'):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=std, generator=self.init_rng)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)

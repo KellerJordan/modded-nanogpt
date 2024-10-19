@@ -18,7 +18,6 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-# TODO rename "LLMC" from name of the flag
 # TODO move these
 # TODO add missing (even if 1)
 SCALER_ATTN_INIT = 0.08 # 1 / n_layers
@@ -88,7 +87,7 @@ class CausalSelfAttention(nn.Module):
         self.qk_scaler = Scaler(dim=self.head_dim, init=1, scale=SCALER_QK_SCALE)
         # output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+        self.c_proj.RESIDUAL_SCALE_FLAG = 1
         self.c_proj.NORMALIZE = 1
         self.c_proj.NORM_FIRST = 1
         self.rotary = Rotary(self.head_dim)
@@ -123,7 +122,7 @@ class MLP(nn.Module):
         self.v_scaler = Scaler(dim=d_ff, init=1, scale=1)
 
         self.c_proj = nn.Linear(d_ff, config.n_embd, bias=False)
-        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+        self.c_proj.RESIDUAL_SCALE_FLAG = 1
         self.c_proj.NORMALIZE = 1
         self.c_proj.NORM_FIRST = 1
 
@@ -143,8 +142,6 @@ class Block(nn.Module):
         self.attn_scaler = Scaler(dim=config.n_embd, init=SCALER_ATTN_INIT, scale=SCALER_ATTN_SCALE)
         self.mlp = MLP(config)
         self.mlp_scaler = Scaler(dim=config.n_embd, init=SCALER_MLP_INIT, scale=SCALER_MLP_SCALE)
-
-        # TODO keep attn_scaler and mlp_scaler positive
 
     def forward(self, x):
         hA = F.normalize(self.attn(x), dim=-1)
@@ -179,7 +176,7 @@ class GPT(nn.Module):
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.NORMALIZE = 1
-        #self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
+        #self.lm_head.SKIP_INIT = 1 # don't init this one, we will tie weights
         #self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights, use a torch rng object to be very careful
@@ -217,10 +214,10 @@ class GPT(nn.Module):
         if isinstance(module, nn.Linear):
             # apply special scaled init to the residual projections, per GPT-2 paper
             base_std = 1 / math.sqrt(self.config.n_embd)
-            std = base_std if not hasattr(module, 'LLMC_RESIDUAL_SCALE_FLAG') else base_std/math.sqrt(2 * self.config.n_layer)
+            std = base_std if not hasattr(module, 'RESIDUAL_SCALE_FLAG') else base_std/math.sqrt(2 * self.config.n_layer)
             # we want to skip initializing lm_head, which shares parameters with wte
             # and wte was already initialized down below during the Embedding init
-            if not hasattr(module, 'LLMC_SKIP_INIT'):
+            if not hasattr(module, 'SKIP_INIT'):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=std, generator=self.init_rng)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
