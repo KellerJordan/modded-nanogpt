@@ -6,6 +6,7 @@ import uuid
 import glob
 import time
 import math
+import wandb
 from dataclasses import dataclass
 import dataclasses
 
@@ -268,10 +269,15 @@ class Hyperparameters:
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
+    log_wandb: bool = False
+    log_wandb_every: int = 12
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
+
+if args.log_wandb:
+    wandb.init(project="modded_gpt", config={**vars(args)})
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
@@ -356,6 +362,8 @@ if master_process:
         f.write(f'{result.stdout}\n')
         f.write('='*100 + '\n')
         # log hyperparameters and config
+        if args.log_wandb:
+            f.write(f"wandb run {wandb.run.name}\n")
         f.write("Hyperparameters:\n")
         f.write(f"{dataclasses.asdict(args)}\n")
         f.write("Model config:\n")
@@ -395,11 +403,13 @@ for step in range(args.num_iterations + 1):
                 del loss
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
-        # log val loss to console and to logfile
+        # log val loss to console, logfile and wandb
         if master_process:
             print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
             with open(logfile, "a") as f:
                 f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+            if args.log_wandb and (step % args.log_wandb_every == 0):
+                wandb.log({"val_loss": val_loss}, step=step)
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -453,6 +463,8 @@ for step in range(args.num_iterations + 1):
         print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
         with open(logfile, "a") as f:
             f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+        if args.log_wandb and (step % args.log_wandb_every == 0):
+            wandb.log({"train_loss": train_loss.item(), "lr": optimizer.param_groups[0]['lr'], "step_avg_ms": approx_time/timed_steps}, step=step)
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
