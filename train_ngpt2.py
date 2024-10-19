@@ -60,9 +60,14 @@ class CausalSelfAttention(nn.Module):
         self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_q.NORMALIZE = 1
+        self.c_k.NORMALIZE = 1
+        self.c_v.NORMALIZE = 1
         # output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+        self.c_proj.NORMALIZE = 1
+        self.c_proj.NORM_FIRST = 1
         self.rotary = Rotary(self.head_dim)
 
     def forward(self, x):
@@ -85,8 +90,13 @@ class MLP(nn.Module):
 
         self.c_fc = nn.Linear(config.n_embd, d_ff, bias=False)
         self.c_fc2 = nn.Linear(config.n_embd, d_ff, bias=False)
+        self.c_fc.NORMALIZE = 1
+        self.c_fc2.NORMALIZE = 1
+
         self.c_proj = nn.Linear(d_ff, config.n_embd, bias=False)
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+        self.c_proj.NORMALIZE = 1
+        self.c_proj.NORM_FIRST = 1
 
     def forward(self, x):
         x1 = self.c_fc(x)
@@ -128,7 +138,10 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
+        self.transformer.wte.NORMALIZE = 1
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.NORMALIZE = 1
         #self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
         #self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
@@ -136,6 +149,8 @@ class GPT(nn.Module):
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(seed or 42)
         self.apply(self._init_weights)
+
+        self.norm_weights()
 
     def forward(self, idx, targets=None, return_logits=True):
 
@@ -173,6 +188,15 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
+
+    @torch.no_grad()
+    def norm_weights(self):
+        for module in self.modules():
+            if hasattr(module, 'NORMALIZE'):
+                if hasattr(module, 'NORM_FIRST'): # W_o of SA and MLP
+                    module.weight.copy_(F.normalize(module.weight, dim=0))
+                else:
+                    module.weight.copy_(F.normalize(module.weight, dim=-1))
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -269,7 +293,7 @@ class Hyperparameters:
     weight_decay : float = 0
     grad_norm_clip : float = 1
     # evaluation and logging hyperparams
-    log_wandb: bool = True
+    log_wandb: bool = False
     log_wandb_every: int = 12
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
@@ -459,6 +483,9 @@ for step in range(args.num_iterations + 1):
     scheduler.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
+    # normalize all the weights (step 2 of nGPT)
+    raw_model.norm_weights()
+
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
