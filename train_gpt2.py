@@ -81,7 +81,7 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        d_ff = (8/3) * config.n_embd
+        d_ff = int((8/3) * config.n_embd)
 
         self.c_fc = nn.Linear(config.n_embd, d_ff, bias=False)
         self.c_fc2 = nn.Linear(config.n_embd, d_ff, bias=False)
@@ -261,11 +261,11 @@ class Hyperparameters:
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 64 # batch size, in sequences, per device
+    device_batch_size : int = 32 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 5100 # number of iterations to run
     learning_rate : float = 0.0036
-    warmup_iters : int = 0
+    warmup_iters : int = 200
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     grad_norm_clip : float = 1
@@ -311,7 +311,8 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768), seed=args.seed)
+gptconfig = GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=1, n_embd=64)
+model = GPT(gptconfig, seed=args.seed)
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
@@ -368,7 +369,7 @@ if master_process:
         f.write("Hyperparameters:\n")
         f.write(f"{dataclasses.asdict(args)}\n")
         f.write("Model config:\n")
-        f.write(f"{dataclasses.asdict(config)}\n")
+        f.write(f"{dataclasses.asdict(gptconfig)}\n")
         f.write('='*100 + '\n')
 
 training_time_ms = 0
