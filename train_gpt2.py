@@ -347,7 +347,10 @@ scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
 # begin logging
 if master_process:
-    run_id = str(uuid.uuid4())
+    if args.log_wandb:
+        run_id = wandb.run.name
+    else:
+        run_id = str(uuid.uuid4())
     logdir = 'logs/%s/' % run_id
     os.makedirs(logdir, exist_ok=True)
     logfile = 'logs/%s.txt' % run_id
