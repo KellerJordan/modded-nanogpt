@@ -18,6 +18,13 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# TODO rename "LLMC" from name of the flag
+# TODO move these
+SCALER_ATTN_INIT = 0.08 # 1 / n_layers
+SCALER_ATTN_SCALE = 0.125 # 1 / sqrt(d_model)
+SCALER_MLP_INIT = 0.08
+SCALER_MLP_SCALE = 0.125
+
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
@@ -48,6 +55,16 @@ def apply_rotary_emb(x, cos, sin):
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).type_as(x)
+
+class Scaler(nn.Module):
+
+    def __init__(self, dim, init, scale):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(dim) * scale)
+        self.forward_scale = init / scale
+
+    def forward(self):
+        return self.scale * self.forward_scale
 
 class CausalSelfAttention(nn.Module):
 
@@ -111,11 +128,17 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
+        self.attn_scaler = Scaler(dim=config.n_embd, init=SCALER_ATTN_INIT, scale=SCALER_ATTN_SCALE)
         self.mlp = MLP(config)
+        self.mlp_scaler = Scaler(dim=config.n_embd, init=SCALER_MLP_INIT, scale=SCALER_MLP_SCALE)
+
+        # TODO keep attn_scaler and mlp_scaler positive
 
     def forward(self, x):
-        x = x + self.attn(x)
-        x = x + self.mlp(x)
+        hA = F.normalize(self.attn(x), dim=-1)
+        x = F.normalize(x + self.attn_scaler() * (hA - x), dim=-1)
+        hM = F.normalize(self.mlp(x), dim=-1)
+        x = F.normalize(x + self.mlp_scaler() * (hM - x), dim=-1)
         return x
 
 # -----------------------------------------------------------------------------
