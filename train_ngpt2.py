@@ -369,7 +369,7 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-gptconfig = GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=2, n_embd=64)
+gptconfig = GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=1, n_embd=64)
 model = GPT(gptconfig, seed=args.seed)
 model = model.cuda()
 print(f"Model initialized. Number of parameters : {sum([p.numel() for p in model.parameters()])}.")
