@@ -268,6 +268,7 @@ class Hyperparameters:
     warmup_iters : int = 0
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
+    grad_norm_clip : float = 1
     # evaluation and logging hyperparams
     log_wandb: bool = False
     log_wandb_every: int = 12
@@ -449,6 +450,9 @@ for step in range(args.num_iterations + 1):
             loss.backward() # just sync on the last step
     for p in model.parameters():
         p.grad /= train_accumulation_steps
+
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_norm_clip, foreach=True)
+
     # step the optimizers and schedulers
     optimizer.step()
     scheduler.step()
@@ -464,7 +468,7 @@ for step in range(args.num_iterations + 1):
         with open(logfile, "a") as f:
             f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
         if args.log_wandb and (step % args.log_wandb_every == 0):
-            wandb.log({"train_loss": train_loss.item(), "lr": optimizer.param_groups[0]['lr'], "step_avg_ms": approx_time/timed_steps}, step=step)
+            wandb.log({"train_loss": train_loss.item(), "lr": optimizer.param_groups[0]['lr'], "grad_norm": grad_norm.item(), "step_avg_ms": approx_time/timed_steps}, step=step)
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
