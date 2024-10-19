@@ -212,24 +212,21 @@ class GPT(nn.Module):
         # Collect parameters into two groups
         params_INPUT_OUTPUT = []
         params_HIDDEN = []
+        params_bias = []
 
         for module in self.modules():
-            params = [p for p in module.parameters() if p.requires_grad]
             if hasattr(module, 'WEIGHT_INPUT') or hasattr(module, 'WEIGHT_OUTPUT'):
-                params_INPUT_OUTPUT.extend(params)
+                params_INPUT_OUTPUT.append(module.weight.wams)
             elif hasattr(module, 'WEIGHT_HIDDEN'):
-                params_HIDDEN.extend(params)
+                params_HIDDEN.append(module.weight)
             else:
                 raise NotImplementedError
                 pass  # Modules without these attributes are ignored
+            if module.bias is not None:
+                params_bias.append(module.bias)
 
-        # Remove duplicates
-        params_INPUT_OUTPUT = list(set(params_INPUT_OUTPUT))
-        params_HIDDEN = list(set(params_HIDDEN))
-
-        # Ensure all parameters are included
         all_params = set(p for p in self.parameters() if p.requires_grad)
-        params_in_groups = set(params_INPUT_OUTPUT + params_HIDDEN)
+        params_in_groups = set(params_INPUT_OUTPUT + params_HIDDEN + params_bias)
         params_remaining = all_params - params_in_groups
 
         if params_remaining:
@@ -247,6 +244,11 @@ class GPT(nn.Module):
                 'params': params_HIDDEN,
                 'lr': learning_rate / mup_width_mult,
                 'weight_decay': weight_decay * mup_width_mult
+            },
+            {
+                'params': params_bias,
+                'lr': learning_rate,
+                'weight_decay': 0.
             }
         ]
 
