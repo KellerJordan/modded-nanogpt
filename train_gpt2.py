@@ -95,7 +95,7 @@ class MLP(nn.Module):
         # output projection
         self.c_proj = nn.Linear(d_ff, config.n_embd, bias=False)
         self.c_proj.RESIDUAL_SCALE_FLAG = 1
-        self.c_fc2.WEIGHT_HIDDEN = 1
+        self.c_proj.WEIGHT_HIDDEN = 1
 
     def forward(self, x):
         x1 = self.c_fc(x)
@@ -210,7 +210,7 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(module.bias)
 
     def configure_optimizer(self, learning_rate, weight_decay, betas):
-        optimizer = torch.optim.AdamW(self.parameters(), betas=betas, fused=True)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=betas, fused=True)
         return optimizer
 
     def configure_optimizer_mup(self, learning_rate, weight_decay, betas):
@@ -220,23 +220,27 @@ class GPT(nn.Module):
 
         for module in self.modules():
             if hasattr(module, 'WEIGHT_INPUT') or hasattr(module, 'WEIGHT_OUTPUT'):
-                params_INPUT_OUTPUT.append(module.weight.wams)
+                params_INPUT_OUTPUT.append(module.weight)
+                if hasattr(module, 'bias') and module.bias is not None:
+                    params_bias.append(module.bias)
             elif hasattr(module, 'WEIGHT_HIDDEN'):
                 params_HIDDEN.append(module.weight)
+                if module.bias is not None:
+                    params_bias.append(module.bias)
             else:
-                raise NotImplementedError
-                pass  # Modules without these attributes are ignored
-            if module.bias is not None:
-                params_bias.append(module.bias)
+                pass
 
         all_params = set(p for p in self.parameters() if p.requires_grad)
         params_in_groups = set(params_INPUT_OUTPUT + params_HIDDEN + params_bias)
         params_remaining = all_params - params_in_groups
 
         if params_remaining:
+            for p in params_remaining:
+                print(p.shape)
+            print("some parameters are remaining")
             raise NotImplementedError
             # Add remaining parameters to the input/output group
-            params_INPUT_OUTPUT.extend(list(params_remaining))
+            #params_INPUT_OUTPUT.extend(list(params_remaining))
 
         param_groups = [
             {
@@ -357,7 +361,7 @@ class Hyperparameters:
     use_mup : bool = True
     mup_base_width : int = 768
     # evaluation and logging hyperparams
-    log_wandb: bool = True
+    log_wandb: bool = False
     log_wandb_every: int = 12
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
