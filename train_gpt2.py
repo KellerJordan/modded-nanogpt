@@ -118,7 +118,7 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, seed=None):
         super().__init__()
         self.config = config
 
@@ -132,7 +132,7 @@ class GPT(nn.Module):
 
         # init all weights, use a torch rng object to be very careful
         self.init_rng = torch.Generator()
-        self.init_rng.manual_seed(42)
+        self.init_rng.manual_seed(seed or 42)
         self.apply(self._init_weights)
 
     def forward(self, idx, targets=None, return_logits=True):
@@ -253,6 +253,7 @@ class DistributedDataLoader:
 
 @dataclass
 class Hyperparameters:
+    seed : int = 123456789 + 0
     # data hyperparams
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
@@ -302,7 +303,7 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768))
+model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768), seed=args.seed)
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
@@ -311,6 +312,10 @@ model = torch.compile(model)
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+
+torch.manual_seed(args.seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(args.seed)
 
 # init the optimizer(s)
 optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
