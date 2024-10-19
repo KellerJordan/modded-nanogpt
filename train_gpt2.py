@@ -274,7 +274,7 @@ class Hyperparameters:
     log_wandb_every: int = 12
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+    save_every : int = 1000 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
 if args.log_wandb:
