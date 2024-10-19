@@ -24,6 +24,7 @@ SCALER_ATTN_INIT = 0.08 # 1 / n_layers
 SCALER_ATTN_SCALE = 0.125 # 1 / sqrt(d_model)
 SCALER_MLP_INIT = 0.08
 SCALER_MLP_SCALE = 0.125
+SCALER_QK_SCALE = 0.125 # 1 / sqrt(d_model)
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -74,12 +75,15 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
+        # q,k,v projection
         self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_q.NORMALIZE = 1
         self.c_k.NORMALIZE = 1
         self.c_v.NORMALIZE = 1
+        # q,k scaling
+        self.qk_scaler = Scaler(dim=self.head_dim, init=1, scale=SCALER_QK_SCALE)
         # output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
@@ -92,9 +96,11 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        q = self.qk_scaler() * F.normalize(q, dim=-1)
+        k = self.qk_scaler() * F.normalize(k, dim=-1)
         cos, sin = self.rotary(q)
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True, scale=math.sqrt(self.head_dim))
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
