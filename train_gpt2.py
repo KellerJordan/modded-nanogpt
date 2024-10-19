@@ -19,11 +19,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
-class NewGELU(nn.Module):
-    """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
-    def forward(self, input):
-        return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
-
 class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
