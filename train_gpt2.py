@@ -60,9 +60,13 @@ class CausalSelfAttention(nn.Module):
         self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_q.WEIGHT_HIDDEN = 1
+        self.c_k.WEIGHT_HIDDEN = 1
+        self.c_v.WEIGHT_HIDDEN = 1
         # output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.RESIDUAL_SCALE_FLAG = 1
+        self.c_proj.WEIGHT_HIDDEN = 1
         self.rotary = Rotary(self.head_dim)
 
     def forward(self, x):
@@ -83,10 +87,15 @@ class MLP(nn.Module):
 
         d_ff = int((8/3) * config.n_embd)
 
+        # uv projection
         self.c_fc = nn.Linear(config.n_embd, d_ff, bias=False)
         self.c_fc2 = nn.Linear(config.n_embd, d_ff, bias=False)
+        self.c_fc.WEIGHT_HIDDEN = 1
+        self.c_fc2.WEIGHT_HIDDEN = 1
+        # output projection
         self.c_proj = nn.Linear(d_ff, config.n_embd, bias=False)
         self.c_proj.RESIDUAL_SCALE_FLAG = 1
+        self.c_fc2.WEIGHT_HIDDEN = 1
 
     def forward(self, x):
         x1 = self.c_fc(x)
@@ -128,14 +137,20 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
+        self.transformer.wte.WEIGHT_INPUT = 1
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.WEIGHT_OUTPUT = 1
         #self.lm_head.SKIP_INIT = 1 # don't init this one, we will tie weights
         #self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights, use a torch rng object to be very careful
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(seed or 42)
-        self.apply(self._init_weights)
+        if args.use_mup:
+            self.apply(self._init_weights_mup)
+        else:
+            self.apply(self._init_weights)
 
     def forward(self, idx, targets=None, return_logits=True):
 
@@ -144,6 +159,9 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         x = F.rms_norm(x, (x.size(-1),))
+
+        if args.use_mup:
+            x = x / mup_width_mult
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -174,6 +192,67 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
+
+    def _init_weights_mup(self, module):
+        base_std = 0.02
+        std = base_std if not hasattr(module, 'RESIDUAL_SCALE_FLAG') else 0.02/math.sqrt(2 * self.config.n_layer)
+        if hasattr(module, 'WEIGHT_INPUT'):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std, generator=self.init_rng)
+        elif hasattr(module, 'WEIGHT_HIDDEN'):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std / math.sqrt(mup_width_mult), generator=self.init_rng)
+        elif hasattr(module, 'WEIGHT_OUTPUT'):
+            torch.nn.init.zeros_(module.weight)
+        else:
+            raise NotImplementedError
+        
+        if module.bias is not None:
+            torch.nn.init.zeros_(module.bias)
+
+    def configure_optimizer(self, learning_rate, weight_decay, betas):
+        # Collect parameters into two groups
+        params_INPUT_OUTPUT = []
+        params_HIDDEN = []
+
+        for module in self.modules():
+            params = [p for p in module.parameters() if p.requires_grad]
+            if hasattr(module, 'WEIGHT_INPUT') or hasattr(module, 'WEIGHT_OUTPUT'):
+                params_INPUT_OUTPUT.extend(params)
+            elif hasattr(module, 'WEIGHT_HIDDEN'):
+                params_HIDDEN.extend(params)
+            else:
+                raise NotImplementedError
+                pass  # Modules without these attributes are ignored
+
+        # Remove duplicates
+        params_INPUT_OUTPUT = list(set(params_INPUT_OUTPUT))
+        params_HIDDEN = list(set(params_HIDDEN))
+
+        # Ensure all parameters are included
+        all_params = set(p for p in self.parameters() if p.requires_grad)
+        params_in_groups = set(params_INPUT_OUTPUT + params_HIDDEN)
+        params_remaining = all_params - params_in_groups
+
+        if params_remaining:
+            raise NotImplementedError
+            # Add remaining parameters to the input/output group
+            params_INPUT_OUTPUT.extend(list(params_remaining))
+
+        param_groups = [
+            {
+                'params': params_INPUT_OUTPUT,
+                'lr': learning_rate,
+                'weight_decay': weight_decay
+            },
+            {
+                'params': params_HIDDEN,
+                'lr': learning_rate / mup_width_mult,
+                'weight_decay': weight_decay * mup_width_mult
+            }
+        ]
+
+        optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=True)
+
+        return optimizer
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -269,6 +348,9 @@ class Hyperparameters:
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     grad_norm_clip : float = 1
+    # mup
+    use_mup : bool = True
+    mup_base_width : int = 768
     # evaluation and logging hyperparams
     log_wandb: bool = True
     log_wandb_every: int = 12
@@ -323,13 +405,15 @@ model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
+if args.use_mup:
+    mup_width_mult = gptconfig.n_embd / args.mup_base_width
+
 torch.manual_seed(args.seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(args.seed)
 
 # init the optimizer(s)
-optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
-                               weight_decay=args.weight_decay, fused=True)
+optimizer = raw_model.configure_optimizer(learning_rate=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95))
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
