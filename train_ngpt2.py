@@ -110,11 +110,15 @@ class MLP(nn.Module):
         super().__init__()
 
         d_ff = int((8/3) * config.n_embd)
+        self.n_embd = config.n_embd
 
         self.c_fc = nn.Linear(config.n_embd, d_ff, bias=False)
         self.c_fc2 = nn.Linear(config.n_embd, d_ff, bias=False)
         self.c_fc.NORMALIZE = 1
         self.c_fc2.NORMALIZE = 1
+
+        self.u_scaler = Scaler(dim=d_ff, init=1, scale=1)
+        self.v_scaler = Scaler(dim=d_ff, init=1, scale=1)
 
         self.c_proj = nn.Linear(d_ff, config.n_embd, bias=False)
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
@@ -122,8 +126,8 @@ class MLP(nn.Module):
         self.c_proj.NORM_FIRST = 1
 
     def forward(self, x):
-        x1 = self.c_fc(x)
-        x2 = self.c_fc2(x)
+        x1 = self.u_scaler() * self.c_fc(x)
+        x2 = math.sqrt(self.n_embd) * self.v_scaler() * self.c_fc2(x)
         x2 = F.silu(x2)
         x = x1 * x2
         x = self.c_proj(x)
