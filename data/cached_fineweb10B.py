@@ -12,5 +12,5 @@ get("fineweb_val_%06d.bin" % 0)
 num_chunks = 104 # full fineweb10B. Each chunk is ~98.5M tokens
 if len(sys.argv) >= 2: # we can pass an argument to download less
     num_chunks = int(sys.argv[1])
-for i in range(1, num_chunks):
+for i in range(1, num_chunks+1):
     get("fineweb_train_%06d.bin" % i)
