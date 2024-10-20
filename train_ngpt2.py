@@ -18,15 +18,6 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-# TODO move these
-# TODO add missing (even if 1)
-SCALER_ATTN_INIT = 0.08 # 1 / n_layers
-SCALER_ATTN_SCALE = 0.125 # 1 / sqrt(d_model)
-SCALER_MLP_INIT = 0.08
-SCALER_MLP_SCALE = 0.125
-SCALER_QK_SCALE = 0.125 # 1 / sqrt(d_model)
-SCALER_LOGITS_SCALE = 0.125 # 1 / sqrt(d_model)
-
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
@@ -83,13 +74,17 @@ class CausalSelfAttention(nn.Module):
         self.c_q.NORMALIZE = 1
         self.c_k.NORMALIZE = 1
         self.c_v.NORMALIZE = 1
+        self.c_q.WEIGHT_HIDDEN = 1
+        self.c_k.WEIGHT_HIDDEN = 1
+        self.c_v.WEIGHT_HIDDEN = 1
         # q,k scaling
-        self.qk_scaler = Scaler(dim=self.head_dim, init=1, scale=SCALER_QK_SCALE)
+        self.qk_scaler = Scaler(dim=self.head_dim, init=1, scale=1/math.sqrt(config.n_embd))
         # output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.RESIDUAL_SCALE_FLAG = 1
         self.c_proj.NORMALIZE = 1
         self.c_proj.NORM_FIRST = 1
+        self.c_proj.WEIGHT_HIDDEN = 1
         self.rotary = Rotary(self.head_dim)
 
     def forward(self, x):
@@ -117,6 +112,8 @@ class MLP(nn.Module):
         self.c_fc2 = nn.Linear(config.n_embd, d_ff, bias=False)
         self.c_fc.NORMALIZE = 1
         self.c_fc2.NORMALIZE = 1
+        self.c_fc.WEIGHT_HIDDEN = 1
+        self.c_fc2.WEIGHT_HIDDEN = 1
 
         self.u_scaler = Scaler(dim=d_ff, init=1, scale=1)
         self.v_scaler = Scaler(dim=d_ff, init=1, scale=1)
@@ -125,6 +122,7 @@ class MLP(nn.Module):
         self.c_proj.RESIDUAL_SCALE_FLAG = 1
         self.c_proj.NORMALIZE = 1
         self.c_proj.NORM_FIRST = 1
+        self.c_proj.WEIGHT_HIDDEN = 1
 
     def forward(self, x):
         x1 = self.u_scaler() * self.c_fc(x)
@@ -139,9 +137,9 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
-        self.attn_scaler = Scaler(dim=config.n_embd, init=SCALER_ATTN_INIT, scale=SCALER_ATTN_SCALE)
+        self.attn_scaler = Scaler(dim=config.n_embd, init=1/config.n_layer, scale=1/math.sqrt(config.n_embd))
         self.mlp = MLP(config)
-        self.mlp_scaler = Scaler(dim=config.n_embd, init=SCALER_MLP_INIT, scale=SCALER_MLP_SCALE)
+        self.mlp_scaler = Scaler(dim=config.n_embd, init=1/config.n_layer, scale=1/math.sqrt(config.n_embd))
 
     def forward(self, x):
         hA = F.normalize(self.attn(x), dim=-1)
@@ -159,6 +157,7 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 12
     n_embd : int = 768
+    mup_width_mult : float = 1
 
 class GPT(nn.Module):
 
@@ -171,18 +170,23 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.transformer.wte.NORMALIZE = 1
+        self.transformer.wte.WEIGHT_INPUT = 1
 
-        self.logits_scaler = Scaler(dim=config.vocab_size, init=1, scale=SCALER_LOGITS_SCALE)
+        self.logits_scaler = Scaler(dim=config.vocab_size, init=1, scale=1/math.sqrt(config.n_embd))
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.NORMALIZE = 1
+        self.lm_head.WEIGHT_OUTPUT = 1
         #self.lm_head.SKIP_INIT = 1 # don't init this one, we will tie weights
         #self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights, use a torch rng object to be very careful
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(seed or 42)
-        self.apply(self._init_weights)
+        if config.mup_width_mult != 1:
+            self.apply(self._init_weights_mup)
+        else:
+            self.apply(self._init_weights)
 
         self.norm_weights()
 
@@ -192,6 +196,9 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         for block in self.transformer.h:
             x = block(x)
+        
+        if self.config.mup_width_mult != 1:
+            x = x / self.config.mup_width_mult
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -223,6 +230,73 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
+
+    # todo : no else ????
+    def _init_weights_mup(self, module):
+        base_std = 0.02
+        std = base_std if not hasattr(module, 'RESIDUAL_SCALE_FLAG') else 0.02/math.sqrt(2 * self.config.n_layer)
+        if hasattr(module, 'WEIGHT_INPUT'):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std, generator=self.init_rng)
+        elif hasattr(module, 'WEIGHT_HIDDEN'):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std / math.sqrt(self.config.mup_width_mult), generator=self.init_rng)
+        elif hasattr(module, 'WEIGHT_OUTPUT'):
+            torch.nn.init.zeros_(module.weight)
+        if hasattr(module, 'bias') and module.bias is not None:
+            torch.nn.init.zeros_(module.bias)
+
+    def configure_optimizer(self, learning_rate, weight_decay, betas):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=betas, fused=True)
+        return optimizer
+
+    def configure_optimizer_mup(self, learning_rate, weight_decay, betas):
+        params_INPUT_OUTPUT = []
+        params_HIDDEN = []
+        params_bias = []
+
+        for module in self.modules():
+            if hasattr(module, 'WEIGHT_INPUT') or hasattr(module, 'WEIGHT_OUTPUT'):
+                params_INPUT_OUTPUT.append(module.weight)
+                if hasattr(module, 'bias') and module.bias is not None:
+                    params_bias.append(module.bias)
+            elif hasattr(module, 'WEIGHT_HIDDEN'):
+                params_HIDDEN.append(module.weight)
+                if module.bias is not None:
+                    params_bias.append(module.bias)
+            elif isinstance(module, Scaler):
+                params_INPUT_OUTPUT.append(module.scale)
+
+        all_params = set(p for p in self.parameters() if p.requires_grad)
+        params_in_groups = set(params_INPUT_OUTPUT + params_HIDDEN + params_bias)
+        params_remaining = all_params - params_in_groups
+
+        if params_remaining:
+            for p in params_remaining:
+                print(p.shape)
+            print("some parameters are remaining")
+            raise NotImplementedError
+            # Add remaining parameters to the input/output group
+            #params_INPUT_OUTPUT.extend(list(params_remaining))
+
+        param_groups = [
+            {
+                'params': params_INPUT_OUTPUT,
+                'lr': learning_rate,
+                'weight_decay': weight_decay
+            },
+            {
+                'params': params_HIDDEN,
+                'lr': learning_rate / self.config.mup_width_mult,
+                'weight_decay': weight_decay * self.config.mup_width_mult
+            },
+            {
+                'params': params_bias,
+                'lr': learning_rate,
+                'weight_decay': 0.
+            }
+        ]
+
+        optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=True)
+        return optimizer
 
     @torch.no_grad()
     def norm_weights(self):
@@ -327,218 +401,227 @@ class Hyperparameters:
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     grad_norm_clip : float = 1
+    # mup
+    use_mup : bool = True
+    mup_base_width : int = 768
     # evaluation and logging hyperparams
-    log_wandb: bool = True
+    log_wandb: bool = False
     log_wandb_every: int = 12
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 1000 # every how many steps to save the checkpoint? 0 for only at the end
-args = Hyperparameters()
 
-if args.log_wandb:
-    wandb.init(project="ngpt", config={**vars(args)})
+if __name__ == "__main__":
+    args = Hyperparameters()
 
-# set up DDP (distributed data parallel). torchrun sets this env variable
-assert torch.cuda.is_available()
-dist.init_process_group(backend='nccl')
-ddp_rank = int(os.environ['RANK'])
-ddp_local_rank = int(os.environ['LOCAL_RANK'])
-ddp_world_size = int(os.environ['WORLD_SIZE'])
-device = f'cuda:{ddp_local_rank}'
-torch.cuda.set_device(device)
-print(f"using device: {device}")
-master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
-
-# convenience variables
-B, T = args.device_batch_size, args.sequence_length
-# calculate the number of steps to take in the val loop.
-assert args.val_tokens % (B * T * ddp_world_size) == 0
-val_steps = args.val_tokens // (B * T * ddp_world_size)
-# calculate the steps of gradient accumulation required to attain the desired global batch size.
-assert args.batch_size % (B * ddp_world_size) == 0
-train_accumulation_steps = args.batch_size // (B * ddp_world_size)
-
-# load tokens
-train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
-if master_process:
-    print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
-    print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
-x, y = train_loader.next_batch()
-
-# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
-# this originates from Karpathy's experiments.
-num_vocab = 50304
-gptconfig = GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=1, n_embd=64)
-model = GPT(gptconfig, seed=args.seed)
-model = model.cuda()
-print(f"Model initialized. Number of parameters : {sum([p.numel() for p in model.parameters()])}.")
-if hasattr(config, "coordinate_descent_tuning"):
-    config.coordinate_descent_tuning = True # suggested by @Chillee
-model = torch.compile(model)
-# here we wrap model into DDP container
-model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module # always contains the "raw" unwrapped model
-ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
-
-torch.manual_seed(args.seed)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(args.seed)
-
-# init the optimizer(s)
-optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
-                               weight_decay=args.weight_decay, fused=True)
-# learning rate decay scheduler (linear warmup and warmdown)
-def get_lr(it):
-    assert it <= args.num_iterations
-    # 1) linear warmup for warmup_iters steps
-    if it < args.warmup_iters:
-        return (it+1) / args.warmup_iters
-    # 2) constant lr for a while
-    elif it < args.num_iterations - args.warmdown_iters:
-        return 1.0
-    # 3) linear warmdown
-    else:
-        decay_ratio = (args.num_iterations - it) / args.warmdown_iters
-        return decay_ratio
-scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
-
-# begin logging
-if master_process:
     if args.log_wandb:
-        run_id = wandb.run.name
-    else:
-        run_id = str(uuid.uuid4())
-    logdir = 'logs/%s/' % run_id
-    os.makedirs(logdir, exist_ok=True)
-    logfile = 'logs/%s.txt' % run_id
-    # create the log file
-    with open(logfile, "w") as f:
-        # begin the log by printing this file (the Python code)
-        f.write('='*100 + '\n')
-        f.write(code)
-        f.write('='*100 + '\n')
-        # log information about the hardware/software environment this is running on
-        # and print the full `nvidia-smi` to file
-        f.write(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:\n")
-        import subprocess
-        result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        f.write(f'{result.stdout}\n')
-        f.write('='*100 + '\n')
-        # log hyperparameters and config
-        if args.log_wandb:
-            f.write(f"wandb run {wandb.run.name}\n")
-        f.write("Hyperparameters:\n")
-        f.write(f"{dataclasses.asdict(args)}\n")
-        f.write("Model config:\n")
-        f.write(f"{dataclasses.asdict(gptconfig)}\n")
-        f.write('='*100 + '\n')
+        wandb.init(project="ngpt", config={**vars(args)})
 
-training_time_ms = 0
-# start the clock
-torch.cuda.synchronize()
-t0 = time.time()
-# begin training
-train_loader.reset()
-for step in range(args.num_iterations + 1):
-    last_step = (step == args.num_iterations)
-    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
-    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
-    # steps with dummy data first, and then re-initialize the model and reset the loader.
-    if step == 10:
-        training_time_ms = 0
-        t0 = time.time()
-    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+    # set up DDP (distributed data parallel). torchrun sets this env variable
+    assert torch.cuda.is_available()
+    dist.init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    print(f"using device: {device}")
+    master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
-    # once in a while evaluate the validation dataset
-    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
-        # stop the clock
-        torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.time() - t0)
-        # run validation batches
-        model.eval()
-        val_loader.reset()
-        val_loss = 0.0
-        for _ in range(val_steps):
-            x_val, y_val = val_loader.next_batch()
-            with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
-                _, loss = model(x_val, y_val, return_logits=False)
-                val_loss += loss.detach()
-                del loss
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        val_loss /= val_steps
-        # log val loss to console, logfile and wandb
-        if master_process:
-            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
-            with open(logfile, "a") as f:
-                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
-            if args.log_wandb:
-                wandb.log({"val_loss": val_loss}, step=step)
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.time()
+    # convenience variables
+    B, T = args.device_batch_size, args.sequence_length
+    # calculate the number of steps to take in the val loop.
+    assert args.val_tokens % (B * T * ddp_world_size) == 0
+    val_steps = args.val_tokens // (B * T * ddp_world_size)
+    # calculate the steps of gradient accumulation required to attain the desired global batch size.
+    assert args.batch_size % (B * ddp_world_size) == 0
+    train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 
-    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
-        # stop the clock
-        torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.time() - t0)
-        # save the state of the training process
-        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizer=optimizer.state_dict())
-        torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.time()
-
-    # bit confusing: we want to make sure to eval on 0th iteration
-    # but also after the very last iteration. so we loop for step <= num_iterations
-    # instead of just < num_iterations (one extra due to <=), only to do
-    # the validation/sampling one last time, and then we break right here as we're done.
-    if last_step:
-        break
-
-    # --------------- TRAINING SECTION BEGIN -----------------
-    model.train()
-    for i in range(1, train_accumulation_steps+1):
-        # forward pass
-        with ctx:
-            _, loss = model(x, y, return_logits=False)
-            train_loss = loss.detach()
-        # advance the dataset for the next batch
-        x, y = train_loader.next_batch()
-        # backward pass
-        if i < train_accumulation_steps:
-            with model.no_sync(): # there's no need to sync gradients every accumulation step
-                loss.backward()
-        else:
-            loss.backward() # just sync on the last step
-    for p in model.parameters():
-        p.grad /= train_accumulation_steps
-
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_norm_clip, foreach=True)
-
-    # step the optimizers and schedulers
-    optimizer.step()
-    scheduler.step()
-    # null the gradients
-    model.zero_grad(set_to_none=True)
-    # normalize all the weights (step 2 of nGPT)
-    raw_model.norm_weights()
-
-    # --------------- TRAINING SECTION END -------------------
-    # everything that follows now is just diagnostics, prints, logging, etc.
-
-    #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+    # load tokens
+    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
     if master_process:
-        approx_time = training_time_ms + 1000 * (time.time() - t0)
-        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
-        with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
-        if args.log_wandb and (step % args.log_wandb_every == 0):
-            wandb.log({"train_loss": train_loss.item(), "lr": optimizer.param_groups[0]['lr'], "grad_norm": grad_norm.item(), "step_avg_ms": approx_time/timed_steps}, step=step)
+        print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+        print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+    x, y = train_loader.next_batch()
 
-if master_process:
-    print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
+    # this originates from Karpathy's experiments.
+    num_vocab = 50304
+    gptconfig = GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=1, n_embd=64)
+    if args.use_mup:
+        gptconfig.mup_width_mult = gptconfig.n_embd / args.mup_base_width
+    model = GPT(gptconfig, seed=args.seed)
+    model = model.cuda()
+    print(f"Model initialized. Number of parameters : {sum([p.numel() for p in model.parameters()])}.")
+    if hasattr(config, "coordinate_descent_tuning"):
+        config.coordinate_descent_tuning = True # suggested by @Chillee
+    model = torch.compile(model)
+    # here we wrap model into DDP container
+    model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module # always contains the "raw" unwrapped model
+    ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
-# -------------------------------------------------------------------------
-# clean up nice
-dist.destroy_process_group()
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+
+    # init the optimizer(s)
+    if not args.use_mup:
+        optimizer = raw_model.configure_optimizer(learning_rate=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+    else:
+        optimizer = raw_model.configure_optimizer_mup(learning_rate=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+    # learning rate decay scheduler (linear warmup and warmdown)
+    def get_lr(it):
+        assert it <= args.num_iterations
+        # 1) linear warmup for warmup_iters steps
+        if it < args.warmup_iters:
+            return (it+1) / args.warmup_iters
+        # 2) constant lr for a while
+        elif it < args.num_iterations - args.warmdown_iters:
+            return 1.0
+        # 3) linear warmdown
+        else:
+            decay_ratio = (args.num_iterations - it) / args.warmdown_iters
+            return decay_ratio
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
+
+    # begin logging
+    if master_process:
+        if args.log_wandb:
+            run_id = wandb.run.name
+        else:
+            run_id = str(uuid.uuid4())
+        logdir = 'logs/%s/' % run_id
+        os.makedirs(logdir, exist_ok=True)
+        logfile = 'logs/%s.txt' % run_id
+        # create the log file
+        with open(logfile, "w") as f:
+            # begin the log by printing this file (the Python code)
+            f.write('='*100 + '\n')
+            f.write(code)
+            f.write('='*100 + '\n')
+            # log information about the hardware/software environment this is running on
+            # and print the full `nvidia-smi` to file
+            f.write(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:\n")
+            import subprocess
+            result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            f.write(f'{result.stdout}\n')
+            f.write('='*100 + '\n')
+            # log hyperparameters and config
+            if args.log_wandb:
+                f.write(f"wandb run {wandb.run.name}\n")
+            f.write("Hyperparameters:\n")
+            f.write(f"{dataclasses.asdict(args)}\n")
+            f.write("Model config:\n")
+            f.write(f"{dataclasses.asdict(gptconfig)}\n")
+            f.write('='*100 + '\n')
+
+    training_time_ms = 0
+    # start the clock
+    torch.cuda.synchronize()
+    t0 = time.time()
+    # begin training
+    train_loader.reset()
+    for step in range(args.num_iterations + 1):
+        last_step = (step == args.num_iterations)
+        # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+        # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+        # steps with dummy data first, and then re-initialize the model and reset the loader.
+        if step == 10:
+            training_time_ms = 0
+            t0 = time.time()
+        timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+
+        # once in a while evaluate the validation dataset
+        if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.time() - t0)
+            # run validation batches
+            model.eval()
+            val_loader.reset()
+            val_loss = 0.0
+            for _ in range(val_steps):
+                x_val, y_val = val_loader.next_batch()
+                with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
+                    _, loss = model(x_val, y_val, return_logits=False)
+                    val_loss += loss.detach()
+                    del loss
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            val_loss /= val_steps
+            # log val loss to console, logfile and wandb
+            if master_process:
+                print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+                with open(logfile, "a") as f:
+                    f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+                if args.log_wandb:
+                    wandb.log({"val_loss": val_loss}, step=step)
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.time()
+
+        if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.time() - t0)
+            # save the state of the training process
+            log = dict(step=step, code=code, model=raw_model.state_dict(), optimizer=optimizer.state_dict())
+            torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.time()
+
+        # bit confusing: we want to make sure to eval on 0th iteration
+        # but also after the very last iteration. so we loop for step <= num_iterations
+        # instead of just < num_iterations (one extra due to <=), only to do
+        # the validation/sampling one last time, and then we break right here as we're done.
+        if last_step:
+            break
+
+        # --------------- TRAINING SECTION BEGIN -----------------
+        model.train()
+        for i in range(1, train_accumulation_steps+1):
+            # forward pass
+            with ctx:
+                _, loss = model(x, y, return_logits=False)
+                train_loss = loss.detach()
+            # advance the dataset for the next batch
+            x, y = train_loader.next_batch()
+            # backward pass
+            if i < train_accumulation_steps:
+                with model.no_sync(): # there's no need to sync gradients every accumulation step
+                    loss.backward()
+            else:
+                loss.backward() # just sync on the last step
+        for p in model.parameters():
+            p.grad /= train_accumulation_steps
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_norm_clip, foreach=True)
+
+        # step the optimizers and schedulers
+        optimizer.step()
+        scheduler.step()
+        # null the gradients
+        model.zero_grad(set_to_none=True)
+        # normalize all the weights (step 2 of nGPT)
+        raw_model.norm_weights()
+
+        # --------------- TRAINING SECTION END -------------------
+        # everything that follows now is just diagnostics, prints, logging, etc.
+
+        #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+        if master_process:
+            approx_time = training_time_ms + 1000 * (time.time() - t0)
+            print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+            with open(logfile, "a") as f:
+                f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+            if args.log_wandb and (step % args.log_wandb_every == 0):
+                wandb.log({"train_loss": train_loss.item(), "lr": optimizer.param_groups[0]['lr'], "grad_norm": grad_norm.item(), "step_avg_ms": approx_time/timed_steps}, step=step)
+
+    if master_process:
+        print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+    # -------------------------------------------------------------------------
+    # clean up nice
+    dist.destroy_process_group()

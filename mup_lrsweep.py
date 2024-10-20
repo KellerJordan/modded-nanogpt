@@ -25,23 +25,23 @@ from train_gpt2 import GPT, GPTConfig
 
 # --------------------------
 
-filename = "gpt2_mup.results.json"
-fig_name = "gpt2_mup.png"
+filename = "gpt2_mup_fulltest.results.json"
+fig_name = "gpt2_mup_fulltest.png"
 
 type_to_lr_range = {
-    "SP": [2**n for n in range(-13, -11 + 1)],
-    "μP": [2**n for n in range(-13, -11 + 1)],
+    #"SP": [2**n for n in range(-11, -7 + 1)],
+    "μP": [2**n for n in range(-15, -13 + 1)],
 }
 
 ctx_length = 256
 
 # --- model parameters ---
-mup_base_width = 64
-widths = [64, 256, 768] # check that for all these widths are divisible by d_head
+mup_base_width = 768
+widths = [64, 768] # check that for all these widths are divisible by d_head
 n_layers = 4
 d_head = 64
 
-batch_size = 32
+batch_size = 128
 
 vocab_size = 256
 
