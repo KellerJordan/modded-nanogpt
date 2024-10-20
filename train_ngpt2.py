@@ -6,6 +6,7 @@ import uuid
 import glob
 import time
 import math
+import tyro
 import wandb
 from dataclasses import dataclass
 import dataclasses
@@ -393,7 +394,7 @@ class Hyperparameters:
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 16 # batch size, in sequences, per device
+    device_batch_size : int = 32 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 4768 # number of iterations to run
     learning_rate : float = 2**(-8) # 0.0036
@@ -412,7 +413,7 @@ class Hyperparameters:
     save_every : int = 1000 # every how many steps to save the checkpoint? 0 for only at the end
 
 if __name__ == "__main__":
-    args = Hyperparameters()
+    args = tyro.cli(Hyperparameters)
 
     if args.log_wandb:
         wandb.init(project="ngpt", config={**vars(args)})
