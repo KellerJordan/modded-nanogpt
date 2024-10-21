@@ -10,15 +10,15 @@ We use the following techniques:
 * Initializing the projection layers to zero (muP-like).
 * Using a new optimizer (Muon - Momentum Orthogonalized by Newton-schulz).
 
-The training runs in 12 minutes on an 8xH100 machine. To execute it, run the following three commands, which install the necessary packages and download the data as well.
-They should complete within <20min on an 8xH100 with decent internet connection.
+To execute the training, simply run the following three commands, which first install the necessary packages and download the data.
+They should all complete within <20min on an 8xH100 with decent internet connection.
 ```bash
 pip install -r requirements.txt
 python data/cached_fineweb10B.py 27 # downloads only the first 2.7B training tokens to save time
 ./run.sh
 ```
 
-This will train a 124M-parameter transformer for 5100 steps on 2.67B tokens of Fineweb [1], achieving ~3.277 validation loss.
+The result will be a 124M-parameter transformer trained for 5100 steps on 2.67B tokens of Fineweb [1], achieving ~3.277 validation loss.
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
 ---
