@@ -347,29 +347,26 @@ class Hyperparameters:
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 32 # batch size, in sequences, per device
+    device_batch_size : int = 16 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 4768 # number of iterations to run
-    learning_rate : float = 2**(-8) # 0.0036
+    learning_rate : float = 2**(-9) # 0.0036
     warmup_iters : int = 200
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
-    weight_decay : float = 0
+    weight_decay : float = 0.1
     grad_norm_clip : float = 1
     # mup
-    use_mup : bool = True
+    use_mup : bool = False
     mup_base_width : int = 768
     # evaluation and logging hyperparams
-    log_wandb: bool = False
+    log_wandb: bool = True
     log_wandb_every: int = 12
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    save_every : int = 1000 # every how many steps to save the checkpoint? 0 for only at the end
+    save_every : int = 2000 # every how many steps to save the checkpoint? 0 for only at the end
 
 if __name__ == "__main__":
     args = tyro.cli(Hyperparameters)
-
-    if args.log_wandb:
-        wandb.init(project="modded_gpt", config={**vars(args)})
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     assert torch.cuda.is_available()
@@ -381,6 +378,9 @@ if __name__ == "__main__":
     torch.cuda.set_device(device)
     print(f"using device: {device}")
     master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+
+    if master_process and args.log_wandb:
+        wandb.init(project="modded_gpt", config={**vars(args)})
 
     # convenience variables
     B, T = args.device_batch_size, args.sequence_length
@@ -402,12 +402,13 @@ if __name__ == "__main__":
     # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
     # this originates from Karpathy's experiments.
     num_vocab = 50304
-    gptconfig = GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=1, n_embd=64)
+    gptconfig = GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768)
     if args.use_mup:
         gptconfig.mup_width_mult = gptconfig.n_embd / args.mup_base_width
     model = GPT(gptconfig, seed=args.seed)
     model = model.cuda()
-    print(f"Model initialized. Number of parameters : {sum([p.numel() for p in model.parameters()])}.")
+    if master_process:
+        print(f"Model initialized. Number of parameters : {sum([p.numel() for p in model.parameters()])}.")
     if hasattr(config, "coordinate_descent_tuning"):
         config.coordinate_descent_tuning = True # suggested by @Chillee
     model = torch.compile(model)
