@@ -23,7 +23,7 @@ For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss 
 
 ## World record history
 
-The following is the progression of world records for the task of *attaining 3.28 validation loss on FineWeb in the minimal time on a machine with 8xH100.*
+The following is the progression of world records for the task of *training a model that attains 3.28 FineWeb validation loss in the minimal time on an 8xH100 machine.*
 
 [45 minutes: llm.c baseline (05/28/24)](https://github.com/karpathy/llm.c/discussions/481) (the 90 minute time is on 8xA100; it's 45 minutes on 8xH100)
 
