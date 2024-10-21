@@ -53,7 +53,7 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 A: Because it is a *competitive* benchmark. In particular, if you attain a new speed record (using whatever method you want), there is an open invitation for you
 to post that record and thereby vacuum up all the clout for yourself. I will even help you do it by reposting you as much as I can.
 
-On the contrary, the idiosyncratic benchmark used in the [Sophia paper](https://arxiv.org/abs/2305.14342), does *not* have this property.
+On the contrary, the idiosyncratic benchmark used in the [Sophia paper](https://arxiv.org/abs/2305.14342), for example, does *not* have this property.
 There is no such open invitation for anyone to compete on the benchmark they used. In fact, if you happen to find better AdamW hyperparameters than
 the ones they used which significantly close the gap to their proposed optimizer (weirdly specific I know),
 then there is no clear path for you to publish that result in *any* form. It simply dies with you and no one learns anything
