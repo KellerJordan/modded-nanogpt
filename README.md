@@ -70,7 +70,7 @@ So if you're rational, the result probably just dies with you and no one else le
 A: Ok, well, "at scale" is an infinite category (what if the methods stop working only for >100T models?), so it's impossible for me to conclusively refute the allegation that whatever we're doing here doesn't work at scale.
 But if you care about 1.5B scale, then you might be convinced by this result:
 
-*Straightforwardly scaling up the speedrun to 1.5B parameters yields a model with GPT-2 (1.5B)-level quality 2.5x more cheaply than [@karpathy's baseline](https://github.com/karpathy/llm.c/discussions/677):*
+*Straightforwardly scaling up the speedrun to 1.5B parameters yields a model with GPT-2 (1.5B)-level quality 2.5x more cheaply than [@karpathy's baseline](https://github.com/karpathy/llm.c/discussions/677) ($233 instead of $576):*
 
 ![](img/nanogpt_speedrun51.png)
 [[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/102024_ScaleUp1B/ad8d7ae5-7b2d-4ee9-bc52-f912e9174d7a.txt)]
