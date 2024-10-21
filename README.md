@@ -27,6 +27,30 @@ Figure 1. Proposed optimizer vs. a well-tuned AdamW.
 
 ---
 
+## World record history
+
+[05/28/24 45 minutes: llm.c baseline](https://github.com/karpathy/llm.c/discussions/481) (the 90 minute time is on 8xA100; this runs in 45 minutes on an 8xH100)
+
+[06/06/24 31.4 minutes: Architectural modernizations and learning rate tuning](https://x.com/kellerjordan0/status/1798863559243513937)
+
+[10/04/24 24.9 minutes: Introduced the Muon optimizer](https://x.com/kellerjordan0/status/1842300916864844014)
+
+[10/11/24 22.3 minutes: Muon improvements](https://x.com/kellerjordan0/status/1844820919061287009)
+
+[10/14/24 15.2 minutes: Pad embeddings & architectural modernizations](https://x.com/kellerjordan0/status/1845865698532450646)
+
+[10/18/24 13.1 minutes: Distributed the overhead of Muon](https://x.com/kellerjordan0/status/1847291684016783746)
+
+[10/18/24 12.0 minutes: Upgraded PyTorch from 2.4.1 to 2.5.0](https://x.com/kellerjordan0/status/1847358578686152764)
+
+Direct contributors to these records: @Grad62304977, @bozavlado, myself
+
+Note: Of course, the original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
+So it's no surprise that there is room to improve. In addition, many of these techniques are completely standard, such as rotary embeddings.
+The goal of this benchmark is simply to find out all the methods which actually work, because I'm going crazy reading all these LLM training papers
+which claim a huge speedup but then use their own weird idiosyncratic benchmarks and no one in the community knows if it's legit for months.
+
+
 ## Muon optimizer
 
 Muon is defined as follows:
