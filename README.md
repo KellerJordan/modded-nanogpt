@@ -38,9 +38,10 @@ Direct contributors to these records: @Grad62304977, @bozavlado, myself
 Note: Of course, the original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
 So it's no surprise that there is room to improve, since as @karpathy said, "llm.c still has a lot of pending optimizations".
 In addition, many of the techniques used in these records are completely standard, such as rotary embeddings.
-The goal of this benchmark is simply to find out all the techniques which actually work, because I'm going crazy reading all these
+The goal of this benchmark/speedrun is simply to find out which techniques actually work, and maybe come up with some new ones.
+<!--The goal of this benchmark is simply to find out all the techniques which actually work, because I'm going crazy reading all these
 LLM training papers
-which claim a huge benefit but then use their own idiosyncratic non-competitive benchmark and therefore no one in the community has any idea if it's legit for months.
+which claim a huge benefit but then use their own idiosyncratic non-competitive benchmark and therefore no one in the community has any idea if it's legit for months.-->
 <!--[LLM](https://arxiv.org/abs/2305.14342) [training](https://arxiv.org/abs/2402.17764) [papers](https://arxiv.org/abs/2410.01131)-->
 <!--I mean hello??? We're in a completely empirical field; it is insane to not have a benchmark. Ideally everyone uses the same LLM training benchmark,
 and then reviewing LLM training papers becomes as simple as checking if they beat the benchmark. It's not like this would be unprecedented, that's how things
