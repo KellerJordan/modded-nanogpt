@@ -35,7 +35,7 @@ The following is the progression of world records for the task of *training a mo
 
 Direct contributors to these records: @Grad62304977, @bozavlado, myself
 
-Note: Of course, the original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
+Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
 So it's no surprise that there is room to improve; as @karpathy has said, 'llm.c still has a lot of pending optimizations.'
 In addition, many of the techniques used in these records are completely standard, such as rotary embeddings.
 The goal of this benchmark/speedrun is simply to find out which techniques actually work, and maybe come up with some new ones.
