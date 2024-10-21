@@ -72,7 +72,7 @@ But if you care about 1.5B scale, then you might be convinced by this result:
 ![](img/nanogpt_speedrun52.png)
 
 
-## Figures
+## More figures
 
 Figure 1. Proposed optimizer vs. a well-tuned AdamW.
 ![](img/fig_optimizer.png)
