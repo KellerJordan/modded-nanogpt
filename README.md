@@ -10,7 +10,7 @@ It uses the following techniques:
 * Projection layers initialized to zero (muP-like).
 * New optimizer: Muon - Momentum Orthogonalized by Newton-schulz.
 
-To execute the training, simply run the following three commands, which first install the necessary packages and download the data.
+To execute the training, run the following three commands.
 They should all complete within <20min on an 8xH100 with decent internet connection.
 ```bash
 pip install -r requirements.txt
