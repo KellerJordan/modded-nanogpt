@@ -52,7 +52,7 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 ### Q: What makes "NanoGPT speedrunning" not just another idiosyncratic benchmark?
 
 A: Because it is a *competitive* benchmark. In particular, if you attain a new speed record (using whatever method you want), there is an open invitation for you
-to post that record and thereby vacuum up all the clout for yourself. I will even help you do it by reposting you as much as I can.
+to post that record (on arXiv or X) and thereby vacuum up all the clout for yourself. I will even help you do it by reposting you as much as I can.
 
 <!--On the contrary, for example, the benchmark used in the [Sophia](https://arxiv.org/abs/2305.14342) paper does *not* have this property.
 There is no such open invitation for anyone to compete on the benchmark they used. In particular, if, for a random and definitely not weirdly specific example, you happen to find better AdamW hyperparameters for their training setup than
