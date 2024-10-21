@@ -29,7 +29,7 @@ Figure 1. Proposed optimizer vs. a well-tuned AdamW.
 
 ## World record history
 
-[45 minutes: llm.c baseline (05/28/24)](https://github.com/karpathy/llm.c/discussions/481) (the 90 minute time is on 8xA100; this runs in 45 minutes on an 8xH100)
+[45 minutes: llm.c baseline (05/28/24)](https://github.com/karpathy/llm.c/discussions/481) (the 90 minute time is on 8xA100; it's 45 minutes on 8xH100)
 
 [31.4 minutes: Architectural modernizations and learning rate tuning (06/06/24)](https://x.com/kellerjordan0/status/1798863559243513937)
 
