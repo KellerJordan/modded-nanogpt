@@ -6,7 +6,7 @@ Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains
 * **12 minutes on 8xH100 instead of 45**
 
 It uses the following techniques:
-* Modernized architecture: Rotary embeddings, QK-Norm, RMSNorm, and ReLU^2.
+* Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
 * Projection layers initialized to zero (muP-like).
 * New optimizer: Muon - Momentum Orthogonalized by Newton-schulz.
 
