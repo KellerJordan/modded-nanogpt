@@ -46,9 +46,10 @@ Figure 1. Proposed optimizer vs. a well-tuned AdamW.
 Direct contributors to these records: @Grad62304977, @bozavlado, myself
 
 Note: Of course, the original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
-So it's no surprise that there is room to improve. In addition, many of these techniques are completely standard, such as rotary embeddings.
+So it's no surprise that there is room to improve - Karpathy himself says "llm.c still has a lot of pending optimizations'.
+In addition, many of these techniques are completely standard, such as rotary embeddings.
 The goal of this benchmark is simply to find out all the methods which actually work, because I'm going crazy reading all these LLM training papers
-which claim a huge speedup but then use their own weird idiosyncratic benchmarks and no one in the community knows if it's legit for months.
+which claim a huge speedup but then use their own weird idiosyncratic benchmarks and therefore no one in the community has any idea if it's legit for months.
 
 
 ## Muon optimizer
