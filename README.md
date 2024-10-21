@@ -21,16 +21,9 @@ python data/cached_fineweb10B.py 27 # downloads only the first 2.7B training tok
 The result will be a 124M-parameter transformer trained for 5100 steps on 2.67B tokens of Fineweb [1], achieving ~3.277 validation loss.
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
----
-
-## Figures
-
-Figure 1. Proposed optimizer vs. a well-tuned AdamW.
-![](img/fig_optimizer.png)
-
----
-
 ## World record history
+
+The following is the progression of world records for the task of *attaining 3.28 validation loss on FineWeb in the minimal time on a machine with 8xH100.*
 
 [45 minutes: llm.c baseline (05/28/24)](https://github.com/karpathy/llm.c/discussions/481) (the 90 minute time is on 8xA100; it's 45 minutes on 8xH100)
 
@@ -53,6 +46,13 @@ So it's no surprise that there is room to improve - Karpathy himself says "llm.c
 In addition, many of these techniques are completely standard, such as rotary embeddings.
 The goal of this benchmark is simply to find out all the methods which actually work, because I'm going crazy reading all these LLM training papers
 which claim a huge speedup but then use their own weird idiosyncratic benchmarks and therefore no one in the community has any idea if it's legit for months.
+
+## Figures
+
+Figure 1. Proposed optimizer vs. a well-tuned AdamW.
+![](img/fig_optimizer.png)
+
+---
 
 
 ## Muon optimizer
