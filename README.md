@@ -27,14 +27,14 @@ Figure 1. Proposed optimizer vs. a well-tuned AdamW.
 
 ---
 
-## Proposed optimizer
+## Muon optimizer
 
-For this training scenario, the proposed optimizer has the following properties:
+For this training scenario, Muon has the following properties:
 * Less memory usage than Adam
 * ~1.5x faster training
 * <2% wallclock overhead
 
-The optimizer is defined as follows:
+Muon is defined as follows:
 
 ![](img/algo_optimizer.png)
 
@@ -55,6 +55,9 @@ def zeroth_power_via_newtonschulz5(G, steps=5, eps=1e-7):
         X = X.T 
     return X.to(G.dtype)
 ```
+
+Note that this iteration approximately replaces `G` with `U @ V.T` where `U, S, V = G.svd()`.
+
 
 ### Provenance
 
