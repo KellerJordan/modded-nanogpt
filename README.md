@@ -59,7 +59,7 @@ the ones they used which significantly close the gap between AdamW and their pro
 then there is no clear path for you to publish that result in *any* form.
 You could try posting it on X.com, but then you would be risking being perceived as aggressive/confrontational, which is *not a good look* in this racket.
 So if you're rational, the result probably just dies with you and no one else learns anything
-(unless you're in a frontier lab, in which case you can do a nice internal writeup).
+(unless you're in a frontier lab, in which case you can do a nice internal writeup. Boy I'd love to get my hands on those writeups).
 
 
 ## Figures
