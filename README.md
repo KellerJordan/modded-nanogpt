@@ -1,14 +1,14 @@
 # Modded-NanoGPT
 
-This is a variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
-Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo. It:
-* Trains 3.8x more efficiently (taking only 2.67 tokens instead of 10B to reach the same validation loss).
-* Has shorter code (537 lines instead of 860).
-* Implements architectural modernizations (rotary embeddings, RMSNorm, ReLU^2, projection zero-init).
-* Implements a new optimizer (Muon - Momentum Orthogonalized by Newton-schulz).
+This is a speedrun variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
+Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss using only 2.67B tokens instead of 10B.
+This training speed is attained through the following techniques:
+* Architectural modifications: Rotary embeddings, QK-Norm, RMSNorm, and ReLU^2.
+* Initializes the projection layers to zero (muP-like).
+* Uses a new optimizer (Muon - Momentum Orthogonalized by Newton-schulz).
 
-To execute the training, run the following three commands on an 8xA100 or 8xH100 node.
-They complete in <20min on an 8xH100 with decent internet connection.
+The training runs in 12 minutes on an 8xH100 machine. To execute it, run the following three commands, which install the necessary packages and download the data as well.
+They should complete within <20min on an 8xH100 with decent internet connection.
 ```bash
 pip install -r requirements.txt
 python data/cached_fineweb10B.py 27 # downloads only the first 2.7B training tokens to save time
@@ -16,7 +16,7 @@ python data/cached_fineweb10B.py 27 # downloads only the first 2.7B training tok
 ```
 
 This will train a 124M-parameter transformer for 5100 steps on 2.67B tokens of Fineweb [1], achieving ~3.277 validation loss.
-For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
+For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
 ---
 
