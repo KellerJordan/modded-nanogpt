@@ -25,7 +25,7 @@ For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss 
 
 The following is the progression of world records for the task of *training a model that attains 3.28 validation loss on FineWeb in the minimal amount of time on an 8xH100 machine.*
 
-1. [45 minutes: llm.c baseline (05/28/24)](https://github.com/karpathy/llm.c/discussions/481) [training log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101324_llmc/main.log) (note: the 90 minute time is on 8xA100; it's 45 minutes on 8xH100)
+1. [45 minutes: llm.c baseline (05/28/24)](https://github.com/karpathy/llm.c/discussions/481) [[training log]](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101324_llmc/main.log) (note: the 90 minute time is on 8xA100; it's 45 minutes on 8xH100)
 2. [31.4 minutes: Architectural modernizations and learning rate tuning (06/06/24)](https://x.com/kellerjordan0/status/1798863559243513937) [training log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/060624_AdamW/f66d43d7-e449-4029-8adf-e8537bab49ea.log) (note: this uses half the tokens as the baseline but isn't yet twice as fast since it's slower PyTorch code rather than raw CUDA. also note: by far the biggest improvement here came from simply tripling the learning rate.)
 3. [24.9 minutes: Introduced the Muon optimizer (10/04/24)](https://x.com/kellerjordan0/status/1842300916864844014) 
 4. [22.3 minutes: Muon improvements (10/11/24)](https://x.com/kellerjordan0/status/1844820919061287009) [reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101024_Muon/eb5659d0-fb6a-49e5-a311-f1f89412f726.txt)
