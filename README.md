@@ -36,7 +36,7 @@ The following is the progression of world records for the task of *training a mo
 Direct contributors to these records: @Grad62304977, @bozavlado, myself
 
 Note: Of course, the original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
-So it's no surprise that there is room to improve, since as Dr. Karpathy said, "llm.c still has a lot of pending optimizations".
+So it's no surprise that there is room to improve, since as @karpathy said, "llm.c still has a lot of pending optimizations".
 In addition, many of the techniques used in these records are completely standard, such as rotary embeddings.
 The goal of this benchmark is simply to find out all the techniques which actually work, because I'm going crazy reading all these [LLM](https://arxiv.org/abs/2305.14342)
 [training](https://arxiv.org/abs/2402.17764) [papers](https://arxiv.org/abs/2410.01131)
@@ -66,7 +66,7 @@ So if you're rational, the result probably just dies with you and no one else le
 Ok, well, "at scale" is an infinite category (what if the methods stop working only for >100T models?), so it's actually impossible to conclusively refute the allegation that whatever we're doing here "doesn't work at scale".
 But if you care about 1.5B scale, then you might be convinced by this result:
 
-*Straightforwardly scaling up the speedrun to 1.5B parameters yields GPT-2 (1.5B)-level quality 2.5x more cheaply than Dr. Karpathy's baseline*
+*Straightforwardly scaling up the speedrun to 1.5B parameters yields GPT-2 (1.5B)-level quality 2.5x more cheaply than @karpathy's baseline*
 
 ![](img/nanogpt_speedrun51.png)
 ![](img/nanogpt_speedrun52.png)
