@@ -43,7 +43,8 @@ The goal of this benchmark is simply to find out all the techniques which actual
 which claim a huge benefit but then use their own weird idiosyncratic benchmarks and therefore no one in the community has any idea if it's legit for months.
 I mean hello??? We're in a completely empirical field; it is insane to not use benchmarks.
 The only possible benefit I can think of for any empirical field to abandon benchmarks is that it would make it easier to publish false results. Oh, I guess that's why it happened.
-No wonder the peer review system has collapsed.
+Hilarious to think about how, in the often-commented-upon and ongoing collapse of the peer review system, people blame the *reviewers* --
+yeah, those guys doing free labor who everyone constantly musters all of their intelligence to lie to, it's *their* fault!
 
 ## Figures
 
