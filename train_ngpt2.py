@@ -75,7 +75,7 @@ class CausalSelfAttention(nn.Module):
         self.c_q.NORMALIZE = 1
         self.c_k.NORMALIZE = 1
         self.c_v.NORMALIZE = 1
-        self.c_q.WEIGHT_HIDDEN = 1
+        self.c_q.WEIGHT_HIDDEN = 1 # muP
         self.c_k.WEIGHT_HIDDEN = 1
         self.c_v.WEIGHT_HIDDEN = 1
         # q,k scaling
@@ -93,11 +93,11 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
-        q = self.qk_scaler() * F.normalize(q, dim=-1)
+        q = self.qk_scaler() * F.normalize(q, dim=-1) # nGPT step 4
         k = self.qk_scaler() * F.normalize(k, dim=-1)
         cos, sin = self.rotary(q)
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True, scale=math.sqrt(self.head_dim))
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True, scale=math.sqrt(self.head_dim)) # nGPT step 4
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -126,8 +126,8 @@ class MLP(nn.Module):
         self.c_proj.WEIGHT_HIDDEN = 1
 
     def forward(self, x):
-        x1 = self.u_scaler() * self.c_fc(x)
-        x2 = math.sqrt(self.n_embd) * self.v_scaler() * self.c_fc2(x)
+        x1 = self.u_scaler() * self.c_fc(x) # nGPT step 5
+        x2 = math.sqrt(self.n_embd) * self.v_scaler() * self.c_fc2(x) # nGPT step 5
         x2 = F.silu(x2)
         x = x1 * x2
         x = self.c_proj(x)
@@ -143,7 +143,7 @@ class Block(nn.Module):
         self.mlp_scaler = Scaler(dim=config.n_embd, init=1/config.n_layer, scale=1/math.sqrt(config.n_embd))
 
     def forward(self, x):
-        hA = F.normalize(self.attn(x), dim=-1)
+        hA = F.normalize(self.attn(x), dim=-1) # nGPT step 3
         x = F.normalize(x + torch.abs(self.attn_scaler()) * (hA - x), dim=-1)
         hM = F.normalize(self.mlp(x), dim=-1)
         x = F.normalize(x + torch.abs(self.mlp_scaler()) * (hM - x), dim=-1)
@@ -203,7 +203,7 @@ class GPT(nn.Module):
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.logits_scaler() * self.lm_head(x)
+            logits = self.logits_scaler() * self.lm_head(x) # nGPT step 6
             logits = logits.float() # use tf32/fp32 for logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
@@ -398,7 +398,7 @@ class Hyperparameters:
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 4768 # number of iterations to run
     learning_rate : float = 2**(-9)
-    warmup_iters : int = 0
+    warmup_iters : int = 0 # nGPT step 7
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     grad_norm_clip : float = 1
@@ -606,8 +606,7 @@ if __name__ == "__main__":
         scheduler.step()
         # null the gradients
         model.zero_grad(set_to_none=True)
-        # normalize all the weights (step 2 of nGPT)
-        raw_model.norm_weights()
+        raw_model.norm_weights() # nGPT step 2
 
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
