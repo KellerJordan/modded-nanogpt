@@ -41,25 +41,25 @@ In addition, many of the techniques used in these records are completely standar
 The goal of this benchmark is simply to find out all the techniques which actually work, because I'm going crazy reading all these [LLM](https://arxiv.org/abs/2305.14342)
 [training](https://arxiv.org/abs/2402.17764) [papers](https://arxiv.org/abs/2410.01131)
 which claim a huge benefit but then use their own idiosyncratic non-competitive benchmark and therefore no one in the community has any idea if it's legit for months.
-I mean hello??? We're in a completely empirical field; it is insane to not have a benchmark. Ideally everyone uses the same LLM training benchmark,
+<!--I mean hello??? We're in a completely empirical field; it is insane to not have a benchmark. Ideally everyone uses the same LLM training benchmark,
 and then reviewing LLM training papers becomes as simple as checking if they beat the benchmark. It's not like this would be unprecedented, that's how things
 were in the ImageNet days.
 The only possible 'benefit' I can think of for any empirical field to abandon benchmarks is that it would make it easier to publish false results. Oh, I guess that's why it happened.
 Hilarious to think about how, in the often-commented-upon and ongoing collapse of the peer review system, people blame the *reviewers* --
-yeah, those guys doing free labor who everyone constantly musters all of their intelligence to lie to, it's *their* fault! My bad, you caught me monologuing.
+yeah, those guys doing free labor who everyone constantly musters all of their intelligence to lie to, it's *their* fault! My bad, you caught me monologuing.-->
 
 ### Q: What makes "NanoGPT speedrunning" not just another idiosyncratic benchmark?
 
 A: Because it is a *competitive* benchmark. In particular, if you attain a new speed record (using whatever method you want), there is an open invitation for you
 to post that record and thereby vacuum up all the clout for yourself. I will even help you do it by reposting you as much as I can.
 
-On the contrary, for example, the benchmark used in the [Sophia](https://arxiv.org/abs/2305.14342) paper does *not* have this property.
+<!--On the contrary, for example, the benchmark used in the [Sophia](https://arxiv.org/abs/2305.14342) paper does *not* have this property.
 There is no such open invitation for anyone to compete on the benchmark they used. In particular, if, for a random and definitely not weirdly specific example, you happen to find better AdamW hyperparameters for their training setup than
 the ones they used which significantly close the gap between AdamW and their proposed optimizer,
 then there is no clear path for you to publish that result in *any* form.
 You could try posting it on X.com, but then you would be risking being perceived as aggressive/confrontational, which is *not a good look* in this racket.
 So if you're rational, the result probably just dies with you and no one else learns anything
-(unless you're in a frontier lab, in which case you can do a nice internal writeup. Boy I'd love to get my hands on those writeups).
+(unless you're in a frontier lab, in which case you can do a nice internal writeup. Boy I'd love to get my hands on those writeups).-->
 
 ### Q: NanoGPT (124M) speedrunning is cool and all, but meh it's probably just overfitting to val loss or small-scale training
 
