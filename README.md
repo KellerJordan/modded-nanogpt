@@ -59,8 +59,7 @@ the ones they used which significantly close the gap between AdamW and their pro
 then there is no clear path for you to publish that result in *any* form.
 You could try posting it on X.com, but then you would be risking being perceived as aggressive/confrontational, which is *not a good look* in this racket.
 So if you're rational, the result simply dies with you and no one learns anything
-(unless you're in a frontier lab, in which case you can do a nice internal writeup on how you tried Sophia but it didn't work).
-(Not to claim that Sophia doesn't work, haha I'm just a nice little guy and definitely shouldn't be perceived as confrontational hehe)
+(unless you're in a frontier lab, in which case you can do a nice internal writeup).
 
 
 ## Figures
