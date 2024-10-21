@@ -144,6 +144,12 @@ pip install --upgrade torch &
 python data/cached_fineweb10B.py 30
 ```
 
+## Running on fewer GPUs or with less memory
+
+To run on fewer GPUs, just modify the 1-liner `run.sh` to have a different `--nproc_per_node`. If you don't have enough memory to fit the batch size, then
+go into `train_gpt2.py` and scale down the `device_batch_size` by either 1/2 or 1/4.
+Both of these changes will have no effect on the training - you should get the exact same loss curve as the most recent record.
+
 ---
 
 ## References
