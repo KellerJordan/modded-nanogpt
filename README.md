@@ -61,6 +61,16 @@ You could try posting it on X.com, but then you would be risking being perceived
 So if you're rational, the result probably just dies with you and no one else learns anything
 (unless you're in a frontier lab, in which case you can do a nice internal writeup. Boy I'd love to get my hands on those writeups).
 
+### Q: NanoGPT (124M) speedrunning is cool and all, but meh it's probably just overfitting to val loss or small-scale training
+
+Ok, well, "at scale" is an infinite category (what if the methods stop working only for >100T models?), so it's actually impossible to conclusively refute the allegation that whatever we're doing here "doesn't work at scale".
+But if you care about 1.5B scale, then you might be convinced by this result:
+
+*Straightforwardly scaling up the speedrun to 1.5B parameters yields GPT-2 (1.5B)-level quality 2.5x more cheaply than Dr. Karpathy's baseline*
+
+![](img/nanogpt_speedrun51.png)
+![](img/nanogpt_speedrun52.png)
+
 
 ## Figures
 
