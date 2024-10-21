@@ -40,7 +40,7 @@ So it's no surprise that there is room to improve, since as Dr. Karpathy said, "
 In addition, many of the techniques used in these records are completely standard, such as rotary embeddings.
 The goal of this benchmark is simply to find out all the techniques which actually work, because I'm going crazy reading all these [LLM](https://arxiv.org/abs/2305.14342)
 [training](https://arxiv.org/abs/2402.17764) [papers](https://arxiv.org/abs/2410.01131)
-which claim a huge benefit but then use their own weird idiosyncratic benchmarks and therefore no one in the community has any idea if it's legit for months.
+which claim a huge benefit but then use their own idiosyncratic non-competitive benchmark and therefore no one in the community has any idea if it's legit for months.
 I mean hello??? We're in a completely empirical field; it is insane to not have a benchmark. Ideally everyone uses the same LLM training benchmark,
 and then reviewing LLM training papers becomes as simple as checking if they beat the benchmark. It's not like this would be unprecedented, that's how things
 were in the ImageNet days.
