@@ -3,9 +3,9 @@
 This is a speedrun variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss using only 2.67B tokens instead of 10B.
 This training speed is attained through the following techniques:
-* Architectural modifications: Rotary embeddings, QK-Norm, RMSNorm, and ReLU^2.
-* Initializes the projection layers to zero (muP-like).
-* Uses a new optimizer (Muon - Momentum Orthogonalized by Newton-schulz).
+* Modernizing the architecture: Rotary embeddings, QK-Norm, RMSNorm, and ReLU^2.
+* Initializing the projection layers to zero (muP-like).
+* Using a new optimizer (Muon - Momentum Orthogonalized by Newton-schulz), with tuned learning rate schedule.
 
 The training runs in 12 minutes on an 8xH100 machine. To execute it, run the following three commands, which install the necessary packages and download the data as well.
 They should complete within <20min on an 8xH100 with decent internet connection.
@@ -74,21 +74,6 @@ Bernstein & Newhouse also pointed out that Shampoo without preconditioner accumu
 and therefore Shampoo can be thought of as a way to smooth out spectral steepest descent.
 The proposed optimizer can be thought of as a second way of smoothing spectral steepest descent, with a different set of memory and runtime tradeoffs
 compared to Shampoo.
-
----
-
-## Other general differences between this codebase and NanoGPT
-
-To simplify the code, some features have been removed, including text generation.
-And to obtain a training speed improvement, we have diverged from being a strict reproduction of the GPT-2 paper.
-
-The speedup is due to the following changes:
-- Increased learning rate by 3x
-- Switched to trapezoidal learning rate schedule following [7]
-- Switched to rotary embeddings and ReLU^2 activation
-- Removed the special initialization for linear layers before residuals. Instead, just scale down the output of the attention block by a fixed scalar.
-- Removed all affine scale and bias parameters from the architecture, and switched to RMSNorm (actually this causes a slight slowdown, and I just did it to reduce code complexity)
-- Switched from AdamW to new optimizer, and removed learning rate warmup
 
 ---
 
