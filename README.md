@@ -8,7 +8,7 @@ Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains
 We attained this training speed via the following techniques:
 * Modernizing the architecture: Rotary embeddings, QK-Norm, RMSNorm, and ReLU^2.
 * Initializing the projection layers to zero (muP-like).
-* Using a new optimizer (Muon - Momentum Orthogonalized by Newton-schulz), with tuned learning rate schedule.
+* Using a new optimizer (Muon - Momentum Orthogonalized by Newton-schulz).
 
 The training runs in 12 minutes on an 8xH100 machine. To execute it, run the following three commands, which install the necessary packages and download the data as well.
 They should complete within <20min on an 8xH100 with decent internet connection.
