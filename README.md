@@ -60,7 +60,7 @@ Muon is defined as follows:
 
 ![](img/algo_optimizer.png)
 
-Where NewtonSchulz5 is the following Newton-Schulz iteration [2, 3]:
+Where NewtonSchulz5 is the following Newton-Schulz iteration [2, 3], which approximately replaces `G` with `U @ V.T` where `U, S, V = G.svd()`.
 ```python
 @torch.compile
 def zeroth_power_via_newtonschulz5(G, steps=5, eps=1e-7):
@@ -77,8 +77,6 @@ def zeroth_power_via_newtonschulz5(G, steps=5, eps=1e-7):
         X = X.T 
     return X.to(G.dtype)
 ```
-
-Note that this iteration approximately replaces `G` with `U @ V.T` where `U, S, V = G.svd()`.
 
 For this training scenario, Muon has the following favorable properties:
 * Less memory usage than Adam
