@@ -40,6 +40,7 @@ So it's no surprise that there is room to improve, since as Dr. Karpathy said, "
 In addition, many of the techniques used in these records are completely standard, such as rotary embeddings.
 The goal of this benchmark is simply to find out all the techniques which actually work, because I'm going crazy reading all these LLM training papers
 which claim a huge speedup but then use their own weird idiosyncratic benchmarks and therefore no one in the community has any idea if it's legit for months.
+I mean hello??? We're in a completely empirical field; it is insane to not use benchmarks. No wonder the peer review system has collapsed.
 
 ## Figures
 
