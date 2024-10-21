@@ -72,15 +72,6 @@ But if you care about 1.5B scale, then you might be convinced by this result:
 ![](img/nanogpt_speedrun51.png)
 ![](img/nanogpt_speedrun52.png)
 
-
-## More figures
-
-Figure 1. Proposed optimizer vs. a well-tuned AdamW.
-![](img/fig_optimizer.png)
-
----
-
-
 ## Muon optimizer
 
 Muon is defined as follows:
