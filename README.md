@@ -29,11 +29,6 @@ Figure 1. Proposed optimizer vs. a well-tuned AdamW.
 
 ## Muon optimizer
 
-For this training scenario, Muon has the following properties:
-* Less memory usage than Adam
-* ~1.5x faster training
-* <2% wallclock overhead
-
 Muon is defined as follows:
 
 ![](img/algo_optimizer.png)
@@ -58,6 +53,11 @@ def zeroth_power_via_newtonschulz5(G, steps=5, eps=1e-7):
 
 Note that this iteration approximately replaces `G` with `U @ V.T` where `U, S, V = G.svd()`.
 
+For this training scenario, Muon has the following favorable properties:
+* Less memory usage than Adam
+* ~1.5x faster training
+* <2% wallclock overhead
+
 
 ### Provenance
 
@@ -80,7 +80,7 @@ compared to Shampoo.
 
 ---
 
-## More info
+## Startup script
 
 Here's a good startup script for a fresh instance. If you get `torchrun not found` after this upon running then just close and reopen your tmux tab.
 
