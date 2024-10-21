@@ -4,6 +4,7 @@ This is a speedrun variant of the [PyTorch GPT-2 trainer](https://github.com/kar
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in:
 * **12 minutes instead of 45**
 * **2.67B tokens instead of 10B**
+
 We attained this training speed via the following techniques:
 * Modernizing the architecture: Rotary embeddings, QK-Norm, RMSNorm, and ReLU^2.
 * Initializing the projection layers to zero (muP-like).
