@@ -25,9 +25,9 @@ For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss 
 
 The following is the progression of world records for the task of *training a model that attains 3.28 validation loss on FineWeb in the minimal time on an 8xH100 machine.*
 
-[45 minutes: llm.c baseline (05/28/24)](https://github.com/karpathy/llm.c/discussions/481) (the 90 minute time is on 8xA100; it's 45 minutes on 8xH100)
+[45 minutes: llm.c baseline (05/28/24)](https://github.com/karpathy/llm.c/discussions/481) (note: the 90 minute time is on 8xA100; it's 45 minutes on 8xH100)
 
-[31.4 minutes: Architectural modernizations and learning rate tuning (06/06/24)](https://x.com/kellerjordan0/status/1798863559243513937)
+[31.4 minutes: Architectural modernizations and learning rate tuning (06/06/24)](https://x.com/kellerjordan0/status/1798863559243513937) (note: this uses half the tokens as the baseline but isn't yet twice as fast since it's slower PyTorch code rather than raw CUDA)
 
 [24.9 minutes: Introduced the Muon optimizer (10/04/24)](https://x.com/kellerjordan0/status/1842300916864844014)
 
@@ -37,7 +37,7 @@ The following is the progression of world records for the task of *training a mo
 
 [13.1 minutes: Distributed the overhead of Muon (10/18/24)](https://x.com/kellerjordan0/status/1847291684016783746)
 
-[12.0 minutes: Upgraded PyTorch from 2.4.1 to 2.5.0 (10/18/24)](https://x.com/kellerjordan0/status/1847358578686152764)
+[12.0 minutes: Upgraded PyTorch from 2.4.1 to 2.5.0 (10/18/24)](https://x.com/kellerjordan0/status/1847358578686152764) (note: this now runs at the same speed per step as the CUDA llm.c trainer)
 
 Direct contributors to these records: @Grad62304977, @bozavlado, myself
 
