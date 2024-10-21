@@ -1,24 +1,66 @@
 # Modded-NanoGPT
 
-This is a variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
-Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo. It:
-* Trains 3.8x more efficiently (taking only 2.67 tokens instead of 10B to reach the same validation loss).
-* Has shorter code (537 lines instead of 860).
-* Implements architectural modernizations (rotary embeddings, RMSNorm, ReLU^2, projection zero-init).
-* Implements a new optimizer (Muon - Momentum Orthogonalized by Newton-schulz).
+This is a "speedrun" variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
+Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in:
+* **2.67B tokens instead of 10B**
+* **12 minutes on 8xH100 instead of 45**
 
-To execute the training, run the following three commands on an 8xA100 or 8xH100 node.
-They complete in <20min on an 8xH100 with decent internet connection.
+We use the following techniques:
+* Modernizing the architecture: Rotary embeddings, QK-Norm, RMSNorm, and ReLU^2.
+* Initializing the projection layers to zero (muP-like).
+* Using a new optimizer (Muon - Momentum Orthogonalized by Newton-schulz).
+
+To execute the training, simply run the following three commands, which first install the necessary packages and download the data.
+They should all complete within <20min on an 8xH100 with decent internet connection.
 ```bash
 pip install -r requirements.txt
 python data/cached_fineweb10B.py 27 # downloads only the first 2.7B training tokens to save time
 ./run.sh
 ```
 
-This will train a 124M-parameter transformer for 5100 steps on 2.67B tokens of Fineweb [1], achieving ~3.277 validation loss.
-For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
+The result will be a 124M-parameter transformer trained for 5100 steps on 2.67B tokens of Fineweb [1], achieving ~3.277 validation loss.
+For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
----
+## World record history
+
+The following is the progression of world records for the task of *training a model that attains 3.28 validation loss on FineWeb in the minimal amount of time on an 8xH100 machine.*
+
+1. [45 minutes: llm.c baseline (05/28/24)](https://github.com/karpathy/llm.c/discussions/481) (note: the 90 minute time is on 8xA100; it's 45 minutes on 8xH100)
+2. [31.4 minutes: Architectural modernizations and learning rate tuning (06/06/24)](https://x.com/kellerjordan0/status/1798863559243513937) (note: this uses half the tokens as the baseline but isn't yet twice as fast since it's slower PyTorch code rather than raw CUDA. also note: by far the biggest improvement here came from simply tripling the learning rate.)
+3. [24.9 minutes: Introduced the Muon optimizer (10/04/24)](https://x.com/kellerjordan0/status/1842300916864844014)
+4. [22.3 minutes: Muon improvements (10/11/24)](https://x.com/kellerjordan0/status/1844820919061287009)
+5. [15.2 minutes: Pad embeddings & architectural modernizations (10/14/24)](https://x.com/kellerjordan0/status/1845865698532450646)
+6. [13.1 minutes: Distributed the overhead of Muon (10/18/24)](https://x.com/kellerjordan0/status/1847291684016783746)
+7. [12.0 minutes: Upgraded PyTorch from 2.4.1 to 2.5.0 (10/18/24)](https://x.com/kellerjordan0/status/1847358578686152764) (note: this now runs at the same speed per step as the CUDA llm.c trainer!)
+
+Direct contributors to these records: @Grad62304977, @bozavlado, myself
+
+Note: Of course, the original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
+So it's no surprise that there is room to improve, since as Dr. Karpathy said, "llm.c still has a lot of pending optimizations".
+In addition, many of the techniques used in these records are completely standard, such as rotary embeddings.
+The goal of this benchmark is simply to find out all the techniques which actually work, because I'm going crazy reading all these [LLM](https://arxiv.org/abs/2305.14342)
+[training](https://arxiv.org/abs/2402.17764) [papers](https://arxiv.org/abs/2410.01131)
+which claim a huge benefit but then use their own idiosyncratic non-competitive benchmark and therefore no one in the community has any idea if it's legit for months.
+I mean hello??? We're in a completely empirical field; it is insane to not have a benchmark. Ideally everyone uses the same LLM training benchmark,
+and then reviewing LLM training papers becomes as simple as checking if they beat the benchmark. It's not like this would be unprecedented, that's how things
+were in the ImageNet days.
+The only possible 'benefit' I can think of for any empirical field to abandon benchmarks is that it would make it easier to publish false results. Oh, I guess that's why it happened.
+Hilarious to think about how, in the often-commented-upon and ongoing collapse of the peer review system, people blame the *reviewers* --
+yeah, those guys doing free labor who everyone constantly musters all of their intelligence to lie to, it's *their* fault! My bad, you caught me monologuing.
+
+### Q: What makes "NanoGPT speedrunning" not just another idiosyncratic benchmark?
+
+A: Because it is a *competitive* benchmark. In particular, if you attain a new speed record (using whatever method you want), there is an open invitation for you
+to post that record and thereby vacuum up all the clout for yourself. I will even help you do it by reposting you as much as I can.
+
+On the contrary, for example, the benchmark used in the [Sophia paper](https://arxiv.org/abs/2305.14342) does *not* have this property.
+There is no such open invitation for anyone to compete on the benchmark they used. In particular, if, for a random and definitely not weirdly specific example, you happen to find better AdamW hyperparameters for their training setup than
+the ones they used which significantly close the gap between AdamW and their proposed optimizer,
+then there is no clear path for you to publish that result in *any* form.
+You could try posting it on X.com, but then you would be risking being perceived as aggressive/confrontational, which is *not a good look* in this racket.
+So if you're rational, the result probably just dies with you and no one else learns anything
+(unless you're in a frontier lab, in which case you can do a nice internal writeup. Boy I'd love to get my hands on those writeups).
+
 
 ## Figures
 
@@ -27,18 +69,14 @@ Figure 1. Proposed optimizer vs. a well-tuned AdamW.
 
 ---
 
-## Proposed optimizer
 
-For this training scenario, the proposed optimizer has the following properties:
-* Less memory usage than Adam
-* ~1.5x faster training
-* <2% wallclock overhead
+## Muon optimizer
 
-The optimizer is defined as follows:
+Muon is defined as follows:
 
 ![](img/algo_optimizer.png)
 
-Where NewtonSchulz5 is the following Newton-Schulz iteration [2, 3]:
+Where NewtonSchulz5 is the following Newton-Schulz iteration [2, 3], which approximately replaces `G` with `U @ V.T` where `U, S, V = G.svd()`.
 ```python
 @torch.compile
 def zeroth_power_via_newtonschulz5(G, steps=5, eps=1e-7):
@@ -56,6 +94,12 @@ def zeroth_power_via_newtonschulz5(G, steps=5, eps=1e-7):
     return X.to(G.dtype)
 ```
 
+For this training scenario, Muon has the following favorable properties:
+* Less memory usage than Adam
+* ~1.5x faster training
+* <2% wallclock overhead
+
+
 ### Provenance
 
 Many of the choices made to generate this optimizer were obtained experimentally by our pursuit of [CIFAR-10 speedrunning](https://github.com/KellerJordan/cifar10-airbench).
@@ -63,6 +107,7 @@ In particular, we experimentally obtained the following practices:
 * Using Nesterov momentum inside the update, with orthogonalization applied after momentum.
 * Using a specifically quintic Newton-Schulz iteration as the method of orthogonalization.
 * Using non-convergent coefficients for the quintic polynomial in order to maximize slope at zero, and thereby minimize the number of necessary Newton-Schulz iterations.
+It turns out that the variance doesn't actually matter that much, so we end up with a quintic that (rapidly) converges to the range 0.68, 1.13 upon repeated application, rather than to 1.
 * Running the Newton-Schulz iteration in bfloat16 (whereas Shampoo implementations often compute the preconditioners via inverse-pth-roots in fp32 or fp64).
 
 Our use of a Newton-Schulz iteration for orthogonalization traces to [Bernstein & Newhouse (2024)](https://arxiv.org/abs/2409.20325),
@@ -77,22 +122,7 @@ compared to Shampoo.
 
 ---
 
-## Other general differences between this codebase and NanoGPT
-
-To simplify the code, some features have been removed, including text generation.
-And to obtain a training speed improvement, we have diverged from being a strict reproduction of the GPT-2 paper.
-
-The speedup is due to the following changes:
-- Increased learning rate by 3x
-- Switched to trapezoidal learning rate schedule following [7]
-- Switched to rotary embeddings and ReLU^2 activation
-- Removed the special initialization for linear layers before residuals. Instead, just scale down the output of the attention block by a fixed scalar.
-- Removed all affine scale and bias parameters from the architecture, and switched to RMSNorm (actually this causes a slight slowdown, and I just did it to reduce code complexity)
-- Switched from AdamW to new optimizer, and removed learning rate warmup
-
----
-
-## More info
+## Startup script
 
 Here's a good startup script for a fresh instance. If you get `torchrun not found` after this upon running then just close and reopen your tmux tab.
 
