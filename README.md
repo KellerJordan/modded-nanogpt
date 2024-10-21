@@ -1,16 +1,16 @@
 # Modded-NanoGPT
 
-This is a speedrunning variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
+This is a fast variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in:
-* **2.67B tokens instead of 10B**
-* **12 minutes on 8xH100 instead of 45**
+* 2.67B tokens instead of 10B
+* 12 minutes on 8xH100 instead of 45
 
 It uses the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
 * Projection layers initialized to zero (muP-like).
 * New optimizer: Muon - Momentum Orthogonalized by Newton-schulz.
 
-To execute the training, simply run the following three commands, which first install the necessary packages and download the data.
+To execute the training, run the following three commands.
 They should all complete within <20min on an 8xH100 with decent internet connection.
 ```bash
 pip install -r requirements.txt
@@ -25,13 +25,13 @@ For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss 
 
 The following is the progression of world records for the task of *training a model that attains 3.28 validation loss on FineWeb in the minimal amount of time on an 8xH100 machine.*
 
-1. [45 minutes: llm.c baseline (05/28/24)](https://github.com/karpathy/llm.c/discussions/481) [[training log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101324_llmc/main.log)] (note: the 90 minute time is on 8xA100; it's 45 minutes on 8xH100)
-2. [31.4 minutes: Architectural modernizations and learning rate tuning (06/06/24)](https://x.com/kellerjordan0/status/1798863559243513937) [[training log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/060624_AdamW/f66d43d7-e449-4029-8adf-e8537bab49ea.log)] (note: this uses half the tokens as the baseline but isn't yet twice as fast since it's slower PyTorch code rather than raw CUDA. also note: by far the biggest improvement here came from simply tripling the learning rate.)
-3. [24.9 minutes: Introduced the Muon optimizer (10/04/24)](https://x.com/kellerjordan0/status/1842300916864844014) 
-4. [22.3 minutes: Muon improvements (10/11/24)](https://x.com/kellerjordan0/status/1844820919061287009) [[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101024_Muon/eb5659d0-fb6a-49e5-a311-f1f89412f726.txt)]
-5. [15.2 minutes: Pad embeddings & architectural modernizations (10/14/24)](https://x.com/kellerjordan0/status/1845865698532450646) [[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101424_ModernArch/dabaaddd-237c-4ec9-939d-6608a9ed5e27.txt)]
-6. [13.1 minutes: Distributed the overhead of Muon (10/18/24)](https://x.com/kellerjordan0/status/1847291684016783746) [[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101724_DistributedMuon/22d24867-eb5a-4fcc-ae2c-263d0277dfd1.txt)]
-7. [12.0 minutes: Upgraded PyTorch from 2.4.1 to 2.5.0 (10/18/24)](https://x.com/kellerjordan0/status/1847358578686152764) [[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101824_PyTorch25/d4bfb25f-688d-4da5-8743-33926fad4842.txt)] (note: this now runs at the same speed per step as the CUDA llm.c trainer!)
+1. [45 minutes: llm.c baseline](https://github.com/karpathy/llm.c/discussions/481) (05/28/24) [[training log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101324_llmc/main.log)] (note: the 90 minute time is on 8xA100; it's 45 minutes on 8xH100)
+2. [31.4 minutes: Architectural modernizations and learning rate tuning](https://x.com/kellerjordan0/status/1798863559243513937) (06/06/24) [[training log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/060624_AdamW/f66d43d7-e449-4029-8adf-e8537bab49ea.log)] (note: this uses half the tokens as the baseline but isn't yet twice as fast since it's slower PyTorch code rather than raw CUDA. also note: by far the biggest improvement here came from simply tripling the learning rate.)
+3. [24.9 minutes: Introduced the Muon optimizer](https://x.com/kellerjordan0/status/1842300916864844014) (10/04/24)
+4. [22.3 minutes: Muon improvements](https://x.com/kellerjordan0/status/1844820919061287009) (10/11/24) [[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101024_Muon/eb5659d0-fb6a-49e5-a311-f1f89412f726.txt)]
+5. [15.2 minutes: Pad embeddings & architectural modernizations](https://x.com/kellerjordan0/status/1845865698532450646) (10/14/24) [[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101424_ModernArch/dabaaddd-237c-4ec9-939d-6608a9ed5e27.txt)]
+6. [13.1 minutes: Distributed the overhead of Muon](https://x.com/kellerjordan0/status/1847291684016783746) (10/18/24) [[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101724_DistributedMuon/22d24867-eb5a-4fcc-ae2c-263d0277dfd1.txt)]
+7. [12.0 minutes: Upgraded PyTorch from 2.4.1 to 2.5.0](https://x.com/kellerjordan0/status/1847358578686152764) (10/18/24) [[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101824_PyTorch25/d4bfb25f-688d-4da5-8743-33926fad4842.txt)] (note: this now runs at the same speed per step as the CUDA llm.c trainer!)
 
 Direct contributors to these records: @Grad62304977, @bozavlado, myself
 
@@ -71,10 +71,11 @@ Ok, well, "at scale" is an infinite category (what if the methods stop working o
 But if you care about 1.5B scale, then you might be convinced by this result:
 
 *Straightforwardly scaling up the speedrun to 1.5B parameters yields GPT-2 (1.5B)-level quality 2.5x more cheaply than [@karpathy's baseline](https://github.com/karpathy/llm.c/discussions/677):*
-[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/102024_ScaleUp1B/ad8d7ae5-7b2d-4ee9-bc52-f912e9174d7a.txt)
 
 ![](img/nanogpt_speedrun51.png)
 ![](img/nanogpt_speedrun52.png)
+
+[[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/102024_ScaleUp1B/ad8d7ae5-7b2d-4ee9-bc52-f912e9174d7a.txt)]
 
 ## Muon optimizer
 
