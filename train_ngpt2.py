@@ -274,8 +274,6 @@ class GPT(nn.Module):
                 print(p.shape)
             print("some parameters are remaining")
             raise NotImplementedError
-            # Add remaining parameters to the input/output group
-            #params_INPUT_OUTPUT.extend(list(params_remaining))
 
         param_groups = [
             {
