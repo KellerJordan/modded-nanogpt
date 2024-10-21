@@ -48,6 +48,19 @@ The only possible 'benefit' I can think of for any empirical field to abandon be
 Hilarious to think about how, in the often-commented-upon and ongoing collapse of the peer review system, people blame the *reviewers* --
 yeah, those guys doing free labor who everyone constantly musters all of their intelligence to lie to, it's *their* fault! My bad, you caught me monologuing.
 
+### Q: What makes "NanoGPT speedrunning" not just another idiosyncratic benchmark?
+
+A: Because it is a *competitive* benchmark. In particular, if you attain a new speed record (using whatever method you want), there is an open invitation for you
+to post that record and thereby vacuum up all the clout for yourself. I will even help you do it by reposting you as much as I can.
+
+On the contrary, the idiosyncratic benchmark used in the [Sophia paper](https://arxiv.org/abs/2305.14342), does *not* have this property.
+There is no such open invitation for anyone to compete on the benchmark they used. In fact, if you happen to find better AdamW hyperparameters than
+the ones they used which significantly close the gap to their proposed optimizer (weirdly specific I know),
+then there is no clear path for you to publish that result in *any* form. It simply dies with you and no one learns anything
+(unless you're in a frontier lab in which case you can do an internal writeup on how you tried Sophia but it didn't work).
+
+
+
 ## Figures
 
 Figure 1. Proposed optimizer vs. a well-tuned AdamW.
