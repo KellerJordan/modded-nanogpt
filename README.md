@@ -31,7 +31,7 @@ The following is the progression of world records for the task of *training a mo
 4. [22.3 minutes: Muon improvements (10/11/24)](https://x.com/kellerjordan0/status/1844820919061287009)
 5. [15.2 minutes: Pad embeddings & architectural modernizations (10/14/24)](https://x.com/kellerjordan0/status/1845865698532450646)
 6. [13.1 minutes: Distributed the overhead of Muon (10/18/24)](https://x.com/kellerjordan0/status/1847291684016783746)
-7. [12.0 minutes: Upgraded PyTorch from 2.4.1 to 2.5.0 (10/18/24)](https://x.com/kellerjordan0/status/1847358578686152764) (note: this now runs at the same speed per step as the CUDA llm.c trainer)
+7. [12.0 minutes: Upgraded PyTorch from 2.4.1 to 2.5.0 (10/18/24)](https://x.com/kellerjordan0/status/1847358578686152764) (note: this now runs at the same speed per step as the CUDA llm.c trainer!)
 
 Direct contributors to these records: @Grad62304977, @bozavlado, myself
 
