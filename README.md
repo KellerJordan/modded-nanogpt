@@ -56,9 +56,11 @@ to post that record and thereby vacuum up all the clout for yourself. I will eve
 On the contrary, the idiosyncratic benchmark used in the [Sophia paper](https://arxiv.org/abs/2305.14342), for example, does *not* have this property.
 There is no such open invitation for anyone to compete on the benchmark they used. In fact, if you happen to find better AdamW hyperparameters than
 the ones they used which significantly close the gap to their proposed optimizer (weirdly specific I know),
-then there is no clear path for you to publish that result in *any* form. It simply dies with you and no one learns anything
-(unless you're in a frontier lab in which case you can do an internal writeup on how you tried Sophia but it didn't work).
-
+then there is no clear path for you to publish that result in *any* form.
+You could try posting it on X.com, but then you would be risking being perceived as aggressive/confrontational, which is *not a good look* in this racket.
+So if you're rational, the result simply dies with you and no one learns anything
+(unless you're in a frontier lab, in which case you can do a nice internal writeup on how you tried Sophia but it didn't work).
+(Not to claim that Sophia doesn't work, haha I'm just a nice little guy and definitely shouldn't be perceived as confrontational hehe)
 
 
 ## Figures
