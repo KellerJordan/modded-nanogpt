@@ -108,7 +108,7 @@ class Muon(torch.optim.Optimizer):
                     if group['nesterov']:
                         g = g.add(buf, alpha=momentum)
                     g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(g.size(0), g.size(1))**0.5 # scale to have update.square().mean() == 1
+                    g *= max(1, g.size(0)/g.size(1))**0.5
                     updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
                 curr_idx += p.numel()
 
@@ -344,7 +344,8 @@ class Hyperparameters:
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 5100 # number of iterations to run
-    learning_rate : float = 0.0036
+    embed_learning_rate : float = 0.0036
+    muon_learning_rate : float = 0.02
     warmup_iters : int = 0
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
@@ -396,9 +397,9 @@ raw_model = model.module # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
+optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.embed_learning_rate, betas=(0.9, 0.95),
                                weight_decay=args.weight_decay, fused=True)
-optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95,
+optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=args.muon_learning_rate, momentum=0.95,
                   rank=ddp_rank, world_size=ddp_world_size)
 optimizers = [optimizer1, optimizer2]
 # learning rate decay scheduler (linear warmup and warmdown)
