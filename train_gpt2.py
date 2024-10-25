@@ -98,8 +98,7 @@ class Muon(torch.optim.Optimizer):
                 # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
                 if i % self.world_size == self.rank:
                     g = p.grad
-                    if g is None:
-                        continue
+                    assert g is not None
                     state = self.state[p]
                     if 'momentum_buffer' not in state:
                         state['momentum_buffer'] = torch.zeros_like(g)
