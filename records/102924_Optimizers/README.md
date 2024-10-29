@@ -1,7 +1,12 @@
+# Optimizer comparison for NanoGPT speedrunning
+
+Reproducible logs:
 * [Adam](95a9fd44-7c13-49c7-b324-3e7d9e23a499.txt)
 * [DistributedShampoo](8bfe4e35-c3fc-4b70-a984-3be937b71ff3)
 * [SOAP](e21a2838-a0f2-46f2-a247-db0021165682.txt)
 * [Muon](8d6193f4-27fc-4e68-899f-af70019a4d54.txt)
+
+### General notes for all optimizers
 
 All optimizers are run using zero weight decay (which is found to be empirically optimal).
 
