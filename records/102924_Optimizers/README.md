@@ -6,6 +6,10 @@ Reproducible logs:
 * [SOAP](e21a2838-a0f2-46f2-a247-db0021165682.txt)
 * [Muon](8d6193f4-27fc-4e68-899f-af70019a4d54.txt)
 
+Results:
+[1](nanogpt_speedrun81z.png)
+[2](nanogpt_speedrun82z.png)
+
 ### General notes for all optimizers
 
 All optimizers are run using zero weight decay (which is found to be empirically optimal).
@@ -93,4 +97,14 @@ Muon(raw_model.transformer.h.parameters(), lr=0.02, momentum=0.95)
 I swept the following hyperparameters:
 * learning rate
 * momentum
+
+
+## Openness policy
+
+These training logs are reproducible (just cut out the part besides the code, and run it using the `run.sh` in the top-level folder). They take 12-25 minutes to run.
+
+I tried to do a good job sweeping the hyperparameters for each optimizer, but I can easily have missed something, or just not have performed enough runs.
+
+Therefore, I am interested in any better hyperparameter settings which other researchers can find. If you post or send me your own reproducible log with
+one of these optimizers, I will be very happy to boost it in any way I can.
 
