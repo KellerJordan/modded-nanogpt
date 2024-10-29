@@ -7,8 +7,8 @@ Reproducible logs:
 * [Muon](8d6193f4-27fc-4e68-899f-af70019a4d54.txt)
 
 Results:
-[1](nanogpt_speedrun81z.png)
-[2](nanogpt_speedrun82z.png)
+![1](nanogpt_speedrun81z.png)
+![2](nanogpt_speedrun82z.png)
 
 ### General notes for all optimizers
 
