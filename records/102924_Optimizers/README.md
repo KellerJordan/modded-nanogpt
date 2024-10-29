@@ -83,7 +83,7 @@ This is using the official SOAP implementation [here](https://github.com/nikhilv
 
 At update frequency 10, SOAP outperforms Shampoo, and matches Muon in terms of the final loss, but has significant wallclock and memory overhead.
 
-Based on conversations with the authors, it is likely that a future SOAP implementation will significantly reduce the wallclock overhead, but not the memory overhead (which matters less for large-scale training).
+Based on conversations with the authors, it is likely that a future SOAP implementation will significantly reduce the wallclock overhead.
 
 I swept the following hyperparameters:
 * learning rate
