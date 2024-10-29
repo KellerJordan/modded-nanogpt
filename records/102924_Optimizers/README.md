@@ -1,25 +1,33 @@
 * [Adam](95a9fd44-7c13-49c7-b324-3e7d9e23a499.txt)
-* [DistributedShampoo](f94396ae-affe-406f-8d79-f364ca632539.txt)
+* [DistributedShampoo](8bfe4e35-c3fc-4b70-a984-3be937b71ff3)
 * [SOAP](e21a2838-a0f2-46f2-a247-db0021165682.txt)
 * [Muon](8d6193f4-27fc-4e68-899f-af70019a4d54.txt)
 
 All optimizers are run using zero weight decay (which is found to be empirically optimal).
 
+In addition, in all cases we use standard Adam to optimize the embedding and lm head layers (which is also found to be empirically optimal).
+Note that in the following code snippets, `raw_model.transformer.h.parameters()` gives all parameters besides those two.
+
 ## Adam
 
-* Learning rate: `0.0018`
-* Betas: `(0.9, 0.95)`
-* Epsilon: default
+The optimizer here is equivalent to:
+```
+torch.optim.Adam(raw_model.transformer.h.parameters(), lr=0.0018, betas=(0.9, 0.95))
+```
+
+We swept over:
+* Learning rate
+* Betas
 
 ## DistributedShampoo
 
 This is using the official `DistributedShampoo` implementation from [here](https://github.com/facebookresearch/optimizers/tree/ad2809a291c01859f68fcabbcb49a2aa75fd7827/distributed_shampoo).
 
-Run as follows:
+This was run exactly as follows:
 ```
 DistributedShampoo(
-    model.parameters(),
-    lr=0.5*args.learning_rate,
+    raw_model.transformer.h.parameters(),
+    lr=0.0018,
     betas=(0.95, 0.95),
     epsilon=1e-12,
     weight_decay=0,
@@ -29,12 +37,12 @@ DistributedShampoo(
     grafting_config=AdamGraftingConfig(
         beta2=0.95,
         epsilon=1e-8,
-    ),
+    ),   
     distributed_config=DDPShampooConfig(
         communication_dtype=CommunicationDType.FP32,
         num_trainers_per_group=8,
         communicate_params=False,
-    ),
+    ),   
 )
 ```
 
@@ -50,10 +58,10 @@ I was unable to find any reasonable hyperparameter settings for which update fre
 Using frequency 32 leads to worse performance (still better than Adam), and using frequency 3 leads to better performance
 but is very slow.
 
-I reasonably swept the following hyperparameters:
-* Learning rate
-* Betas
-* Epsilon
+I reasonably swept over the following hyperparameters:
+* learning rate
+* betas
+* epsilon
 
 Overall, I wasn't able to find any hyperparameters which outperform Muon in either sample-efficiency or wallclock time.
 
@@ -69,18 +77,21 @@ Based on conversations with the authors, it is likely that a future SOAP impleme
 
 I am running SOAP as follows:
 ```
-SOAP(model.parameters(), lr=0.0018, betas=(.95, .95), precondition_frequency=10)
+SOAP(model.transformer.h.parameters(), lr=0.0018, betas=(.95, .95), precondition_frequency=10)
 ```
 
 I swept the following hyperparameters:
-* SOAP(raw_model.transformer.h.parameters(), lr=0.0018, betas=(.95, .95), precondition_frequency=10)
-
+* learning rate
+* betas
 
 ## Muon
 
+Is run like:
+```
+Muon(raw_model.transformer.h.parameters(), lr=0.02, momentum=0.95)
+```
 
-
-
-
-
+I swept the following hyperparameters:
+* learning rate
+* momentum
 
