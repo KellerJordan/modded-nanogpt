@@ -27,7 +27,7 @@ I swept over the following hyperparameters:
 * learning rate
 * betas
 
-## [DistributedShampoo](8bfe4e35-c3fc-4b70-a984-3be937b71ff3)
+## [DistributedShampoo](8bfe4e35-c3fc-4b70-a984-3be937b71ff3.txt)
 Run as follows:
 ```
 DistributedShampoo(
