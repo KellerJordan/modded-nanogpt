@@ -96,7 +96,7 @@ I swept the following hyperparameters:
 * momentum
 
 
-## Openness policy
+## Openness
 
 These training logs are reproducible (just cut out the part besides the code, and run it using the `run.sh` in the top-level folder). They take 12-25 minutes to run.
 
