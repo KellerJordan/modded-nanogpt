@@ -16,6 +16,8 @@ Results:
 
 All optimizers are run using zero weight decay (which is found to be empirically optimal).
 
+And they are all run with a warmup-stable-decay / trapezoidal schedule, which also seems to be optimal. That's what causes the kink in the loss curve ~75% of the way to the end.
+
 In addition, in all cases, we optimize the shared embedding/head layer just using Adam (which is also found to be empirically optimal).
 Note that in the following code snippets, `raw_model.transformer.h.parameters()` gives all parameters besides those two.
 
