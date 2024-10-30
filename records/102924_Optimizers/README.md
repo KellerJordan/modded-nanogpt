@@ -23,9 +23,9 @@ The optimizer here is equivalent to:
 torch.optim.Adam(raw_model.transformer.h.parameters(), lr=0.0018, betas=(0.9, 0.95))
 ```
 
-We swept over:
-* Learning rate
-* Betas
+I swept over the following hyperparameters:
+* learning rate
+* betas
 
 ## [DistributedShampoo](8bfe4e35-c3fc-4b70-a984-3be937b71ff3)
 Run as follows:
