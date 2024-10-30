@@ -65,8 +65,6 @@ I reasonably swept over the following hyperparameters:
 * betas
 * epsilon
 
-Overall, I wasn't able to find any hyperparameters which outperform Muon in either sample-efficiency or wallclock time.
-
 I'm open to hyperparameter suggestions; the experiment takes ~20-30 minutes to run on a fresh 8xH100 instance, so it's not hard for me to run more attempts.
 
 ## [SOAP](e21a2838-a0f2-46f2-a247-db0021165682.txt)
