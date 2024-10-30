@@ -21,15 +21,14 @@ And they are all run with a warmup-stable-decay / trapezoidal schedule, which al
 In addition, in all cases, we optimize the shared embedding/head layer just using Adam (which is also found to be empirically optimal).
 Note that in the following code snippets, `raw_model.transformer.h.parameters()` gives all parameters besides those two.
 
+In each case, the hyperparameters are the best ones I could find in around 20 attempts.
+
 ## [Adam](95a9fd44-7c13-49c7-b324-3e7d9e23a499.txt)
 The optimizer here is equivalent to:
 ```
 torch.optim.Adam(raw_model.transformer.h.parameters(), lr=0.0018, betas=(0.9, 0.95))
 ```
 
-I swept over the following hyperparameters:
-* learning rate
-* betas
 
 ## [DistributedShampoo](8bfe4e35-c3fc-4b70-a984-3be937b71ff3.txt)
 Run as follows:
@@ -62,12 +61,8 @@ Things that turned out to be important:
 * Betas=(0.95, 0.95) seemed optimal, which turns out to be the same thing that SOAP uses
 * Higher preconditioner update frequency is better but slower
 
-I reasonably swept over the following hyperparameters:
-* learning rate
-* betas
-* epsilon
-
 I'm open to hyperparameter suggestions; the experiment takes ~20-30 minutes to run on a fresh 8xH100 instance, so it's not hard for me to run more attempts.
+
 
 ## [SOAP](e21a2838-a0f2-46f2-a247-db0021165682.txt)
 ```
@@ -78,18 +73,11 @@ This is using the official SOAP implementation [here](https://github.com/nikhilv
 
 Based on conversations with the authors, it is likely that a future SOAP implementation will significantly reduce the wallclock overhead.
 
-I swept the following hyperparameters:
-* learning rate
-* betas
 
 ## [Muon](8d6193f4-27fc-4e68-899f-af70019a4d54.txt)
 ```
 Muon(raw_model.transformer.h.parameters(), lr=0.02, momentum=0.95)
 ```
-
-I swept the following hyperparameters:
-* learning rate
-* momentum
 
 
 ## Openness
