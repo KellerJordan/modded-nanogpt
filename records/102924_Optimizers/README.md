@@ -109,7 +109,7 @@ If you post or send me your own reproducible log with one of these optimizers, I
 
 I believe it was Shazeer who said something like "negative results in machine learning are not worth much, because your inability to make something work doesn't prove that it can't work"
 
-With that disclaimer, here are the optimizers that I tried to make work, but was unable to get a significant boost over Adam with:
+Given that disclaimer, here are some optimizers that I tried to make work, but was unable to get a significant boost over Adam with:
 * Sophia
 * Lion
 * AdamWScheduleFree
