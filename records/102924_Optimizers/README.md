@@ -16,7 +16,7 @@ Results:
 
 All optimizers are run using zero weight decay (which is found to be empirically optimal).
 
-In addition, in all cases we use the same standard Adam to optimize the embedding and lm head layers (which is also found to be empirically optimal).
+In addition, in all cases, we optimize the shared embedding/head layer just using Adam (which is also found to be empirically optimal).
 Note that in the following code snippets, `raw_model.transformer.h.parameters()` gives all parameters besides those two.
 
 ## [Adam](95a9fd44-7c13-49c7-b324-3e7d9e23a499.txt)
