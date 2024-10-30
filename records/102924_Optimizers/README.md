@@ -115,5 +115,5 @@ With that disclaimer, here are the optimizers that I tried to make work, but was
 * AdamWScheduleFree
 * AdEmaMix (actually this was slightly better than Adam, just not enough to get near competing with the three Shampoo-like optimizers)
 
-Of course, this is just for NanoGPT speedrunning (short train duration), and as usual I'd be quite interested to see any hyperparameters for them that work well.
+Of course, this is just for NanoGPT speedrunning (short train duration); it's quite possible they work better at longer training duration or for larger models.
 
