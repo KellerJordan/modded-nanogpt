@@ -60,10 +60,7 @@ Open to suggestions.
 Things that turned out to be important:
 * Don't use epsilon above 1e-8; this loses performance. Epsilon 1e-12 performs as well as 1e-15
 * Betas=(0.95, 0.95) seemed optimal, which turns out to be the same thing that SOAP uses
-* Higher preconditioner update frequency is better, but much slower. Infrequent updates can even lead to instability;
-I was unable to find any reasonable hyperparameter settings for which update frequency 100 converges.
-Using frequency 32 leads to worse performance (still better than Adam), and using frequency 3 leads to better performance
-but is very slow.
+* Higher preconditioner update frequency is better but slower
 
 I reasonably swept over the following hyperparameters:
 * learning rate
