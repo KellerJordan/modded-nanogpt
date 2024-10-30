@@ -102,8 +102,8 @@ These training logs are reproducible (just cut out the part besides the code, an
 
 I tried to do a good job sweeping the hyperparameters for each optimizer, but I can easily have missed something, or just not have performed enough runs.
 
-Therefore, I am interested in any better hyperparameter settings which other researchers can find. If you post or send me your own reproducible log with
-one of these optimizers, I will be very happy to boost it in any way I can.
+Therefore, I am interested in any better hyperparameter settings which other researchers can find, for any of the optimizers.
+If you post or send me your own reproducible log with one of these optimizers, I will be very happy to boost it in any way I can.
 
 ## Appendix: Negative results
 
