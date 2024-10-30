@@ -1,5 +1,7 @@
 # Optimizer comparison for NanoGPT speedrunning
 
+This is a comparison between the four best optimizers I am aware of for NanoGPT speedrunning.
+
 Reproducible logs:
 * [Adam](95a9fd44-7c13-49c7-b324-3e7d9e23a499.txt)
 * [DistributedShampoo](8bfe4e35-c3fc-4b70-a984-3be937b71ff3)
@@ -102,4 +104,16 @@ I tried to do a good job sweeping the hyperparameters for each optimizer, but I 
 
 Therefore, I am interested in any better hyperparameter settings which other researchers can find. If you post or send me your own reproducible log with
 one of these optimizers, I will be very happy to boost it in any way I can.
+
+## Appendix: Negative results
+
+I believe it was Shazeer who said something like "negative results in machine learning are not worth much, because your inability to make something work doesn't prove that it can't work"
+
+With that disclaimer, here are the optimizers that I tried to make work, but was unable to get a significant boost over Adam with:
+* Sophia
+* Lion
+* AdamWScheduleFree
+* AdEmaMix (actually this was slightly better than Adam, just not enough to get near competing with the three Shampoo-like optimizers)
+
+Of course, this is just for NanoGPT speedrunning (short train duration), and as usual I'd be quite interested to see any hyperparameters for them that work well.
 
