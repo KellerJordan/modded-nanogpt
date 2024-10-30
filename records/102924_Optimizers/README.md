@@ -55,10 +55,6 @@ DistributedShampoo(
 
 This is using the official `DistributedShampoo` implementation from [here](https://github.com/facebookresearch/optimizers/tree/ad2809a291c01859f68fcabbcb49a2aa75fd7827/distributed_shampoo).
 
-I was surprised at how high the wallclock overhead of this was. I presume I'm doing something wrong, but my hyperparameters appear
-to be completely standard relative to the README, and after doing tens of runs I haven't found anything better.
-Open to suggestions.
-
 Things that turned out to be important:
 * Don't use epsilon above 1e-8; this loses performance. Epsilon 1e-12 performs as well as 1e-15
 * Betas=(0.95, 0.95) seemed optimal, which turns out to be the same thing that SOAP uses
