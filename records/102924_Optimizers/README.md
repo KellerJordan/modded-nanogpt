@@ -81,8 +81,6 @@ SOAP(model.transformer.h.parameters(), lr=0.0018, betas=(.95, .95), precondition
 
 This is using the official SOAP implementation [here](https://github.com/nikhilvyas/SOAP/blob/bbce86e890d3b697380f4376acb600c2d6c3d203/soap.py).
 
-At update frequency 10, SOAP outperforms Shampoo, and matches Muon in terms of the final loss, but has significant wallclock and memory overhead.
-
 Based on conversations with the authors, it is likely that a future SOAP implementation will significantly reduce the wallclock overhead.
 
 I swept the following hyperparameters:
