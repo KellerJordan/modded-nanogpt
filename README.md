@@ -2,28 +2,29 @@
 
 This is a fast variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in:
-* 2.67B tokens instead of 10B
-* 12 minutes on 8xH100 instead of 45
+* 2.4B tokens instead of 10B
+* 10.8 minutes on 8xH100 instead of 45
 
 It uses the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
 * Projection layers initialized to zero (muP-like).
+* Untied head from embedding and init to zero.
 * New optimizer: Muon - Momentum Orthogonalized by Newton-schulz.
 
 To execute the training, run the following three commands.
 They should all complete within <20min on an 8xH100 with decent internet connection.
 ```bash
 pip install -r requirements.txt
-python data/cached_fineweb10B.py 27 # downloads only the first 2.7B training tokens to save time
+python data/cached_fineweb10B.py 24 # downloads only the first 2.4B training tokens to save time
 ./run.sh
 ```
 
-The result will be a 124M-parameter transformer trained for 5100 steps on 2.67B tokens of Fineweb [1], achieving ~3.277 validation loss.
+The result will be a transformer with 124M active parameters trained for 4768 steps on 2.4B tokens of Fineweb [1], achieving ~3.275 validation loss.
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
 ## World record history
 
-The following is the progression of world records for the task of *training a model that attains 3.28 validation loss on FineWeb in the minimal amount of time on an 8xH100 machine.*
+The following is the progression of world records for the task of *training a model with 124M active parameters to 3.28 validation loss on FineWeb in the minimal amount of time on an 8xH100 machine.*
 
 1. [45 minutes: llm.c baseline](https://github.com/karpathy/llm.c/discussions/481) (05/28/24) [[training log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101324_llmc/main.log)] (note: the 90 minute time is on 8xA100; it's 45 minutes on 8xH100)
 2. [31.4 minutes: Architectural modernizations and learning rate tuning](https://x.com/kellerjordan0/status/1798863559243513937) (06/06/24) [[training log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/060624_AdamW/f66d43d7-e449-4029-8adf-e8537bab49ea.log)] (note: this uses half the tokens as the baseline but isn't yet twice as fast since it's slower PyTorch code rather than raw CUDA. also note: by far the biggest improvement here came from simply tripling the learning rate.)
