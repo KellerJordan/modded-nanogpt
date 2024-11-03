@@ -400,7 +400,7 @@ enable_math_sdp(False)
 
 # init the optimizer(s)
 optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.003, betas=(0.9, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, betas=(0.9, 0.95), fused=True)
 optimizer3 = Muon(raw_model.transformer.h.parameters(),           lr=0.02,  momentum=0.95)
 optimizers = [optimizer1, optimizer2, optimizer3]
 # learning rate decay scheduler (linear warmup and warmdown)
