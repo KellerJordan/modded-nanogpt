@@ -390,6 +390,8 @@ model = torch.compile(model)
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+ctx2 = sdpa_kernel(SDPBackend.CUDNN_ATTENTION) # CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default
+ctx2.__enter__()
 
 # init the optimizer(s)
 optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
