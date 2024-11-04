@@ -10,7 +10,7 @@ The following two runs compare different optimizers for the transformer body. Th
 Some HellaSwag baselines:
 * Karpathy's baseline llm.c training (trained for 10B FineWeb tokens): 29.9
 * OpenAI GPT-2 (124M): 29.4
-* OpenAI GPT-3 (124M) (trained for 300B OpenWebText tokens): 33.7
+* OpenAI GPT-3 (124M) (trained for 300B WebText tokens): 33.7
 * Huggingface SmolLM2-135M (trained for 2T FineWeb/DCLM/etc tokens): 42.1
 
 Note: I'm a little concerned that the learning rate schedule (WSD) and weight decay (zero), which are tuned for the speedrun duration,
