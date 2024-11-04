@@ -13,7 +13,7 @@ Some HellaSwag baselines:
 * OpenAI GPT-3 (124M) (trained for 300B OpenWebText tokens): 33.7
 * Huggingface SmolLM2-135M (trained for 2T FineWeb/DCLM/etc tokens): 42.1
 
-Note: I'm a little concerned the learning rate schedule (WSD) and weight decay (zero), which are tuned for the speedrun duration,
-become undertuned for trainings of this duration.
-It looks like the gap between Muon/Adam is too large to be closed by something like this, and the HellaSwag scores look quite reasonable, but you never know.
+Note: I'm a little concerned that the learning rate schedule (WSD) and weight decay (zero), which are tuned for the speedrun duration,
+become undertuned/suboptimal for trainings of this duration.
+It does look like the gap between Muon/Adam is too large to be closed by something like this, and the HellaSwag scores look quite reasonable, but you never know.
 
