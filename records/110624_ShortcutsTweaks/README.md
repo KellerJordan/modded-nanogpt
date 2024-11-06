@@ -75,12 +75,12 @@ for block in self.transformer.h:
 
 ### Momentum warmup
 
-Just adds the following three lines.
+Just adds the following two lines.
 ```
-# momentum warmup for Muon 
 frac = min(step/500, 1)
 optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
 ```
+where `optimizer3` is the Muon for the body of the transformer.
 
 ### Tanh soft capping
 
