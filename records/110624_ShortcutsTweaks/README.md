@@ -1,5 +1,10 @@
 # New record 11/06/24
 
+8.2 minutes on 8xH100
+
+![](nanogpt_speedrun110.png)
+![](nanogpt_speedrun111.png)
+
 * [Old record 11/03/24](d6b50d71-f419-4d26-bb39-a60d55ae7a04.txt)
 * [+shorten duration](4a71cc92-0f43-4058-a033-23e85c1e98f1.txt)
 * [+value residual](042f9e87-07e6-4504-bb04-4ec59a380211.txt) [1]
