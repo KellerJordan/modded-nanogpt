@@ -1,6 +1,6 @@
 # New record 11/06/24
 
-8.2 minutes on 8xH100
+8.2 minutes on 8xH100 (previous record: 10.8 minutes)
 
 ![](nanogpt_speedrun110.png)
 ![](nanogpt_speedrun111.png)
