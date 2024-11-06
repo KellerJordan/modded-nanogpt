@@ -13,6 +13,83 @@
 * [+momentum warmup](10119f53-7001-4248-bfd9-33d32427a912.txt)
 * [+tanh logit capping](dd7304a6-cc43-4d5e-adb8-c070111464a1.txt) by @Grad62304977 following [2]
 
+## Code snippets
+
+### Value residual
+
+In the attention layer:
+```
+def forward(self, x, v1=None):
+    ...
+    v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+    if v1 is None:
+        v1 = v
+    v = 0.5 * v + 0.5 * v1.view_as(v)
+```
+Where the first block receives v1=None, and subsequent blocks receive v1 as the value produced by the first block.
+
+### Learnable lambda
+
+In the attention block:
+```
+def __init__(self, config):
+    ...
+    self.lamb = nn.Parameter(torch.tensor(0.5))
+
+def forward(self, x, v1=None):
+    ...
+    v = (1 - self.lamb) * v + self.lamb * v1.view_as(v)
+```
+That is, we just replace the fixed 0.5 constant used in standard value residual [1] with a learnable scalar (optimized by Adam(lr=0.02)).
+
+### Embed shortcut
+
+Replaces the standard transformer block with this:
+
+```
+class Block(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.attn = CausalSelfAttention(config)
+        self.mlp = MLP(config)
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+
+    def forward(self, x, x0): 
+        x = self.lambdas[0] * x + self.lambdas[1] * x0 
+        x = x + self.attn(F.rms_norm(x, (x.size(-1),)), v1)
+        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
+        return x
+```
+
+where the two scalars are optimized using Adam(lr=0.02), and `x0` is fed in from the initial embedding via:
+```
+...
+x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+x = F.rms_norm(x, (x.size(-1),))
+x0 = x
+for block in self.transformer.h:
+    x = block(x, x0)
+...
+```
+
+### Momentum warmup
+
+Just adds the following three lines.
+```
+# momentum warmup for Muon 
+frac = min(step/500, 1)
+optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+```
+
+### Tanh soft capping
+
+Just adds the following line.
+
+```
+logits = 30 * torch.tanh(logits / 30)
+```
+
 
 ## References
 
