@@ -2,20 +2,22 @@
 
 This is a fast variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in:
-* 2.4B tokens instead of 10B
-* 10.8 minutes on 8xH100 instead of 45
+* 1.68B tokens instead of 10B
+* 8.2 minutes on 8xH100 instead of 45
 
 It uses the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
+* New optimizer: Muon - Momentum Orthogonalized by Newton-schulz.
 * Projection layers initialized to zero (muP-like).
 * Untied head from embedding and init to zero.
-* New optimizer: Muon - Momentum Orthogonalized by Newton-schulz.
+* Architectural shortcuts: value residual and embedding shortcut.
+* Momentum warmup, tanh soft capping.
 
 To execute the training, run the following three commands.
 They should all complete within <20min on an 8xH100 with decent internet connection.
 ```bash
 pip install -r requirements.txt
-python data/cached_fineweb10B.py 24 # downloads only the first 2.4B training tokens to save time
+python data/cached_fineweb10B.py 18 # downloads only the first 1.8B training tokens to save time
 ./run.sh
 ```
 
@@ -69,7 +71,7 @@ So if you're rational, the result probably just dies with you and no one else le
 
 ### Q: NanoGPT speedrunning is cool and all, but meh it probably won't scale and is just overfitting to val loss
 
-A: Ok, well, "at scale" is an infinite category (what if the methods stop working only for >100T models?), so it's impossible for me to conclusively refute the allegation that whatever we're doing here doesn't work at scale.
+A: This is hard to refute, since "at scale" is an infinite category (what if the methods stop working only for >100T models?), making it impossible to prove anything works at arbitrary scale.
 But if you care about 1.5B models, then you might be convinced by this result:
 
 *Straightforwardly scaling up the speedrun to 1.5B parameters yields a model with GPT-2 (1.5B)-level quality 2.5x more cheaply than [@karpathy's baseline](https://github.com/karpathy/llm.c/discussions/677) ($233 instead of $576):*
