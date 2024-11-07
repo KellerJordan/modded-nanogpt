@@ -38,7 +38,7 @@ The following is the progression of world records for the task of *training a mo
 8. [10.8 minutes: Untied embed and lm_head](https://x.com/kellerjordan0/status/1853188916704387239) (11/03/24) [[reproducible log](./records/110324_UntieEmbed/d6b50d71-f419-4d26-bb39-a60d55ae7a04.txt)]
 9. [8.2 minutes: Shortcuts & tweaks](https://x.com/kellerjordan0/status/1854296101303800108) (11/06/24) [[reproducible log](./records/110624_ShortcutsTweaks/dd7304a6-cc43-4d5e-adb8-c070111464a1.txt)]
 
-Direct contributors to these records: @Grad62304977, @bozavlado, myself
+Direct contributors to these records: [@Grad62304977](https://x.com/Grad62304977), [Vlado Boza](https://x.com/bozavlado), myself
 
 Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
 So it's no surprise that there is room to improve; as @karpathy has said, 'llm.c still has a lot of pending optimizations.'
