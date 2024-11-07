@@ -23,7 +23,7 @@ def zeropower_via_svd(G, steps=None):
     return U @ V.T
 
 @torch.compile
-def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 10):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -36,13 +36,15 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
-    X /= (X.norm() + eps) # ensure top singular value <= 1
+    I = torch.eye(min(G.size(0), G.size(1)), dtype=X.dtype, device=X.device)
+    X.div_(X.norm() + 1e-7) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
     for _ in range(steps):
         A = X @ X.T
-        B = A @ X
-        X = a * X + b * B + c * A @ B
+        S = A @ (b * I + c * A)
+        torch.diagonal(S).add_(a)
+        X = S @ X
     if G.size(0) > G.size(1):
         X = X.T
     return X
@@ -164,7 +166,7 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
-        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
 
     def forward(self, x, v1=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -173,7 +175,7 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
         if v1 is None:
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
-        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
+        v = self.lambdas[0] * v + self.lambdas[1] * v1.view_as(v) # @Grad62304977
         cos, sin = self.rotary(q)
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
@@ -351,7 +353,7 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 3200 # number of iterations to run
+    num_iterations : int = 3125 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 914 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
@@ -391,9 +393,11 @@ x, y = train_loader.next_batch()
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
+if master_process:
+    print("Building model...")
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
-model = model.cuda()
+model = model.to(device)
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
@@ -401,6 +405,8 @@ model = torch.compile(model)
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+if master_process:
+    print("Model built.")
 
 # CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
 from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
@@ -532,7 +538,12 @@ for step in range(args.num_iterations + 1):
         p.grad /= train_accumulation_steps
     # momentum warmup for Muon
     frac = min(step/500, 1)
+    frac2 = 1 - max(step - args.num_iterations + 500, 0) / 500
     optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+    optimizer1.param_groups[0]['betas'] = (
+        (1 - frac2) * 0.80 + frac2 * 0.90,
+        (1 - frac2) * 0.85 + frac2 * 0.95,
+    )
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
