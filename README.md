@@ -8,10 +8,11 @@ Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains
 It uses the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
 * New optimizer: Muon - Momentum Orthogonalized by Newton-schulz.
-* Projection layers initialized to zero (muP-like).
-* Untied head from embedding and init to zero.
-* Architectural shortcuts: value residual and embedding shortcut.
-* Momentum warmup, tanh soft capping.
+* Untied head from embedding.
+* Projection and classification layers initialized to zero (muP-like).
+* Architectural shortcuts: value residual and embedding shortcut (partially following https://arxiv.org/abs/2410.17897).
+* Momentum warmup.
+* Tanh soft logit capping (following Gemma 2).
 
 To execute the training, run the following three commands.
 They should all complete within <20min on an 8xH100 with decent internet connection.
