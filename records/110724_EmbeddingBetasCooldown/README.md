@@ -1,9 +1,11 @@
 # New record 11/07/24
 
 ![](nanogpt_speedrun.png)
+![](nanogpt_speedrun_wallclock.png)
 
 * [Old record](dd7304a6-cc43-4d5e-adb8-c070111464a1.txt)
-* [New record](6c9d875b-ad91-46c9-9ede-2c7f998b9b16.txt)
+* [Old record, Franz' Machine](b5329e17-61ba-479c-80cb-098ea2c2671d.txt)
+* [New record, Franz' Machine](6c9d875b-ad91-46c9-9ede-2c7f998b9b16.txt)
 
 ## Code snippets
 
