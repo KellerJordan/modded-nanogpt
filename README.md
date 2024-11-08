@@ -154,7 +154,7 @@ compared to Shampoo.
 
 ## Startup script
 
-Here's a good startup script for a fresh instance. If you get `torchrun not found` after this upon running then just close and reopen your tmux tab.
+Here's a good startup script for a fresh 8xH100 instance.
 
 ```
 sudo apt-get update
