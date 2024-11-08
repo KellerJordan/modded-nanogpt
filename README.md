@@ -36,6 +36,8 @@ go into `train_gpt2.py` and scale down the `device_batch_size` to either 16 or 3
 Both of these changes will have no effect on the training - you should get the exact same loss curve as the most recent record, because the training code
 will automatically adjust the gradient accumulation in order to have the same total batch size.
 
+---
+
 ## World record history
 
 The following is the progression of world records for the task of *training a model with 124M active parameters to 3.28 validation loss on FineWeb in the minimal amount of time on an 8xH100 machine.*
@@ -68,6 +70,8 @@ The only possible 'benefit' I can think of for any empirical field to abandon be
 Hilarious to think about how, in the often-commented-upon and ongoing collapse of the peer review system, people blame the *reviewers* --
 yeah, those guys doing free labor who everyone constantly musters all of their intelligence to lie to, it's *their* fault! My bad, you caught me monologuing.-->
 
+---
+
 ### Q: What makes "NanoGPT speedrunning" not just another idiosyncratic benchmark?
 
 A: Because it is a *competitive* benchmark. In particular, if you attain a new speed record (using whatever method you want), there is an open invitation for you
@@ -93,6 +97,8 @@ But if you care about 1.5B models, then you might be convinced by this result:
 ![](img/nanogpt_speedrun51.png)
 [[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/102024_ScaleUp1B/ad8d7ae5-7b2d-4ee9-bc52-f912e9174d7a.txt)]
 ![](img/nanogpt_speedrun52.png)
+
+---
 
 ## Muon optimizer
 
