@@ -14,6 +14,10 @@ It uses the following techniques:
 * Momentum warmup.
 * Tanh soft logit capping (following Gemma 2).
 
+---
+
+## Running the current speedrun
+
 To execute the training, run the following three commands.
 They should all complete within <20min on an 8xH100 with decent internet connection.
 ```bash
@@ -24,6 +28,13 @@ python data/cached_fineweb10B.py 18 # downloads only the first 1.8B training tok
 
 The result will be a transformer with 124M active parameters trained for 4768 steps on 2.4B tokens of Fineweb [1], achieving ~3.275 validation loss.
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
+
+## Running the speedrun on fewer GPUs or with less memory
+
+To run on fewer GPUs, just modify `run.sh` to have a different `--nproc_per_node`. If you don't have enough memory to fit the batch size, then
+go into `train_gpt2.py` and scale down the `device_batch_size` to either 16 or 32.
+Both of these changes will have no effect on the training - you should get the exact same loss curve as the most recent record, because the training code
+will automatically adjust the gradient accumulation in order to have the same total batch size.
 
 ## World record history
 
@@ -147,15 +158,8 @@ tmux
 
 pip install numpy==1.23.5 huggingface-hub tqdm
 pip install --upgrade torch &
-python data/cached_fineweb10B.py 30
+python data/cached_fineweb10B.py 18
 ```
-
-## Running on fewer GPUs or with less memory
-
-To run on fewer GPUs, just modify the 1-liner `run.sh` to have a different `--nproc_per_node`. If you don't have enough memory to fit the batch size, then
-go into `train_gpt2.py` and scale down the `device_batch_size` by either 1/2 or 1/4.
-Both of these changes will have no effect on the training - you should get the exact same loss curve as the most recent record, because the training code
-will automatically adjust the gradient accumulation in order to have the same total batch size.
 
 ---
 
