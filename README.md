@@ -29,7 +29,7 @@ python data/cached_fineweb10B.py 18 # downloads only the first 1.8B training tok
 The result will be a transformer with 124M active parameters trained for 4768 steps on 2.4B tokens of Fineweb [1], achieving ~3.275 validation loss.
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
-## Running the speedrun on fewer GPUs or with less memory
+## Running it on fewer GPUs or with less memory
 
 To run on fewer GPUs, just modify `run.sh` to have a different `--nproc_per_node`. If you don't have enough memory to fit the batch size, then
 go into `train_gpt2.py` and scale down the `device_batch_size` to either 16 or 32.
