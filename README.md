@@ -16,7 +16,7 @@ It uses the following techniques:
 
 ---
 
-## Running the current speedrun
+## Running the training
 
 To execute the training, run the following three commands.
 They should all complete within <20min on an 8xH100 with decent internet connection.
