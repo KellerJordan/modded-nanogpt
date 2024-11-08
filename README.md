@@ -73,7 +73,7 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 
 ### Q: What is the point of NanoGPT speedrunning?
 
-A: The official goal of NanoGPT speedrunning is as follows: `gotta go fast`. But for something a little more verbose involving an argument for good benchmarking, here's some kind of manifesto, adorned with a blessing from the master. [https://x.com/karpathy/status/1846790537262571739](https://x.com/karpathy/status/1846790537262571739)
+A: The officially stated goal of NanoGPT speedrunning is as follows: `gotta go fast`. But for something a little more verbose involving an argument for good benchmarking, here's some kind of manifesto, adorned with a blessing from the master. [https://x.com/karpathy/status/1846790537262571739](https://x.com/karpathy/status/1846790537262571739)
 
 ### Q: What makes "NanoGPT speedrunning" not just another idiosyncratic benchmark?
 
