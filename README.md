@@ -43,7 +43,7 @@ will automatically adjust the gradient accumulation in order to have the same to
 
 The following is the progression of world records for the task of *training a model with 124M active parameters to 3.28 validation loss on FineWeb in the minimal amount of time on an 8xH100 machine.*
 
-1. [45 minutes: llm.c baseline](https://github.com/karpathy/llm.c/discussions/481) (05/28/24) [[training log](./records/101324_llmc/main.log)] (note: the 90 minute time is on 8xA100; it's 45 minutes on 8xH100)
+1. [45 minutes: llm.c baseline](https://github.com/karpathy/llm.c/discussions/481) (05/28/24) [[training log](./records/101324_llmc/main.log)] (note: the 90 minute time is on 8xA100; it's 45 minutes on 8xH100. This run is essentially a hardware-optimized GPT-2 (small) replication using better training data.)
 2. [31.4 minutes: Architectural modernizations and learning rate tuning](https://x.com/kellerjordan0/status/1798863559243513937) (06/06/24) [[training log](./records/060624_AdamW/f66d43d7-e449-4029-8adf-e8537bab49ea.log)] (note: this uses half the tokens as the baseline but isn't yet twice as fast since it's slower PyTorch code rather than raw CUDA. also note: most of the improvement here came from simply tripling the learning rate.)
 3. [24.9 minutes: Introduced the Muon optimizer](https://x.com/kellerjordan0/status/1842300916864844014) (10/04/24)
 4. [22.3 minutes: Muon improvements](https://x.com/kellerjordan0/status/1844820919061287009) (10/11/24) [[reproducible log](./records/101024_Muon/eb5659d0-fb6a-49e5-a311-f1f89412f726.txt)]
@@ -54,10 +54,10 @@ The following is the progression of world records for the task of *training a mo
 9. [8.2 minutes: Shortcuts & tweaks](https://x.com/kellerjordan0/status/1854296101303800108) (11/06/24) [[reproducible log](./records/110624_ShortcutsTweaks/dd7304a6-cc43-4d5e-adb8-c070111464a1.txt)]
 10. [8.05(?) minutes](https://x.com/leloykun/status/1854557419768254915) (11/07/24) (this one is a bit difficult to certify since the [reproducible log](https://github.com/leloykun/modded-nanogpt/blob/224f10d190677d9dc3c9c45da280078196a6fe40/records/110724_EmbeddingBetasCooldown/6c9d875b-ad91-46c9-9ede-2c7f998b9b16.txt) shows a slower time than the 11/06 record, but based on same-hardware tests it does appear to be a new record by 10-15 seconds.)
 
-Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
+<!--Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
 So it's no surprise that there is room to improve; as @karpathy has said, 'llm.c still has a lot of pending optimizations.'
 In addition, many of the techniques used in these records are completely standard, such as rotary embeddings.
-The goal of this benchmark/speedrun is simply to find out which techniques actually work, and maybe come up with some new ones.
+The goal of this benchmark/speedrun is simply to find out which techniques actually work, and maybe come up with some new ones.-->
 <!--The goal of this benchmark is simply to find out all the techniques which actually work, because I'm going crazy reading all these
 LLM training papers
 which claim a huge benefit but then use their own idiosyncratic non-competitive benchmark and therefore no one in the community has any idea if it's legit for months.-->
