@@ -129,7 +129,7 @@ def zeroth_power_via_newtonschulz5(G, steps=5, eps=1e-7):
 ```
 
 For this training scenario, Muon has the following favorable properties:
-* Less memory usage than Adam
+* Lower memory usage than Adam
 * ~1.5x better sample-efficiency
 * <2% wallclock overhead
 
