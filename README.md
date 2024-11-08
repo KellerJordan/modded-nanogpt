@@ -93,7 +93,7 @@ So if you're rational, the result probably just dies with you and no one else le
 ### Q: NanoGPT speedrunning is cool and all, but meh it probably won't scale and is just overfitting to val loss
 
 A: This is hard to refute, since "at scale" is an infinite category (what if the methods stop working only for >100T models?), making it impossible to fully prove.
-But if you care about 1.5B models, then you might be convinced by this result:
+But if the reader cares about 1.5B models, they might be convinced by this result:
 
 *Straightforwardly scaling up the speedrun (10/18/24 version) to 1.5B parameters yields a model with GPT-2 (1.5B)-level quality 2.5x more cheaply than [@karpathy's baseline](https://github.com/karpathy/llm.c/discussions/677) ($233 instead of $576):*
 
