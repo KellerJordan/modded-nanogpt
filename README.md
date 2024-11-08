@@ -31,8 +31,9 @@ For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss 
 
 ## Running it on fewer GPUs or with less memory
 
-To run on fewer GPUs, just modify `run.sh` to have a different `--nproc_per_node`. If you don't have enough memory to fit the batch size, then
-go into `train_gpt2.py` and scale down the `device_batch_size` to either 16 or 32.
+* To run on fewer GPUs, just modify `run.sh` to have a different `--nproc_per_node`.
+* If you don't have enough memory to fit the batch size, then go into `train_gpt2.py` and scale down the `device_batch_size` to either 16 or 32.
+
 Both of these changes will have no effect on the training - you should get the exact same loss curve as the most recent record, because the training code
 will automatically adjust the gradient accumulation in order to have the same total batch size.
 
