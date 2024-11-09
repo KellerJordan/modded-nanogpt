@@ -1,7 +1,7 @@
 This is a replication attempt for the record attempt described [here](https://x.com/leloykun/status/1854557419768254915).
 
 The original record could not be directly accepted because it showed a slower wallclock time than the previous record -
-however, this was plausibly due to hardware differences, where the competitor's hardware as slightly slower.
+however, this was plausibly due to hardware differences, as the competitor's hardware was slightly slower.
 
 The [original record attempt's reproducible log](https://github.com/leloykun/modded-nanogpt/blob/224f10d190677d9dc3c9c45da280078196a6fe40/records/110724_EmbeddingBetasCooldown/6c9d875b-ad91-46c9-9ede-2c7f998b9b16.txt)) attained a val loss of 3.2798, just barely below the 3.28 threshold.
 
