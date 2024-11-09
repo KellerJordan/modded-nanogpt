@@ -3,7 +3,7 @@ This is a replication attempt for the record attempt described [here](https://x.
 The original record could not be directly accepted because it showed a slower wallclock time than the previous record -
 however, this was plausibly due to hardware differences, as the competitor's hardware was slightly slower.
 
-The [original record attempt's reproducible log](https://github.com/leloykun/modded-nanogpt/blob/224f10d190677d9dc3c9c45da280078196a6fe40/records/110724_EmbeddingBetasCooldown/6c9d875b-ad91-46c9-9ede-2c7f998b9b16.txt)) attained a val loss of 3.2798, just barely below the 3.28 threshold.
+The [original record attempt's reproducible log](https://github.com/leloykun/modded-nanogpt/blob/224f10d190677d9dc3c9c45da280078196a6fe40/records/110724_EmbeddingBetasCooldown/6c9d875b-ad91-46c9-9ede-2c7f998b9b16.txt) attained a val loss of 3.2798, just barely below the 3.28 threshold.
 
 To attempt to certify this record, I performed a reproduction (with no modifications) on my own hardware.
 This indeeded yielded a new wallclock record (by about 11 seconds), but unfortunately my run attained a worse val loss of 3.2824.
