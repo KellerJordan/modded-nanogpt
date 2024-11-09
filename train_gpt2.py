@@ -150,8 +150,6 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3).type_as(x)
 
 class CastedLinear(nn.Linear):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
 
