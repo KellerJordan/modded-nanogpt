@@ -1,4 +1,4 @@
-This is a replication attempt for the record attempt described [here](https://x.com/leloykun/status/1854557419768254915).
+This is a replication attempt for the record attempt described [here](https://x.com/leloykun/status/1854557419768254915) by @leloykun.
 
 The original record could not be directly accepted because it showed a slower wallclock time than the previous record -
 however, this was plausibly due to hardware differences, as the competitor's hardware was slightly slower.
