@@ -77,7 +77,7 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 
 1. Must not modify the train or validation data pipelines (except to change batch size if you want).
 2. Must use ≤ 124M active parameters per token.
-3. Must attain ≤ 3.28 val loss. A tasteful number would be 3.278 so that [this doesn't happen](./records/110924_Replicateleloykun).
+3. Must attain ≤ 3.28 val loss. A tasteful number would be 3.278 so that [this doesn't happen](./records/110924_Replicateleloykun/1621af10-aa0c-42af-bf54-8a773c63a2af.txt#L3780).
 
 ---
 
