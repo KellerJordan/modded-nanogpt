@@ -149,6 +149,12 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).type_as(x)
 
+class CastedLinear(nn.Linear):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    def forward(self, x):
+        return F.linear(x, self.weight.to(x.dtype))
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -157,11 +163,11 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
         # output projection
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
@@ -186,8 +192,8 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
@@ -231,10 +237,10 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(self, idx, targets=None, return_logits=True):
+    def forward(self, idx, target):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -245,24 +251,11 @@ class GPT(nn.Module):
             x, v1 = block(x, v1, x0)
         x = F.rms_norm(x, (x.size(-1),))
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            logits = 30 * torch.tanh(logits / 30) # @Grad62304977
-            logits = logits.float() # use tf32/fp32 for logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            logits = 30 * torch.tanh(logits / 30) # @Grad62304977
-            logits = logits.float() # use tf32/fp32 for logits
-            loss = None
-
-        # there are performance reasons why not returning logits is prudent, if not needed
-        if not return_logits:
-            logits = None
-
-        return logits, loss
+        logits = self.lm_head(x)
+        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
+        logits = logits.float()
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
+        return loss.float()
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -351,9 +344,9 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 3200 # number of iterations to run
+    num_iterations : int = 3242 # number of iterations to run
     warmup_iters : int = 0
-    warmdown_iters : int = 914 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 926 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -393,14 +386,16 @@ x, y = train_loader.next_batch()
 # this originates from Karpathy's experiments.
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
-model = model.cuda()
+model = model.cuda().bfloat16()
+for m in model.modules():
+    if isinstance(m, CastedLinear):
+        m.float()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
-ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 # CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
 from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
@@ -479,11 +474,9 @@ for step in range(args.num_iterations + 1):
         val_loader.reset()
         val_loss = 0.0
         for _ in range(val_steps):
-            x_val, y_val = val_loader.next_batch()
-            with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
-                _, loss = model(x_val, y_val, return_logits=False)
-                val_loss += loss.detach()
-                del loss
+            with torch.no_grad():
+                x_val, y_val = val_loader.next_batch()
+                val_loss += model(x_val, y_val)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
@@ -517,9 +510,8 @@ for step in range(args.num_iterations + 1):
     model.train()
     for i in range(1, train_accumulation_steps+1):
         # forward pass
-        with ctx:
-            _, loss = model(x, y, return_logits=False)
-            train_loss = loss.detach()
+        loss = model(x, y)
+        train_loss = loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
         # backward pass
