@@ -116,7 +116,7 @@ But if the reader cares about 1.5B models, they might be convinced by this resul
 
 ---
 
-## Muon optimizer
+## [Muon optimizer](https://github.com/KellerJordan/Muon)
 
 Muon is defined as follows:
 
