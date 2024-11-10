@@ -1,6 +1,6 @@
 # Optimizer comparison for NanoGPT speedrunning
 
-This is a comparison between the four best optimizers I am aware of for NanoGPT speedrunning.
+This is a comparison between the four best optimizers I am aware of for NanoGPT speedrunning. They are compared using the 10/18/24 NanoGPT speedrunning record.
 
 Reproducible logs:
 * [Adam](95a9fd44-7c13-49c7-b324-3e7d9e23a499.txt)
