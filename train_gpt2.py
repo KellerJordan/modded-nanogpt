@@ -41,7 +41,7 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
         X = X.T
     for _ in range(steps):
         A = X @ X.T
-        B = b * A + c * A @ A # adapted from suggestion by @leloykun, @YouJiacheng, and @jsbz
+        B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
     if G.size(0) > G.size(1):
         X = X.T
