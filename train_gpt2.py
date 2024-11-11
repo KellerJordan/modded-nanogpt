@@ -125,7 +125,9 @@ class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
         super().__init__()
-        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.dim = dim
+        self.base = base
+        self.inv_freq = None
         self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
@@ -133,9 +135,10 @@ class Rotary(torch.nn.Module):
     def forward(self, x):
         seq_len = x.shape[1]
         if seq_len != self.seq_len_cached:
+            self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=x.device).float() / dim))
             self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.outer(t, self.inv_freq).to(x.device)
+            t = torch.arange(seq_len, device=x.device).type_as(inv_freq)
+            freqs = torch.outer(t, inv_freq)
             self.cos_cached = freqs.cos().bfloat16()
             self.sin_cached = freqs.sin().bfloat16()
         return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
@@ -364,6 +367,7 @@ print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
 # begin logging
+logfile = None
 if master_process:
     run_id = str(uuid.uuid4())
     logdir = 'logs/%s/' % run_id
@@ -375,19 +379,19 @@ if master_process:
         f.write('='*100 + '\n')
         f.write(code)
         f.write('='*100 + '\n')
-        # log information about the hardware/software environment this is running on
-        # and print the full `nvidia-smi` to file
-        f.write(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:\n")
-        import subprocess
-        result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        f.write(f'{result.stdout}\n')
-        f.write('='*100 + '\n')
-
-def print0(s):
+def print0(s, logonly=False):
     if master_process:
         with open(logfile, "a") as f:
-            print(s)
-            f.write(s)
+            if not logonly:
+                print(s)
+            f.write(s+'\n')
+# log information about the hardware/software environment this is running on
+# and print the full `nvidia-smi` to file
+print0(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:")
+import subprocess
+result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+print0(f'{result.stdout}', logonly=True)
+print0('='*100, logonly=True)
 
 # convenience variables
 B, T = args.device_batch_size, args.sequence_length
@@ -403,6 +407,7 @@ train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_s
 val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
 print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+print0('='*100, logonly=True)
 x, y = train_loader.next_batch()
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
@@ -451,6 +456,7 @@ def get_lr(it):
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
+# Start training loop
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -538,7 +544,7 @@ for step in range(args.num_iterations + 1):
     approx_time = training_time_ms + 1000 * (time.time() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
 
-print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
 # -------------------------------------------------------------------------
 # clean up nice
