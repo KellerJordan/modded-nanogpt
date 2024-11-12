@@ -37,6 +37,17 @@ For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss 
 Both of these changes will have no effect on the training - you should get the exact same loss curve as the most recent record, because the training code
 will automatically adjust the gradient accumulation in order to have the same total batch size.
 
+## Running with Docker
+
+For cases where CUDA or NCCL versions aren't compatible with your current system setup, Docker can be a helpful alternative.
+This approach standardizes versions for CUDA, NCCL, CUDNN, and Python, reducing dependency issues and simplifying setup. 
+Note: an NVIDIA driver must already be installed on the system (useful if only the NVIDIA driver and Docker are available).
+
+```bash
+sudo docker build -t modded-nanogpt .
+sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt python data/cached_fineweb10B.py 18
+sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt sh run.sh
+```
 ---
 
 ## World record history
