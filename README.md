@@ -89,6 +89,11 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 
 1. [An 11/07/24 attempt, which I attempted to cerify on 11/09/24](./records/110924_Replicateleloykun)
 
+### Notable forks
+
+* [https://github.com/BlinkDL/modded-nanogpt-rwkv](https://github.com/BlinkDL/modded-nanogpt-rwkv)
+* [https://github.com/nikhilvyas/modded-nanogpt-SOAP](https://github.com/nikhilvyas/modded-nanogpt-SOAP)
+
 ### Speedrun rules
 
 1. Must not modify the train or validation data pipelines (except to change batch size if you want).
