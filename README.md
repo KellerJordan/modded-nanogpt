@@ -68,7 +68,7 @@ The following is the progression of world records for the task of *training a mo
 
 Please see the X threads for the contributors to each record.
 
-The `train_gpt2.py` in this repo is the 11/08/24 record. To run the latest 11/10/24 record, use the code in the reproducible log for that record.
+The `train_gpt2.py` in this repo is the 11/08/24 record. To run the latest 11/10/24 record, use the code in its reproducible log.
 
 <!--Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
 So it's no surprise that there is room to improve; as @karpathy has said, 'llm.c still has a lot of pending optimizations.'
