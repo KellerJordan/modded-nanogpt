@@ -53,7 +53,6 @@ sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt sh 
 ## World record history
 
 The following is the progression of world records for the task of *training a model with 124M active parameters to 3.28 validation loss on FineWeb in the minimal amount of time on an 8xH100 machine.*
-See the X threads for contributors to each record.
 
 1. [45 minutes: llm.c baseline](https://github.com/karpathy/llm.c/discussions/481) (05/28/24) [[training log](./records/101324_llmc/main.log)] (note: the 90 minute time is on 8xA100; it's 45 minutes on 8xH100. This run is essentially a hardware-optimized GPT-2 (small) replication using better training data.)
 2. [31.4 minutes: Architectural modernizations and learning rate tuning](https://x.com/kellerjordan0/status/1798863559243513937) (06/06/24) [[training log](./records/060624_AdamW/f66d43d7-e449-4029-8adf-e8537bab49ea.log)] (note: this uses half the tokens as the baseline but isn't yet twice as fast since it's slower PyTorch code rather than raw CUDA. also note: most of the improvement here came from simply tripling the learning rate.)
@@ -66,6 +65,8 @@ See the X threads for contributors to each record.
 9. [8.2 minutes: Shortcuts & tweaks](https://x.com/kellerjordan0/status/1854296101303800108) (11/06/24) [[reproducible log](./records/110624_ShortcutsTweaks/dd7304a6-cc43-4d5e-adb8-c070111464a1.txt)]
 11. [7.8 minutes: Bfloat16 activations](https://x.com/kellerjordan0/status/1855267054774865980) (11/08/24) [[reproducible log](./records/110824_CastBf16/a833bed8-2fa8-4cfe-af05-58c1cc48bc30.txt)]
 12. [7.23 minutes: U-net & 2x lr](https://x.com/kellerjordan0/status/1856053121103093922) (11/10/24) [[reproducible log](./records/111024_UNetDoubleLr/c87bb826-797b-4f37-98c7-d3a5dad2de74.txt)]
+
+Please see the X threads for the contributors to each record.
 
 <!--Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
 So it's no surprise that there is room to improve; as @karpathy has said, 'llm.c still has a lot of pending optimizations.'
