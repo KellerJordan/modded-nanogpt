@@ -208,7 +208,7 @@ python data/cached_fineweb10B.py 18
 6. [Anil, Rohan, et al. "Scalable second order optimization for deep learning." arXiv preprint arXiv:2002.09018 (2020).](https://arxiv.org/abs/2002.09018)
 7. [Hägele, Alexander, et al. "Scaling Laws and Compute-Optimal Training Beyond Fixed Training Durations." arXiv preprint arXiv:2405.18392 (2024).](https://arxiv.org/abs/2405.18392)
 
-<iframe width="560" height="315" src="https://www.youtube.com/embed/dv13gl0a-FA" frameborder="0" allowfullscreen></iframe>
+[![video](https://img.youtube.com/vi/dv13gl0a-FA/0.jpg)](https://www.youtube.com/watch?v=dv13gl0a-FA)
 
 <img src="img/dofa.jpg" alt="itsover_wereback" style="width:100%;">
 
