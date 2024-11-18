@@ -1,3 +1,110 @@
+import torch
+# SOAP optimizer, refactored from https://github.com/nikhilvyas/SOAP. Original comments included.
+
+# Parts of the code are modifications of Pytorch's AdamW optimizer
+# Parts of the code are modifications of code from https://github.com/jiaweizzhao/GaLore/blob/master/galore_torch/galore_projector.py
+class SOAP(torch.optim.Optimizer):
+    """
+    Implements SOAP algorithm (https://arxiv.org/abs/2409.11321).
+    Parameters:
+        params (`Iterable[nn.Parameter]`):
+            Iterable of parameters to optimize or dictionaries defining parameter groups.
+        lr (`float`, *optional*, defaults to 0.003):
+            The learning rate to use.
+        betas (`Tuple[float,float]`, *optional*, defaults to `(0.95, 0.95)`):
+            Adam's betas parameters (b1, b2).
+        shampoo_beta (`float`, *optional*, defaults to -1):
+            If >= 0, use this beta for the preconditioner (L and R in paper, state['GG'] below) moving average instead of betas[1].
+        eps (`float`, *optional*, defaults to 1e-08):
+            Adam's epsilon for numerical stability.
+        precondition_frequency (`int`, *optional*, defaults to 10):
+            How often to update the preconditioner.
+    """
+    def __init__(self, params, lr=3e-3, betas=(0.95, 0.95), eps=1e-8,
+                 shampoo_beta=None, precondition_frequency=10):
+        if shampoo_beta is None:
+            shampoo_beta = betas[1]
+        defaults = dict(lr=lr, betas=betas, shampoo_beta=shampoo_beta, eps=eps,
+                        precondition_frequency=precondition_frequency)
+        super().__init__(params, defaults)
+
+    def step(self):
+
+        for group in self.param_groups:
+            beta1, beta2 = group['betas']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                assert len(grad.shape) == 2
+
+                state = self.state[p]
+                state['step'] = state.get('step', 0) + 1
+                if state['step'] == 1:
+                    state['exp_avg'] = torch.zeros_like(grad)
+                    state['exp_avg_sq'] = torch.zeros_like(grad)
+                    state['GG'] = [torch.zeros(d, d, device=grad.device) for d in grad.shape] # Will hold all the preconditioner matrices (L and R in the paper).
+                    state['Q'] = [torch.linalg.eigh(m)[1].flip(1) for m in state['GG']] # start with exact orthogonalization using eigh
+                    continue # first step is skipped so that we never use the current gradients in the projection.
+
+                # Projecting gradients to the eigenbases of Shampoo's preconditioner
+                # i.e. projecting to the eigenbases of matrices in state['GG']
+                grad_projected = self.project(grad, state)
+
+                # Decay the first and second moment running average coefficient
+                # In-place operations to update the averages at the same time
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                exp_avg.lerp_(grad, 1-beta1)
+                exp_avg_sq.lerp_(grad_projected.square(), 1-beta2)
+
+                # Projecting the exponential moving average of gradients to the eigenbases of Shampoo's preconditioner
+                # i.e. projecting to the eigenbases of matrices in state['GG']
+                exp_avg_projected = self.project(exp_avg, state)
+
+                # Projecting back the preconditioned (by Adam) exponential moving average of gradients to the original space
+                adam_update = exp_avg_projected / (exp_avg_sq.sqrt() + group['eps'])
+                update = self.project_back(adam_update, state)
+
+                bias_correction1 = 1 - beta1**state['step']
+                bias_correction2 = 1 - beta2**state['step']
+                step_size = group['lr'] * bias_correction2**0.5 / bias_correction1
+                p.data.add_(update, alpha=-step_size)
+
+                # Preconditioner update is done after the gradient step to avoid using current gradients in the projection.
+                state['GG'][0].lerp_(grad @ grad.T, 1-group['shampoo_beta'])
+                state['GG'][1].lerp_(grad.T @ grad, 1-group['shampoo_beta'])
+                if state['step'] % group['precondition_frequency'] == 0:
+                    self.update_preconditioner(grad, state)
+
+    def project(self, grad, state):
+        """
+        Projects the gradient to the eigenbases of the preconditioner.
+        """
+        return state['Q'][0].T @ grad @ state['Q'][1]
+
+    def project_back(self, grad, state):
+        """
+        Projects the gradient back to the original space.
+        """
+        return state['Q'][0] @ grad @ state['Q'][1].T
+
+    def update_preconditioner(self, grad, state):
+        """
+        Updates the preconditioner matrices and the eigenbases (L, R, Q_L, Q_R in the paper).
+        Computes the eigenbases of the preconditioner using one round of power iteration
+        followed by torch.linalg.qr decomposition.
+        """
+        exp_avg_sq = state['exp_avg_sq']
+        for i in [0, 1]:
+            m = state['GG'][i]
+            o = state['Q'][i]
+            est_evals = (o.T @ m @ o).diag()
+            sort_idx = torch.argsort(est_evals, descending=True)
+            exp_avg_sq[:] = exp_avg_sq.index_select(i, sort_idx)
+            Q, _ = torch.linalg.qr(m @ o[:, sort_idx])
+            state['Q'][i] = Q
+
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -14,109 +121,6 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
-
-# -----------------------------------------------------------------------------
-# Muon optimizer
-
-def zeropower_via_svd(G, steps=None):
-    U, S, V = G.svd()
-    return U @ V.T
-
-@torch.compile
-def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
-    r"""
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
-    assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750,  2.0315)
-    X = G.bfloat16()
-    X /= (X.norm() + eps) # ensure top singular value <= 1
-    if G.size(0) > G.size(1):
-        X = X.T
-    for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
-    if G.size(0) > G.size(1):
-        X = X.T
-    return X
-
-zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
-
-class Muon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Some warnings:
-    - This optimizer assumes that all parameters passed in are 2D.
-    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
-    parameters; those should all be optimized by a standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
-    - We believe it is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
-    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
-
-    Arguments:
-        lr: The learning rate used by the internal SGD.
-        momentum: The momentum used by the internal SGD.
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
-        backend_steps: The number of iteration steps to use in the backend, if it is iterative.
-    """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
-                 backend='newtonschulz5', backend_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
-        super().__init__(params, defaults)
-
-    def step(self):
-
-        for group in self.param_groups:
-
-            lr = group['lr']
-            momentum = group['momentum']
-            zeropower_backend = zeropower_backends[group['backend']]
-
-            # generate weight updates in distributed fashion
-            total_params = sum(p.numel() for p in group['params'])
-            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
-            curr_idx = 0
-            for i, p in enumerate(group['params']):
-                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
-                if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
-                    g = p.grad
-                    assert g is not None
-                    state = self.state[p]
-                    if 'momentum_buffer' not in state:
-                        state['momentum_buffer'] = torch.zeros_like(g)
-                    buf = state['momentum_buffer']
-                    buf.mul_(momentum).add_(g)
-                    if group['nesterov']:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(1, g.size(0)/g.size(1))**0.5
-                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
-                curr_idx += p.numel()
-
-            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
-            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
-
-            # deserialize and apply updates
-            curr_idx = 0
-            for p in group['params']:
-                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
-                p.data.add_(g, alpha=-lr)
-                curr_idx += p.numel()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -346,7 +350,7 @@ class Hyperparameters:
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 3242 # number of iterations to run
-    warmup_iters : int = 0
+    warmup_iters : int = 250
     warmdown_iters : int = 926 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
@@ -438,7 +442,7 @@ optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, beta
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2]
-optimizer3 = Muon(matrix_params, lr=0.02, momentum=0.95)
+optimizer3 = SOAP(matrix_params, lr=0.002)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)
@@ -528,9 +532,6 @@ for step in range(args.num_iterations + 1):
             loss.backward() # just sync on the last step
     for p in model.parameters():
         p.grad /= train_accumulation_steps
-    # momentum warmup for Muon
-    frac = min(step/500, 1)
-    optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
