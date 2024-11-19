@@ -14,6 +14,8 @@ It uses the following techniques:
 * Momentum warmup.
 * Tanh soft logit capping (following Gemma 2).
 
+The training has attained this speed due to the contributions of meself, @Grad62304977, @jxbz, @brendanh0gan, & @bozavlado!
+
 ---
 
 ## Running the training
