@@ -13,7 +13,7 @@ It uses the following techniques:
 * Architectural shortcuts: value residual and embedding shortcut (partially following https://arxiv.org/abs/2410.17897).
 * Momentum warmup.
 * Tanh soft logit capping (following Gemma 2).
-* Flex Attention.
+* FlexAttention.
 
 The training has attained this speed due to the contributions of meself, @Grad62304977, @jxbz, @bozavlado, @brendanh0gan, & @KoszarskyB!
 
