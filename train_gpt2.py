@@ -14,6 +14,10 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
+# Use of FlexAttention contributed by @bkoszarsky
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+flex_attention = torch.compile(flex_attention, dynamic=False)
+create_block_mask = torch.compile(create_block_mask, dynamic=False)
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -173,7 +177,7 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(self.head_dim)
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
 
-    def forward(self, x, v1=None):
+    def forward(self, x, v1, block_mask):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
@@ -184,7 +188,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(q)
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y, v1
@@ -211,9 +215,9 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x, v1, x0):
+    def forward(self, x, v1, x0, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1)
+        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1, block_mask)
         x = x + x1
         x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
         return x, v1
@@ -248,8 +252,18 @@ class GPT(nn.Module):
 
     def forward(self, idx, target):
 
+        docs = (idx == 50256).cumsum(0)
+        def document_causal_mask(b, h, q_idx, kv_idx):
+          causal_mask = q_idx >= kv_idx
+          document_mask = docs[q_idx] == docs[kv_idx]
+          window_mask = q_idx - kv_idx < 1024
+          return causal_mask & document_mask & window_mask
+
+        S = len(idx)
+        block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
+
         # forward the GPT model itself
-        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
         x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
         x0 = x
         v1 = None
@@ -258,12 +272,12 @@ class GPT(nn.Module):
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
         for i in range(self.num_encoder_layers):
-            x, v1 = self.transformer.h[i](x, v1, x0)
+            x, v1 = self.transformer.h[i](x, v1, x0, block_mask)
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
-            x, v1 = self.transformer.h[self.num_encoder_layers + i](x, v1, x0)
+            x, v1 = self.transformer.h[self.num_encoder_layers + i](x, v1, x0, block_mask)
 
         x = F.rms_norm(x, (x.size(-1),))
         logits = self.lm_head(x)
@@ -321,13 +335,11 @@ class DistributedDataLoader:
             ntok_total += int(shard_ntok)
         self.ntok_total = ntok_total
 
-        # kick things off
         self.reset()
 
     def reset(self):
-        self.current_shard = 0
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.current_shard = -1
+        self.advance()
 
     def advance(self): # advance to next data shard
         self.current_shard = (self.current_shard + 1) % len(self.files)
@@ -335,15 +347,14 @@ class DistributedDataLoader:
         self.tokens = _load_data_shard(self.files[self.current_shard])
 
     def next_batch(self):
-        B = self.B
-        T = self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        batch_size = self.B * self.T * self.num_processes
+        buf = self.tokens[self.current_position:self.current_position+self.B*self.T+1]
         buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
+        x = buf[:-1] # inputs
+        y = buf[1:] # targets
         # advance current position and load next shard if necessary
-        self.current_position += B * T * self.num_processes
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+        self.current_position += batch_size
+        if self.current_position + batch_size >= len(self.tokens):
             self.advance()
         return x.cuda(), y.cuda()
 
@@ -356,12 +367,12 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 64 # batch size, in sequences, per device
-    sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 3000 # number of iterations to run
+    batch_size : int = 8 # batch size, in sequences, across all devices
+    device_batch_size : int = 1 # batch size, in sequences, per device
+    sequence_length : int = 64*1024 # sequence length, in tokens
+    num_iterations : int = 1875 # number of iterations to run
     warmup_iters : int = 0
-    warmdown_iters : int = 900 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 562 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -476,7 +487,6 @@ training_time_ms = 0
 torch.cuda.synchronize()
 t0 = time.time()
 # begin training
-train_loader.reset()
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
