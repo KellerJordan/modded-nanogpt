@@ -24,7 +24,7 @@ def zeropower_via_svd(G, steps=None):
 
 @torch.compile
 def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
-    r"""
+    """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
     of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
@@ -232,7 +232,12 @@ class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.config = config
+
+        # U-net design by @brendanh0gan
+        self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
+        self.num_decoder_layers = config.n_layer - self.num_encoder_layers # Remaining for decoder
+        # Add learnable skip connection weights for decoder layers
+        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -248,15 +253,24 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
         x0 = x
         v1 = None
-        for block in self.transformer.h:
-            x, v1 = block(x, v1, x0)
-        x = F.rms_norm(x, (x.size(-1),))
 
+        # Store outputs for U-Net skip connections
+        skip_connections = []
+        # Encoder pass - process only the first half of the blocks
+        for i in range(self.num_encoder_layers):
+            x, v1 = self.transformer.h[i](x, v1, x0)
+            skip_connections.append(x)
+        # Decoder pass - process the remaining blocks with weighted skip connections
+        for i in range(self.num_decoder_layers):
+            x = x + self.skip_weights[i] * skip_connections.pop()
+            x, v1 = self.transformer.h[self.num_encoder_layers + i](x, v1, x0)
+
+        x = F.rms_norm(x, (x.size(-1),))
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
-        return loss.float()
+        return loss
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -345,9 +359,9 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 3242 # number of iterations to run
+    num_iterations : int = 3000 # number of iterations to run
     warmup_iters : int = 0
-    warmdown_iters : int = 926 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 900 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -433,13 +447,13 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, betas=(0.9, 0.95), fused=True)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.9, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.9, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
-scalar_params = [p for p in params if p.ndim < 2]
-optimizer3 = Muon(matrix_params, lr=0.02, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
+optimizer3 = Muon(matrix_params, lr=0.04, momentum=0.95)
+optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
