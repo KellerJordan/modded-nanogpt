@@ -1,20 +1,22 @@
 import os
 import sys
+
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
-import uuid
-import time
 import contextlib
+import math
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from torch import nn
-import torch.nn.functional as F
-import torch.distributed as dist
 import torch._inductor.config as config
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch import nn
+from torch.nn.attention.flex_attention import BlockMask, flex_attention  # KoszarskyB
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.nn.attention.flex_attention import BlockMask, flex_attention #KoszarskyB
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -30,18 +32,18 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
-    assert len(G.shape) == 2
+    assert G.ndim == 2 or G.ndim == 3
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
-    X /= (X.norm() + eps) # ensure top singular value <= 1
-    if G.size(0) > G.size(1):
-        X = X.T
+    X /= (X.norm(dim=(-2, -1), keepdim=True) + eps) # ensure top singular value <= 1
+    if G.size(-2) > G.size(-1):
+        X = X.mT
     for _ in range(steps):
-        A = X @ X.T
+        A = X @ X.mT
         B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
-    if G.size(0) > G.size(1):
-        X = X.T
+    if G.size(-2) > G.size(-1):
+        X = X.mT
     return X
 
 class Muon(torch.optim.Optimizer):
@@ -109,7 +111,7 @@ class Muon(torch.optim.Optimizer):
                 for p_world, g_world in zip(params_world, update_buffers):
                     p_world.data.add_(
                         g_world.view_as(p_world),
-                        alpha=-lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
+                        alpha=-lr * max(1, p_world.size(-2) / p_world.size(-1)) ** 0.5,
                     )
             for base_i in range(len(params))[::self.world_size]:
                 p = params[base_i + self.rank]
@@ -171,9 +173,13 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
-        self.c_q = CastedLinear(dim, dim)
-        self.c_k = CastedLinear(dim, dim)
-        self.c_v = CastedLinear(dim, dim)
+        self.dim, self.num_heads, self.head_dim = dim, num_heads, dim // num_heads
+        self.w_q = nn.Parameter(torch.empty(self.num_heads, self.head_dim, self.dim))
+        self.w_k = nn.Parameter(torch.empty(self.num_heads, self.head_dim, self.dim))
+        self.w_v = nn.Parameter(torch.empty(self.num_heads, self.head_dim, self.dim))
+        nn.init.kaiming_uniform_(self.w_q, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.w_k, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.w_v, a=math.sqrt(5))
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
         self.c_proj = CastedLinear(dim, dim)
@@ -182,9 +188,9 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x, vi, block_mask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q = self.c_q(x).view(B, T, self.num_heads, -1)
-        k = self.c_k(x).view(B, T, self.num_heads, -1)
-        v = self.c_v(x).view(B, T, self.num_heads, -1)
+        q = F.linear(x, self.w_q.to(x.dtype).view(self.dim, self.dim)).view(B, T, self.num_heads, self.head_dim)
+        k = F.linear(x, self.w_k.to(x.dtype).view(self.dim, self.dim)).view(B, T, self.num_heads, self.head_dim)
+        v = F.linear(x, self.w_v.to(x.dtype).view(self.dim, self.dim)).view(B, T, self.num_heads, self.head_dim)
         v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v) # @KoszarskyB & @Grad62304977
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
@@ -454,6 +460,7 @@ def print0(s, logonly=False):
 print0(f"Running python {sys.version}")
 print0(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:")
 import subprocess
+
 result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 print0(f'{result.stdout}', logonly=True)
 print0('='*100, logonly=True)
@@ -492,7 +499,7 @@ embed_params = [*raw_model.embed.parameters(), *raw_model.value_embeds.parameter
 optimizer1 = torch.optim.Adam(embed_params, lr=0.6, betas=(0.8, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
 params = list(raw_model.blocks.parameters())
-matrix_params = [p for p in params if p.ndim == 2]
+matrix_params = [p for p in params if p.ndim == 2 or p.ndim == 3]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
 optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
