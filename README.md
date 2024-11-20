@@ -7,7 +7,7 @@ Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains
 
 It uses the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
-* New optimizer: Muon - Momentum Orthogonalized by Newton-schulz.
+* New optimizer: [Muon - Momentum Orthogonalized by Newton-schulz](https://github.com/KellerJordan/Muon).
 * Untied head from embedding.
 * Projection and classification layers initialized to zero (muP-like).
 * Architectural shortcuts: value residual and embedding shortcut (partially following https://arxiv.org/abs/2410.17897).
