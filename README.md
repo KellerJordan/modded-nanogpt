@@ -34,7 +34,7 @@ python data/cached_fineweb10B.py 10 # downloads only the first 1.0B training tok
 The result will be a transformer with 124M active parameters trained for 1875 steps on 1.0B tokens of Fineweb [1], achieving ~3.278 validation loss (w/ up to 0.005 inter-run stddev).
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
-**Note: On the first run the compile time will be pretty brutal.**
+**Note: torch.compile will take a while on the first run.**
 
 ## Running it on fewer GPUs or with less memory
 
