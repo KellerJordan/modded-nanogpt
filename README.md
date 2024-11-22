@@ -3,7 +3,7 @@
 This is a modified variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in:
 * 1B tokens instead of 10B
-* 5.1 minutes on 8xH100 instead of 45
+* 5 minutes on 8xH100 instead of 45
 
 It uses the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
@@ -72,7 +72,7 @@ The following is the progression of world records for the task of *training a mo
 9. [8.2 minutes: Shortcuts & tweaks](https://x.com/kellerjordan0/status/1854296101303800108) (11/06/24) [[reproducible log](./records/110624_ShortcutsTweaks/dd7304a6-cc43-4d5e-adb8-c070111464a1.txt)]
 11. [7.8 minutes: Bfloat16 activations](https://x.com/kellerjordan0/status/1855267054774865980) (11/08/24) [[reproducible log](./records/110824_CastBf16/a833bed8-2fa8-4cfe-af05-58c1cc48bc30.txt)]
 12. [7.23 minutes: U-net & 2x lr](https://x.com/kellerjordan0/status/1856053121103093922) (11/10/24) [[reproducible log](./records/111024_UNetDoubleLr/c87bb826-797b-4f37-98c7-d3a5dad2de74.txt)]
-13. [5.1 minutes: FlexAttention](https://x.com/kellerjordan0/status/1859331370268623321) (11/19/24) [[reproducible log](./records/111924_FlexAttention/8384493d-dba9-4991-b16b-8696953f5e6d.txt)] (requires PyTorch 2.6.0 (nightly))
+13. [5.03 minutes: FlexAttention](https://x.com/kellerjordan0/status/1859331370268623321) (11/19/24) [[reproducible log](./records/111924_FlexAttention/8384493d-dba9-4991-b16b-8696953f5e6d.txt)] (requires PyTorch 2.6.0 (nightly))
 
 Please see the X threads for the contributors to each record.
 
