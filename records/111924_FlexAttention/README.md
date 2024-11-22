@@ -1,8 +1,5 @@
 ## 11/19/24 FlexAttention record
 
+This training has significant variance of around 0.005 stddev between runs. So not all runs go beneath 3.28, though [the mean is around 3.279](https://x.com/YouJiacheng/status/1859876224639828068).
 
-Note: This record was run for 1875 steps, (5.03 minutes) and attained barely below 3.28 loss.
-
-However, @leloykun discovered that it only attains below 3.28 around half the time. So it's not quite clear that this is valid.
-
-As a result, in the main branch, I have increased the step count by +30, which would make the training 5.1 minutes.
+This variance is probably caused by the previous record doubling the learning rate, plus this record significantly shortening the duration.
