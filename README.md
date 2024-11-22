@@ -102,7 +102,7 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 
 ### Speedrun rules
 
-1. Must not modify the train or validation data pipelines. (Except to change batch size & seqlen. I.e., just don't change the order of the tokens.)
+1. Must not modify the train or validation data pipelines. (Except to change batch size, seqlen, attention structure etc. I.e., just don't change the order of the tokens.)
 2. Must use ≤ 124M active parameters per token. (So MoE is OK, and the untied embedding matrix only contributes hidden_dim active params.)
 3. Must attain ≤ 3.28 val loss. (A tasteful number would be 3.278, so that the gap exceeds the inter-run variance.)
 
