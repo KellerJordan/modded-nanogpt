@@ -15,7 +15,7 @@ It uses the following techniques:
 * Tanh soft logit capping (following Gemma 2).
 * FlexAttention.
 
-The training has attained this speed due to the contributions of meself, [@Grad62304977](https://x.com/Grad62304977),
+The training has attained this speed due to the contributions of myself, [@Grad62304977](https://x.com/Grad62304977),
 [@jxbz](https://x.com/jxbz), [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan), & [@KoszarskyB](https://x.com/KoszarskyB).
 
 ---
