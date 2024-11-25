@@ -129,6 +129,14 @@ class Muon(torch.optim.Optimizer):
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
+class CastedLinear(nn.Linear):
+
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=False)
+
+    def forward(self, x):
+        return F.linear(x, self.weight.to(x.dtype))
+
 class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
@@ -149,24 +157,15 @@ class Rotary(torch.nn.Module):
             freqs = torch.outer(t, self.inv_freq)
             self.cos_cached = freqs.cos().bfloat16()
             self.sin_cached = freqs.sin().bfloat16()
-        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
-
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4 # multihead attention
-    d = x.shape[3]//2
-    x1 = x[..., :d]
-    x2 = x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3).type_as(x)
-
-class CastedLinear(nn.Linear):
-
-    def __init__(self, in_features, out_features):
-        super().__init__(in_features, out_features, bias=False)
-
-    def forward(self, x):
-        return F.linear(x, self.weight.to(x.dtype))
+        cos, sin = self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+        # apply_rotary_emb(x, cos, sin)
+        assert x.ndim == 4 # multihead attention
+        d = x.shape[3]//2
+        x1 = x[..., :d]
+        x2 = x[..., d:]
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat([y1, y2], 3).type_as(x)
 
 class CausalSelfAttention(nn.Module):
 
@@ -194,9 +193,8 @@ class CausalSelfAttention(nn.Module):
         if v1 is None:
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
-        cos, sin = self.rotary(q)
         q, k = norm(q), norm(k) # QK norm suggested by @Grad62304977
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
