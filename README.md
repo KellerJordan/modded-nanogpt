@@ -79,7 +79,7 @@ The following is the progression of world records for the task of *training a mo
 13 | 4.66 minutes | Attention window warmup | 11/24/24 | [log](./records/112424_WindowWarmup/cf9e4571-c5fc-4323-abf3-a98d862ec6c8.txt) | @fernbear.bsky.social
 
 Notes:
-* For the llm.c baseline: The 90 minute time is on 8xA100; it's 45 minutes on 8xH100. This baseline is essentially a hardware-optimized GPT-2 (small) replication using better training data.
+* For the llm.c baseline: The 90 minute time is on 8xA100; it's 45 minutes on 8xH100. This baseline is essentially a hardware-optimized GPT-2-small replication using better training data.
 * All runs before 11/19/24 can be run with PyTorch 2.5.1 or below.
 * Runs including and after 11/19/24 require PyTorch 2.6.0 (nightly) to use FlexAttention.
 * For more details on methods & authorship, see the linked post associated with each record.
