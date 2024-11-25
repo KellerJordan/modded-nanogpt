@@ -7,7 +7,7 @@ Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains
 
 It uses the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
-* New optimizer: Muon - Momentum Orthogonalized by Newton-schulz.
+* New optimizer: [Muon - Momentum Orthogonalized by Newton-schulz](https://github.com/KellerJordan/Muon).
 * Untied head from embedding.
 * Projection and classification layers initialized to zero (muP-like).
 * Architectural shortcuts: value residual and embedding shortcut (partially following https://arxiv.org/abs/2410.17897).
@@ -33,6 +33,8 @@ python data/cached_fineweb10B.py 10 # downloads only the first 1.0B training tok
 
 The result will be a transformer with 124M active parameters trained for 1750 steps on 0.9B tokens of Fineweb [1], achieving ~3.278 mean validation loss (w/ up to 0.005 inter-run stddev).
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
+
+**Note: torch.compile will take a while on the first run.**
 
 ## Running it on fewer GPUs or with less memory
 
@@ -70,7 +72,7 @@ The following is the progression of world records for the task of *training a mo
 9. [8.2 minutes: Shortcuts & tweaks](https://x.com/kellerjordan0/status/1854296101303800108) (11/06/24) [[reproducible log](./records/110624_ShortcutsTweaks/dd7304a6-cc43-4d5e-adb8-c070111464a1.txt)]
 11. [7.8 minutes: Bfloat16 activations](https://x.com/kellerjordan0/status/1855267054774865980) (11/08/24) [[reproducible log](./records/110824_CastBf16/a833bed8-2fa8-4cfe-af05-58c1cc48bc30.txt)]
 12. [7.23 minutes: U-net & 2x lr](https://x.com/kellerjordan0/status/1856053121103093922) (11/10/24) [[reproducible log](./records/111024_UNetDoubleLr/c87bb826-797b-4f37-98c7-d3a5dad2de74.txt)]
-13. [5.03 minutes: FlexAttention](https://x.com/kellerjordan0/status/1859331370268623321) (11/19/24) [[reproducible log](./records/111924_FlexAttention/8384493d-dba9-4991-b16b-8696953f5e6d.txt)] (requires PyTorch 2.6.0)
+13. [5.03 minutes: FlexAttention](https://x.com/kellerjordan0/status/1859331370268623321) (11/19/24) [[reproducible log](./records/111924_FlexAttention/8384493d-dba9-4991-b16b-8696953f5e6d.txt)] (requires PyTorch 2.6.0 (nightly))
 14. [4.66 minutes: Window Warmup]() (11/24/24) [[reproducible log](./records/112424_WindowWarmup/cf9e4571-c5fc-4323-abf3-a98d862ec6c8.txt)]
 
 Please see the X threads for the contributors to each record.
@@ -101,7 +103,7 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 
 ### Speedrun rules
 
-1. Must not modify the train or validation data pipelines. (Except to change batch size & seqlen. I.e., just don't change the order of the tokens.)
+1. Must not modify the train or validation data pipelines. (Except to change batch size, seqlen, attention structure etc. I.e., just don't change the order of the tokens.)
 2. Must use ≤ 124M active parameters per token. (So MoE is OK, and the untied embedding matrix only contributes hidden_dim active params.)
 3. Must attain ≤ 3.28 val loss. (A tasteful number would be 3.278, so that the gap exceeds the inter-run variance.)
 
