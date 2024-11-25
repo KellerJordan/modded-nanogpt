@@ -546,15 +546,18 @@ for step in range(args.num_iterations + 1):
             with model.no_sync(): # there's no need to sync gradients every accumulation step
                 # forward pass
                 loss = model(x, y, attn_blocksize=attn_blocksize)
+                # advance the dataset for the next batch
+                x, y = train_loader.next_batch()
                 # backward pass
                 loss.backward()
         else: # just sync on the last step
             # forward pass
-            loss = model(x, y, attn_blocksize=attn_blocksize)           
+            loss = model(x, y, attn_blocksize=attn_blocksize)      
+            # advance the dataset for the next batch
+            x, y = train_loader.next_batch()     
             # backward pass
             loss.backward()
         train_loss = loss.detach()
-        x, y = train_loader.next_batch()  
     for p in model.parameters():
         p.grad /= train_accumulation_steps
     # momentum warmup for Muon
