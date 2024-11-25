@@ -187,6 +187,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, v1, block_mask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
+        assert B == 1, "Must use batch size = 1 for FlexAttention"
         q = self.c_q(x).view(B, T, self.n_head, -1)
         k = self.c_k(x).view(B, T, self.n_head, -1)
         v = self.c_v(x).view(B, T, self.n_head, -1)
