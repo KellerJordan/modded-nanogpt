@@ -62,8 +62,8 @@ sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt sh 
 
 The following is the progression of world records for the task of *training a model with 124M active parameters to 3.28 validation loss on FineWeb in the minimal amount of time on an 8xH100 machine.*
 
-Record time | Description | Date | Log | Contributors
-- | - | - | - | -
+| Record time | Description | Date | Log | Contributors |
+| - | - | - | - | - |
 45 minutes | [llm.c baseline](https://github.com/karpathy/llm.c/discussions/481) | 05/28/24 | [log](./records/101324_llmc/main.log) | @karpathy, llm.c contributors
 31.4 minutes | [Architectural modernizations & tuned learning rate](https://x.com/kellerjordan0/status/1798863559243513937) | 06/06/24 | [log](./records/060624_AdamW/f66d43d7-e449-4029-8adf-e8537bab49ea.log) | @kellerjordan0
 24.9 minutes | [Introduced the Muon optimizer](https://x.com/kellerjordan0/status/1842300916864844014) | 10/04/24 | none | @kellerjordan0, @jxbz
