@@ -5,6 +5,7 @@ with open(sys.argv[0]) as f:
 import uuid
 import glob
 import time
+import contextlib
 from dataclasses import dataclass
 
 import numpy as np
@@ -317,10 +318,9 @@ def _load_data_shard(filename):
     return tokens
 
 class DistributedDataLoader:
-    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+    def __init__(self, filename_pattern, T, process_rank, num_processes):
         self.process_rank = process_rank
         self.num_processes = num_processes
-        self.B = B
         self.T = T
 
         # glob files that match the pattern
@@ -331,7 +331,7 @@ class DistributedDataLoader:
         ntok_total = 0
         for fname in self.files:
             shard_ntok = _peek_data_shard(fname)
-            assert shard_ntok >= num_processes * B * T + 1
+            assert shard_ntok >= num_processes * T + 1
             ntok_total += int(shard_ntok)
         self.ntok_total = ntok_total
 
@@ -343,12 +343,12 @@ class DistributedDataLoader:
 
     def advance(self): # advance to next data shard
         self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.B * self.T
+        self.current_position = self.process_rank * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
 
     def next_batch(self):
-        batch_size = self.B * self.T * self.num_processes
-        buf = self.tokens[self.current_position:self.current_position+self.B*self.T+1]
+        batch_size = self.T * self.num_processes
+        buf = self.tokens[self.current_position:self.current_position+self.T+1]
         buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
         x = buf[:-1] # inputs
         y = buf[1:] # targets
@@ -368,7 +368,6 @@ class Hyperparameters:
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
-    device_batch_size : int = 1 # batch size, in sequences, per device
     sequence_length : int = 64*1024 # sequence length, in tokens
     num_iterations : int = 1750 # number of iterations to run
     warmup_iters : int = 0
@@ -419,17 +418,17 @@ print0(f'{result.stdout}', logonly=True)
 print0('='*100, logonly=True)
 
 # convenience variables
-B, T = args.device_batch_size, args.sequence_length
+T = args.sequence_length
 # calculate the number of steps to take in the val loop.
-assert args.val_tokens % (B * T * ddp_world_size) == 0
-val_steps = args.val_tokens // (B * T * ddp_world_size)
+assert args.val_tokens % (T * ddp_world_size) == 0
+val_steps = args.val_tokens // (T * ddp_world_size)
 # calculate the steps of gradient accumulation required to attain the desired global batch size.
-assert args.batch_size % (B * ddp_world_size) == 0
-train_accumulation_steps = args.batch_size // (B * ddp_world_size)
+assert args.batch_size % (ddp_world_size) == 0
+train_accumulation_steps = args.batch_size // ddp_world_size
 
 # load tokens
-train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+train_loader = DistributedDataLoader(args.input_bin, T, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(args.input_val_bin, T, ddp_rank, ddp_world_size)
 print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
 print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 print0('='*100, logonly=True)
@@ -542,19 +541,12 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     for i in range(1, train_accumulation_steps+1):
-        if i < train_accumulation_steps:
-            with model.no_sync(): # there's no need to sync gradients every accumulation step
-                # forward pass
-                loss = model(x, y, attn_blocksize=attn_blocksize)
-                # advance the dataset for the next batch
-                x, y = train_loader.next_batch()
-                # backward pass
-                loss.backward()
-        else: # just sync on the last step
+        ctx = model.no_sync() if i < train_accumulation_steps else contextlib.nullcontext()
+        with ctx: # there's no need to sync gradients every accumulation step
             # forward pass
-            loss = model(x, y, attn_blocksize=attn_blocksize)      
+            loss = model(x, y, attn_blocksize=attn_blocksize)
             # advance the dataset for the next batch
-            x, y = train_loader.next_batch()     
+            x, y = train_loader.next_batch()
             # backward pass
             loss.backward()
         train_loss = loss.detach()
