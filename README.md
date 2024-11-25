@@ -76,7 +76,7 @@ The following is the progression of world records for the task of *training a mo
 10 | 7.8 minutes | [Bfloat16 activations](https://x.com/kellerjordan0/status/1855267054774865980) | 11/08/24 | [log](./records/110824_CastBf16/a833bed8-2fa8-4cfe-af05-58c1cc48bc30.txt) | @kellerjordan0
 11 | 7.2 minutes | [U-net & 2x lr](https://x.com/kellerjordan0/status/1856053121103093922) | 11/10/24 | [log](./records/111024_UNetDoubleLr/c87bb826-797b-4f37-98c7-d3a5dad2de74.txt) | @brendanh0gan
 12 | 5.03 minutes | [FlexAttention](https://x.com/kellerjordan0/status/1859331370268623321) | 11/19/24 | [log](./records/111924_FlexAttention/8384493d-dba9-4991-b16b-8696953f5e6d.txt) | @KoszarskyB
-13 | 4.66 minutes | Attention window warmup | 11/24/24 | [log](./records/112424_WindowWarmup/cf9e4571-c5fc-4323-abf3-a98d862ec6c8.txt) | @fernbear.bsky.social
+13 | 4.66 minutes | [Attention window warmup](https://x.com/hi_tysam/status/1860851011797053450) | 11/24/24 | [log](./records/112424_WindowWarmup/cf9e4571-c5fc-4323-abf3-a98d862ec6c8.txt) | @fernbear.bsky.social
 
 Notes:
 * For the llm.c baseline: The 90 minute time is on 8xA100; it's 45 minutes on 8xH100. This baseline is essentially a hardware-optimized GPT-2-small replication using better training data.
