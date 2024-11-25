@@ -126,6 +126,9 @@ class Muon(torch.optim.Optimizer):
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),))
+
 class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
@@ -156,9 +159,6 @@ def apply_rotary_emb(x, cos, sin):
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).type_as(x)
-
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
 
 class CastedLinear(nn.Linear):
     def forward(self, x):
