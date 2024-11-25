@@ -157,6 +157,9 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).type_as(x)
 
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),))
+
 class CastedLinear(nn.Linear):
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
@@ -187,7 +190,7 @@ class CausalSelfAttention(nn.Module):
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
         cos, sin = self.rotary(q)
-        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
+        q, k = norm(q), norm(k) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
@@ -218,9 +221,9 @@ class Block(nn.Module):
 
     def forward(self, x, v1, x0, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1, block_mask)
+        x1, v1 = self.attn(norm(x), v1, block_mask)
         x = x + x1
-        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
+        x = x + self.mlp(norm(x))
         return x, v1
 
 # -----------------------------------------------------------------------------
@@ -265,7 +268,7 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
-        x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
+        x = norm(x) # @Grad62304977
         x0 = x
         v1 = None
 
@@ -280,7 +283,7 @@ class GPT(nn.Module):
             x = x + self.skip_weights[i] * skip_connections.pop()
             x, v1 = self.transformer.h[self.num_encoder_layers + i](x, v1, x0, block_mask)
 
-        x = F.rms_norm(x, (x.size(-1),))
+        x = norm(x)
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
