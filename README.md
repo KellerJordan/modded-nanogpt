@@ -80,8 +80,7 @@ The following is the progression of world records for the task of *training a mo
 
 Notes:
 * For the llm.c baseline: The 90 minute time is on 8xA100; it's 45 minutes on 8xH100. This baseline is essentially a hardware-optimized GPT-2-small replication using better training data.
-* All runs before 11/19/24 can be run with PyTorch 2.5.1 or below.
-* Runs including and after 11/19/24 require PyTorch 2.6.0 (nightly) to use FlexAttention.
+* All runs before 11/19/24 can be run with PyTorch 2.5.1 or below. Runs including and after 11/19/24 require PyTorch 2.6.0 (nightly) to use FlexAttention.
 * For more details on methods & authorship, see the linked post associated with each record.
 
 <!--Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
