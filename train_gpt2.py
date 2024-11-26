@@ -204,8 +204,8 @@ class MLP(nn.Module):
 
     def __init__(self, dim):
         super().__init__()
-        self.c_fc    = CastedLinear(dim, 4 * dim)
-        self.c_proj  = CastedLinear(4 * dim, dim)
+        self.c_fc   = CastedLinear(dim, 4 * dim)
+        self.c_proj = CastedLinear(4 * dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
