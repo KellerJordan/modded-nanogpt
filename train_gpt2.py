@@ -406,7 +406,6 @@ if master_process:
     # create the log file
     with open(logfile, "w") as f:
         # begin the log by printing this file (the Python code)
-        f.write('='*100 + '\n')
         f.write(code)
         f.write('='*100 + '\n')
 def print0(s, logonly=False):
