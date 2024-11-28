@@ -22,7 +22,7 @@ def annotated_zeropower_via_newtonschulz5(G, steps=10, eps=1e-12):
     # a, b, c = (3.4445, -4.7750,  2.0315)
     a, b, c = (2.37, -2.028, 0.706)
     X = G
-    X = X / (X.norm() + eps) # ensure top singular value <= 1
+    X = X / (X.norm() + eps) * 1.2 # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
     singular_values_over_iters = []
