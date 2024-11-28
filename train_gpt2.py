@@ -16,6 +16,7 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import wandb
+import svd_utils
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -36,7 +37,8 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
     assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750,  2.0315)
+    # a, b, c = (3.4445, -4.7750,  2.0315)
+    a, b, c = (2.37, -2.028, 0.706)
     X = G.bfloat16()
     X /= (X.norm() + eps) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
@@ -356,6 +358,10 @@ class Hyperparameters:
     val_loss_every : int = 5 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+
+    log_singular_values : bool = True
+    newton_schulz_iters : int = 5
+
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -504,6 +510,12 @@ for step in range(args.num_iterations + 1):
                 "minibatch_idx": step,
                 "train_time_ms": training_time_ms,
             }, step=step)
+        if args.log_singular_values:
+            singular_values_df = svd_utils.get_singular_values(matrix_params, args.newton_schulz_iters)
+            gif_path = svd_utils.animate_singular_values(singular_values_df, interval=200, bins=30)
+            wandb.log({
+                "singular_values_distribution": wandb.Video(gif_path)
+            })
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -566,13 +578,15 @@ if master_process:
 # clean up nice
 dist.destroy_process_group()
 
-if __name__ == "__main__":
-    if ddp_rank == 0:  # Only create sweep on master process
-        sweep_configuration = {
-            'method': 'grid',
-            'parameters': {
-                'muon_lr': {'values': [0.01, 0.02]}
-            }
-        }
-        sweep_id = wandb.sweep(sweep_configuration, project="nanogpt")
-        wandb.agent(sweep_id, function=lambda: None, count=5)
+
+# UNCOMMENT TO RUN SWEEP
+# if __name__ == "__main__":
+#     if ddp_rank == 0:  # Only create sweep on master process
+#         sweep_configuration = {
+#             'method': 'grid',
+#             'parameters': {
+#                 'muon_lr': {'values': [0.01, 0.02]}
+#             }
+#         }
+#         sweep_id = wandb.sweep(sweep_configuration, project="nanogpt")
+#         wandb.agent(sweep_id, function=lambda: None, count=5)
