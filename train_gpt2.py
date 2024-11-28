@@ -15,6 +15,9 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+import wandb
+import svd_utils
+
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
@@ -34,7 +37,8 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
     assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750,  2.0315)
+    # a, b, c = (3.4445, -4.7750,  2.0315)
+    a, b, c = (2.37, -2.028, 0.706)
     X = G.bfloat16()
     X /= (X.norm() + eps) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
@@ -342,17 +346,22 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 64 # batch size, in sequences, per device
+    batch_size : int = 8*32 # batch size, in sequences, across all devices
+    device_batch_size : int = 32 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 3242 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 926 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
+    muon_lr : float = 0.01
     # evaluation and logging hyperparams
-    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every : int = 5 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+
+    log_singular_values : bool = True
+    newton_schulz_iters : int = 5
+
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -369,6 +378,10 @@ master_process = (ddp_rank == 0) # this process will do logging, checkpointing e
 # begin logging
 logfile = None
 if master_process:
+    run = wandb.init(project="nanogpt", config=args.__dict__, reinit=True)
+    for k in wandb.config:
+        setattr(args, k, wandb.config[k])
+
     run_id = str(uuid.uuid4())
     logdir = 'logs/%s/' % run_id
     os.makedirs(logdir, exist_ok=True)
@@ -438,7 +451,7 @@ optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, beta
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2]
-optimizer3 = Muon(matrix_params, lr=0.02, momentum=0.95)
+optimizer3 = Muon(matrix_params, lr=args.muon_lr, momentum=0.95)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)
@@ -490,6 +503,19 @@ for step in range(args.num_iterations + 1):
         val_loss /= val_steps
         # log val loss to console and to logfile
         print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+        # log to wandb
+        if master_process:
+            wandb.log({
+                "val_loss": val_loss,
+                "minibatch_idx": step,
+                "train_time_ms": training_time_ms,
+            }, step=step)
+        if args.log_singular_values:
+            singular_values_df = svd_utils.get_singular_values(matrix_params, args.newton_schulz_iters)
+            gif_path = svd_utils.animate_singular_values(singular_values_df, interval=200, bins=30)
+            wandb.log({
+                "singular_values_distribution": wandb.Video(gif_path)
+            })
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -546,7 +572,21 @@ for step in range(args.num_iterations + 1):
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    wandb.finish()
 
 # -------------------------------------------------------------------------
 # clean up nice
 dist.destroy_process_group()
+
+
+# UNCOMMENT TO RUN SWEEP
+# if __name__ == "__main__":
+#     if ddp_rank == 0:  # Only create sweep on master process
+#         sweep_configuration = {
+#             'method': 'grid',
+#             'parameters': {
+#                 'muon_lr': {'values': [0.01, 0.02]}
+#             }
+#         }
+#         sweep_id = wandb.sweep(sweep_configuration, project="nanogpt")
+#         wandb.agent(sweep_id, function=lambda: None, count=5)
