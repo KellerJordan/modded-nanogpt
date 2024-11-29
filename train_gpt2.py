@@ -7,6 +7,7 @@ import glob
 import time
 import contextlib
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import torch
@@ -168,7 +169,7 @@ class Rotary(torch.nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, dim, n_head):
+    def __init__(self, dim, n_head, flex_kernel_options=None):
         super().__init__()
         assert dim % n_head == 0
         self.n_head = n_head
@@ -182,6 +183,8 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        # flex_attention kernel_options
+        self.flex_kernel_options = flex_kernel_options
 
     def forward(self, x, v1, block_mask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -194,7 +197,13 @@ class CausalSelfAttention(nn.Module):
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
         q, k = norm(q), norm(k) # QK norm suggested by @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
+        y = flex_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            block_mask=block_mask,
+            kernel_options=self.flex_kernel_options
+        )
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y, v1
@@ -217,7 +226,7 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.attn = CausalSelfAttention(config.n_embd, config.n_head)
+        self.attn = CausalSelfAttention(config.n_embd, config.n_head, config.flex_kernel_options)
         self.mlp = MLP(config.n_embd)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
@@ -233,10 +242,14 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
+    # there are only 50257 unique GPT-2 tokens; we extend to nearest
+    # multiple of 128 for efficiency. suggested to me by @Grad62304977.
+    # this originates from Karpathy's experiments.
     vocab_size : int = 50304
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
+    flex_kernel_options: Optional[dict] = None
 
 class GPT(nn.Module):
 
@@ -382,7 +395,19 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-args = Hyperparameters()
+
+if len(sys.argv) > 1 and sys.argv[1] == "1x4090":
+    args = Hyperparameters(batch_size=16, sequence_length=32*1024)  # set to4090
+    model_config = GPTConfig(
+        flex_kernel_options={
+            "BLOCK_M": 64, "BLOCK_N": 64,  # forward
+            "BLOCK_M1": 32, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 32  # backwards
+        }
+    )
+
+else:
+    args = Hyperparameters()  # default 8xH100
+    model_config = GPTConfig()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
@@ -438,10 +463,7 @@ print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} 
 print0('='*100, logonly=True)
 x, y = train_loader.next_batch()
 
-# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
-# this originates from Karpathy's experiments.
-num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+model = GPT(model_config)
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):

@@ -40,6 +40,7 @@ For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss 
 ## Running it on fewer GPUs or with less memory
 
 * To run on fewer GPUs, just modify `run.sh` to have a different `--nproc_per_node`.
+  * RTX 4090 (and 3090) runs are officially supported out of the box via `torchrun --standalone --nproc_per_node=1 train_gpt2.py 1x4090`. This serve as a less expensive (but slower) experimentation utility.
 * If you're running out of memory, then go into `train_gpt2.py` and scale down the `device_batch_size` to either 16 or 32. (Update 11/19/24: Actually this is impossible now since we're using 64K seqlen with FlexAttention)
 
 Both of these changes will have no effect on the training - you should get the exact same loss curve as the most recent record, because the training code
