@@ -16,7 +16,8 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import wandb
-import svd_utils
+import research_experimentation_utils.svd_utils as svd_utils
+import research_experimentation_utils.serialization_utils as serialization_utils
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -355,12 +356,13 @@ class Hyperparameters:
     weight_decay : float = 0
     muon_lr : float = 0.01
     # evaluation and logging hyperparams
-    val_loss_every : int = 5 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 
     log_singular_values : bool = True
     newton_schulz_iters : int = 5
+    serialize_checkpoints: bool = True
 
 args = Hyperparameters()
 
@@ -516,6 +518,9 @@ for step in range(args.num_iterations + 1):
             wandb.log({
                 "singular_values_distribution": wandb.Video(gif_path)
             })
+        if args.serialize_checkpoints:
+            checkpoint_path = f'logs/{run_id}/checkpoint_step{step}.pkl'
+            serialization_utils.serialize_matrix_params(model, checkpoint_path)
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
