@@ -143,7 +143,6 @@ class Rotary(torch.nn.Module):
         super().__init__()
         self.dim = dim
         self.base = base
-        self.inv_freq = None
         self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
@@ -151,10 +150,10 @@ class Rotary(torch.nn.Module):
     def forward(self, x):
         seq_len = x.shape[1]
         if seq_len != self.seq_len_cached:
-            self.inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=x.device).float() / self.dim))
+            inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=x.device).float() / self.dim))
             self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.outer(t, self.inv_freq)
+            t = torch.arange(seq_len, device=x.device).type_as(inv_freq)
+            freqs = torch.outer(t, inv_freq)
             self.cos_cached = freqs.cos().bfloat16()
             self.sin_cached = freqs.sin().bfloat16()
         cos, sin = self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
