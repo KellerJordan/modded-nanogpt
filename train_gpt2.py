@@ -106,8 +106,7 @@ class Muon(torch.optim.Optimizer):
                         state['momentum_buffer'] = torch.zeros_like(g)
                     buf = state['momentum_buffer']
                     buf.mul_(momentum).add_(g)
-                    if group['nesterov']:
-                        g = g.add(buf, alpha=momentum)
+                    g = g.add(buf, alpha=momentum) if group['nesterov'] else buf
                     g = zeropower_backend(g, steps=group['backend_steps'])
                     g *= max(1, g.size(0)/g.size(1))**0.5
                     updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
