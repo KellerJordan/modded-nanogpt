@@ -160,7 +160,7 @@ class Rotary(torch.nn.Module):
         x1, x2 = x.chunk(2, dim=3)
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
-        return torch.cat((y1, y2), 3)
+        return torch.cat((y1, y2), 3).type_as(x)
 
 class CausalSelfAttention(nn.Module):
 
