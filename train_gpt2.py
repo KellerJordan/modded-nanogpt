@@ -157,10 +157,7 @@ class Rotary(torch.nn.Module):
             self.sin_cached = freqs.sin().bfloat16()
         cos, sin = self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
         # apply_rotary_emb(x, cos, sin)
-        assert x.ndim == 4 # multihead attention
-        d = x.shape[3]//2
-        x1 = x[..., :d]
-        x2 = x[..., d:]
+        x1, x2 = x.chunk(2, dim=3)
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat([y1, y2], 3).type_as(x)
