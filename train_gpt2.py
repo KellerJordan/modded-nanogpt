@@ -140,7 +140,7 @@ class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
         super().__init__()
-        self.inv_freq = (1 / base) ** (torch.arange(0, dim, 2, device=x.device) / dim)
+        self.register_buffer('inv_freq', (1 / base) ** (torch.arange(0, dim, 2) / dim))
         self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
