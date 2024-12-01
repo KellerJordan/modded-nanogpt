@@ -149,18 +149,18 @@ class Rotary(torch.nn.Module):
     def forward(self, x):
         seq_len = x.shape[1]
         if seq_len != self.seq_len_cached:
-            inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=x.device).float() / self.dim))
-            self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(inv_freq)
+            inv_freq = (1 / self.base) ** (torch.arange(0, self.dim, 2, device=x.device) / self.dim)
+            t = torch.arange(seq_len, device=x.device)
             freqs = torch.outer(t, inv_freq)
-            self.cos_cached = freqs.cos().bfloat16()
-            self.sin_cached = freqs.sin().bfloat16()
+            self.seq_len_cached = seq_len
+            self.cos_cached = freqs.cos()
+            self.sin_cached = freqs.sin()
         cos, sin = self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
         # apply_rotary_emb(x, cos, sin)
         x1, x2 = x.chunk(2, dim=3)
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
-        return torch.cat([y1, y2], 3).type_as(x)
+        return torch.cat((y1, y2), 3)
 
 class CausalSelfAttention(nn.Module):
 
