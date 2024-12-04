@@ -409,8 +409,6 @@ class Hyperparameters:
 
 
 def train(model_config: GPTConfig, args: Hyperparameters):
-    print(model_config)
-    print(args)
     # set up DDP (distributed data parallel). torchrun sets this env variable
     assert torch.cuda.is_available()
     dist.init_process_group(backend='nccl')
@@ -447,6 +445,8 @@ def train(model_config: GPTConfig, args: Hyperparameters):
     result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     print0(f'{result.stdout}', logonly=True)
     print0('='*100, logonly=True)
+    print0(model_config)
+    print0(args)
 
     # convenience variables
     T = args.sequence_length
