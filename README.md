@@ -37,14 +37,39 @@ For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss 
 
 **Note: torch.compile will take a while on the first run.**
 
-## Running it on fewer GPUs or with less memory
+## Consumer Hardware, and Training / Model Configuration
 
-* To run on fewer GPUs, just modify `run.sh` to have a different `--nproc_per_node`.
-  * RTX 4090 (and 3090) runs are officially supported out of the box via `torchrun --standalone --nproc_per_node=1 train_gpt2.py 1x4090`. This serve as a less expensive (but slower) experimentation utility.
-* If you're running out of memory, then go into `train_gpt2.py` and scale down the `device_batch_size` to either 16 or 32. (Update 11/19/24: Actually this is impossible now since we're using 64K seqlen with FlexAttention)
 
-Both of these changes will have no effect on the training - you should get the exact same loss curve as the most recent record, because the training code
-will automatically adjust the gradient accumulation in order to have the same total batch size.
+#### Adjusting GPU Count
+
+To run the training script on fewer GPUs, modify the `nproc_per_node` parameter in the command. For example, to use 2 GPUs:
+
+```
+torchrun --standalone --nproc_per_node=2
+```
+
+#### Running on Consumer Hardware (e.g., RTX 4090/3090)
+
+
+For consumer GPUs like the RTX 4090 or 3090, enable `gpt.flex_kernel_consumer` to automatically configure the models `flex_attention` kernel config for these devices. Additionally:
+- **Sequence Length:** Halve from `2**16` (65,536) to `2**15` (32,768) to accommodate lower memory.
+- **Batch size:** Double the gradient accumulation batch size to 32 to maintain the effective batch size.
+
+Example configuration for 4x4090 or 4x3090:
+
+```
+torchrun --standalone --nproc_per_node=4 train_gpt2.py \
+    --gpt.flex_kernel_consumer True --train.sequence_length 32768 --train.batch_size 32
+```
+
+#### Customizing Model Architecture
+
+You can experiment with model architecture parameters without changing the code, for example
+
+```
+torchrun --standalone --nproc_per_node=4 train_gpt2.py \
+    --gpt.n_layer 24 --gpt.n_head 15 --gpt.n_embd 960 --gpt.n_intermediate 2560
+```
 
 ## Running with Docker
 
