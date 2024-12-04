@@ -477,7 +477,7 @@ total_params = sum(p.numel() for p in model.parameters())
 wte_params = model.transformer.wte.weight.numel()
 vte_params = model.transformer.vte.weight.numel()
 total_params = total_params - (wte_params + vte_params) + (768 + 12*768)
-print(f"Total parameters: {total_params:,}")
+print0(f"Total parameters: {total_params:,}")
 
 for m in model.modules():
     if isinstance(m, CastedLinear):
