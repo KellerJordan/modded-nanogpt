@@ -222,8 +222,8 @@ class Block(nn.Module):
         self.norm1_scale = nn.Parameter(torch.ones(1))
         self.norm2_scale = nn.Parameter(torch.ones(1))
 
-        self.alpha1 = nn.Parameter(torch.tensor([.1])
-        self.alpha2 = nn.Parameter(torch.tensor([.1])
+        self.alpha1 = nn.Parameter(torch.tensor([.1]))
+        self.alpha2 = nn.Parameter(torch.tensor([.1]))
         self.alpha3 = nn.Parameter(torch.ones(1))
 
     def forward(self, x, vi, x0, block_mask):
