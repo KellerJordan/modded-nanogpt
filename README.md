@@ -53,13 +53,13 @@ torchrun --standalone --nproc_per_node=2
 
 For consumer GPUs like the RTX 4090 or 3090, enable `gpt.flex_kernel_consumer` to automatically configure the models `flex_attention` kernel config for these devices. Additionally:
 - **Sequence Length:** Halve from `2**16` (65,536) to `2**15` (32,768) to accommodate lower memory.
-- **Batch size:** Double the gradient accumulation batch size to 32 to maintain the effective batch size.
+- **Batch size:** Double the gradient accumulation batch size to 16 to maintain the effective batch size.
 
 Example configuration for 4x4090 or 4x3090:
 
 ```
 torchrun --standalone --nproc_per_node=4 train_gpt2.py \
-    --gpt.flex_kernel_consumer True --train.sequence_length 32768 --train.batch_size 32
+    --gpt.flex_kernel_consumer True --train.sequence_length 32768 --train.batch_size 16
 ```
 
 #### Customizing Model Architecture
