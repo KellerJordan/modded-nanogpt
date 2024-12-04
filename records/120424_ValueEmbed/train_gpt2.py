@@ -218,6 +218,7 @@ class Block(nn.Module):
         self.mlp = MLP(config.n_embd)
 
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+
         # Add learnable scales for RMS norm
         self.norm1_scale = nn.Parameter(torch.ones(1))
         self.norm2_scale = nn.Parameter(torch.ones(1))
@@ -271,7 +272,7 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
-        self.lm_head.weight.data.zero_()
+        self.lm_head.weight.data.zero_() # @Grad62304977
 
         # Add learnable scales for RMS norm
         self.norm1_scale = nn.Parameter(torch.ones(1))
