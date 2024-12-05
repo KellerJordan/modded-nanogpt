@@ -138,7 +138,7 @@ class CastedLinear(nn.Linear):
 
 class Rotary(torch.nn.Module):
 
-    def __init__(self, dim, base=15000):
+    def __init__(self, dim, base=10000):
         super().__init__()
         self.register_buffer('inv_freq', (1 / base) ** (torch.arange(0, dim, 2) / dim))
         self.seq_len_cached = None
@@ -170,15 +170,12 @@ class CausalSelfAttention(nn.Module):
         self.c_k = CastedLinear(dim, dim)
         self.c_v = CastedLinear(dim, dim)
         # value residual lambda
-        self.lamb_v = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
+        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
         # rotary embeddings
         self.rotary = Rotary(dim // n_head) # dim // n_head = head_dim
         # output projection
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
-        # Add learnable scales for RMS norm
-        self.norm_q_scale = nn.Parameter(torch.ones(1))
-        self.norm_k_scale = nn.Parameter(torch.ones(1))
 
     def forward(self, x, vi, block_mask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -186,9 +183,8 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).view(B, T, self.n_head, -1)
         k = self.c_k(x).view(B, T, self.n_head, -1)
         v = self.c_v(x).view(B, T, self.n_head, -1)
-        v = (1 - self.lamb_v) * v + self.lamb_v * vi.view_as(v) # @Grad62304977
-        q = self.norm_q_scale * norm(q) # QK norm with learnable scale
-        k = self.norm_k_scale * norm(k) # QK norm with learnable scale
+        v = (1 - self.lamb) * v + self.lamb * vi.view_as(v) # @Grad62304977
+        q, k = norm(q), norm(k) # QK norm suggested by @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
@@ -213,35 +209,14 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-
         self.attn = CausalSelfAttention(config.n_embd, config.n_head)
         self.mlp = MLP(config.n_embd)
-
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-        # Add learnable scales for RMS norm
-        self.norm1_scale = nn.Parameter(torch.ones(1))
-        self.norm2_scale = nn.Parameter(torch.ones(1))
-
-        self.alpha1 = nn.Parameter(torch.tensor([.1]))
-        self.alpha2 = nn.Parameter(torch.tensor([.1]))
-        self.alpha3 = nn.Parameter(torch.ones(1))
-
     def forward(self, x, vi, x0, block_mask):
-
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-
-        # Compute attention with dual normalization path
-        x_norm = self.norm1_scale * norm(x)
-        attn_output = self.attn(x_norm, vi, block_mask)
-        # Combine paths with learned scaling
-        x = x + self.alpha1 * attn_output + self.alpha2 * norm(attn_output)
-
-        # Same for MLP
-        x_norm = self.norm2_scale * norm(x)
-        mlp_output = self.mlp(x_norm)
-        x = x + self.alpha3 * mlp_output
-
+        x = x + self.attn(norm(x), vi, block_mask)
+        x = x + self.mlp(norm(x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -274,12 +249,6 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-        # Add learnable scales for RMS norm
-        self.norm1_scale = nn.Parameter(torch.ones(1))
-        self.norm2_scale = nn.Parameter(torch.ones(1))
-
-        self.register_buffer('noise_scale', torch.tensor(0.1))
-
     def forward(self, idx, target, attn_blocksize):
 
         docs = (idx == 50256).cumsum(0)
@@ -294,12 +263,7 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
-
-        if self.training:
-            noise = torch.randn_like(x) * self.noise_scale
-            x = x + noise
-
-        x = self.norm1_scale * norm(x) # @Grad62304977
+        x = norm(x) # @Grad62304977
         x0 = x
         vi = self.transformer.vte(idx[None]).chunk(12, dim=-1)
 
@@ -314,7 +278,7 @@ class GPT(nn.Module):
             x = x + self.skip_weights[i] * skip_connections.pop()
             x = self.transformer.h[self.num_encoder_layers + i](x, vi[self.num_encoder_layers+i], x0, block_mask)
 
-        x = self.norm2_scale * norm(x)
+        x = norm(x)
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
@@ -403,9 +367,9 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     sequence_length : int = 64*1024 # sequence length, in tokens
-    num_iterations : int = 1440 # number of iterations to run
+    num_iterations : int = 1530 # number of iterations to run
     warmup_iters : int = 0
-    cooldown_iters : int = 560 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
+    cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -472,14 +436,6 @@ x, y = train_loader.next_batch()
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda().bfloat16()
-
-# Count parameters
-total_params = sum(p.numel() for p in model.parameters())
-wte_params = model.transformer.wte.weight.numel()
-vte_params = model.transformer.vte.weight.numel()
-total_params = total_params - (wte_params + vte_params) + (768 + 12*768)
-print0(f"Total parameters: {total_params:,}")
-
 for m in model.modules():
     if isinstance(m, CastedLinear):
         m.float()
@@ -495,7 +451,7 @@ optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight, raw_model.trans
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
-scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights, raw_model.norm1_scale, raw_model.norm2_scale]
+scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
 optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
@@ -532,15 +488,6 @@ for step in range(args.num_iterations + 1):
 
     # Set the attention blocksize for the current step, in chunks of 64. By @fernbear.bsky.social
     attn_blocksize = torch.tensor(64*((step/args.num_iterations * (1792 - 64) + 64)//64), dtype=torch.int, device='cuda')
-
-    # Update noise scale to follow triangular schedule
-    if step < args.num_iterations - args.cooldown_iters:
-        noise_scale = .01 # Maintain 0.1 until cooldown
-    else:
-        # During cooldown, linearly decrease from 0.1 to 0
-        cooldown_frac = (args.num_iterations - step) / args.cooldown_iters
-        noise_scale = .01 * cooldown_frac
-    raw_model.noise_scale.copy_(torch.tensor(noise_scale))
 
     # once in a while evaluate the validation dataset
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
@@ -596,9 +543,8 @@ for step in range(args.num_iterations + 1):
     for p in model.parameters():
         p.grad /= train_accumulation_steps
     # momentum warmup for Muon
-    frac = min(step/280, 1)
+    frac = min(step/300, 1)
     optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
-
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
