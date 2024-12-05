@@ -80,10 +80,14 @@ The following is the progression of world records for the task of *training a mo
 13 | 4.66 minutes | [Attention window warmup](https://x.com/hi_tysam/status/1860851011797053450) | 11/24/24 | [log](./records/112424_WindowWarmup/cf9e4571-c5fc-4323-abf3-a98d862ec6c8.txt) | @fernbear.bsky.social
 14 | 4.41 minutes | [Value Embeddings]() | 12/04/24 | [log](./records/120424_ValueEmbed) | @KoszarskyB
 
-Notes:
-* For the llm.c baseline: The 90 minute time is on 8xA100; it's 45 minutes on 8xH100. This baseline is essentially a hardware-optimized GPT-2-small replication using better training data.
-* All runs before 11/19/24 can be run with PyTorch 2.5.1 or below. Runs including and after 11/19/24 require PyTorch 2.6.0 (nightly) to use FlexAttention.
-* For more details on methods & authorship, see the linked post associated with each record.
+### Speedrun rules
+
+1. Must not modify the train or validation data pipelines. (Except to change batch size, seqlen, attention structure etc. I.e., just don't change the order of the tokens.)
+2. Must use ≤ 124M active parameters per token. (So MoE is OK, and the untied embedding matrix only contributes hidden_dim active params.)
+3. Must attain ≤ 3.28 val loss. (A tasteful number would be 3.278, so that the gap exceeds the inter-run variance.)
+4. Unfortunately, due to high inter-run variance, new record attempts must provide enough run logs to attain a statistical significance level of p<0.01 that their average val loss is lower than 3.28. You see see how to conduct a t-test [here](./records/120424_ValueEmbed).
+
+Other than that, go crazy! Anything is fair game
 
 <!--Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
 So it's no surprise that there is room to improve; as @karpathy has said, 'llm.c still has a lot of pending optimizations.'
@@ -109,13 +113,9 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 * [https://github.com/BlinkDL/modded-nanogpt-rwkv](https://github.com/BlinkDL/modded-nanogpt-rwkv)
 * [https://github.com/nikhilvyas/modded-nanogpt-SOAP](https://github.com/nikhilvyas/modded-nanogpt-SOAP)
 
-### Speedrun rules
-
-1. Must not modify the train or validation data pipelines. (Except to change batch size, seqlen, attention structure etc. I.e., just don't change the order of the tokens.)
-2. Must use ≤ 124M active parameters per token. (So MoE is OK, and the untied embedding matrix only contributes hidden_dim active params.)
-3. Must attain ≤ 3.28 val loss. (A tasteful number would be 3.278, so that the gap exceeds the inter-run variance.)
-
-Other than that, go crazy! Anything is fair game
+### Notes
+* For the llm.c baseline: The 90 minute time is on 8xA100; it's 45 minutes on 8xH100. This baseline is essentially a hardware-optimized GPT-2-small replication using better training data.
+* All runs before 11/19/24 can be run with PyTorch 2.5.1 or below. Runs including and after 11/19/24 require PyTorch 2.6.0 (nightly) to use FlexAttention.
 
 ---
 
