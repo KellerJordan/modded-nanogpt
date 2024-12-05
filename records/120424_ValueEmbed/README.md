@@ -17,7 +17,7 @@ print(torch.std_mean(torch.tensor(accs)))
 
 ## ChangeLog
 
-* Added 12 new embedding layers which get mixed into the value activations at each layer.
+* Added 12 new embedding layers which get mixed into the value activations at each layer. (=463M new parameters, of which 9216 are active per token)
 
 ## Contributors
 
