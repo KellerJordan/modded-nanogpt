@@ -40,7 +40,7 @@ For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss 
 
 ## Running it on fewer GPUs or with less memory
 
-* To run on fewer GPUs, just modify `run.sh` to have a different `--nproc_per_node`.
+* To run on fewer GPUs, just modify `run.sh` to have a different `--nproc_per_node`. (this does not change the expected behavior of the training)
 * If you're running out of memory, you may need to reduce the sequence length for FlexAttention (which does change the training. see [here](https://github.com/KellerJordan/modded-nanogpt/pull/38) for a guide)
 
 Both of these changes will have no effect on the training - you should get the exact same loss curve as the most recent record, because the training code
