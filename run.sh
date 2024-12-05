@@ -1,2 +1,1 @@
-torchrun --standalone --nproc_per_node=8 train_gpt2.py > logs.txt 2>&1
-# heyyy
+CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 train_gpt2_hyp.py > last_logs.txt 2>&1
