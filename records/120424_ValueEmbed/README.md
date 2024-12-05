@@ -1,3 +1,5 @@
+## Statistical tests
+
 ```
 accs = [3.2759, 3.2781, 3.2791, 3.2771, 3.2838, 3.2749, 3.2793, 3.279, 3.2794, 3.2744, 3.2751,
         3.2845, 3.2736, 3.2783, 3.2793, 3.2779, 3.2756, 3.281, 3.2803, 3.2766, 3.2851, 3.275,
@@ -12,4 +14,13 @@ import torch
 print(torch.std_mean(torch.tensor(accs)))
 # (tensor(0.0040), tensor(3.2777))
 ```
+
+## ChangeLog
+
+* Added 12 new embedding layers which get mixed into the value activations at each layer.
+
+## Contributors
+
+* @KoszarskyB
+
 
