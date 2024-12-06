@@ -352,7 +352,7 @@ class DistributedDataLoader:
         y = buf[1:] # targets
         # advance current position and load next shard if necessary
         self.current_position += batch_size
-        if self.current_position + batch_size >= len(self.tokens):
+        if self.current_position + batch_size + 1 >= len(self.tokens):
             self.advance()
         return x.cuda(), y.cuda()
 
@@ -474,7 +474,7 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
-t0 = time.time()
+t0 = time.perf_counter()
 # begin training
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
@@ -483,7 +483,7 @@ for step in range(args.num_iterations + 1):
     # steps with dummy data first, and then re-initialize the model and reset the loader.
     if step == 10:
         training_time_ms = 0
-        t0 = time.time()
+        t0 = time.perf_counter()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
     # Set the attention blocksize for the current step, in chunks of 64. By @fernbear.bsky.social
@@ -493,7 +493,7 @@ for step in range(args.num_iterations + 1):
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
         # stop the clock
         torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.time() - t0)
+        training_time_ms += 1000 * (time.perf_counter() - t0)
         # run validation batches
         model.eval()
         val_loader.reset()
@@ -508,18 +508,18 @@ for step in range(args.num_iterations + 1):
         print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
         # start the clock again
         torch.cuda.synchronize()
-        t0 = time.time()
+        t0 = time.perf_counter()
 
     if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
         # stop the clock
         torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.time() - t0)
+        training_time_ms += 1000 * (time.perf_counter() - t0)
         # save the state of the training process
         log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
         torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
         # start the clock again
         torch.cuda.synchronize()
-        t0 = time.time()
+        t0 = time.perf_counter()
 
     # bit confusing: we want to make sure to eval on 0th iteration
     # but also after the very last iteration. so we loop for step <= num_iterations
@@ -555,7 +555,7 @@ for step in range(args.num_iterations + 1):
     # everything that follows now is just diagnostics, prints, logging, etc.
 
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
-    approx_time = training_time_ms + 1000 * (time.time() - t0)
+    approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
 
 if master_process:
