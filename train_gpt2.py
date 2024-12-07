@@ -16,7 +16,7 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+from torch.nn.attention.flex_attention import BlockMask, flex_attention, create_block_mask
 flex_attention = torch.compile(flex_attention, dynamic=False)
 create_block_mask = torch.compile(create_block_mask, dynamic=False)
 
@@ -170,20 +170,20 @@ class CausalSelfAttention(nn.Module):
         self.c_k = CastedLinear(dim, dim)
         self.c_v = CastedLinear(dim, dim)
         # value residual lambda
-        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5])) # @Grad62304977
         # rotary embeddings
         self.rotary = Rotary(dim // n_head) # dim // n_head = head_dim
         # output projection
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
-    def forward(self, x, vi, block_mask):
+    def forward(self, x: torch.Tensor, vi: torch.Tensor, block_mask: BlockMask) -> torch.Tensor:
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q = self.c_q(x).view(B, T, self.n_head, -1)
-        k = self.c_k(x).view(B, T, self.n_head, -1)
-        v = self.c_v(x).view(B, T, self.n_head, -1)
-        v = (1 - self.lamb) * v + self.lamb * vi.view_as(v) # @Grad62304977
+        q: torch.Tensor = self.c_q(x).view(B, T, self.n_head, -1)
+        k: torch.Tensor = self.c_k(x).view(B, T, self.n_head, -1)
+        v: torch.Tensor = self.c_v(x).view(B, T, self.n_head, -1)
+        v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v) # @Grad62304977
         q, k = norm(q), norm(k) # QK norm suggested by @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
@@ -193,13 +193,13 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
 
-    def __init__(self, dim):
+    def __init__(self, dim: int):
         super().__init__()
         self.c_fc   = CastedLinear(dim, 4 * dim)
         self.c_proj = CastedLinear(4 * dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.c_fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
@@ -213,7 +213,7 @@ class Block(nn.Module):
         self.mlp = MLP(config.n_embd)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x, vi, x0, block_mask):
+    def forward(self, x: torch.Tensor, vi: torch.Tensor, x0: torch.Tensor, block_mask: BlockMask) -> torch.Tensor:
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         x = x + self.attn(norm(x), vi, block_mask)
         x = x + self.mlp(norm(x))
@@ -228,11 +228,14 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
+    lm_head_softcap : int = 30
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig):
         super().__init__()
+        self.n_layer = config.n_layer
+        self.lm_head_softcap = config.lm_head_softcap
 
         # U-net design by @brendanh0gan
         self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
@@ -243,20 +246,21 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
-            vte = nn.Embedding(config.vocab_size, config.n_embd*12),
+            # U-net structure on token value embeddings by @leloykun
+            vte = nn.Embedding(config.vocab_size, config.n_embd*self.num_encoder_layers),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(self, idx, target, attn_blocksize):
+    def forward(self, idx: torch.Tensor, target: torch.Tensor, attn_blocksize: torch.Tensor) -> torch.Tensor:
 
         docs = (idx == 50256).cumsum(0)
         def document_causal_mask(b, h, q_idx, kv_idx):
-          causal_mask = q_idx >= kv_idx
-          document_mask = docs[q_idx] == docs[kv_idx]
-          window_mask = q_idx - kv_idx < attn_blocksize
-          return causal_mask & document_mask & window_mask
+            causal_mask = q_idx >= kv_idx
+            document_mask = docs[q_idx] == docs[kv_idx]
+            window_mask = q_idx - kv_idx < attn_blocksize
+            return causal_mask & document_mask & window_mask
 
         S = len(idx)
         block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
@@ -265,7 +269,7 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
         x = norm(x) # @Grad62304977
         x0 = x
-        vi = self.transformer.vte(idx[None]).chunk(12, dim=-1)
+        vi = self.transformer.vte(idx[None]).chunk(self.num_encoder_layers, dim=-1)
 
         # Store outputs for U-Net skip connections
         skip_connections = []
@@ -276,11 +280,12 @@ class GPT(nn.Module):
         # Decoder pass - process the remaining blocks with weighted skip connections
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
-            x = self.transformer.h[self.num_encoder_layers + i](x, vi[self.num_encoder_layers+i], x0, block_mask)
+            # U-net structure on token value embeddings by @leloykun
+            x = self.transformer.h[self.num_encoder_layers + i](x, vi[self.num_encoder_layers-1-i], x0, block_mask)
 
         x = norm(x)
         logits = self.lm_head(x)
-        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
+        logits = self.lm_head_softcap * torch.tanh(logits / self.lm_head_softcap) # @Grad62304977
         logits = logits.float()
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
         return loss
@@ -367,7 +372,7 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     sequence_length : int = 64*1024 # sequence length, in tokens
-    num_iterations : int = 1530 # number of iterations to run
+    num_iterations : int = 1480 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
