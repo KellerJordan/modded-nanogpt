@@ -233,7 +233,7 @@ class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-
+        self.n_layer = config.n_layer
         # U-net design by @brendanh0gan
         self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
         self.num_decoder_layers = config.n_layer - self.num_encoder_layers # Remaining for decoder
@@ -243,7 +243,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
-            vte = nn.Embedding(config.vocab_size, config.n_embd*12),
+            vte = nn.Embedding(config.vocab_size, config.n_embd*config.n_layer),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
@@ -265,7 +265,7 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
         x = norm(x) # @Grad62304977
         x0 = x
-        vi = self.transformer.vte(idx[None]).chunk(12, dim=-1)
+        vi = self.transformer.vte(idx[None]).chunk(self.n_layer, dim=-1)
 
         # Store outputs for U-Net skip connections
         skip_connections = []
