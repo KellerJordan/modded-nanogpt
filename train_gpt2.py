@@ -353,7 +353,7 @@ class DistributedDataLoader:
 
     def next_batch(self):
         batch_size = self.seq_len * self.num_processes
-        buf = self.tokens[self.current_position:self.current_position+self.T+1]
+        buf = self.tokens[self.current_position:self.current_position+self.seq_len+1]
         # host side async is sufficient;
         # no performance improvement was observed when introducing a separate stream.
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
