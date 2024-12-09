@@ -417,7 +417,6 @@ def print0(s, logonly=False):
 # log information about the hardware/software environment this is running on
 # and print the full `nvidia-smi` to file
 print0(f"Running python {sys.version}")
-print0(f"Running numpy {np.version.__version__}")
 print0(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:")
 import subprocess
 result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
