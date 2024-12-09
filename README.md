@@ -14,7 +14,7 @@ It uses the following techniques:
 * Momentum warmup.
 * Tanh soft logit capping (following Gemma 2).
 * FlexAttention with window size warmup.
-* Extra embedding layers which are fed into intermediate layers.
+* Extra embeddings which are fed into intermediate attention layers.
 
 The training has attained this speed due to the contributions of meself, [@Grad62304977](https://x.com/Grad62304977),
 [@jxbz](https://x.com/jxbz), [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan),
