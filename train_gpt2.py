@@ -551,7 +551,7 @@ for step in range(args.num_iterations + 1):
     for i in range(1, train_accumulation_steps+1):
         ctx = model.no_sync() if i < train_accumulation_steps else contextlib.nullcontext()
         with ctx: # there's no need to sync gradients every accumulation step
-            loss = model(x, y, attn_blocksize=attn_blocksize)
+            loss = model(x, y, sliding_window_size)
             loss.backward()
             train_loss = loss.item()
             del loss
