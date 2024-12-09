@@ -435,7 +435,7 @@ val_loader = DistributedDataLoader(args.input_val_bin, args.sequence_length, ddp
 print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
 print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 print0('='*100, logonly=True)
-x, y = train_loader.next_batch()
+inputs_train, targets_train = train_loader.next_batch()
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
@@ -511,8 +511,8 @@ for step in range(args.num_iterations + 1):
         val_loss = 0.0
         for _ in range(val_steps):
             with torch.no_grad():
-                x_val, y_val = val_loader.next_batch()
-                val_loss += model(x_val, y_val, sliding_window_size)
+                inputs_val, targets_val = val_loader.next_batch()
+                val_loss += model(inputs_val, targets_val, sliding_window_size)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
@@ -544,11 +544,11 @@ for step in range(args.num_iterations + 1):
     for i in range(1, train_accumulation_steps+1):
         ctx = model.no_sync() if i < train_accumulation_steps else contextlib.nullcontext()
         with ctx: # there's no need to sync gradients every accumulation step
-            loss = model(x, y, sliding_window_size)
+            loss = model(inputs_train, targets_train, sliding_window_size)
             loss.backward()
             train_loss = loss.item()
             del loss
-            x, y = train_loader.next_batch()
+            inputs_train, targets_train = train_loader.next_batch()
     if train_accumulation_steps != 1:
         for p in model.parameters():
             p.grad /= train_accumulation_steps
