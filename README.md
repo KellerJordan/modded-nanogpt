@@ -228,10 +228,9 @@ python data/cached_fineweb10B.py 18
 6. [Anil, Rohan, et al. "Scalable second order optimization for deep learning." arXiv preprint arXiv:2002.09018 (2020).](https://arxiv.org/abs/2002.09018)
 7. [Hägele, Alexander, et al. "Scaling Laws and Compute-Optimal Training Beyond Fixed Training Durations." arXiv preprint arXiv:2405.18392 (2024).](https://arxiv.org/abs/2405.18392)
 
-<img src="img/dofa.jpg" alt="itsover_wereback" style="width:100%;">
-
 ## Citation
 
+```
 @misc{modded_nanogpt_2024,
   author       = {Keller Jordan and Jeremy Bernstein and Brendan Rappazzo and @fernbear.bsky.social and Boza Vlado and You Jiacheng and Franz Cesista and Braden Koszarsky and @Grad62304977},
   title        = {Modded-NanoGPT: Speedrunning Karpathy's Benchmark},
@@ -239,3 +238,7 @@ python data/cached_fineweb10B.py 18
   url          = {https://github.com/KellerJordan/modded-nanogpt},
   note         = {Accessed: 2024-12-09}
 }
+```
+
+<img src="img/dofa.jpg" alt="itsover_wereback" style="width:100%;">
+
