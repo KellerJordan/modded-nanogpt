@@ -232,7 +232,9 @@ python data/cached_fineweb10B.py 18
 
 ```
 @misc{modded_nanogpt_2024,
-  author       = {Keller Jordan and Jeremy Bernstein and Brendan Rappazzo and @fernbear.bsky.social and Boza Vlado and You Jiacheng and Franz Cesista and Braden Koszarsky and @Grad62304977},
+  author       = {Keller Jordan and Jeremy Bernstein and Brendan Rappazzo and
+                  @fernbear.bsky.social and Boza Vlado and You Jiacheng and
+                  Franz Cesista and Braden Koszarsky and @Grad62304977},
   title        = {Modded-NanoGPT: Speedrunning Karpathy's Benchmark},
   year         = {2024},
   url          = {https://github.com/KellerJordan/modded-nanogpt},
