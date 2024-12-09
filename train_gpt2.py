@@ -252,11 +252,11 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(self, idx, target, sliding_window_size):
+    def forward(self, inputs, targets, sliding_window_size):
 
         BLOCK_SIZE = 128
-        assert idx.ndim == 1
-        docs = (idx == 50256).cumsum(0)
+        assert inputs.ndim == 1
+        docs = (inputs == 50256).cumsum(0)
         docs_low = docs.reshape(-1, BLOCK_SIZE)[:, 0].contiguous()
         docs_high = docs.reshape(-1, BLOCK_SIZE)[:, -1].contiguous()
         def document_sliding_window_causal(b, h, q_idx, kv_idx):
@@ -265,7 +265,7 @@ class GPT(nn.Module):
             window_mask = q_idx - kv_idx < sliding_window_size
             return causal_mask & document_mask & window_mask
 
-        S = len(idx)
+        S = len(inputs)
         def create_sliding_window_causal_mask(S, sliding_window_size):
             kv_idx = block_idx = torch.arange(S // BLOCK_SIZE, dtype=torch.int32, device="cuda")
             q_idx = block_idx[:, None]
@@ -282,10 +282,10 @@ class GPT(nn.Module):
         block_mask = create_sliding_window_causal_mask(S, sliding_window_size)
 
         # forward the GPT model itself
-        x = self.embed(idx[None]) # token embeddings of shape (b, t, model_dim)
+        x = self.embed(inputs[None]) # token embeddings of shape (b, t, model_dim)
         x = norm(x) # @Grad62304977
         x0 = x
-        vi = self.value_embeds(idx[None]).chunk(self.num_encoder_layers, dim=-1)
+        vi = self.value_embeds(inputs[None]).chunk(self.num_encoder_layers, dim=-1)
 
         # Store outputs for U-Net skip connections
         skip_connections = []
@@ -303,7 +303,7 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return loss
 
 # -----------------------------------------------------------------------------
@@ -326,10 +326,10 @@ def _load_data_shard(file: Path, ntok: int):
     return tokens
 
 class DistributedDataLoader:
-    def __init__(self, filename_pattern, T, process_rank, num_processes):
+    def __init__(self, filename_pattern, seq_len, process_rank, num_processes):
         self.process_rank = process_rank
         self.num_processes = num_processes
-        self.T = T
+        self.seq_len = seq_len
 
         # glob files that match the pattern
         self.files = sorted(Path.cwd().glob(filename_pattern))
@@ -352,17 +352,17 @@ class DistributedDataLoader:
         self.tokens = _load_data_shard(self.files[self.current_shard], self.ntoks[self.current_shard])
 
     def next_batch(self):
-        batch_size = self.T * self.num_processes
+        batch_size = self.seq_len * self.num_processes
         buf = self.tokens[self.current_position:self.current_position+self.T+1]
         # host side async is sufficient;
         # no performance improvement was observed when introducing a separate stream.
-        x = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
-        y = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # targets
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # targets
         # advance current position and load next shard if necessary
         self.current_position += batch_size
         if self.current_position + batch_size + 1 >= len(self.tokens):
             self.advance()
-        return x, y
+        return inputs, targets
 
 # -----------------------------------------------------------------------------
 # int main
@@ -422,18 +422,16 @@ result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subproces
 print0(f'{result.stdout}', logonly=True)
 print0('='*100, logonly=True)
 
-# convenience variables
-T = args.sequence_length
 # calculate the number of steps to take in the val loop.
-assert args.val_tokens % (T * ddp_world_size) == 0
-val_steps = args.val_tokens // (T * ddp_world_size)
+assert args.val_tokens % (args.sequence_length * ddp_world_size) == 0
+val_steps = args.val_tokens // (args.sequence_length * ddp_world_size)
 # calculate the steps of gradient accumulation required to attain the desired global batch size.
 assert args.batch_size % (ddp_world_size) == 0
 train_accumulation_steps = args.batch_size // ddp_world_size
 
 # load tokens
-train_loader = DistributedDataLoader(args.input_bin, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, T, ddp_rank, ddp_world_size)
+train_loader = DistributedDataLoader(args.input_bin, args.sequence_length, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(args.input_val_bin, args.sequence_length, ddp_rank, ddp_world_size)
 print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
 print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 print0('='*100, logonly=True)
