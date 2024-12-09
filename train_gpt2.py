@@ -414,7 +414,7 @@ logfile = None
 if master_process:
     run_id = str(uuid.uuid4())
     logdir = 'logs/%s/' % run_id
-    # os.makedirs(logdir, exist_ok=True)
+    os.makedirs(logdir, exist_ok=True)
     logfile = 'logs/%s.txt' % run_id
     # create the log file
     with open(logfile, "w") as f:
