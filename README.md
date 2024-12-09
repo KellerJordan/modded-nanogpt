@@ -1,7 +1,7 @@
 # Modded-NanoGPT
 
 This is a modified variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
-Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in:
+Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in only:
 * 0.75B tokens instead of 10B
 * 4.4 minutes on 8xH100 instead of 45
 
@@ -14,7 +14,7 @@ It uses the following techniques:
 * Momentum warmup.
 * Tanh soft logit capping (following Gemma 2).
 * FlexAttention with window size warmup.
-* Extra embedding layers which are fed into intermediate layers.
+* Extra embeddings which are fed into intermediate attention layers.
 
 The training has attained this speed due to the contributions of meself, [@Grad62304977](https://x.com/Grad62304977),
 [@jxbz](https://x.com/jxbz), [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan),
@@ -40,11 +40,8 @@ For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss 
 
 ## Running it on fewer GPUs or with less memory
 
-* To run on fewer GPUs, just modify `run.sh` to have a different `--nproc_per_node`.
-* If you're running out of memory, then go into `train_gpt2.py` and scale down the `device_batch_size` to either 16 or 32. (Update 11/19/24: Actually this is impossible now since we're using 64K seqlen with FlexAttention)
-
-Both of these changes will have no effect on the training - you should get the exact same loss curve as the most recent record, because the training code
-will automatically adjust the gradient accumulation in order to have the same total batch size.
+* To run on fewer GPUs, just modify `run.sh` to have a different `--nproc_per_node`. (this does not change the expected behavior of the training)
+* If you're running out of memory, you may need to reduce the sequence length for FlexAttention (which does change the training. see [here](https://github.com/KellerJordan/modded-nanogpt/pull/38) for a guide)
 
 ## Running with Docker
 
@@ -80,10 +77,15 @@ The following is the progression of world records for the task of *training a mo
 13 | 4.66 minutes | [Attention window warmup](https://x.com/hi_tysam/status/1860851011797053450) | 11/24/24 | [log](./records/112424_WindowWarmup/cf9e4571-c5fc-4323-abf3-a98d862ec6c8.txt) | @fernbear.bsky.social
 14 | 4.41 minutes | [Value Embeddings]() | 12/04/24 | [log](./records/120424_ValueEmbed) | @KoszarskyB
 
-Notes:
-* For the llm.c baseline: The 90 minute time is on 8xA100; it's 45 minutes on 8xH100. This baseline is essentially a hardware-optimized GPT-2-small replication using better training data.
-* All runs before 11/19/24 can be run with PyTorch 2.5.1 or below. Runs including and after 11/19/24 require PyTorch 2.6.0 (nightly) to use FlexAttention.
-* For more details on methods & authorship, see the linked post associated with each record.
+### Speedrun rules
+
+All new record attempts:
+
+1. Must not modify the train or validation data pipelines. (Except to change batch size, seqlen, attention structure etc. I.e., just don't change the underlying tokens.)
+2. Must use ≤ 124M active parameters per token. (So MoE is fine; and extra embedding layers can be added since they only contribute hidden_dim active params.)
+3. Must attain ≤ 3.28 val loss. Unfortunately, due to high inter-run variance, new record attempts must provide enough run logs to attain a statistical significance level of p<0.01 that their average val loss is lower than 3.28. You see see how to conduct a t-test [here](./records/120424_ValueEmbed).
+
+Other than that, go crazy! Anything is fair game
 
 <!--Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
 So it's no surprise that there is room to improve; as @karpathy has said, 'llm.c still has a lot of pending optimizations.'
@@ -100,22 +102,16 @@ The only possible 'benefit' I can think of for any empirical field to abandon be
 Hilarious to think about how, in the often-commented-upon and ongoing collapse of the peer review system, people blame the *reviewers* --
 yeah, those guys doing free labor who everyone constantly musters all of their intelligence to lie to, it's *their* fault! My bad, you caught me monologuing.-->
 
-### Notable attempts
+### Notes
+* For the llm.c baseline: The 90 minute time is on 8xA100; it's 45 minutes on 8xH100. This baseline is essentially a hardware-optimized GPT-2-small replication using better training data.
+* All runs before 11/19/24 can be run with PyTorch 2.5.1 or below. Runs including and after 11/19/24 require PyTorch 2.6.0 (nightly) to use FlexAttention.
 
-1. [An 11/07/24 attempt, which I attempted to cerify on 11/09/24](./records/110924_Replicateleloykun)
+---
 
 ### Notable forks
 
 * [https://github.com/BlinkDL/modded-nanogpt-rwkv](https://github.com/BlinkDL/modded-nanogpt-rwkv)
 * [https://github.com/nikhilvyas/modded-nanogpt-SOAP](https://github.com/nikhilvyas/modded-nanogpt-SOAP)
-
-### Speedrun rules
-
-1. Must not modify the train or validation data pipelines. (Except to change batch size, seqlen, attention structure etc. I.e., just don't change the order of the tokens.)
-2. Must use ≤ 124M active parameters per token. (So MoE is OK, and the untied embedding matrix only contributes hidden_dim active params.)
-3. Must attain ≤ 3.28 val loss. (A tasteful number would be 3.278, so that the gap exceeds the inter-run variance.)
-
-Other than that, go crazy! Anything is fair game
 
 ---
 
@@ -231,6 +227,20 @@ python data/cached_fineweb10B.py 18
 5. [Vineet Gupta, Tomer Koren, and Yoram Singer. "Shampoo: Preconditioned stochastic tensor optimization." International Conference on Machine Learning. PMLR, 2018.](https://arxiv.org/abs/1802.09568)
 6. [Anil, Rohan, et al. "Scalable second order optimization for deep learning." arXiv preprint arXiv:2002.09018 (2020).](https://arxiv.org/abs/2002.09018)
 7. [Hägele, Alexander, et al. "Scaling Laws and Compute-Optimal Training Beyond Fixed Training Durations." arXiv preprint arXiv:2405.18392 (2024).](https://arxiv.org/abs/2405.18392)
+
+## Citation
+
+```
+@misc{modded_nanogpt_2024,
+  author       = {Keller Jordan and Jeremy Bernstein and Brendan Rappazzo and
+                  @fernbear.bsky.social and Boza Vlado and You Jiacheng and
+                  Franz Cesista and Braden Koszarsky and @Grad62304977},
+  title        = {Modded-NanoGPT: Speedrunning Karpathy's Benchmark},
+  year         = {2024},
+  url          = {https://github.com/KellerJordan/modded-nanogpt},
+  note         = {Accessed: 2024-12-09}
+}
+```
 
 <img src="img/dofa.jpg" alt="itsover_wereback" style="width:100%;">
 
