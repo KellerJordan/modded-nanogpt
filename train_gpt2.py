@@ -337,7 +337,7 @@ class DistributedDataLoader:
 
         # load and validate all data shards, count number of tokens in total
         self.ntoks = [_peek_data_shard(file) for file in self.files]
-        assert min(self.ntoks) >= num_processes * T + 1
+        assert min(self.ntoks) >= num_processes * seq_len + 1
         self.ntok_total = sum(self.ntoks)
 
         self.reset()
