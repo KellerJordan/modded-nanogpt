@@ -495,7 +495,7 @@ for step in range(args.num_iterations + 1):
         t0 = time.perf_counter()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-    # Set the sliding window size for the current step, in chunks of 64. By @fernbear.bsky.social
+    # Linearly increase the sliding window size over training in chunks of 64 from 64 -> 1792. By @fernbear.bsky.social
     frac_done = step / args.num_iterations # training progress
     sw_size = 64 * (((1 - frac_done) * 64 + frac_done * 1792) // 64)
     if sw_size != sw_size_prev:
