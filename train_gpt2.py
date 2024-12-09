@@ -527,7 +527,7 @@ for step in range(args.num_iterations + 1):
         for _ in range(val_steps):
             with torch.no_grad():
                 x_val, y_val = val_loader.next_batch()
-                val_loss += model(x_val, y_val, sliding_window=sliding_window_size)
+                val_loss += model(x_val, y_val, sliding_window_size)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
