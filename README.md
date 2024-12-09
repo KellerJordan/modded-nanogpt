@@ -76,7 +76,7 @@ The following is the progression of world records for the task of *training a mo
 12 | 5.03 minutes | [FlexAttention](https://x.com/kellerjordan0/status/1859331370268623321) | 11/19/24 | [log](./records/111924_FlexAttention/8384493d-dba9-4991-b16b-8696953f5e6d.txt) | @KoszarskyB
 13 | 4.66 minutes | [Attention window warmup](https://x.com/hi_tysam/status/1860851011797053450) | 11/24/24 | [log](./records/112424_WindowWarmup/cf9e4571-c5fc-4323-abf3-a98d862ec6c8.txt) | @fernbear.bsky.social
 14 | 4.41 minutes | [Value Embeddings](https://x.com/KoszarskyB/status/1864746625572257852) | 12/04/24 | [log](./records/120424_ValueEmbed) | @KoszarskyB
-15 | 3.95 minutes | [U-net structure for value embeddings, assorted code improvements](https://x.com/YouJiacheng/status/1865761473886347747) | 12/08/24 | [log](https://gist.github.com/YouJiacheng/1fed95270177aa04f389b46e8c7d7733) | @leloykun, @YouJiacheng
+15 | 3.95 minutes | [U-net pattern for value embeds, assorted code improvements](https://x.com/YouJiacheng/status/1865761473886347747) | 12/08/24 | [log](https://gist.github.com/YouJiacheng/1fed95270177aa04f389b46e8c7d7733) | @leloykun, @YouJiacheng
 
 ### Speedrun rules
 
