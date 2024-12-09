@@ -168,24 +168,24 @@ class Rotary(torch.nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, dim, n_head):
+    def __init__(self, dim, num_heads):
         super().__init__()
-        assert dim % n_head == 0
-        self.n_head = n_head
+        assert dim % num_heads == 0
+        self.num_heads = num_heads
         self.c_q = CastedLinear(dim, dim)
         self.c_k = CastedLinear(dim, dim)
         self.c_v = CastedLinear(dim, dim)
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
-        self.rotary = Rotary(dim // n_head) # dim // n_head = head_dim
+        self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x, vi, block_mask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q = self.c_q(x).view(B, T, self.n_head, -1)
-        k = self.c_k(x).view(B, T, self.n_head, -1)
-        v = self.c_v(x).view(B, T, self.n_head, -1)
+        q = self.c_q(x).view(B, T, self.num_heads, -1)
+        k = self.c_k(x).view(B, T, self.num_heads, -1)
+        v = self.c_v(x).view(B, T, self.num_heads, -1)
         v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v) # @KoszarskyB & @Grad62304977
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
@@ -212,7 +212,7 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.attn = CausalSelfAttention(config.n_embd, config.n_head)
+        self.attn = CausalSelfAttention(config.model_dim, config.num_heads)
         self.mlp = MLP(config.n_embd)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
@@ -228,30 +228,28 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     vocab_size : int = 50304
-    n_layer : int = 12
-    n_head : int = 6 # head dim 128 suggested by @Grad62304977
-    n_embd : int = 768
+    num_layers : int = 12
+    num_heads : int = 6 # head dim 128 suggested by @Grad62304977
+    model_dim : int = 768
 
 class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.n_layer = config.n_layer
+        self.num_layers = config.num_layers
 
         # U-net design by @brendanh0gan
-        self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
-        self.num_decoder_layers = config.n_layer - self.num_encoder_layers # Remaining for decoder
+        self.num_encoder_layers = config.num_layers // 2 # Half of the layers for encoder
+        self.num_decoder_layers = config.num_layers - self.num_encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
-            # U-net structure on token value embeddings by @leloykun
-            vte = nn.Embedding(config.vocab_size, config.n_embd*self.num_encoder_layers),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-        ))
-        self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
+        self.embed = nn.Embedding(config.vocab_size, config.model_dim)
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
+        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
+        # U-net structure on token value embeddings by @leloykun
+        self.value_embeds = nn.Embedding(config.vocab_size, config.model_dim*self.num_encoder_layers)
+        self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
     def forward(self, idx, target, sliding_window_size):
@@ -284,10 +282,10 @@ class GPT(nn.Module):
         block_mask = create_sliding_window_causal_mask(S, sliding_window_size)
 
         # forward the GPT model itself
-        x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
+        x = self.embed(idx[None]) # token embeddings of shape (b, t, model_dim)
         x = norm(x) # @Grad62304977
         x0 = x
-        vi = self.transformer.vte(idx[None]).chunk(self.num_encoder_layers, dim=-1)
+        vi = self.value_embeds(idx[None]).chunk(self.num_encoder_layers, dim=-1)
 
         # Store outputs for U-Net skip connections
         skip_connections = []
@@ -444,7 +442,7 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+model = GPT(GPTConfig(vocab_size=num_vocab, num_layers=12, num_heads=6, model_dim=768))
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
@@ -457,9 +455,9 @@ model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight, raw_model.transformer.vte.weight], lr=0.6, betas=(0.8, 0.95), fused=True)
+optimizer1 = torch.optim.Adam([raw_model.embed.weight, raw_model.value_embeds], lr=0.6, betas=(0.8, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
-params = list(raw_model.transformer.h.parameters())
+params = list(raw_model.blocks.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
 optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
