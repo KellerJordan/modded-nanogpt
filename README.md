@@ -230,3 +230,12 @@ python data/cached_fineweb10B.py 18
 
 <img src="img/dofa.jpg" alt="itsover_wereback" style="width:100%;">
 
+## Citation
+
+@misc{modded_nanogpt_2024,
+  author       = {Keller Jordan and Jeremy Bernstein and Brendan Rappazzo and @fernbear.bsky.social and Boza Vlado and You Jiacheng and Franz Cesista and Braden Koszarsky and @Grad62304977},
+  title        = {Modded-NanoGPT: Speedrunning Karpathy's Benchmark},
+  year         = {2024},
+  url          = {https://github.com/KellerJordan/modded-nanogpt},
+  note         = {Accessed: 2024-12-09}
+}
