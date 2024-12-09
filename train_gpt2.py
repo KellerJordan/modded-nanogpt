@@ -291,13 +291,13 @@ class GPT(nn.Module):
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
         for i in range(self.num_encoder_layers):
-            x = self.transformer.h[i](x, vi[i], x0, block_mask)
+            x = self.blocks[i](x, vi[i], x0, block_mask)
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
             # U-net structure on token value embeddings by @leloykun
-            x = self.transformer.h[self.num_encoder_layers + i](x, vi[self.num_encoder_layers-1-i], x0, block_mask)
+            x = self.blocks[self.num_encoder_layers + i](x, vi[self.num_encoder_layers-1-i], x0, block_mask)
 
         x = norm(x)
         logits = self.lm_head(x)
