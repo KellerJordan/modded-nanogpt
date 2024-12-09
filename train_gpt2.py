@@ -453,7 +453,7 @@ model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.embed.weight, raw_model.value_embeds], lr=0.6, betas=(0.8, 0.95), fused=True)
+optimizer1 = torch.optim.Adam([raw_model.embed.weight, raw_model.value_embeds.weight], lr=0.6, betas=(0.8, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
 params = list(raw_model.blocks.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
