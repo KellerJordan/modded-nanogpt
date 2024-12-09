@@ -546,7 +546,6 @@ for step in range(args.num_iterations + 1):
         with ctx: # there's no need to sync gradients every accumulation step
             loss = model(inputs_train, targets_train, sliding_window_size)
             loss.backward()
-            train_loss = loss.item()
             del loss
             inputs_train, targets_train = train_loader.next_batch()
     if train_accumulation_steps != 1:
