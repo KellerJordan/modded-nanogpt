@@ -317,12 +317,12 @@ def _peek_data_shard(file: Path):
     assert header[1] == 1, "unsupported version"
     return int(header[2]) # number of tokens (claimed)
 
-def _load_data_shard(file: Path, ntok: int):
-    with file.open("rb") as f:
-        tokens = torch.empty(ntok, dtype=torch.uint16, pin_memory=True)
+def _load_data_shard(path, num_tokens):
+    with path.open("rb") as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy())
-        assert nbytes == 2 * ntok, "number of tokens read does not match header?"
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header?"
     return tokens
 
 class DistributedDataLoader:
@@ -336,9 +336,9 @@ class DistributedDataLoader:
         assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
 
         # load and validate all data shards, count number of tokens in total
-        self.ntoks = [_peek_data_shard(file) for file in self.files]
-        assert min(self.ntoks) >= num_processes * seq_len + 1
-        self.ntok_total = sum(self.ntoks)
+        self.files_num_tokens = [_peek_data_shard(file) for file in self.files]
+        assert min(self.files_num_tokens) >= num_processes * seq_len + 1
+        self.total_num_tokens = sum(self.files_num_tokens)
 
         self.reset()
 
@@ -348,8 +348,8 @@ class DistributedDataLoader:
 
     def advance(self): # advance to next data shard
         self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard], self.ntoks[self.current_shard])
+        self.current_position = self.process_rank * self.seq_len
+        self.tokens = _load_data_shard(self.files[self.current_shard], self.files_num_tokens[self.current_shard])
 
     def next_batch(self):
         batch_size = self.seq_len * self.num_processes
@@ -432,8 +432,8 @@ train_accumulation_steps = args.batch_size // ddp_world_size
 # load tokens
 train_loader = DistributedDataLoader(args.input_bin, args.sequence_length, ddp_rank, ddp_world_size)
 val_loader = DistributedDataLoader(args.input_val_bin, args.sequence_length, ddp_rank, ddp_world_size)
-print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
-print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
+print0(f"Validation DataLoader: total number of tokens: {val_loader.total_num_tokens} across {len(val_loader.files)} files")
 print0('='*100, logonly=True)
 inputs_train, targets_train = train_loader.next_batch()
 
