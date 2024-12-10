@@ -174,12 +174,8 @@ class CausalSelfAttention(nn.Module):
         assert dim % num_heads == 0
         self.num_heads = num_heads
         self.dim, self.num_heads, self.head_dim = dim, num_heads, dim // num_heads
-        self.w_q = nn.Parameter(torch.empty(self.num_heads, self.head_dim, self.dim))
-        self.w_k = nn.Parameter(torch.empty(self.num_heads, self.head_dim, self.dim))
-        self.w_v = nn.Parameter(torch.empty(self.num_heads, self.head_dim, self.dim))
-        nn.init.kaiming_uniform_(self.w_q, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.w_k, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.w_v, a=math.sqrt(5))
+        self.w_qkv = nn.Parameter(torch.empty(3 * self.num_heads, self.head_dim, self.dim))
+        nn.init.kaiming_uniform_(self.w_qkv, a=math.sqrt(5))
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
         self.c_proj = CastedLinear(dim, dim)
@@ -188,9 +184,8 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x, vi, block_mask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q = F.linear(x, self.w_q.to(x.dtype).view(self.dim, self.dim)).view(B, T, self.num_heads, self.head_dim)
-        k = F.linear(x, self.w_k.to(x.dtype).view(self.dim, self.dim)).view(B, T, self.num_heads, self.head_dim)
-        v = F.linear(x, self.w_v.to(x.dtype).view(self.dim, self.dim)).view(B, T, self.num_heads, self.head_dim)
+        qkv = F.linear(x, self.w_qkv.to(x.dtype).view(3 * self.dim, self.dim)).view(B, T, 3 * self.num_heads, self.head_dim)
+        q, k, v = torch.tensor_split(qkv, 3, dim=-2)
         v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v) # @KoszarskyB & @Grad62304977
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
