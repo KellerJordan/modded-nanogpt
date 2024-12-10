@@ -24,9 +24,11 @@ The training has attained this speed due to the contributions of meself, [@Grad6
 
 ## Running the current record
 
-To execute the training, run the following three commands.
+To install and execute the training, run the following four commands.
 They should all complete within <20min on an 8xH100 with decent internet connection.
+If the torch install command updates your cuda installation, you many need to reboot.
 ```bash
+git clone https://github.com/KellerJordan/modded-nanogpt.git & cd modded-nanogpt
 pip install -r requirements.txt
 pip install --pre torch==2.6.0.dev20241203+cu124 --index-url https://download.pytorch.org/whl/nightly/cu124 --upgrade # install torch 2.6.0
 python data/cached_fineweb10B.py 10 # downloads only the first 1.0B training tokens to save time
