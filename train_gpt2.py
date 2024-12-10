@@ -422,6 +422,19 @@ class GPTConfig:
         return replace(self, **overrides)
 
 
+def get_param_counts(model):
+    active_params_per_token = 0
+    total_params = 0
+    for name, param in model.named_parameters():
+        if name.endswith(".embed.weight") or name.endswith(".value_embeds.weight"):
+            active_params_per_token += param.size(1)
+        else:
+            active_params_per_token += param.numel()
+        total_params += param.numel()
+    return active_params_per_token, total_params
+
+
+
 def train(gpt_config, args):
     # set up DDP (distributed data parallel). torchrun sets this env variable
     assert torch.cuda.is_available()
@@ -553,8 +566,9 @@ def train(gpt_config, args):
                     val_loss += model(inputs_val, targets_val, sliding_window_size)
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
             val_loss /= val_steps
+            active_params_per_token, total_params = get_param_counts(model)
             # log val loss to console and to logfile
-            print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+            print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms active_params_per_token:{active_params_per_token:,}, total_params:{total_params:,}')
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.perf_counter()
