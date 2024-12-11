@@ -265,9 +265,8 @@ class GPT(nn.Module):
             window_mask = q_idx - kv_idx < sliding_window_size
             return causal_mask & document_mask & window_mask
 
-        S = len(inputs)
-        def create_sliding_window_causal_mask(S, sliding_window_size):
-            kv_idx = block_idx = torch.arange(S // BLOCK_SIZE, dtype=torch.int32, device="cuda")
+        def create_sliding_window_causal_mask(seq_len, sliding_window_size):
+            kv_idx = block_idx = torch.arange(seq_len // BLOCK_SIZE, dtype=torch.int32, device="cuda")
             q_idx = block_idx[:, None]
             causal_mask = q_idx >= kv_idx
             document_mask = (docs_low[q_idx] <= docs_high[kv_idx]) & (docs_low[kv_idx] <= docs_high[q_idx])
@@ -279,7 +278,7 @@ class GPT(nn.Module):
             num_blocks = num_blocks[None, None, :].contiguous()
             indices = indices[None, None, :].contiguous()
             return BlockMask.from_kv_blocks(num_blocks, indices, BLOCK_SIZE=BLOCK_SIZE, mask_mod=document_sliding_window_causal)
-        block_mask = create_sliding_window_causal_mask(S, sliding_window_size)
+        block_mask = create_sliding_window_causal_mask(len(inputs), sliding_window_size)
 
         # forward the GPT model itself
         x = self.embed(inputs[None]) # token embeddings of shape (b, t, model_dim)
