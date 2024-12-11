@@ -27,7 +27,7 @@ WORKDIR /modded-nanogpt
 RUN python -m pip install --upgrade pip && \
     pip install -r requirements.txt
 
-RUN pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu124 --upgrade
+RUN pip install --pre torch==2.6.0.dev20241203+cu124 --index-url https://download.pytorch.org/whl/nightly/cu124 --upgrade
 
 CMD ["bash"]
 ENTRYPOINT []
