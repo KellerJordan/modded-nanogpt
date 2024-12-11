@@ -136,8 +136,8 @@ def norm(x):
 
 class CastedLinear(nn.Linear):
 
-    def __init__(self, in_features, out_features):
-        super().__init__(in_features, out_features, bias=False)
+    def __init__(self, in_features, out_features, bias=False):
+        super().__init__(in_features, out_features, bias)
 
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
@@ -249,7 +249,7 @@ class GPT(nn.Module):
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
         # U-net structure on token value embeddings by @leloykun
         self.value_embeds = nn.Embedding(config.vocab_size, config.model_dim*self.num_encoder_layers)
-        self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
+        self.lm_head = CastedLinear(config.model_dim, config.vocab_size, bias=True)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
     def forward(self, inputs, targets, sliding_window_size):
@@ -363,6 +363,23 @@ class DistributedDataLoader:
             self.advance()
         return inputs, targets
 
+def set_output_layer_bias(model, dataloader, num_vocab, n_batches):
+    # Use token prevalence to initialize output layer bias & avoid initial shock to network of having to find it.
+    for i in enumerate(range(n_batches)):
+        # n_batches*batch_size "stratified" samples of 1024 tokens. n=100 => ~+- 0.1 @ 0.95 CI
+        _, targets_train = dataloader.next_batch()
+        if i==0:
+            total_counts = torch.zeros(num_vocab, dtype=torch.int32, device=targets_train.device)
+        ids, counts = torch.unique(targets_train, sorted=True, return_counts=True)
+        total_counts[ids] += counts
+
+    target_probs = total_counts / total_counts.sum()
+    target_probs = (target_probs+1e-12) # Avoid zero's
+    target_probs = target_probs/target_probs.sum()
+
+    with torch.no_grad():
+        model.linear_out.bias.copy_(target_probs.log())
+
 # -----------------------------------------------------------------------------
 # int main
 
@@ -447,6 +464,9 @@ for m in model.modules():
         m.float()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
+
+set_output_layer_bias(model, train_loader, num_vocab, n_batches=100)
+
 model = torch.compile(model)
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
