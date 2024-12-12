@@ -365,7 +365,7 @@ class DistributedDataLoader:
 
 def set_output_layer_bias(model, dataloader, num_vocab, n_batches):
     # Use token prevalence to initialize output layer bias & avoid initial shock to network of having to find it.
-    for i in enumerate(range(n_batches)):
+    for i in range(n_batches):
         # n_batches*batch_size "stratified" samples of 1024 tokens. n=100 => ~+- 0.1 @ 0.95 CI
         _, targets_train = dataloader.next_batch()
         if i==0:
