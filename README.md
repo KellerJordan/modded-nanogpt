@@ -58,6 +58,21 @@ sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt sh 
 ```
 ---
 
+## Running on AMD MI300X
+
+To install and execute the training, run the following commands, which are modified from the above setup of H100.
+They should all complete within <20min on an 8xH100 with decent internet connection.
+If the torch install command updates your cuda installation, you many need to reboot.
+```bash
+git clone https://github.com/KellerJordan/modded-nanogpt.git & cd modded-nanogpt
+pip install uv 
+uv pip install -r requirements.txt
+uv pip install --pre torch==2.6.0.dev20241122+rocm6.2 --index-url https://download.pytorch.org/whl/nightly/rocm6.2 --upgrade # install torch 2.6.0 with rocm
+python data/cached_fineweb10B.py 10 # downloads only the first 1.0B training tokens to save time
+./run-rocm.sh
+```
+
+
 ## World record history
 
 The following is the progression of world records for the task of *training a model with 124M active parameters to 3.28 validation loss on FineWeb in the minimal amount of time on an 8xH100 machine.*
