@@ -378,7 +378,12 @@ def set_output_layer_bias(model, dataloader, num_vocab, n_batches):
     target_probs = target_probs/target_probs.sum()
 
     with torch.no_grad():
-        model.linear_out.bias.copy_(target_probs.log())
+        model.lm_head.bias.copy_(target_probs.log())
+
+    old_init_loss = torch.log(1/num_vocab).item()
+    new_init_loss = (target_probs*target_probs.log()).sum().item()
+    print0(f"Centered output layer, init loss {old_init_loss:3f}=>{new_init_loss:3f}")
+
 
 # -----------------------------------------------------------------------------
 # int main
