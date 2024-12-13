@@ -76,16 +76,16 @@ class Muon(torch.optim.Optimizer):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         params = list(params)
         assert all(isinstance(p, torch.Tensor) for p in params)
-        sorted_shapes = {tuple(sorted(p.shape)) for p in params}
+        ndims_and_sizes = {(p.ndim, p.numel()) for p in params}
         param_groups = [
             {
-                'params': [p for p in params if tuple(sorted(p.shape)) == sorted_shape],
+                'params': [p for p in params if p.ndim == ndim and p.numel() == size],
                 'update_buffer': [
-                    torch.empty(sorted_shape, device='cuda', dtype=torch.bfloat16).flatten()
+                    torch.empty(size, device='cuda', dtype=torch.bfloat16)
                     for _ in range(self.world_size)
                 ],
             }
-            for sorted_shape in sorted_shapes
+            for ndim, size in ndims_and_sizes
         ]
         super().__init__(param_groups, defaults)
 
