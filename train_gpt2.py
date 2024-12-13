@@ -437,7 +437,6 @@ dist.barrier()
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
 # begin logging
-logfile = None
 if master_process:
     run_id = uuid.uuid4()
     logdir = Path("logs") / f"{run_id}"
@@ -445,16 +444,15 @@ if master_process:
     logfile = Path("logs") / f"{run_id}.txt"
     print(logfile.stem)
     # create the log file
-    with logfile.open("w") as f:
-        # begin the log by printing this file (the Python code)
-        print(code, file=f)
-        print("=" * 100, file=f)
+    logfp = logfile.open("w")
+    # begin the log by printing this file (the Python code)
+    print(code, file=logfp, flush=True)
+    print("=" * 100, file=logfp, flush=True)
 def print0(s, logonly=False):
     if master_process:
-        with logfile.open("a") as f:
-            if not logonly:
-                print(s)
-            print(s, file=f)
+        if not logonly:
+            print(s)
+        print(s, file=logfp, flush=True)
 # log information about the hardware/software environment this is running on
 # and print the full `nvidia-smi` to file
 print0(f"Running python {sys.version}")
