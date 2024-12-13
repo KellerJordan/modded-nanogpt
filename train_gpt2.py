@@ -441,7 +441,7 @@ logfile = None
 if master_process:
     run_id = uuid.uuid4()
     logdir = Path("logs") / f"{run_id}"
-    logdir.mkdir(exist_ok=True)
+    logdir.mkdir(parents=True, exist_ok=True)
     logfile = Path("logs") / f"{run_id}.txt"
     print(logfile.stem)
     # create the log file
