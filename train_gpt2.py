@@ -30,22 +30,22 @@ def zeropower_via_newtonschulz5(G, steps):
     where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
-    assert len(G.shape) == 2
+    assert G.ndim == 2 or G.ndim == 3
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
-    if G.size(0) > G.size(1):
-        X = X.T
+    if G.size(-2) > G.size(-1):
+        X = X.mT
 
     # Ensure spectral norm is at most 1
-    X = X / (X.norm() + 1e-7)
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     # Perform the NS iterations
     for _ in range(steps):
-        A = X @ X.T
+        A = X @ X.mT
         B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
-    
-    if G.size(0) > G.size(1):
-        X = X.T
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
     return X
 
 class Muon(torch.optim.Optimizer):
@@ -113,7 +113,7 @@ class Muon(torch.optim.Optimizer):
                 for p_world, g_world in zip(params_world, update_buffers):
                     p_world.data.add_(
                         g_world.view_as(p_world),
-                        alpha=-lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
+                        alpha=-lr * max(1, p_world.size(-2) / p_world.size(-1)) ** 0.5,
                     )
             for base_i in range(len(params))[::self.world_size]:
                 p = params[base_i + self.rank]
