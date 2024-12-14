@@ -45,6 +45,7 @@ def zeropower_via_newtonschulz5(G, steps):
     X /= A2_norm**0.25 # ensure top singular value <= 1
     A /= A2_norm**0.5
     A2 /= A2_norm
+    X = a * X + (b * A + c * A2) @ X
 
     # Perform the remaining NS iterations
     for _ in range(steps-1):
