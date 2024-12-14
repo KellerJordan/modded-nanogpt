@@ -20,7 +20,7 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention #Koszars
 # Muon optimizer
 
 @torch.compile
-def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+def zeropower_via_newtonschulz5(G, steps):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -33,13 +33,25 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
-    X /= (X.norm() + eps) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
-    for _ in range(steps):
+
+    # Use the Frobenius norm of (X @ X.T)^2 computed during first NS iteration to ensure spectral norm
+    # is below 1, as suggested by Johan Sokrates Wind @johanwind
+    # https://github.com/KellerJordan/modded-nanogpt/discussions/23#discussioncomment-11293594
+    A = X @ X.T
+    A2 = A @ A
+    A2_norm = A2.norm() + 1e-28
+    X /= (A2_norm + eps)**0.25 # ensure top singular value <= 1
+    A /= A2_norm**0.5
+    A2 /= A2_norm
+
+    # Perform the remaining NS iterations
+    for _ in range(steps-1):
         A = X @ X.T
         B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
+    
     if G.size(0) > G.size(1):
         X = X.T
     return X
@@ -68,7 +80,7 @@ class Muon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=4):
         self.world_size = int(os.environ['WORLD_SIZE'])
         self.rank = int(os.environ['RANK'])
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
