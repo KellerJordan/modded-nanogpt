@@ -237,7 +237,6 @@ class Block(nn.Module):
 class ValueEmbedding(nn.Module):
     def __init__(self, config: "GPTConfig"):
         super().__init__()
-        self.__setattr__
         self.embed = nn.ModuleList([
             nn.Embedding(config.vocab_size, config.model_dim)
             for _ in range(6)
