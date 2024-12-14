@@ -248,7 +248,6 @@ class ValueEmbedding(nn.Module):
         ve += reversed(ve)
         return ve
 
-
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
 
