@@ -36,19 +36,8 @@ def zeropower_via_newtonschulz5(G, steps):
     if G.size(0) > G.size(1):
         X = X.T
 
-    # Use the Frobenius norm of (X @ X.T)^2 computed during first NS iteration to ensure spectral norm
-    # is below 1, as suggested by Johan Sokrates Wind @johanwind
-    # https://github.com/KellerJordan/modded-nanogpt/discussions/23#discussioncomment-11293594
-    A = X @ X.T
-    A2 = A @ A
-    A2_norm = A2.norm() + 1e-28
-    X /= A2_norm**0.25 # ensure top singular value <= 1
-    A /= A2_norm**0.5
-    A2 /= A2_norm
-    X = a * X + (b * A + c * A2) @ X
-
     # Perform the remaining NS iterations
-    for _ in range(steps-1):
+    for _ in range(steps):
         A = X @ X.T
         B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
