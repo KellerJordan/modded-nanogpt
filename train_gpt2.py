@@ -42,7 +42,7 @@ def zeropower_via_newtonschulz5(G, steps):
     A = X @ X.T
     A2 = A @ A
     A2_norm = A2.norm() + 1e-28
-    X /= (A2_norm + eps)**0.25 # ensure top singular value <= 1
+    X /= A2_norm**0.25 # ensure top singular value <= 1
     A /= A2_norm**0.5
     A2 /= A2_norm
 
