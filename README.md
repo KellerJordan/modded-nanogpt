@@ -5,6 +5,8 @@ Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains
 * 0.8B tokens instead of 10B
 * 3.8 minutes on 8xH100 instead of 45
 
+It has been hyperoptimized by the community, and has become a good baseline from which to perform research on the architecture/optimizer/etc.
+
 It uses the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
 * New optimizer: [Muon - Momentum Orthogonalized by Newton-schulz](https://github.com/KellerJordan/Muon).
