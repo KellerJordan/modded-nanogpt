@@ -38,7 +38,7 @@ def zeropower_via_newtonschulz5(G, steps):
 
     # Ensure spectral norm is at most 1
     X = X / (X.norm() + 1e-7)
-    # Perform the remaining NS iterations
+    # Perform the NS iterations
     for _ in range(steps):
         A = X @ X.T
         B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
