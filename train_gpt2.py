@@ -423,9 +423,9 @@ ddp_rank = int(os.environ['RANK'])
 ddp_local_rank = int(os.environ['LOCAL_RANK'])
 ddp_world_size = int(os.environ['WORLD_SIZE'])
 assert torch.cuda.is_available()
-device = torch.device(f"cuda:{ddp_local_rank}")
+device = torch.device(f'cuda:{ddp_local_rank}')
 torch.cuda.set_device(device)
-print(f"using device: {device}")
+print(f'using device: {device}')
 dist.init_process_group(backend='nccl', device_id=device)
 dist.barrier()
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
@@ -434,25 +434,26 @@ master_process = (ddp_rank == 0) # this process will do logging, checkpointing e
 logfile = None
 if master_process:
     run_id = uuid.uuid4()
-    logdir = Path("logs") / f"{run_id}"
-    logdir.mkdir(exist_ok=True)
-    logfile = Path("logs") / f"{run_id}.txt"
+    Path('logs').mkdir(exist_ok=True)
+    logdir = Path('logs') / f'{run_id}'
+    logdir.mkdir()
+    logfile = Path('logs') / f'{run_id}.txt'
     print(logfile.stem)
     # create the log file
-    with logfile.open("w") as f:
+    with logfile.open('w') as f:
         # begin the log by printing this file (the Python code)
         print(code, file=f)
-        print("=" * 100, file=f)
+        print('=' * 100, file=f)
 def print0(s, logonly=False):
     if master_process:
-        with logfile.open("a") as f:
+        with logfile.open('a') as f:
             if not logonly:
                 print(s)
             print(s, file=f)
 # log information about the hardware/software environment this is running on
 # and print the full `nvidia-smi` to file
-print0(f"Running python {sys.version}")
-print0(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:")
+print0(f'Running python {sys.version}')
+print0(f'Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:')
 import subprocess
 result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 print0(f'{result.stdout}', logonly=True)
