@@ -1,11 +1,25 @@
 #!/bin/bash
 
 # Sequence of curvature values
-curvatures=(10.0 15.0 20.0 25.0 30.0 40.0 50.0)
+curvatures=(100.0 200.0 500.0 1000.0)
 
-# Iterate over each curvature value
-for curvature in "${curvatures[@]}"; do
-    echo "Running script with curvature=${curvature}"
-    CUDA_VISIBLE_DEVICES=5 torchrun --standalone --nproc_per_node=1 train_gpt2_hyp.py --curvature "${curvature}" > logs_curvature_${curvature}.txt 2>&1
-    echo "Finished run with curvature=${curvature}, logs saved to logs_curvature_${curvature}.txt"
+# Sequence of seeds
+seeds=(1 2 3 4)
+
+# First, run Euclidean training with all seeds
+for seed in "${seeds[@]}"; do
+    echo "Running Euclidean model training with seed=${seed}"
+    CUDA_VISIBLE_DEVICES=4,5 torchrun --standalone --nproc_per_node=2 train_gpt2_hyp.py --lm_head 'euc' --seed "${seed}" > logs/logs_euclidean_seed_${seed}.txt 2>&1
+    echo "Finished Euclidean run with seed=${seed}, logs saved to logs/logs_euclidean_seed_${seed}.txt"
 done
+
+# Now, run training for each curvature and each seed
+for curvature in "${curvatures[@]}"; do
+    for seed in "${seeds[@]}"; do
+        echo "Running script with curvature=${curvature} and seed=${seed}"
+        CUDA_VISIBLE_DEVICES=4,5 torchrun --standalone --nproc_per_node=2 train_gpt2_hyp.py --lm_head 'hyp' --curvature "${curvature}" --seed "${seed}" > logs/logs_curvature_${curvature}_seed_${seed}.txt 2>&1
+        echo "Finished run with curvature=${curvature} and seed=${seed}, logs saved to logs/logs_curvature_${curvature}_seed_${seed}.txt"
+    done
+done
+
+echo "All experiments completed!"
