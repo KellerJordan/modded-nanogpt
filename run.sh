@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 train_gpt2_hyp.py > last_logs.txt 2>&1
+CUDA_VISIBLE_DEVICES=6,7 torchrun --standalone --nproc_per_node=2 train_gpt2_hyp.py --curvature 0.5 > last_logs2.txt 2>&1
