@@ -300,7 +300,7 @@ class GPT(nn.Module):
 
         x = norm(x)
         logits = self.lm_head(x)
-        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
+        logits = 30 * torch.tanh(logits / 30) # @Grad62304977 # Not needed anymore?
         logits = logits.float()
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return loss
@@ -363,8 +363,10 @@ class DistributedDataLoader:
             self.advance()
         return inputs, targets
 
-def set_output_layer_bias(model, dataloader, num_vocab, n_batches):
+def set_output_layer_bias(model, dataloader, n_batches):
     # Use token prevalence to initialize output layer bias & avoid initial shock to network of having to find it.
+    print0("Centering output layer  bias..")
+    num_vocab = model.lm_head.bias.size(0)
     for i in range(n_batches):
         # n_batches*batch_size "stratified" samples of 1024 tokens. n=100 => ~+- 0.1 @ 0.95 CI
         _, targets_train = dataloader.next_batch()
@@ -380,9 +382,9 @@ def set_output_layer_bias(model, dataloader, num_vocab, n_batches):
     with torch.no_grad():
         model.lm_head.bias.copy_(target_probs.log())
 
-    old_init_loss = torch.log(1/num_vocab).item()
+    old_init_loss = torch.tensor(1/num_vocab).log().item()
     new_init_loss = (target_probs*target_probs.log()).sum().item()
-    print0(f"Centered output layer, init loss {old_init_loss:3f}=>{new_init_loss:3f}")
+    print0(f"Centered output layer, initial loss {old_init_loss:3f} => {new_init_loss:3f}")
 
 
 # -----------------------------------------------------------------------------
@@ -470,7 +472,7 @@ for m in model.modules():
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 
-set_output_layer_bias(model, train_loader, num_vocab, n_batches=100)
+set_output_layer_bias(model, train_loader, n_batches=100)
 
 model = torch.compile(model)
 # here we wrap model into DDP container
