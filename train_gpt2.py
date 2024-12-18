@@ -369,23 +369,22 @@ def set_output_layer_bias(model, dataloader, n_batches):
     num_vocab = model.lm_head.bias.size(0)
     for i in range(n_batches):
         _, targets_train = dataloader.next_batch()
-        if i==0:
+        if i == 0:
             total_counts = torch.zeros(num_vocab, dtype=torch.int32, device=targets_train.device)
         ids, counts = torch.unique(targets_train, sorted=True, return_counts=True)
         total_counts[ids] += counts
 
     target_probs = total_counts / total_counts.sum()
-    target_probs = (target_probs+1e-12) # Avoid zero's
-    target_probs = target_probs/target_probs.sum()
+    target_probs = (target_probs + 1e-12)
+    target_probs = target_probs / target_probs.sum()
 
     with torch.no_grad():
         model.lm_head.bias.copy_(target_probs.log())
 
-    old_init_loss = torch.tensor(1/num_vocab).log().item()
-    new_init_loss = (target_probs*target_probs.log()).sum().item()
-    total_time = time.perf_counter()-t0
+    old_init_loss = torch.tensor(1 / num_vocab).log().item()
+    new_init_loss = (target_probs * target_probs.log()).sum().item()
+    total_time = time.perf_counter() - t0
     print0(f"Centered output layer, initial loss {old_init_loss:.3f} => {new_init_loss:.3f} ({total_time:.1f}s)")
-
 
 # -----------------------------------------------------------------------------
 # int main
