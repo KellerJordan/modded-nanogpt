@@ -365,10 +365,8 @@ class DistributedDataLoader:
 
 def set_output_layer_bias(model, dataloader, n_batches):
     # Use token prevalence to initialize output layer bias & avoid initial shock to network of having to find it.
-    print0("Centering output layer  bias..")
     num_vocab = model.lm_head.bias.size(0)
     for i in range(n_batches):
-        # n_batches*batch_size "stratified" samples of 1024 tokens. n=100 => ~+- 0.1 @ 0.95 CI
         _, targets_train = dataloader.next_batch()
         if i==0:
             total_counts = torch.zeros(num_vocab, dtype=torch.int32, device=targets_train.device)
