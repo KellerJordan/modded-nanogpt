@@ -365,6 +365,7 @@ class DistributedDataLoader:
 
 def set_output_layer_bias(model, dataloader, n_batches):
     # Use token prevalence to initialize output layer bias & avoid initial shock to network of having to find it.
+    t0 = time.perf_counter()
     num_vocab = model.lm_head.bias.size(0)
     for i in range(n_batches):
         _, targets_train = dataloader.next_batch()
@@ -382,7 +383,8 @@ def set_output_layer_bias(model, dataloader, n_batches):
 
     old_init_loss = torch.tensor(1/num_vocab).log().item()
     new_init_loss = (target_probs*target_probs.log()).sum().item()
-    print0(f"Centered output layer, initial loss {old_init_loss:3f} => {new_init_loss:3f}")
+    total_time = time.perf_counter()-t0
+    print0(f"Centered output layer, initial loss {old_init_loss:.3f} => {new_init_loss:.3f} ({total_time:.1f}s)")
 
 
 # -----------------------------------------------------------------------------
