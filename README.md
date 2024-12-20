@@ -2,12 +2,14 @@
 
 This is a modified variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in only:
-* 0.75B tokens instead of 10B
-* 4.4 minutes on 8xH100 instead of 45
+* 0.8B tokens instead of 10B
+* 3.8 minutes on 8xH100 instead of 45
+
+It has been hyperoptimized by the community, and has become a good baseline from which to perform research on the architecture/optimizer/etc.
 
 It uses the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
-* New optimizer: [Muon - Momentum Orthogonalized by Newton-schulz](https://github.com/KellerJordan/Muon).
+* New optimizer: [Muon - Momentum Orthogonalized by Newton-schulz](https://kellerjordan.github.io/posts/muon/) [[standalone implementation](https://github.com/KellerJordan/Muon)].
 * Untied head from embedding.
 * Projection and classification layers initialized to zero (muP-like).
 * Architectural shortcuts: value residual and embedding shortcut (partially following https://arxiv.org/abs/2410.17897).
@@ -35,7 +37,7 @@ python data/cached_fineweb10B.py 10 # downloads only the first 1.0B training tok
 ./run.sh
 ```
 
-The result will be a transformer with 124M active parameters trained for 1430 steps on 0.75B tokens of Fineweb [1], achieving ~3.278 mean validation loss (w/ up to 0.005 inter-run stddev).
+The result will be a transformer with 124M active parameters trained for 1480 steps on 0.75B tokens of Fineweb [1], achieving ~3.278 mean validation loss (w/ up to 0.005 inter-run stddev).
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
 **Note: torch.compile will take a long time on the first run.**
@@ -79,6 +81,7 @@ The following is the progression of world records for the task of *training a mo
 13 | 4.66 minutes | [Attention window warmup](https://x.com/hi_tysam/status/1860851011797053450) | 11/24/24 | [log](./records/112424_WindowWarmup/cf9e4571-c5fc-4323-abf3-a98d862ec6c8.txt) | @fernbear.bsky.social
 14 | 4.41 minutes | [Value Embeddings](https://x.com/KoszarskyB/status/1864746625572257852) | 12/04/24 | [log](./records/120424_ValueEmbed) | @KoszarskyB
 15 | 3.95 minutes | [U-net pattern for value embeds, assorted code improvements](https://x.com/YouJiacheng/status/1865761473886347747) | 12/08/24 | [log](records/120824_UNetValueEmbedsTweaks) | @leloykun, @YouJiacheng
+16 | 3.80 minutes | [MFU tweaks](https://x.com/YouJiacheng/status/1866734331559071981) | 12/10/24 | [log](records/121024_MFUTweaks) | @YouJiacheng
 
 ### Speedrun rules
 
