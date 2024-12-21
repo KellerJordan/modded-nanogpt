@@ -43,7 +43,7 @@ def zeropower_via_newtonschulz5(G, steps):
         A = X @ X.T
         B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
-    
+
     if G.size(0) > G.size(1):
         X = X.T
     return X
@@ -241,16 +241,9 @@ class ValueEmbedding(nn.Module):
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
 
-@dataclass
-class GPTConfig:
-    vocab_size : int = 50304
-    num_layers : int = 12
-    num_heads : int = 6 # head dim 128 suggested by @Grad62304977
-    model_dim : int = 768
-
 class GPT(nn.Module):
 
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: "GPTConfig"):
         super().__init__()
         self.num_layers = config.num_layers
 
@@ -283,10 +276,8 @@ class GPT(nn.Module):
         docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
         docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
 
-        def document_causal(b, h, q_idx, kv_idx):
-            causal_mask = q_idx >= kv_idx
-            document_mask = docs[q_idx] == docs[kv_idx]
-            return causal_mask & document_mask
+        def document_mask_mod(b, h, q_idx, kv_idx):
+            return docs[q_idx] == docs[kv_idx]
 
         def dense_to_ordered(dense_mask: torch.Tensor):
             num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
@@ -313,7 +304,7 @@ class GPT(nn.Module):
                 full_kv_num_blocks,
                 full_kv_indices,
                 BLOCK_SIZE=BLOCK_SIZE,
-                mask_mod=document_causal,
+                mask_mod=document_mask_mod,
             )
 
         block_mask = create_doc_swc_block_mask(sliding_window_num_blocks)
@@ -420,6 +411,17 @@ class Hyperparameters:
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+
+@dataclass
+class GPTConfig:
+    # 33 tokens: https://huggingface.co/Synthyra/ESMplusplus_large/blob/main/modeling_esm_plusplus.py#L868-L874
+    vocab_size : int = 33
+    num_layers : int = 12
+    num_heads : int = 6 # head dim 128 suggested by @Grad62304977
+    model_dim : int = 768
+
+
+gpt_config = GPTConfig()
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -478,10 +480,7 @@ print0(f"Validation DataLoader: total number of tokens: {val_loader.total_num_to
 print0('='*100, logonly=True)
 inputs_train, targets_train = train_loader.next_batch()
 
-# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
-# this originates from Karpathy's experiments.
-num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, num_layers=12, num_heads=6, model_dim=768))
+model = GPT(gpt_config)
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
