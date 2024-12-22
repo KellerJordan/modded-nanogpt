@@ -21,4 +21,4 @@ if len(sys.argv) >= 2: # we can pass an argument to download less
 
 
 for i in range(1, num_chunks+1):
-    get(f"data/train-0000{i}-of-00091.parquet")
+    get(f"data/train-{i:05d}-of-00091.parquet")
