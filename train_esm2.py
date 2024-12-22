@@ -273,50 +273,19 @@ class GPT(nn.Module):
         targets: torch.Tensor,
         sliding_window_num_blocks: torch.Tensor,
     ):
-        BLOCK_SIZE = 128
-        seq_len = len(inputs)
-        assert seq_len % BLOCK_SIZE == 0
-        total_num_blocks = seq_len // BLOCK_SIZE
-        assert inputs.ndim == 1
-        docs = (inputs == 50256).cumsum(0)
-        docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
-        docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
+        docs = (inputs == self.bos_token_id).cumsum(0)
+        S = len(inputs)
 
-        def document_mask_mod(b, h, q_idx, kv_idx):
+        def doc_mask_mod(b, h, q_idx, kv_idx):
             return docs[q_idx] == docs[kv_idx]
 
-        def dense_to_ordered(dense_mask: torch.Tensor):
-            num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
-            indices = dense_mask.argsort(dim=-1, descending=True, stable=True).to(torch.int32)
-            return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
+        block_mask = create_block_mask(
+            mask_mod=doc_mask_mod,
+            B=None, H=None,
+            Q_LEN=S, KV_LEN=S,
+        )
 
-        def create_doc_swc_block_mask(sliding_window_num_blocks: torch.Tensor):
-            kv_idx = block_idx = torch.arange(total_num_blocks, dtype=torch.int32, device="cuda")
-            q_idx = block_idx[:, None]
-            causal_bm = q_idx >= kv_idx
-            causal_full_bm = q_idx > kv_idx
-            window_bm = q_idx - kv_idx < sliding_window_num_blocks
-            window_full_bm = window_bm
-            # document_bm = (docs_low[q_idx] <= docs_high[kv_idx]) & (docs_low[kv_idx] <= docs_high[q_idx])
-            document_bm = (docs_low[:, None] <= docs_high) & (docs_low <= docs_high[:, None])
-            document_full_bm = (docs_low[:, None] == docs_high) & (docs_low == docs_high[:, None])
-            nonzero_bm = causal_bm & window_bm & document_bm
-            full_bm  = causal_full_bm & window_full_bm & document_full_bm
-            kv_num_blocks, kv_indices = dense_to_ordered(nonzero_bm ^ full_bm)
-            full_kv_num_blocks, full_kv_indices = dense_to_ordered(full_bm)
-            return BlockMask.from_kv_blocks(
-                kv_num_blocks,
-                kv_indices,
-                full_kv_num_blocks,
-                full_kv_indices,
-                BLOCK_SIZE=BLOCK_SIZE,
-                mask_mod=document_mask_mod,
-            )
-
-        block_mask = create_doc_swc_block_mask(sliding_window_num_blocks)
-
-        # forward the GPT model itself
-        x = self.embed(inputs[None]) # token embeddings of shape (b, t, model_dim)
+        x = self.embed(inputs[None])
         x = norm(x) # @Grad62304977
         x0 = x
         ve = self.value_embeds(inputs)
