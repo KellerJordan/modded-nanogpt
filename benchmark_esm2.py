@@ -3,6 +3,7 @@ import random
 import pandas as pd
 from transformers import EsmTokenizer, EsmForMaskedLM
 from datasets import load_dataset
+from huggingface_hub import hf_hub_download
 from tqdm.auto import tqdm
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, matthews_corrcoef
 
@@ -12,13 +13,25 @@ SEED = 42
 random.seed(SEED)
 torch.manual_seed(SEED)
 
-sequences = load_dataset('Synthyra/esm2_speedrun_eval', split='train')['sequence']
+
+local_file = hf_hub_download(
+    repo_id="Synthyra/omg_prot50",
+    filename="data/test-00000-of-00001.parquet",
+    repo_type="dataset"
+)
+local_file = local_file.replace('\\', '/').split('/data')[0]
+print(local_file)
+data = load_dataset(local_file, split='test').remove_columns('__index_level_0__')
+print(data)
+sequences = data['sequence']
+print(sequences[0])
 sequences = sorted(sequences, key=len, reverse=True)
 
 # Load the ESM tokenizer and model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 #model_names = ['facebook/esm2_t6_8M_UR50D', 'facebook/esm2_t12_35M_UR50D', 'facebook/esm2_t30_150M_UR50D', 'facebook/esm2_t33_650M_UR50D']
-model_names = ['facebook/esm2_t6_8M_UR50D']
+model_names = ['facebook/esm2_t12_35M_UR50D', 'facebook/esm2_t30_150M_UR50D', 'facebook/esm2_t33_650M_UR50D']
+#model_names = ['facebook/esm2_t6_8M_UR50D']
 
 tokenizer = EsmTokenizer.from_pretrained(model_names[0])
 mask_rate = 0.15
