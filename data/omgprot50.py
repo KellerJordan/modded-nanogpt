@@ -90,7 +90,7 @@ with mp.Pool(nprocs) as pool:
         else:
             # write the current shard and start a new one
             split = "val" if shard_index == 0 else "train"
-            filename = os.path.join(DATA_CACHE_DIR, f"omgprot50_{split}_{shard_index:06d}.bin")
+            filename = os.path.join(DATA_CACHE_DIR, f"omgprot50_{split}_{shard_index:06d}.bin") # this probably needs to be changed
             # split the document into whatever fits in this shard; the remainder goes to next one
             remainder = args.shard_size - token_count
             progress_bar.update(remainder)
