@@ -18,7 +18,6 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention #Koszars
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
-
 @torch.compile
 def zeropower_via_newtonschulz5(G, steps):
     """
@@ -47,6 +46,7 @@ def zeropower_via_newtonschulz5(G, steps):
     if G.size(0) > G.size(1):
         X = X.T
     return X
+
 
 class Muon(torch.optim.Optimizer):
     """
@@ -131,11 +131,12 @@ class Muon(torch.optim.Optimizer):
                 params_world = params[base_i : base_i + self.world_size]
             update_prev()
 
+
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
-
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
+
 
 class CastedLinear(nn.Linear):
 
@@ -144,6 +145,7 @@ class CastedLinear(nn.Linear):
 
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
+
 
 class Rotary(torch.nn.Module):
 
@@ -168,6 +170,7 @@ class Rotary(torch.nn.Module):
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x)
+
 
 class CausalSelfAttention(nn.Module):
 
@@ -197,6 +200,7 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
+
 class MLP(nn.Module):
 
     def __init__(self, dim):
@@ -210,6 +214,7 @@ class MLP(nn.Module):
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
         return x
+
 
 class Block(nn.Module):
 
@@ -225,6 +230,7 @@ class Block(nn.Module):
         x = x + self.mlp(norm(x))
         return x
 
+
 class ValueEmbedding(nn.Module):
     def __init__(self, config: "GPTConfig"):
         super().__init__()
@@ -238,9 +244,9 @@ class ValueEmbedding(nn.Module):
         ve += reversed(ve)
         return ve
 
+
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
-
 class GPT(nn.Module):
 
     def __init__(self, config: "GPTConfig"):
@@ -335,9 +341,9 @@ class GPT(nn.Module):
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return loss
 
+
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
-
 def _peek_data_shard(file: Path):
     # only reads the header, returns header data
     # header is 256 int32
@@ -346,13 +352,15 @@ def _peek_data_shard(file: Path):
     assert header[1] == 1, "unsupported version"
     return int(header[2]) # number of tokens (claimed)
 
+
 def _load_data_shard(path: Path, num_tokens):
     with path.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        tokens = torch.empty(num_tokens, dtype=torch.uint8, pin_memory=True)
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy())
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header?"
     return tokens
+
 
 class DistributedDataLoader:
     def __init__(self, filename_pattern, seq_len, process_rank, num_processes):
@@ -393,14 +401,16 @@ class DistributedDataLoader:
             self.advance()
         return inputs, targets
 
+
 # -----------------------------------------------------------------------------
 # int main
-
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    input_bin : str = 'data/omgprot50/data/train-*-of-00091.parquet' # input .bin to train on
+    #input_val_bin : str = 'data/omgprot50/data/valid-*-of-00001.parquet' # input .bin to eval validation loss on
+    # actual benchmark is on test set
+    input_test_bin : str = 'data/omgprot50/data/test-*-of-00001.parquet' # input .bin to eval test loss on
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     sequence_length : int = 64*1024 # sequence length, in tokens
@@ -412,9 +422,15 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
 
+
 @dataclass
 class GPTConfig:
     # 33 tokens: https://huggingface.co/Synthyra/ESMplusplus_large/blob/main/modeling_esm_plusplus.py#L868-L874
+    # Depth of the number of layers is typically more important than the depth of the hidden dimension for PLMs
+    # ESM2-8M has 6 layers, 20 heads, 320 hidden dim: https://huggingface.co/facebook/esm2_t6_8M_UR50D/blob/main/config.json
+    # ESM2-35M has 12 layers, 20 heads, 480 hidden dim: https://huggingface.co/facebook/esm2_t12_35M_UR50D/blob/main/config.json
+    # ESM2-150M has 30 layers, 20 heads, 640 hidden dim: https://huggingface.co/facebook/esm2_t30_150M_UR50D/blob/main/config.json
+    # ESM2-650M has 33 layers, 20 heads, 1280 hidden dim: https://huggingface.co/facebook/esm2_t33_650M_UR50D/blob/main/config.json
     vocab_size : int = 33
     num_layers : int = 12
     num_heads : int = 6 # head dim 128 suggested by @Grad62304977
