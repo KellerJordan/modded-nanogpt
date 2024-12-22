@@ -2,7 +2,7 @@
 This repo is an open-source collaboration to reproduce ESM2-150M validation loss in as little time as possible inspired by the fantastic [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) repo. 
 
 ## Benchmarks to beat
-[OMGprot50](https://huggingface.co/datasets/Synthyra/omg_prot50) test set.
+[OMGprot50](https://huggingface.co/datasets/Synthyra/omg_prot50) test set, 15% MLM objective.
 | model      | loss         | precision | recall |  f1    | accuracy |  mcc   |
 |------------|--------------|-----------|--------|--------|----------|--------|
 | ESM2-8M    | 2.3388       | 0.3445    | 0.3007 | 0.2979 | 0.3007   | 0.2515 |
