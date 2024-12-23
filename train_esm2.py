@@ -312,17 +312,23 @@ class BERT(nn.Module):
         # MLM mask/replace constants from https://www.biorxiv.org/content/10.1101/2022.07.20.500902v3.full.pdf
         pct_masked = 0.12
         pct_replaced = 0.015
+        pct_kept = 0.015
+
         # set pct_masked% to <mask>
         mlm_mask = self.get_frac_mask(seq, pct_masked)
         input_seq = seq.clone().masked_fill(mlm_mask, self.mask_id)
         # substitute pct_replaced% with token id between 4 and 30 (inclusive)
         sub_mask = self.get_frac_mask(seq, pct_replaced, include=~mlm_mask)
         input_seq[sub_mask] = torch.randint(4, 31, (sub_mask.sum(),), dtype=seq.dtype, device=seq.device)
+        # retain pct_kept%
+        keep_mask = self.get_frac_mask(seq, pct_kept, include=~(sub_mask | mlm_mask))
+
+        loss_mask = mlm_mask | sub_mask | keep_mask
 
         logits = self.encoder_pass(input_seq, sliding_window_size)
         return F.cross_entropy(
             logits.view(-1, logits.size(-1)),
-            seq.masked_fill(~mlm_mask, -100).to(dtype=torch.int64).view(-1),
+            seq.masked_fill(~loss_mask, -100).to(dtype=torch.int64).view(-1),
             ignore_index=-100
         )
 
