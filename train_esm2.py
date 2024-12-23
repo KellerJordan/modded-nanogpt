@@ -318,15 +318,14 @@ class BERT(nn.Module):
         pct_kept = 0.015     # 1.5% of tokens are kept unchanged
 
         # set pct_masked% to <mask>
-        mlm_mask = self.get_frac_mask(seq, pct_masked)
+        mlm_mask = self.get_frac_mask(seq, pct_masked, torch.ones_like(seq, dtype=torch.bool))
         input_seq = seq.clone().masked_fill(mlm_mask, self.mask_id)
-
-        # substitute pct_replaced% with random token id between 4 and 30 (inclusive)
-        sub_mask = self.get_frac_mask(seq, pct_replaced, include=~mlm_mask)
+        # substitute pct_replaced% with token id between 4 and 30 (inclusive)
+        sub_mask = self.get_frac_mask(seq, pct_replaced, ~mlm_mask)
         input_seq[sub_mask] = torch.randint(4, 31, (sub_mask.sum(),), dtype=seq.dtype, device=seq.device)
 
         # retain pct_kept%
-        keep_mask = self.get_frac_mask(seq, pct_kept, include=~(sub_mask | mlm_mask))
+        keep_mask = self.get_frac_mask(seq, pct_kept, ~(sub_mask | mlm_mask))
 
         mlm_loss_mask = mlm_mask | sub_mask | keep_mask
         logits = self.encoder_pass(input_seq, sliding_window_size)
