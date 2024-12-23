@@ -252,8 +252,6 @@ class GPT(nn.Module):
     def __init__(self, config: "GPTConfig"):
         super().__init__()
 
-        self.mlm_p = 0.3  # masking probability: masked language model loss
-
         self.mask_id = 32
         self.bos_id = 33
 
