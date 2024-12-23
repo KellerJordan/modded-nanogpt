@@ -440,6 +440,14 @@ class ModelConfig:
 model_config = ModelConfig()
 args = Hyperparameters()
 
+
+def get_param_count(model):
+    total_params = 0
+    for name, param in model.named_parameters():
+        total_params += param.numel()
+    return total_params
+
+
 # set up DDP (distributed data parallel). torchrun sets this env variable
 ddp_rank = int(os.environ['RANK'])
 ddp_local_rank = int(os.environ['LOCAL_RANK'])
@@ -573,7 +581,7 @@ for step in range(args.num_iterations + 1):
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
-        print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+        print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms perplexity:{(2**val_loss):.4f} param_count:{get_param_count(model),}')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
