@@ -326,12 +326,11 @@ class BERT(nn.Module):
         # retain pct_kept%
         keep_mask = self.get_frac_mask(seq, pct_kept, include=~(sub_mask | mlm_mask))
 
-        loss_mask = mlm_mask | sub_mask | keep_mask
-
+        mlm_loss_mask = mlm_mask | sub_mask | keep_mask
         logits = self.encoder_pass(input_seq, sliding_window_size)
         return F.cross_entropy(
             logits.view(-1, logits.size(-1)),
-            seq.masked_fill(~loss_mask, -100).to(dtype=torch.int64).view(-1),
+            seq.masked_fill(~mlm_loss_mask, -100).to(dtype=torch.int64).view(-1),
             ignore_index=-100
         )
 
