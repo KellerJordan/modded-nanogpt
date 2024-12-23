@@ -271,35 +271,23 @@ class BERT(nn.Module):
         self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(self, seq: torch.Tensor, sliding_window_size: torch.Tensor):
-        masked_input_seq = seq.clone()
-        target_seq = seq.to(dtype=torch.int64)
-
-        docs = (masked_input_seq == self.bos_id).cumsum(0)
-
-        # Create the MLM mask with exactly one token being True masked per document
-        unique, inverse_indices = torch.unique(docs, return_inverse=True)
-        random_values = torch.rand_like(docs, dtype=torch.float)
-        max_per_group = torch.zeros_like(unique, dtype=random_values.dtype)
-        max_per_group.scatter_reduce_(dim=0, index=inverse_indices, src=random_values, reduce='amax', include_self=True)
-        mlm_mask = random_values == max_per_group[inverse_indices]
-
-        masked_input_seq[mlm_mask] = self.mask_id
-        target_seq[~mlm_mask] = -100
+    def encoder_pass(self, input_seq: torch.Tensor, sliding_window_size: torch.Tensor):
+        docs = (input_seq == self.bos_id).cumsum(0)
 
         def doc_mask_mod(b, h, q_idx, kv_idx):
             bidirectional_sliding_window_mask = torch.abs(q_idx - kv_idx) < sliding_window_size
             doc_mask = docs[q_idx] == docs[kv_idx]
             return bidirectional_sliding_window_mask & doc_mask
-        S = len(masked_input_seq)
+
+        S = len(input_seq)
         block_mask = create_block_mask(
             doc_mask_mod, None, None, S, S,
         )
 
-        x = self.embed(masked_input_seq[None])
+        x = self.embed(input_seq[None])
         x = norm(x) # @Grad62304977
         x0 = x
-        ve = self.value_embeds(masked_input_seq)
+        ve = self.value_embeds(input_seq)
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
 
         # Store outputs for U-Net skip connections
@@ -318,8 +306,43 @@ class BERT(nn.Module):
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq.view(-1), ignore_index=-100)
-        return loss
+        return logits
+
+    def forward(self, seq, sliding_window_size: torch.Tensor):
+        # MLM mask/replace constants from https://www.biorxiv.org/content/10.1101/2022.07.20.500902v3.full.pdf
+        pct_masked = 0.12
+        pct_replaced = 0.015
+        # set pct_masked% to <mask>
+        mlm_mask = self.get_frac_mask(seq, pct_masked)
+        input_seq = seq.clone().masked_fill(mlm_mask, self.mask_id)
+        # substitute pct_replaced% with token id between 4 and 30 (inclusive)
+        sub_mask = self.get_frac_mask(seq, pct_replaced, include=~mlm_mask)
+        input_seq[sub_mask] = torch.randint(4, 31, (sub_mask.sum(),), dtype=seq.dtype, device=seq.device)
+
+        logits = self.encoder_pass(input_seq, sliding_window_size)
+        return F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            seq.masked_fill(~mlm_mask, -100).to(dtype=torch.int64).view(-1),
+            ignore_index=-100
+        )
+
+    def get_frac_mask(self, seq: torch.Tensor, pct: float, include=None):
+        docs = (seq == self.bos_id).cumsum(0)
+        valid_tokens_mask = (seq >= 4) & (seq <= 30)
+        if include is not None:
+            valid_tokens_mask &= include
+        random_values = torch.rand_like(docs, dtype=torch.float) * valid_tokens_mask
+
+        # Map each token to its doc index, count tokens per doc, and compute how many to mask
+        _, inv_docs = torch.unique(docs, return_inverse=True)
+        doc_counts = torch.bincount(inv_docs)  # total tokens in each doc
+        num_to_mask = (doc_counts.float() * pct).ceil().to(torch.int64)
+
+        # Rank tokens globally by random value and select num_to_mask
+        sorted_indices = torch.argsort(random_values, descending=True)
+        ranks = torch.empty_like(sorted_indices, dtype=torch.int64)
+        ranks[sorted_indices] = torch.arange(len(seq), device=seq.device)
+        return ranks < num_to_mask[inv_docs]
 
 
 # -----------------------------------------------------------------------------
