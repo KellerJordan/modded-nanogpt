@@ -133,7 +133,7 @@ class Muon(torch.optim.Optimizer):
 
 
 # -----------------------------------------------------------------------------
-# PyTorch nn.Module definitions for the GPT-2 model
+# PyTorch nn.Module definitions
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
@@ -232,7 +232,7 @@ class Block(nn.Module):
 
 
 class ValueEmbedding(nn.Module):
-    def __init__(self, config: "GPTConfig"):
+    def __init__(self, config: "ModelConfig"):
         super().__init__()
         self.embed = nn.ModuleList([
             nn.Embedding(config.vocab_size, config.model_dim)
@@ -246,10 +246,10 @@ class ValueEmbedding(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# The main GPT-2 model
-class GPT(nn.Module):
+# The main ESM Bert model
+class BERT(nn.Module):
 
-    def __init__(self, config: "GPTConfig"):
+    def __init__(self, config: "ModelConfig"):
         super().__init__()
 
         self.mask_id = 32
@@ -401,7 +401,7 @@ class Hyperparameters:
 
 
 @dataclass
-class GPTConfig:
+class ModelConfig:
     # 33 tokens: https://huggingface.co/Synthyra/ESMplusplus_large/blob/main/modeling_esm_plusplus.py#L868-L874
     # Depth of the number of layers is typically more important than the depth of the hidden dimension for PLMs
     # ESM2-8M has 6 layers, 20 heads, 320 hidden dim: https://huggingface.co/facebook/esm2_t6_8M_UR50D/blob/main/config.json
@@ -414,7 +414,7 @@ class GPTConfig:
     model_dim : int = 768
 
 
-gpt_config = GPTConfig()
+model_config = ModelConfig()
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -473,7 +473,7 @@ print0(f"Validation DataLoader: total number of tokens: {val_loader.total_num_to
 print0('='*100, logonly=True)
 seq_train = train_loader.next_batch()
 
-model = GPT(gpt_config)
+model = BERT(model_config)
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
