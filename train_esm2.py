@@ -550,8 +550,8 @@ def get_lr(it):
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
-sliding_window_size = torch.tensor(128, dtype=torch.int32, device="cuda")
-sw_prev = 128
+sliding_window_size = torch.tensor(1024 - 128, dtype=torch.int32, device="cuda")
+sw_prev = 1024 - 128
 # Start training loop
 training_time_ms = 0
 # start the clock
@@ -568,9 +568,9 @@ for step in range(args.num_iterations + 1):
         t0 = time.perf_counter()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-    # Linearly increase the sliding window size over training in chunks of 128 from 128 -> 2048. By @fernbear.bsky.social
+    # Linearly increase the sliding window size over training in chunks of 128 from 1024 -> 2048. By @fernbear.bsky.social
     frac_done = step / args.num_iterations # training progress
-    sw_size = int(((1 - frac_done) * 128 + frac_done * 2048) // 128) * 128
+    sw_size = int(((1 - frac_done) * 1023 + frac_done * 2048) // 128) * 128
     if sw_size != sw_prev:
         sliding_window_size.copy_(sw_size, non_blocking=True)
         sw_prev = sw_size
