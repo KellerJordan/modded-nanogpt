@@ -14,7 +14,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.nn.attention.flex_attention import BlockMask, flex_attention #KoszarskyB
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -251,6 +251,12 @@ class GPT(nn.Module):
 
     def __init__(self, config: "GPTConfig"):
         super().__init__()
+
+        self.mlm_p = 0.3  # masking probability: masked language model loss
+
+        self.mask_id = 32
+        self.bos_id = 33
+
         self.num_layers = config.num_layers
 
         # U-net design by @brendanh0gan
@@ -267,28 +273,35 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(
-        self,
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-        sliding_window_num_blocks: torch.Tensor,
-    ):
-        docs = (inputs == self.bos_token_id).cumsum(0)
-        S = len(inputs)
+    def forward(self, seq: torch.Tensor, sliding_window_size: torch.Tensor):
+        masked_input_seq = seq.clone()
+        target_seq = seq.to(dtype=torch.int64)
+
+        docs = (masked_input_seq == self.bos_id).cumsum(0)
+
+        # Create the MLM mask with exactly one token being True masked per document
+        unique, inverse_indices = torch.unique(docs, return_inverse=True)
+        random_values = torch.rand_like(docs, dtype=torch.float)
+        max_per_group = torch.zeros_like(unique, dtype=random_values.dtype)
+        max_per_group.scatter_reduce_(dim=0, index=inverse_indices, src=random_values, reduce='amax', include_self=True)
+        mlm_mask = random_values == max_per_group[inverse_indices]
+
+        masked_input_seq[mlm_mask] = self.mask_id
+        target_seq[~mlm_mask] = -100
 
         def doc_mask_mod(b, h, q_idx, kv_idx):
-            return docs[q_idx] == docs[kv_idx]
-
+            bidirectional_sliding_window_mask = torch.abs(q_idx - kv_idx) < sliding_window_size
+            doc_mask = docs[q_idx] == docs[kv_idx]
+            return bidirectional_sliding_window_mask & doc_mask
+        S = len(masked_input_seq)
         block_mask = create_block_mask(
-            mask_mod=doc_mask_mod,
-            B=None, H=None,
-            Q_LEN=S, KV_LEN=S,
+            doc_mask_mod, None, None, S, S,
         )
 
-        x = self.embed(inputs[None])
+        x = self.embed(masked_input_seq[None])
         x = norm(x) # @Grad62304977
         x0 = x
-        ve = self.value_embeds(inputs)
+        ve = self.value_embeds(masked_input_seq)
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
 
         # Store outputs for U-Net skip connections
@@ -307,7 +320,7 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq.view(-1), ignore_index=-100)
         return loss
 
 
@@ -324,7 +337,7 @@ def _peek_data_shard(file: Path):
 
 def _load_data_shard(path: Path, num_tokens):
     with path.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint8, pin_memory=True)
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy())
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header?"
@@ -362,13 +375,12 @@ class DistributedDataLoader:
         buf = self.tokens[self.current_position:self.current_position+self.seq_len+1]
         # host side async is sufficient;
         # no performance improvement was observed when introducing a separate stream.
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # targets
+        seq = buf.to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
         # advance current position and load next shard if necessary
         self.current_position += batch_size
         if self.current_position + batch_size + 1 >= len(self.tokens):
             self.advance()
-        return inputs, targets
+        return seq
 
 
 # -----------------------------------------------------------------------------
@@ -376,10 +388,8 @@ class DistributedDataLoader:
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = 'data/omgprot50/data/train-*-of-00091.parquet' # input .bin to train on
-    #input_val_bin : str = 'data/omgprot50/data/valid-*-of-00001.parquet' # input .bin to eval validation loss on
-    # actual benchmark is on test set
-    input_test_bin : str = 'data/omgprot50/data/test-*-of-00001.parquet' # input .bin to eval test loss on
+    input_bin : str = 'data/omgprot50/omgprot50_train_*.bin' # input .bin to train on
+    input_val_bin : str = 'data/omgprot50/omgprot50_val_*.bin'  # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     sequence_length : int = 64*1024 # sequence length, in tokens
@@ -400,7 +410,7 @@ class GPTConfig:
     # ESM2-35M has 12 layers, 20 heads, 480 hidden dim: https://huggingface.co/facebook/esm2_t12_35M_UR50D/blob/main/config.json
     # ESM2-150M has 30 layers, 20 heads, 640 hidden dim: https://huggingface.co/facebook/esm2_t30_150M_UR50D/blob/main/config.json
     # ESM2-650M has 33 layers, 20 heads, 1280 hidden dim: https://huggingface.co/facebook/esm2_t33_650M_UR50D/blob/main/config.json
-    vocab_size : int = 33
+    vocab_size : int = 34  # normal vocab plus mock BOS
     num_layers : int = 12
     num_heads : int = 6 # head dim 128 suggested by @Grad62304977
     model_dim : int = 768
@@ -463,7 +473,7 @@ val_loader = DistributedDataLoader(args.input_val_bin, args.sequence_length, ddp
 print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
 print0(f"Validation DataLoader: total number of tokens: {val_loader.total_num_tokens} across {len(val_loader.files)} files")
 print0('='*100, logonly=True)
-inputs_train, targets_train = train_loader.next_batch()
+seq_train = train_loader.next_batch()
 
 model = GPT(gpt_config)
 model = model.cuda().bfloat16()
@@ -501,8 +511,8 @@ def get_lr(it):
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
-sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device="cuda")
-sw_num_blocks_prev = 1
+sliding_window_size = torch.tensor(128, dtype=torch.int32, device="cuda")
+sw_prev = 128
 # Start training loop
 training_time_ms = 0
 # start the clock
@@ -519,12 +529,12 @@ for step in range(args.num_iterations + 1):
         t0 = time.perf_counter()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-    # Linearly increase the sliding window size over training in chunks of 128 from 128 -> 1856. By @fernbear.bsky.social
+    # Linearly increase the sliding window size over training in chunks of 128 from 128 -> 2048. By @fernbear.bsky.social
     frac_done = step / args.num_iterations # training progress
-    sw_num_blocks = int(((1 - frac_done) * 128 + frac_done * 1856) // 128)
-    if sw_num_blocks != sw_num_blocks_prev:
-        sliding_window_num_blocks.copy_(sw_num_blocks, non_blocking=True)
-        sw_num_blocks_prev = sw_num_blocks
+    sw_size = int(((1 - frac_done) * 128 + frac_done * 2048) // 128) * 128
+    if sw_size != sw_prev:
+        sliding_window_size.copy_(sw_size, non_blocking=True)
+        sw_prev = sw_size
 
     # once in a while evaluate the validation dataset
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
@@ -537,8 +547,8 @@ for step in range(args.num_iterations + 1):
         val_loss = 0.0
         for _ in range(val_steps):
             with torch.no_grad():
-                inputs_val, targets_val = val_loader.next_batch()
-                val_loss += model(inputs_val, targets_val, sliding_window_num_blocks)
+                seq_val = val_loader.next_batch()
+                val_loss += model(seq_val, sliding_window_size)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
@@ -575,8 +585,8 @@ for step in range(args.num_iterations + 1):
                 stack.enter_context(model.no_sync())
             if step >= 5:
                 stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
-            model(inputs_train, targets_train, sliding_window_num_blocks).backward()
-            inputs_train, targets_train = train_loader.next_batch()
+            model(seq_train, sliding_window_size).backward()
+            seq_train = train_loader.next_batch()
     if train_accumulation_steps != 1:
         for p in model.parameters():
             p.grad /= train_accumulation_steps
