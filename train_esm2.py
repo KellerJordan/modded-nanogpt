@@ -5,6 +5,8 @@ with open(sys.argv[0]) as f:
 import uuid
 import time
 import contextlib
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -312,7 +314,7 @@ class BERT(nn.Module):
     def forward(self, seq, sliding_window_size: torch.Tensor):
         # MLM mask/replace constants from https://www.biorxiv.org/content/10.1101/2022.07.20.500902v3.full.pdf
         pct_masked = 0.12    # 12% of tokens are masked
-        pct_replaced = 0.015 # 1.5% of tokens are randomly replaced 
+        pct_replaced = 0.015 # 1.5% of tokens are randomly replaced
         pct_kept = 0.015     # 1.5% of tokens are kept unchanged
 
         # set pct_masked% to <mask>
@@ -589,7 +591,7 @@ for step in range(args.num_iterations + 1):
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
-        print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms perplexity:{(2**val_loss):.4f} param_count:{get_param_count(model):,}')
+        print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms perplexity:{(math.e**val_loss):.4f} param_count:{get_param_count(model):,}')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
