@@ -621,8 +621,8 @@ for step in range(args.num_iterations + 1):
         with contextlib.ExitStack() as stack:
             if i < train_accumulation_steps: # there's no need to sync gradients every accumulation step
                 stack.enter_context(model.no_sync())
-            if step >= 5:
-                stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
+            #if step >= 5:
+            #    stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
             model(seq_train, sliding_window_size).backward()
             seq_train = train_loader.next_batch()
     if train_accumulation_steps != 1:
