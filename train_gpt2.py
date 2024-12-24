@@ -522,7 +522,7 @@ raw_model = model.module # always contains the "raw" unwrapped model
 # init the optimizer(s)
 embed_params = [*raw_model.embed.parameters(), *raw_model.value_embeds.parameters()]
 optimizer1 = torch.optim.Adam(embed_params, lr=0.6, betas=(0.8, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight, raw_model.lm_head.bias], lr=0.008, betas=(0.8, 0.95), fused=True)
 params = list(raw_model.blocks.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
