@@ -116,6 +116,7 @@ for model_name in model_names:
             count += 1
 
     average_loss = total_loss / count
+    perplexity = torch.exp(torch.tensor(average_loss)).item()
     
     # Calculate metrics
     precision = precision_score(all_true, all_pred, average='weighted')
@@ -125,7 +126,8 @@ for model_name in model_names:
     mcc = matthews_corrcoef(all_true, all_pred)
     
     print(f'Results for {model_name}:')
-    print(f'Average loss: {average_loss}')
+    print(f'Loss: {average_loss}')
+    print(f'Perplexity: {perplexity:.4f}')
     print(f'Precision: {precision:.4f}')
     print(f'Recall: {recall:.4f}')
     print(f'F1: {f1:.4f}')
@@ -134,7 +136,8 @@ for model_name in model_names:
     
     results.append({
         'model': model_name,
-        'average_loss': round(average_loss, 4),
+        'loss': round(average_loss, 4),
+        'perplexity': round(perplexity, 4),
         'precision': round(precision, 4),
         'recall': round(recall, 4),
         'f1': round(f1, 4),
