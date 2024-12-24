@@ -1,11 +1,18 @@
 import torch
 import random
 import pandas as pd
+import argparse
 from transformers import EsmTokenizer, EsmForMaskedLM
-from datasets import load_dataset
+from datasets import Dataset
 from huggingface_hub import hf_hub_download
 from tqdm.auto import tqdm
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, matthews_corrcoef
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--type', type=str, default='valid', help='Type of dataset to use: valid or test')
+args = parser.parse_args()
+
 
 
 # Set a fixed seed for reproducibility
@@ -16,22 +23,20 @@ torch.manual_seed(SEED)
 
 local_file = hf_hub_download(
     repo_id="Synthyra/omg_prot50",
-    filename="data/test-00000-of-00001.parquet",
+    filename=f"data/{args.type}-00000-of-00001.parquet",
     repo_type="dataset"
 )
-local_file = local_file.replace('\\', '/').split('/data')[0]
-print(local_file)
-data = load_dataset(local_file, split='test').remove_columns('__index_level_0__')
+data = Dataset.from_parquet(local_file)
 print(data)
 sequences = data['sequence']
-print(sequences[0])
 sequences = sorted(sequences, key=len, reverse=True)
+print(sequences[0])
+total_tokens = sum(len(seq) for seq in sequences)
+print(f"Total tokens: {total_tokens}")
 
 # Load the ESM tokenizer and model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-#model_names = ['facebook/esm2_t6_8M_UR50D', 'facebook/esm2_t12_35M_UR50D', 'facebook/esm2_t30_150M_UR50D', 'facebook/esm2_t33_650M_UR50D']
-model_names = ['facebook/esm2_t12_35M_UR50D', 'facebook/esm2_t30_150M_UR50D', 'facebook/esm2_t33_650M_UR50D']
-#model_names = ['facebook/esm2_t6_8M_UR50D']
+model_names = ['facebook/esm2_t6_8M_UR50D', 'facebook/esm2_t12_35M_UR50D', 'facebook/esm2_t30_150M_UR50D', 'facebook/esm2_t33_650M_UR50D']
 
 tokenizer = EsmTokenizer.from_pretrained(model_names[0])
 mask_rate = 0.15
@@ -151,4 +156,4 @@ for model_name in model_names:
 
 # Save results to CSV
 results_df = pd.DataFrame(results)
-results_df.to_csv('esm2_benchmark_results.csv', index=False)
+results_df.to_csv(f'esm2_benchmark_result_{args.type}.csv', index=False)
