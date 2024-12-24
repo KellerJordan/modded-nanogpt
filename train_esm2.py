@@ -5,16 +5,17 @@ with open(sys.argv[0]) as f:
 import uuid
 import time
 import contextlib
-from dataclasses import dataclass
-from pathlib import Path
-
 import torch
-from torch import nn
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+from transformers import EsmTokenizer
+from dataclasses import dataclass
+from pathlib import Path
+
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -251,9 +252,9 @@ class BERT(nn.Module):
 
     def __init__(self, config: "ModelConfig"):
         super().__init__()
-
-        self.mask_id = 32
-        self.bos_id = 33
+        tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
+        self.mask_id = tokenizer.mask_token_id
+        self.cls_id = tokenizer.cls_token_id
 
         self.num_layers = config.num_layers
 
@@ -272,7 +273,7 @@ class BERT(nn.Module):
         self.lm_head.weight.data.zero_() # @Grad62304977
 
     def encoder_pass(self, input_seq: torch.Tensor, sliding_window_size: torch.Tensor):
-        docs = (input_seq == self.bos_id).cumsum(0)
+        docs = (input_seq == self.cls_id).cumsum(0)
 
         def doc_mask_mod(b, h, q_idx, kv_idx):
             bidirectional_sliding_window_mask = torch.abs(q_idx - kv_idx) < sliding_window_size
@@ -310,16 +311,18 @@ class BERT(nn.Module):
 
     def forward(self, seq, sliding_window_size: torch.Tensor):
         # MLM mask/replace constants from https://www.biorxiv.org/content/10.1101/2022.07.20.500902v3.full.pdf
-        pct_masked = 0.12
-        pct_replaced = 0.015
-        pct_kept = 0.015
+        pct_masked = 0.12    # 12% of tokens are masked
+        pct_replaced = 0.015 # 1.5% of tokens are randomly replaced 
+        pct_kept = 0.015     # 1.5% of tokens are kept unchanged
 
         # set pct_masked% to <mask>
         mlm_mask = self.get_frac_mask(seq, pct_masked)
         input_seq = seq.clone().masked_fill(mlm_mask, self.mask_id)
-        # substitute pct_replaced% with token id between 4 and 30 (inclusive)
+
+        # substitute pct_replaced% with random token id between 4 and 30 (inclusive)
         sub_mask = self.get_frac_mask(seq, pct_replaced, include=~mlm_mask)
         input_seq[sub_mask] = torch.randint(4, 31, (sub_mask.sum(),), dtype=seq.dtype, device=seq.device)
+
         # retain pct_kept%
         keep_mask = self.get_frac_mask(seq, pct_kept, include=~(sub_mask | mlm_mask))
 
@@ -333,7 +336,7 @@ class BERT(nn.Module):
         )
 
     def get_frac_mask(self, seq: torch.Tensor, pct: float, include=None):
-        docs = (seq == self.bos_id).cumsum(0)
+        docs = (seq == self.cls_id).cumsum(0)
         valid_tokens_mask = (seq >= 4) & (seq <= 30)
         if include is not None:
             valid_tokens_mask &= include
@@ -437,7 +440,7 @@ class ModelConfig:
     # ESM2-35M has 12 layers, 20 heads, 480 hidden dim: https://huggingface.co/facebook/esm2_t12_35M_UR50D/blob/main/config.json
     # ESM2-150M has 30 layers, 20 heads, 640 hidden dim: https://huggingface.co/facebook/esm2_t30_150M_UR50D/blob/main/config.json
     # ESM2-650M has 33 layers, 20 heads, 1280 hidden dim: https://huggingface.co/facebook/esm2_t33_650M_UR50D/blob/main/config.json
-    vocab_size : int = 34  # normal vocab plus mock BOS
+    vocab_size : int = 33
     num_layers : int = 12
     num_heads : int = 6 # head dim 128 suggested by @Grad62304977
     model_dim : int = 768
