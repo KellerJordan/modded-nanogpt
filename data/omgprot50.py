@@ -63,7 +63,7 @@ enc = EsmTokenizer.from_pretrained("facebook/esm2_t6_8M_UR50D")
 def tokenize(doc):
     # tokenizes a single document and returns a numpy array of uint8 tokens
     tokens = enc.encode(doc["sequence"], add_special_tokens=True)
-    assert tokens[0] == 0 and (tokens == 0).sum() == 1, "CLS token should always be at start and only at start"
+    assert tokens[0] == 0 and tokens.count(0) == 1, "CLS token should always be at start and only at start"
     tokens_np = np.array(tokens)
     assert (0 <= tokens_np).all() and (tokens_np < 2**8).all(), "token dictionary too large for uint8"
     tokens_np_uint16 = tokens_np.astype(np.uint16) # can use uint8 because only 33 tokens
