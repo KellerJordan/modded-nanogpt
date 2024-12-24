@@ -22,7 +22,7 @@ args = parser.parse_args()
 
 
 def write_datafile(filename, toks):
-    """ 
+    """
     Saves token data as a .bin file, for reading in C.
     - First comes a header with 256 int32s
     - The tokens follow, each as a uint16
@@ -61,12 +61,13 @@ fw = load_dataset("Synthyra/omg_prot50", split="train")
 enc = EsmTokenizer.from_pretrained("facebook/esm2_t6_8M_UR50D")
 
 def tokenize(doc):
-    # tokenizes a single document and returns a numpy array of uint16 tokens
-    tokens = enc.encode(doc["sequence"], add_special_tokens=True).input_ids
+    # tokenizes a single document and returns a numpy array of uint8 tokens
+    tokens = enc.encode(doc["sequence"], add_special_tokens=True)
+    assert tokens[0] == 0 and tokens.count(0) == 1, "CLS token should always be at start and only at start"
     tokens_np = np.array(tokens)
     assert (0 <= tokens_np).all() and (tokens_np < 2**8).all(), "token dictionary too large for uint8"
-    tokens_np_uint8 = tokens_np.astype(np.uint8) # can use uint8 because only 33 tokens
-    return tokens_np_uint8
+    tokens_np_uint16 = tokens_np.astype(np.uint16) # can use uint8 because only 33 tokens
+    return tokens_np_uint16
 
 
 # tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
@@ -74,7 +75,7 @@ nprocs = max(1, os.cpu_count() - 2) # don't hog the entire system
 with mp.Pool(nprocs) as pool:
     shard_index = 0
     # preallocate buffer to hold current shard
-    all_tokens_np = np.empty((args.shard_size,), dtype=np.uint8)
+    all_tokens_np = np.empty((args.shard_size,), dtype=np.uint16)
     token_count = 0
     progress_bar = None
     for tokens in pool.imap(tokenize, fw, chunksize=16):

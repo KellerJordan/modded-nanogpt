@@ -1,5 +1,17 @@
 # Replicating ESM2 at the speed of sound
-This repo is an open-source collaboration to reproduce ESM2-150M validation loss in as little time as possible inspired by the fantastic [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) repo. 
+This repo is an open-source collaboration to reproduce ESM2-150M validation loss in as little time as possible inspired by the fantastic [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) repo.
+
+## Quick Start
+
+Setup environment and train ESM2
+
+```
+git clone https://github.com/Synthyra/SpeedRunningESM2 && cd SpeedRunningESM2
+pip install -r requirements.txt
+pip install --pre torch==2.6.0.dev20241203+cu124 --index-url https://download.pytorch.org/whl/nightly/cu124 --upgrade # install torch 2.6.0
+python data/cached_omgprot50.py 10 # downloads only the first 1.0B training tokens to save time
+./run.sh
+```
 
 ## Benchmarks to match
 [OMGprot50](https://huggingface.co/datasets/Synthyra/omg_prot50) validation and test sets, 15% BERT-like MLM objective.

@@ -5,16 +5,19 @@ with open(sys.argv[0]) as f:
 import uuid
 import time
 import contextlib
-from dataclasses import dataclass
-from pathlib import Path
+import math
 
 import torch
-from torch import nn
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.nn.attention.flex_attention import BlockMask, flex_attention #KoszarskyB
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+from transformers import EsmTokenizer
+from dataclasses import dataclass
+from pathlib import Path
+
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -133,7 +136,7 @@ class Muon(torch.optim.Optimizer):
 
 
 # -----------------------------------------------------------------------------
-# PyTorch nn.Module definitions for the GPT-2 model
+# PyTorch nn.Module definitions
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
@@ -232,7 +235,7 @@ class Block(nn.Module):
 
 
 class ValueEmbedding(nn.Module):
-    def __init__(self, config: "GPTConfig"):
+    def __init__(self, config: "ModelConfig"):
         super().__init__()
         self.embed = nn.ModuleList([
             nn.Embedding(config.vocab_size, config.model_dim)
@@ -246,11 +249,15 @@ class ValueEmbedding(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# The main GPT-2 model
-class GPT(nn.Module):
+# The main ESM Bert model
+class BERT(nn.Module):
 
-    def __init__(self, config: "GPTConfig"):
+    def __init__(self, config: "ModelConfig"):
         super().__init__()
+        tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
+        self.mask_id = tokenizer.mask_token_id
+        self.cls_id = tokenizer.cls_token_id
+
         self.num_layers = config.num_layers
 
         # U-net design by @brendanh0gan
@@ -267,59 +274,23 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(
-        self,
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-        sliding_window_num_blocks: torch.Tensor,
-    ):
-        BLOCK_SIZE = 128
-        seq_len = len(inputs)
-        assert seq_len % BLOCK_SIZE == 0
-        total_num_blocks = seq_len // BLOCK_SIZE
-        assert inputs.ndim == 1
-        docs = (inputs == 50256).cumsum(0)
-        docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
-        docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
+    def encoder_pass(self, input_seq: torch.Tensor, sliding_window_size: torch.Tensor):
+        docs = (input_seq == self.cls_id).cumsum(0)
 
-        def document_mask_mod(b, h, q_idx, kv_idx):
-            return docs[q_idx] == docs[kv_idx]
+        def doc_mask_mod(b, h, q_idx, kv_idx):
+            bidirectional_sliding_window_mask = torch.abs(q_idx - kv_idx) < sliding_window_size
+            doc_mask = docs[q_idx] == docs[kv_idx]
+            return bidirectional_sliding_window_mask & doc_mask
 
-        def dense_to_ordered(dense_mask: torch.Tensor):
-            num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
-            indices = dense_mask.argsort(dim=-1, descending=True, stable=True).to(torch.int32)
-            return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
+        S = len(input_seq)
+        block_mask = create_block_mask(
+            doc_mask_mod, None, None, S, S,
+        )
 
-        def create_doc_swc_block_mask(sliding_window_num_blocks: torch.Tensor):
-            kv_idx = block_idx = torch.arange(total_num_blocks, dtype=torch.int32, device="cuda")
-            q_idx = block_idx[:, None]
-            causal_bm = q_idx >= kv_idx
-            causal_full_bm = q_idx > kv_idx
-            window_bm = q_idx - kv_idx < sliding_window_num_blocks
-            window_full_bm = window_bm
-            # document_bm = (docs_low[q_idx] <= docs_high[kv_idx]) & (docs_low[kv_idx] <= docs_high[q_idx])
-            document_bm = (docs_low[:, None] <= docs_high) & (docs_low <= docs_high[:, None])
-            document_full_bm = (docs_low[:, None] == docs_high) & (docs_low == docs_high[:, None])
-            nonzero_bm = causal_bm & window_bm & document_bm
-            full_bm  = causal_full_bm & window_full_bm & document_full_bm
-            kv_num_blocks, kv_indices = dense_to_ordered(nonzero_bm ^ full_bm)
-            full_kv_num_blocks, full_kv_indices = dense_to_ordered(full_bm)
-            return BlockMask.from_kv_blocks(
-                kv_num_blocks,
-                kv_indices,
-                full_kv_num_blocks,
-                full_kv_indices,
-                BLOCK_SIZE=BLOCK_SIZE,
-                mask_mod=document_mask_mod,
-            )
-
-        block_mask = create_doc_swc_block_mask(sliding_window_num_blocks)
-
-        # forward the GPT model itself
-        x = self.embed(inputs[None]) # token embeddings of shape (b, t, model_dim)
+        x = self.embed(input_seq[None])
         x = norm(x) # @Grad62304977
         x0 = x
-        ve = self.value_embeds(inputs)
+        ve = self.value_embeds(input_seq)
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
 
         # Store outputs for U-Net skip connections
@@ -338,8 +309,49 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return loss
+        return logits
+
+    def forward(self, seq, sliding_window_size: torch.Tensor):
+        # MLM mask/replace constants from https://www.biorxiv.org/content/10.1101/2022.07.20.500902v3.full.pdf
+        pct_masked = 0.12    # 12% of tokens are masked
+        pct_replaced = 0.015 # 1.5% of tokens are randomly replaced
+        pct_kept = 0.015     # 1.5% of tokens are kept unchanged
+
+        # set pct_masked% to <mask>
+        mlm_mask = self.get_frac_mask(seq, pct_masked, torch.ones_like(seq, dtype=torch.bool))
+        input_seq = seq.clone().masked_fill(mlm_mask, self.mask_id)
+        # substitute pct_replaced% with token id between 4 and 30 (inclusive)
+        sub_mask = self.get_frac_mask(seq, pct_replaced, ~mlm_mask)
+        input_seq[sub_mask] = torch.randint(4, 31, (sub_mask.sum(),), dtype=seq.dtype, device=seq.device)
+
+        # retain pct_kept%
+        keep_mask = self.get_frac_mask(seq, pct_kept, ~(sub_mask | mlm_mask))
+
+        mlm_loss_mask = mlm_mask | sub_mask | keep_mask
+        logits = self.encoder_pass(input_seq, sliding_window_size)
+        return F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            seq.masked_fill(~mlm_loss_mask, -100).to(dtype=torch.int64).view(-1),
+            ignore_index=-100
+        )
+
+    def get_frac_mask(self, seq: torch.Tensor, pct: float, include=None):
+        docs = (seq == self.cls_id).cumsum(0)
+        valid_tokens_mask = (seq >= 4) & (seq <= 30)
+        if include is not None:
+            valid_tokens_mask &= include
+        random_values = torch.rand_like(docs, dtype=torch.float) * valid_tokens_mask
+
+        # Map each token to its doc index, count tokens per doc, and compute how many to mask
+        _, inv_docs = torch.unique(docs, return_inverse=True)
+        doc_counts = torch.bincount(inv_docs)  # total tokens in each doc
+        num_to_mask = (doc_counts.float() * pct).ceil().to(torch.int64)
+
+        # Rank tokens globally by random value and select num_to_mask
+        sorted_indices = torch.argsort(random_values, descending=True)
+        ranks = torch.empty_like(sorted_indices, dtype=torch.int64)
+        ranks[sorted_indices] = torch.arange(len(seq), device=seq.device)
+        return ranks < num_to_mask[inv_docs]
 
 
 # -----------------------------------------------------------------------------
@@ -355,7 +367,7 @@ def _peek_data_shard(file: Path):
 
 def _load_data_shard(path: Path, num_tokens):
     with path.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint8, pin_memory=True)
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy())
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header?"
@@ -393,13 +405,12 @@ class DistributedDataLoader:
         buf = self.tokens[self.current_position:self.current_position+self.seq_len+1]
         # host side async is sufficient;
         # no performance improvement was observed when introducing a separate stream.
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # targets
+        seq = buf.to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
         # advance current position and load next shard if necessary
         self.current_position += batch_size
         if self.current_position + batch_size + 1 >= len(self.tokens):
             self.advance()
-        return inputs, targets
+        return seq
 
 
 # -----------------------------------------------------------------------------
@@ -407,10 +418,8 @@ class DistributedDataLoader:
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = 'data/omgprot50/data/train-*-of-00091.parquet' # input .bin to train on
-    #input_val_bin : str = 'data/omgprot50/data/valid-*-of-00001.parquet' # input .bin to eval validation loss on
-    # actual benchmark is on test set
-    input_test_bin : str = 'data/omgprot50/data/test-*-of-00001.parquet' # input .bin to eval test loss on
+    input_bin : str = 'data/omgprot50/omgprot50_train_*.bin' # input .bin to train on
+    input_val_bin : str = 'data/omgprot50/omgprot50_val_*.bin'  # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     sequence_length : int = 64*1024 # sequence length, in tokens
@@ -424,7 +433,7 @@ class Hyperparameters:
 
 
 @dataclass
-class GPTConfig:
+class ModelConfig:
     # 33 tokens: https://huggingface.co/Synthyra/ESMplusplus_large/blob/main/modeling_esm_plusplus.py#L868-L874
     # Depth of the number of layers is typically more important than the depth of the hidden dimension for PLMs
     # ESM2-8M has 6 layers, 20 heads, 320 hidden dim: https://huggingface.co/facebook/esm2_t6_8M_UR50D/blob/main/config.json
@@ -437,8 +446,16 @@ class GPTConfig:
     model_dim : int = 768
 
 
-gpt_config = GPTConfig()
+model_config = ModelConfig()
 args = Hyperparameters()
+
+
+def get_param_count(model):
+    total_params = 0
+    for name, param in model.named_parameters():
+        total_params += param.numel()
+    return total_params
+
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
 ddp_rank = int(os.environ['RANK'])
@@ -494,9 +511,9 @@ val_loader = DistributedDataLoader(args.input_val_bin, args.sequence_length, ddp
 print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
 print0(f"Validation DataLoader: total number of tokens: {val_loader.total_num_tokens} across {len(val_loader.files)} files")
 print0('='*100, logonly=True)
-inputs_train, targets_train = train_loader.next_batch()
+seq_train = train_loader.next_batch()
 
-model = GPT(gpt_config)
+model = BERT(model_config)
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
@@ -532,8 +549,8 @@ def get_lr(it):
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
-sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device="cuda")
-sw_num_blocks_prev = 1
+sliding_window_size = torch.tensor(1024 - 128, dtype=torch.int32, device="cuda")
+sw_prev = 1024 - 128
 # Start training loop
 training_time_ms = 0
 # start the clock
@@ -550,12 +567,12 @@ for step in range(args.num_iterations + 1):
         t0 = time.perf_counter()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-    # Linearly increase the sliding window size over training in chunks of 128 from 128 -> 1856. By @fernbear.bsky.social
+    # Linearly increase the sliding window size over training in chunks of 128 from 1024 -> 2048. By @fernbear.bsky.social
     frac_done = step / args.num_iterations # training progress
-    sw_num_blocks = int(((1 - frac_done) * 128 + frac_done * 1856) // 128)
-    if sw_num_blocks != sw_num_blocks_prev:
-        sliding_window_num_blocks.copy_(sw_num_blocks, non_blocking=True)
-        sw_num_blocks_prev = sw_num_blocks
+    sw_size = int(((1 - frac_done) * 1023 + frac_done * 2048) // 128) * 128
+    if sw_size != sw_prev:
+        sliding_window_size.copy_(sw_size, non_blocking=True)
+        sw_prev = sw_size
 
     # once in a while evaluate the validation dataset
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
@@ -568,12 +585,12 @@ for step in range(args.num_iterations + 1):
         val_loss = 0.0
         for _ in range(val_steps):
             with torch.no_grad():
-                inputs_val, targets_val = val_loader.next_batch()
-                val_loss += model(inputs_val, targets_val, sliding_window_num_blocks)
+                seq_val = val_loader.next_batch()
+                val_loss += model(seq_val, sliding_window_size)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
-        print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+        print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms perplexity:{(math.e**val_loss):.4f} param_count:{get_param_count(model):,}')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -604,10 +621,10 @@ for step in range(args.num_iterations + 1):
         with contextlib.ExitStack() as stack:
             if i < train_accumulation_steps: # there's no need to sync gradients every accumulation step
                 stack.enter_context(model.no_sync())
-            if step >= 5:
-                stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
-            model(inputs_train, targets_train, sliding_window_num_blocks).backward()
-            inputs_train, targets_train = train_loader.next_batch()
+            #if step >= 5:
+            #    stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
+            model(seq_train, sliding_window_size).backward()
+            seq_train = train_loader.next_batch()
     if train_accumulation_steps != 1:
         for p in model.parameters():
             p.grad /= train_accumulation_steps
