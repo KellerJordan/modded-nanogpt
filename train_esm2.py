@@ -95,9 +95,7 @@ class Muon(torch.optim.Optimizer):
         super().__init__(param_groups, defaults)
 
     def step(self):
-
         for group in self.param_groups:
-
             lr = group['lr']
             momentum = group['momentum']
             nesterov = group['nesterov']
@@ -142,7 +140,6 @@ def norm(x):
 
 
 class CastedLinear(nn.Linear):
-
     def __init__(self, in_features, out_features):
         super().__init__(in_features, out_features, bias=False)
 
@@ -151,7 +148,6 @@ class CastedLinear(nn.Linear):
 
 
 class Rotary(torch.nn.Module):
-
     def __init__(self, dim, base=10000):
         super().__init__()
         self.register_buffer('inv_freq', (1 / base) ** (torch.arange(0, dim, 2) / dim))
@@ -175,8 +171,7 @@ class Rotary(torch.nn.Module):
         return torch.cat((y1, y2), 3).type_as(x)
 
 
-class CausalSelfAttention(nn.Module):
-
+class SelfAttention(nn.Module):
     def __init__(self, dim, num_heads):
         super().__init__()
         assert dim % num_heads == 0
@@ -205,7 +200,6 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-
     def __init__(self, dim):
         super().__init__()
         self.c_fc   = CastedLinear(dim, 4 * dim)
@@ -220,10 +214,9 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-
     def __init__(self, config):
         super().__init__()
-        self.attn = CausalSelfAttention(config.model_dim, config.num_heads)
+        self.attn = SelfAttention(config.model_dim, config.num_heads)
         self.mlp = MLP(config.model_dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
@@ -251,30 +244,54 @@ class ValueEmbedding(nn.Module):
 # -----------------------------------------------------------------------------
 # The main ESM Bert model
 class BERT(nn.Module):
-
     def __init__(self, config: "ModelConfig"):
         super().__init__()
         tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
         self.mask_id = tokenizer.mask_token_id
         self.cls_id = tokenizer.cls_token_id
-
+        self.vocab_size = tokenizer.vocab_size
         self.num_layers = config.num_layers
 
         # U-net design by @brendanh0gan
+        assert config.num_layers % 2 == 0, "Number of layers should be even for U-net design"
         self.num_encoder_layers = config.num_layers // 2 # Half of the layers for encoder
         self.num_decoder_layers = config.num_layers - self.num_encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
-        self.embed = nn.Embedding(config.vocab_size, config.model_dim)
+        self.embed = nn.Embedding(self.vocab_size, config.model_dim)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
         # U-net structure on token value embeddings by @leloykun
         self.value_embeds = ValueEmbedding(config)
-        self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
+        self.lm_head = CastedLinear(config.model_dim, self.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
+        self.cross_entropy = nn.CrossEntropyLoss()
 
-    def encoder_pass(self, input_seq: torch.Tensor, sliding_window_size: torch.Tensor):
+        # MLM mask constants from https://www.biorxiv.org/content/10.1101/2022.07.20.500902v3.full.pdf
+        self.pct_masked = 0.12    # 12% of tokens are masked
+        self.pct_replaced = 0.015 # 1.5% of tokens are randomly replaced
+        self.pct_kept = 0.015     # 1.5% of tokens are kept unchanged
+
+    def get_frac_mask(self, seq: torch.Tensor, pct: float, include=None):
+        docs = (seq == self.cls_id).cumsum(0)
+        valid_tokens_mask = (seq >= 4) & (seq <= 30)
+        if include is not None:
+            valid_tokens_mask &= include
+        random_values = torch.rand_like(docs, dtype=torch.float) * valid_tokens_mask
+
+        # Map each token to its doc index, count tokens per doc, and compute how many to mask
+        _, inv_docs = torch.unique(docs, return_inverse=True)
+        doc_counts = torch.bincount(inv_docs)  # total tokens in each doc
+        num_to_mask = (doc_counts.float() * pct).ceil().to(torch.int64)
+
+        # Rank tokens globally by random value and select num_to_mask
+        sorted_indices = torch.argsort(random_values, descending=True)
+        ranks = torch.empty_like(sorted_indices, dtype=torch.int64)
+        ranks[sorted_indices] = torch.arange(len(seq), device=seq.device)
+        return ranks < num_to_mask[inv_docs]
+
+    def get_logits(self, input_seq: torch.Tensor, sliding_window_size: torch.Tensor):
         docs = (input_seq == self.cls_id).cumsum(0)
 
         def doc_mask_mod(b, h, q_idx, kv_idx):
@@ -311,47 +328,24 @@ class BERT(nn.Module):
         logits = logits.float()
         return logits
 
-    def forward(self, seq, sliding_window_size: torch.Tensor):
-        # MLM mask/replace constants from https://www.biorxiv.org/content/10.1101/2022.07.20.500902v3.full.pdf
-        pct_masked = 0.12    # 12% of tokens are masked
-        pct_replaced = 0.015 # 1.5% of tokens are randomly replaced
-        pct_kept = 0.015     # 1.5% of tokens are kept unchanged
+    def inference(self, input_seq): # premasked sequences
+        sliding_window_size = torch.tensor(2048, dtype=torch.int32, device="cuda")
+        return self.get_logits(input_seq, sliding_window_size)
 
-        # set pct_masked% to <mask>
-        mlm_mask = self.get_frac_mask(seq, pct_masked, torch.ones_like(seq, dtype=torch.bool))
+    def forward(self, seq, sliding_window_size: torch.Tensor):
+        ### MLM masking logic
+        mlm_mask = self.get_frac_mask(seq, self.pct_masked, torch.ones_like(seq, dtype=torch.bool))
         input_seq = seq.clone().masked_fill(mlm_mask, self.mask_id)
         # substitute pct_replaced% with token id between 4 and 30 (inclusive)
-        sub_mask = self.get_frac_mask(seq, pct_replaced, ~mlm_mask)
+        sub_mask = self.get_frac_mask(seq, self.pct_replaced, ~mlm_mask)
         input_seq[sub_mask] = torch.randint(4, 31, (sub_mask.sum(),), dtype=seq.dtype, device=seq.device)
-
         # retain pct_kept%
-        keep_mask = self.get_frac_mask(seq, pct_kept, ~(sub_mask | mlm_mask))
+        keep_mask = self.get_frac_mask(seq, self.pct_kept, ~(sub_mask | mlm_mask))
 
         mlm_loss_mask = mlm_mask | sub_mask | keep_mask
-        logits = self.encoder_pass(input_seq, sliding_window_size)
-        return F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            seq.masked_fill(~mlm_loss_mask, -100).to(dtype=torch.int64).view(-1),
-            ignore_index=-100
-        )
+        logits = self.get_logits(input_seq, sliding_window_size)
+        return self.cross_entropy(logits.view(-1, self.vocab_size), seq.masked_fill(~mlm_loss_mask, -100).long().view(-1))
 
-    def get_frac_mask(self, seq: torch.Tensor, pct: float, include=None):
-        docs = (seq == self.cls_id).cumsum(0)
-        valid_tokens_mask = (seq >= 4) & (seq <= 30)
-        if include is not None:
-            valid_tokens_mask &= include
-        random_values = torch.rand_like(docs, dtype=torch.float) * valid_tokens_mask
-
-        # Map each token to its doc index, count tokens per doc, and compute how many to mask
-        _, inv_docs = torch.unique(docs, return_inverse=True)
-        doc_counts = torch.bincount(inv_docs)  # total tokens in each doc
-        num_to_mask = (doc_counts.float() * pct).ceil().to(torch.int64)
-
-        # Rank tokens globally by random value and select num_to_mask
-        sorted_indices = torch.argsort(random_values, descending=True)
-        ranks = torch.empty_like(sorted_indices, dtype=torch.int64)
-        ranks[sorted_indices] = torch.arange(len(seq), device=seq.device)
-        return ranks < num_to_mask[inv_docs]
 
 
 # -----------------------------------------------------------------------------
@@ -375,6 +369,10 @@ def _load_data_shard(path: Path, num_tokens):
 
 
 class DistributedDataLoader:
+    """
+    TODO
+    This may not be sufficient, as sequences may be cut off when loading
+    """
     def __init__(self, filename_pattern, seq_len, process_rank, num_processes):
         self.process_rank = process_rank
         self.num_processes = num_processes
@@ -442,7 +440,6 @@ class ModelConfig:
     # ESM2-35M has 12 layers, 20 heads, 480 hidden dim: https://huggingface.co/facebook/esm2_t12_35M_UR50D/blob/main/config.json
     # ESM2-150M has 30 layers, 20 heads, 640 hidden dim: https://huggingface.co/facebook/esm2_t30_150M_UR50D/blob/main/config.json
     # ESM2-650M has 33 layers, 20 heads, 1280 hidden dim: https://huggingface.co/facebook/esm2_t33_650M_UR50D/blob/main/config.json
-    vocab_size : int = 33
     num_layers : int = 12
     num_heads : int = 6 # head dim 128 suggested by @Grad62304977
     model_dim : int = 768
@@ -510,8 +507,10 @@ train_accumulation_steps = args.batch_size // ddp_world_size
 # load tokens
 train_loader = DistributedDataLoader(args.input_bin, args.sequence_length, ddp_rank, ddp_world_size)
 val_loader = DistributedDataLoader(args.input_val_bin, args.sequence_length, ddp_rank, ddp_world_size)
+test_loader = DistributedDataLoader(args.input_test_bin, args.sequence_length, ddp_rank, ddp_world_size)
 print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
 print0(f"Validation DataLoader: total number of tokens: {val_loader.total_num_tokens} across {len(val_loader.files)} files")
+print0(f"Test DataLoader: total number of tokens: {test_loader.total_num_tokens} across {len(test_loader.files)} files")
 print0('='*100, logonly=True)
 seq_train = train_loader.next_batch()
 
@@ -536,6 +535,7 @@ scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
 optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -549,6 +549,7 @@ def get_lr(it):
     else:
         decay_ratio = (args.num_iterations - it) / args.cooldown_iters
         return decay_ratio
+
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
 sliding_window_size = torch.tensor(1024 - 128, dtype=torch.int32, device="cuda")
@@ -558,7 +559,8 @@ training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
-# begin training
+
+### BEGIN TRAINING LOOP ###
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
@@ -585,8 +587,8 @@ for step in range(args.num_iterations + 1):
         model.eval()
         val_loader.reset()
         val_loss = 0.0
-        for _ in range(val_steps):
-            with torch.no_grad():
+        with torch.no_grad():
+            for _ in range(val_steps):
                 seq_val = val_loader.next_batch()
                 val_loss += model(seq_val, sliding_window_size)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -612,9 +614,12 @@ for step in range(args.num_iterations + 1):
 
     # run final test set evaluation and exit training
     if last_step:
+        model.eval()
+        test_loader.reset()
+
         break
 
-    # --------------- TRAINING SECTION BEGIN -----------------
+    # --------------- FORWARD AND BACKWARD PASS -----------------
     model.train()
     for i in range(1, train_accumulation_steps + 1):
         with contextlib.ExitStack() as stack:
@@ -637,7 +642,7 @@ for step in range(args.num_iterations + 1):
         sched.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
-    # --------------- TRAINING SECTION END -------------------
+    # --------------- FORWARD AND BACKWARD PASS END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")

@@ -9,6 +9,7 @@ def get(fname):
         hf_hub_download(repo_id="lapp0/omg_prot50_packed", filename=fname,
                         repo_type="dataset", local_dir=local_dir)
 get("omgprot50_val_%06d.bin" % 0)
+get("omgprot50_test_%06d.bin" % 0)
 num_chunks = 442  # Each chunk is 100M tokens
 if len(sys.argv) >= 2: # we can pass an argument to download less
     num_chunks = int(sys.argv[1])
