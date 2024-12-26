@@ -143,7 +143,11 @@ class CastedLinear(nn.Linear):
         super().__init__(in_features, out_features, bias)
 
     def forward(self, x):
-        return F.linear(x, self.weight.to(x.dtype))
+        return F.linear(
+            x,
+            self.weight.to(x.dtype),
+            None if self.bias is None else self.bias.to(x.dtype)
+        )
 
 class Rotary(torch.nn.Module):
 
