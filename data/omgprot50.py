@@ -11,14 +11,10 @@ import os
 import argparse
 import multiprocessing as mp
 import numpy as np
+from functools import partial
 from transformers import EsmTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
-
-
-parser = argparse.ArgumentParser(description="FineWeb dataset preprocessing")
-parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of each shard in tokens")
-args = parser.parse_args()
 
 
 def write_datafile(filename, toks):
@@ -39,38 +35,25 @@ def write_datafile(filename, toks):
         f.write(header.tobytes())
         f.write(toks.tobytes())
 
-# ------------------------------------------
-local_dir = 'omgprot50'
 
-# create the cache the local directory if it doesn't exist yet
-DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
-os.makedirs(DATA_CACHE_DIR, exist_ok=True)
-
-# download the dataset
-train_fw = load_dataset("Synthyra/omg_prot50", split="train")
-valid_fw = load_dataset("Synthyra/omg_prot50", split="valid")
-test_fw = load_dataset("Synthyra/omg_prot50", split="test")
-
-# init the tokenizer
-enc = EsmTokenizer.from_pretrained("facebook/esm2_t6_8M_UR50D")
-
-
-def tokenize(doc):
+def tokenize(doc, tokenizer):
     # tokenizes a single document and returns a numpy array of uint16 tokens
     # uint8 can hold the 33 tokens but causes a bug
-    return np.array(enc.encode(doc["sequence"], add_special_tokens=True), dtype=np.uint16)
+    return np.array(tokenizer.encode(doc["sequence"], add_special_tokens=True), dtype=np.uint16)
 
 
 def tokenize_fw(fw, split='train'):
     # tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
-    nprocs = max(1, os.cpu_count() - 8) # don't hog the entire system
+    tokenizer = EsmTokenizer.from_pretrained("facebook/esm2_t6_8M_UR50D")
+    nprocs = max(1, os.cpu_count() - 4) # don't hog the entire system
     with mp.Pool(nprocs) as pool:
         shard_index = 0
         # preallocate buffer to hold current shard
         all_tokens_np = np.empty((args.shard_size,), dtype=np.uint16)
         token_count = 0
         progress_bar = None
-        for tokens in pool.imap(tokenize, fw, chunksize=16):
+        tokenize_fn = partial(tokenize, tokenizer=tokenizer)
+        for tokens in pool.imap(tokenize_fn, fw, chunksize=16):
             # is there enough space in the current shard for the new tokens?
             if token_count + len(tokens) < args.shard_size:
                 # simply append tokens to current shard
@@ -99,6 +82,22 @@ def tokenize_fw(fw, split='train'):
             write_datafile(filename, all_tokens_np[:token_count])
 
 
-tokenize_fw(train_fw, split='train')
-tokenize_fw(valid_fw, split='valid')
-tokenize_fw(test_fw, split='test')
+parser = argparse.ArgumentParser(description="FineWeb dataset preprocessing")
+parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of each shard in tokens")
+
+
+if __name__ == "__main__":
+    args = parser.parse_args()
+    local_dir = 'omgprot50'
+
+    # create the cache the local directory if it doesn't exist yet
+    DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
+    os.makedirs(DATA_CACHE_DIR, exist_ok=True)
+
+    # download the dataset
+    train_fw = load_dataset("Synthyra/omg_prot50", split="train")
+    valid_fw = load_dataset("Synthyra/omg_prot50", split="valid")
+    test_fw = load_dataset("Synthyra/omg_prot50", split="test")
+    tokenize_fw(valid_fw, split='valid')
+    tokenize_fw(test_fw, split='test')
+    tokenize_fw(train_fw, split='train')
