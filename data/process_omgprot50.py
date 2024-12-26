@@ -21,25 +21,25 @@ def write_datafile(filename, toks):
     """
     Saves token data as a .bin file, for reading in C.
     - First comes a header with 256 int32s
-    - The tokens follow, each as a uint16
+    - The tokens follow, each as a uint8
     """
     assert len(toks) < 2**31, "token count too large" # ~2.1B tokens
     # construct the header
     header = np.zeros(256, dtype=np.int32)
     header[0] = 20240520 # magic
     header[1] = 1 # version
-    header[2] = len(toks) # number of tokens after the 256*4 bytes of header (each 2 bytes as uint16)
+    header[2] = len(toks) # number of tokens after the 256*4 bytes of header (each 2 bytes as uint8)
     # construct the tokens numpy array, if not already
-    print(f"writing {len(toks):,} tokens to {filename}")
+    print(f"\nwriting {len(toks):,} tokens to {filename}")
     with open(filename, "wb") as f:
         f.write(header.tobytes())
         f.write(toks.tobytes())
 
 
 def tokenize(doc, tokenizer):
-    # tokenizes a single document and returns a numpy array of uint16 tokens
+    # tokenizes a single document and returns a numpy array of uint8 tokens
     # uint8 can hold the 33 tokens but causes a bug
-    return np.array(tokenizer.encode(doc["sequence"], add_special_tokens=True), dtype=np.uint16)
+    return np.array(tokenizer.encode(doc["sequence"], add_special_tokens=True), dtype=np.uint8)
 
 
 def tokenize_fw(fw, split='train'):
@@ -49,7 +49,7 @@ def tokenize_fw(fw, split='train'):
     with mp.Pool(nprocs) as pool:
         shard_index = 0
         # preallocate buffer to hold current shard
-        all_tokens_np = np.empty((args.shard_size,), dtype=np.uint16)
+        all_tokens_np = np.empty((args.shard_size,), dtype=np.uint8)
         token_count = 0
         progress_bar = None
         tokenize_fn = partial(tokenize, tokenizer=tokenizer)

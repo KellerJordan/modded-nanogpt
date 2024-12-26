@@ -361,7 +361,7 @@ def _peek_data_shard(file: Path):
 
 def _load_data_shard(path: Path, num_tokens):
     with path.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        tokens = torch.empty(num_tokens, dtype=torch.uint8, pin_memory=True)
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy())
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header?"
