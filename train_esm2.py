@@ -420,6 +420,7 @@ class Hyperparameters:
     # data hyperparams
     input_bin : str = 'data/omgprot50/omgprot50_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/omgprot50/omgprot50_val_*.bin'  # input .bin to eval validation loss on
+    input_test_bin : str = 'data/omgprot50/omgprot50_test_*.bin'  # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     sequence_length : int = 64*1024 # sequence length, in tokens
@@ -430,6 +431,7 @@ class Hyperparameters:
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    save_every = None # save every how many steps? None for no saving
 
 
 @dataclass
@@ -575,7 +577,7 @@ for step in range(args.num_iterations + 1):
         sw_prev = sw_size
 
     # once in a while evaluate the validation dataset
-    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+    if args.val_loss_every > 0 and step % args.val_loss_every == 0:
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
@@ -595,23 +597,20 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-    # uncomment if you want to save any checkpoints
-    #save_every = 1000
-    #if master_process and (last_step or (save_every > 0 and step % save_every == 0)):
-    #    # stop the clock
-    #    torch.cuda.synchronize()
-    #    training_time_ms += 1000 * (time.perf_counter() - t0)
-    #    # save the state of the training process
-    #    log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-    #    torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
-    #    # start the clock again
-    #    torch.cuda.synchronize()
-    #    t0 = time.perf_counter()
+    # save checkpoint every `save_every` steps
+    if master_process and args.save_every:
+        if last_step or (step % args.save_every == 0):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            # save the state of the training process
+            log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
 
-    # bit confusing: we want to make sure to eval on 0th iteration
-    # but also after the very last iteration. so we loop for step <= num_iterations
-    # instead of just < num_iterations (one extra due to <=), only to do
-    # the validation/sampling one last time, and then we break right here as we're done.
+    # run final test set evaluation and exit training
     if last_step:
         break
 
