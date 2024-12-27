@@ -92,7 +92,12 @@ class TestDataset(torch.utils.data.Dataset):
             if self.current_idx >= self.num_seqs:
                 self.current_idx = 0
             
-            input_ids = self.tokenizer(self.sequences[self.current_idx], truncation=True, max_length=1024, add_special_tokens=True).input_ids
+            input_ids = self.tokenizer(
+                self.sequences[self.current_idx],
+                truncation=True,
+                padding=False,
+                max_length=1024,
+                add_special_tokens=True).input_ids
             current_length += len(input_ids)
             if current_length >= self.batch_size:
                 break
