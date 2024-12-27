@@ -74,25 +74,31 @@ class TestDataset(torch.utils.data.Dataset):
         print(data)
         sequences = data['sequence']
         self.sequences = sorted(sequences, key=len, reverse=True)
+        self.num_tokens = sum(len(seq) for seq in self.sequences)
+        self.num_seqs = len(self.sequences)
         self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
         self.masker = ProteinMasker(tokenizer, 0.15) # 15% masking rate like ESM2 for inference
         self.batch_size = batch_size
         self.current_idx = 0
 
     def __len__(self):
-        return (len(self.sequences) + self.batch_size - 1) // self.batch_size
+        return self.num_tokens // self.batch_size
 
     def __getitem__(self, idx):
         batch_input_ids = []
-        
-        for i in range(self.batch_size):
-            if self.current_idx >= len(self.sequences):
+        current_length = 0
+
+        for _ in range(self.num_seqs):
+            if self.current_idx >= self.num_seqs:
                 self.current_idx = 0
             
-            input_ids = self.tokenizer(self.sequences[self.current_idx], return_tensors='pt', truncation=True, max_length=1024).input_ids
-            batch_input_ids.extend(input_ids.flatten().tolist())
+            input_ids = self.tokenizer(self.sequences[self.current_idx], truncation=True, max_length=1024).input_ids
+            current_length += len(input_ids)
+            if current_length >= self.batch_size:
+                break
+            batch_input_ids.extend(input_ids)
             self.current_idx += 1
             
-        input_ids = torch.tensor(batch_input_ids)
+        input_ids = torch.tensor(batch_input_ids).view(1, -1)
         input_ids, labels = self.masker(input_ids)
         return input_ids, labels

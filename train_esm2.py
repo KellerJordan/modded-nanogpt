@@ -41,7 +41,7 @@ def get_args():
     
     # Model hyperparams
     parser.add_argument('--vocab_size', type=int, default=33, help='vocabulary size')
-    parser.add_argument('--num_layers', type=int, default=6, help='number of transformer layers')
+    parser.add_argument('--num_layers', type=int, default=20, help='number of transformer layers')
     parser.add_argument('--num_heads', type=int, default=6, help='number of attention heads (head dim 128 suggested by @Grad62304977)')
     parser.add_argument('--model_dim', type=int, default=768, help='model hidden dimension size')
     
@@ -52,14 +52,13 @@ def get_args():
     
     # Optimization hyperparams
     parser.add_argument('--batch_size', type=int, default=64*1024, help='batch size, in tokens, across all devices')
-    parser.add_argument('--grad_accum', type=int, default=1, help='number of gradient accumulation steps')
-    parser.add_argument('--num_iterations', type=int, default=1480, help='number of iterations to run')
-    parser.add_argument('--warmup_iters', type=int, default=0, help='number of warmup iterations')
-    parser.add_argument('--cooldown_iters', type=int, default=600, help='number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule')
-    parser.add_argument('--weight_decay', type=float, default=0, help='weight decay coefficient')
+    parser.add_argument('--grad_accum', type=int, default=1, help='manually set number of gradient accumulation steps, else, will be ddp_world_size')
+    parser.add_argument('--num_steps', type=int, default=25000, help='number of iterations to run')
+    parser.add_argument('--warmup_steps', type=int, default=1000, help='number of warmup steps')
+    parser.add_argument('--cooldown_steps', type=int, default=1000, help='number of cooldown steps')
     
     # Evaluation and logging hyperparams
-    parser.add_argument('--val_loss_every', type=int, default=125, help='every how many steps to evaluate val loss? 0 for only at the end')
+    parser.add_argument('--val_loss_every', type=int, default=500, help='every how many steps to evaluate val loss? 0 for only at the end')
     parser.add_argument('--val_tokens', type=int, default=2077660, help='how many tokens of validation data? important to keep fixed for consistent comparisons')
     parser.add_argument('--save_every', type=int, default=None, help='save every how many steps? None for no saving')
     args = parser.parse_args()
@@ -179,16 +178,16 @@ if __name__ == "__main__":
 
     # learning rate decay scheduler (linear warmup and cooldown)
     def get_lr(it):
-        assert it <= args.num_iterations
-        # 1) linear warmup for warmup_iters steps
-        if it < args.warmup_iters:
-            return (it+1) / args.warmup_iters
+        assert it <= args.num_steps
+        # 1) linear warmup for warmup_steps steps
+        if it < args.warmup_steps:
+            return (it+1) / args.warmup_steps
         # 2) constant lr for a while
-        elif it < args.num_iterations - args.cooldown_iters:
+        elif it < args.num_steps - args.cooldown_steps:
             return 1.0
         # 3) linear cooldown
         else:
-            decay_ratio = (args.num_iterations - it) / args.cooldown_iters
+            decay_ratio = (args.num_steps - it) / args.cooldown_steps
             return decay_ratio
 
     schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
@@ -203,8 +202,8 @@ if __name__ == "__main__":
 
 
     ### BEGIN TRAINING LOOP ###
-    for step in range(args.num_iterations + 1):
-        last_step = (step == args.num_iterations)
+    for step in range(args.num_steps + 1):
+        last_step = (step == args.num_steps)
         # This effectively ignores timing first 10 steps, which are slower for weird reasons.
         # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
         # steps with dummy data first, and then re-initialize the model and reset the loader.
@@ -214,7 +213,7 @@ if __name__ == "__main__":
         timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
         # Linearly increase the sliding window size over training in chunks of 128 from 1024 -> 2048. By @fernbear.bsky.social
-        frac_done = step / args.num_iterations # training progress
+        frac_done = step / args.num_steps # training progress
         sw_size = int(((1 - frac_done) * 1023 + frac_done * 2048) // 128) * 128
         if sw_size != sw_prev:
             sliding_window_size.copy_(sw_size, non_blocking=True)
@@ -237,7 +236,7 @@ if __name__ == "__main__":
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
             val_loss /= val_steps
             # log val loss to console and to logfile
-            print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms perplexity:{(math.e**val_loss):.4f} param_count:{get_param_count(model):,}')
+            print0(f'step:{step}/{args.num_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms perplexity:{(math.e**val_loss):.4f} param_count:{get_param_count(model):,}')
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -284,7 +283,7 @@ if __name__ == "__main__":
         # --------------- FORWARD AND BACKWARD PASS END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
         approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-        print0(f"step:{step+1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+        print0(f"step:{step+1}/{args.num_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
 
 
     # Finish timing before inference
