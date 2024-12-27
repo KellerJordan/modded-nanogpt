@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from transformers import EsmTokenizer
 from utils import ProteinMasker
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Any
 
 
 class ModelConfig:
@@ -175,6 +175,7 @@ class ESM(nn.Module):
         super().__init__()
         tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
         self.masker = ProteinMasker(tokenizer, 0.20) # 20% masking rate https://arxiv.org/abs/2301.06568
+        self.inference_masker = ProteinMasker(tokenizer, 0.15) # 15% masking rate for inference, ESM2
         self.cls_id = tokenizer.cls_token_id
         self.vocab_size = tokenizer.vocab_size
         self.num_layers = config.num_layers
@@ -256,13 +257,13 @@ class ESM(nn.Module):
 
         return self.get_logits(x)
 
-    def inference(self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None) -> Tuple[Optional[torch.Tensor], torch.Tensor]: # premaked input_ids
-        sliding_window_size = torch.tensor(1024, dtype=torch.int32, device="cuda")
+    def inference(self, input_ids: torch.Tensor, sliding_window_size: torch.Tensor = None) -> Tuple[torch.Tensor, Any, Any]:
+        input_ids, labels = self.inference_masker(input_ids)
         logits = self.flex_forward(input_ids, sliding_window_size)
         loss = None
         if labels is not None:
             loss = self.cross_entropy(logits.view(-1, self.vocab_size), labels.view(-1).long())
-        return loss, logits
+        return logits, loss, labels
 
     def forward(self, input_ids: torch.Tensor, sliding_window_size: torch.Tensor) -> torch.Tensor:
         input_ids, labels = self.masker(input_ids)

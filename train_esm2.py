@@ -28,12 +28,11 @@ import torch
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
-from transformers import EsmTokenizer
 from pathlib import Path
 
 from optimizer import Muon
 from model import ModelConfig, ESM, CastedLinear
-from dataloading import DistributedDataLoader, TestDataset
+from dataloading import DistributedDataLoader
 
 
 def get_args():
@@ -47,8 +46,8 @@ def get_args():
     
     # Data hyperparams
     parser.add_argument('--input_bin', type=str, default='data/omgprot50/omgprot50_train_*.bin', help='input .bins to train on')
-    parser.add_argument('--input_val_bin', type=str, default='data/omgprot50/omgprot50_valid_*.bin', help='input .bins to eval validation loss on')
-    #parser.add_argument('--input_test_bin', type=str, default='data/omgprot50/omgprot50_test_*.bin', help='input .bins to eval test loss on')   
+    parser.add_argument('--input_valid_bin', type=str, default='data/omgprot50/omgprot50_valid_*.bin', help='input .bins to eval validation loss on')
+    parser.add_argument('--input_test_bin', type=str, default='data/omgprot50/omgprot50_test_*.bin', help='input .bins to eval test loss on')   
     
     # Optimization hyperparams
     parser.add_argument('--batch_size', type=int, default=64*1024, help='batch size, in tokens, across all devices')
@@ -58,8 +57,7 @@ def get_args():
     parser.add_argument('--cooldown_steps', type=int, default=1000, help='number of cooldown steps')
     
     # Evaluation and logging hyperparams
-    parser.add_argument('--val_loss_every', type=int, default=500, help='every how many steps to evaluate val loss? 0 for only at the end')
-    parser.add_argument('--val_tokens', type=int, default=2077660, help='how many tokens of validation data? important to keep fixed for consistent comparisons')
+    parser.add_argument('--valid_loss_every', type=int, default=500, help='every how many steps to evaluate val loss? 0 for only at the end')
     parser.add_argument('--save_every', type=int, default=None, help='save every how many steps? None for no saving')
     args = parser.parse_args()
     return args
@@ -127,18 +125,16 @@ if __name__ == "__main__":
     print0(f'{result.stdout}', logonly=True)
     print0('='*100, logonly=True)
 
-    # calculate the number of steps to take in the val loop.
-    args.val_tokens = (args.val_tokens // (args.batch_size * ddp_world_size)) * (args.batch_size * ddp_world_size)
-    val_steps = args.val_tokens // (args.batch_size * ddp_world_size)
-    # calculate the steps of gradient accumulation required to attain the desired global batch size.
+    # calculate the steps of gradient accumulation required to attain the desired global batch size
+    # args.batch_size should refer to the total amount of tokens per backward pass
     train_accumulation_steps = 1
     batch_size = args.batch_size
+
+    assert ddp_world_size == 1 or args.grad_accum == 1, "Cannot currently use both DDP and gradient accumulation"
     if ddp_world_size > 1:
-        assert args.batch_size % ddp_world_size == 0
         train_accumulation_steps = ddp_world_size
-        batch_size = args.batch_size // ddp_world_size
-    
-    if args.grad_accum > 1:
+        batch_size = args.batch_size // ddp_world_size 
+    elif args.grad_accum > 1:
         train_accumulation_steps *= args.grad_accum
         batch_size = args.batch_size // args.grad_accum
 
@@ -149,10 +145,16 @@ if __name__ == "__main__":
 
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size)
-    val_loader = DistributedDataLoader(args.input_val_bin, batch_size, ddp_rank, ddp_world_size)
+    valid_loader = DistributedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size)
+    test_loader = DistributedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size)
     print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
-    print0(f"Validation DataLoader: total number of tokens: {val_loader.total_num_tokens} across {len(val_loader.files)} files")
+    print0(f"Validation DataLoader: total number of tokens: {valid_loader.total_num_tokens} across {len(valid_loader.files)} files")
+    print0(f"Testing DataLoader: total number of tokens: {test_loader.total_num_tokens} across {len(test_loader.files)} files")
     print0('='*100, logonly=True)
+
+    valid_steps = valid_loader.total_num_tokens // args.batch_size
+    test_steps = test_loader.total_num_tokens // args.batch_size
+
     input_ids = train_loader.next_batch()
 
     model = ESM(model_config)
@@ -172,11 +174,11 @@ if __name__ == "__main__":
 
     # init the optimizers
     embed_params = [*raw_model.embed.parameters(), *raw_model.value_embeds.parameters()]
-    optimizer1 = torch.optim.Adam(embed_params, lr=0.6, betas=(0.8, 0.95), fused=True)
-    optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
     params = list(raw_model.blocks.parameters())
     matrix_params = [p for p in params if p.ndim == 2]
     scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
+    optimizer1 = torch.optim.Adam(embed_params, lr=0.6, betas=(0.8, 0.95), fused=True)
+    optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
     optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
     optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
     optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
@@ -205,7 +207,6 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-
     ### BEGIN TRAINING LOOP ###
     for step in range(args.num_steps + 1):
         last_step = (step == args.num_steps)
@@ -225,21 +226,21 @@ if __name__ == "__main__":
             sw_prev = sw_size
 
         # once in a while evaluate the validation dataset
-        if args.val_loss_every > 0 and step % args.val_loss_every == 0:
+        if args.valid_loss_every > 0 and step % args.valid_loss_every == 0:
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
             # run validation batches
             model.eval()
-            val_loader.reset()
+            valid_loader.reset()
             val_loss = 0.0
             with torch.no_grad():
-                for _ in range(val_steps):
-                    seq_val = val_loader.next_batch()
-                    val_loss += model(seq_val, sliding_window_size)
+                for _ in range(valid_steps):
+                    input_ids = valid_loader.next_batch()
+                    val_loss += model(input_ids, sliding_window_size)
             if ddp_world_size > 1:
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-            val_loss /= val_steps
+            val_loss /= valid_steps
             # log val loss to console and to logfile
             print0(f'step:{step}/{args.num_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms perplexity:{(math.e**val_loss):.4f} param_count:{get_param_count(model):,}')
             # start the clock again
@@ -295,28 +296,21 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     torch.manual_seed(42)
     import numpy as np
-    from torch.utils.data import DataLoader
     from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, matthews_corrcoef
     model.eval()
     results, all_true, all_pred = [], [], []
-    total_loss, count = 0.0, 0
-    tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
-    """
-    TODO
-    Figure out why testing uses so much more VRAM than training
-    """
-    test_loader = DataLoader(TestDataset(tokenizer, batch_size // 4), batch_size=1) # was getting ooms so reducing batch size
+    total_loss = 0.0
 
     from tqdm import tqdm
     with torch.no_grad():
-        for input_ids, labels in tqdm(test_loader, total=len(test_loader), desc="Evaluating"):
-            loss, logits = model.inference(input_ids.cuda(), labels.cuda())        
-            total_loss += loss.detach().cpu().item()
-            count += 1
+        for _ in tqdm(range(test_steps), desc="Evaluating"):
+            input_ids = test_loader.next_batch()
+            logits, loss, labels = model.inference(input_ids, sliding_window_size)       
             all_true.extend(labels.cpu().numpy().flatten())
             all_pred.extend(logits.argmax(dim=-1).cpu().numpy().flatten())
+            total_loss += loss.detach().cpu().item()
 
-    average_loss = total_loss / count
+    average_loss = total_loss / test_steps
     perplexity = torch.exp(torch.tensor(average_loss)).item()
     all_true = np.array(all_true)
     all_pred = np.array(all_pred)
