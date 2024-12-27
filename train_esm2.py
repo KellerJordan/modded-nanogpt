@@ -14,7 +14,6 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-from torch.utils.data import DataLoader
 from transformers import EsmTokenizer
 from dataclasses import dataclass
 from pathlib import Path
@@ -419,7 +418,7 @@ def collate_fn(batch):
 class Hyperparameters:
     # data hyperparams
     input_bin : str = 'data/omgprot50/omgprot50_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/omgprot50/omgprot50_val_*.bin'  # input .bin to eval validation loss on
+    input_val_bin : str = 'data/omgprot50/omgprot50_vaild_*.bin'  # input .bin to eval validation loss on
     #input_test_bin : str = 'data/omgprot50/omgprot50_test_*.bin'  # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
@@ -516,10 +515,8 @@ train_accumulation_steps = args.batch_size // ddp_world_size
 # load tokens
 train_loader = DistributedDataLoader(args.input_bin, args.sequence_length, ddp_rank, ddp_world_size)
 val_loader = DistributedDataLoader(args.input_val_bin, args.sequence_length, ddp_rank, ddp_world_size)
-test_loader = DataLoader(TestDataset(), batch_size=args.batch_size, collate_fn=collate_fn)
 print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
 print0(f"Validation DataLoader: total number of tokens: {val_loader.total_num_tokens} across {len(val_loader.files)} files")
-print0(f"Test DataLoader: total number of tokens: {test_loader.total_num_tokens} across {len(test_loader.files)} files")
 print0('='*100, logonly=True)
 seq_train = train_loader.next_batch()
 
@@ -660,10 +657,12 @@ for step in range(args.num_iterations + 1):
 torch.cuda.synchronize()
 torch.manual_seed(42)
 import numpy as np
+from torch.utils.data import DataLoader
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, matthews_corrcoef
 model.eval()
 results, all_true, all_pred = [], [], []
 total_loss, count = 0.0, 0
+test_loader = DataLoader(TestDataset(), batch_size=args.batch_size, collate_fn=collate_fn)
 
 with torch.no_grad():
     for input_ids, labels in test_loader:
