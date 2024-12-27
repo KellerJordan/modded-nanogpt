@@ -418,7 +418,7 @@ def collate_fn(batch):
 class Hyperparameters:
     # data hyperparams
     input_bin : str = 'data/omgprot50/omgprot50_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/omgprot50/omgprot50_vaild_*.bin'  # input .bin to eval validation loss on
+    input_val_bin : str = 'data/omgprot50/omgprot50_valid_*.bin'  # input .bin to eval validation loss on
     #input_test_bin : str = 'data/omgprot50/omgprot50_test_*.bin'  # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
