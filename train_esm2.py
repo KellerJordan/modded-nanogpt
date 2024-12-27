@@ -273,21 +273,22 @@ class ESM(nn.Module):
         self.lm_head.weight.data.zero_() # @Grad62304977
         self.cross_entropy = nn.CrossEntropyLoss()
 
-    def get_logits(self, input_seq: torch.Tensor, sliding_window_size: torch.Tensor):
-        docs = (input_seq == self.cls_id).cumsum(0)
+    def get_logits(self, input_ids: torch.Tensor, sliding_window_size: torch.Tensor):
+        input_ids = input_ids.flatten() # flex_attention needs batch 1
+        docs = (input_ids == self.cls_id).cumsum(0)
 
         def doc_mask_mod(b, h, q_idx, kv_idx):
             bidirectional_sliding_window_mask = torch.abs(q_idx - kv_idx) < sliding_window_size
             doc_mask = docs[q_idx] == docs[kv_idx]
             return bidirectional_sliding_window_mask & doc_mask
 
-        S = len(input_seq)
+        S = len(input_ids)
         block_mask = create_block_mask(doc_mask_mod, None, None, S, S)
 
-        x = self.embed(input_seq[None])
+        x = self.embed(input_ids[None])
         x = norm(x) # @Grad62304977
         x0 = x
-        ve = self.value_embeds(input_seq)
+        ve = self.value_embeds(input_ids)
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
 
         # Store outputs for U-Net skip connections
@@ -696,7 +697,7 @@ test_loader = DataLoader(TestDataset(tokenizer), batch_size=args.batch_size, col
 
 with torch.no_grad():
     for input_ids, labels in test_loader:
-        loss, logits = model.inference(input_ids.view(1, -1).cuda(), labels.view(1, -1).cuda())        
+        loss, logits = model.inference(input_ids.cuda(), labels.cuda())        
         total_loss += loss.item()
         count += 1
         all_true.extend(labels.cpu().numpy().flatten())
