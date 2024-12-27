@@ -33,7 +33,7 @@ from pathlib import Path
 
 from optimizer import Muon
 from model import ModelConfig, ESM, CastedLinear
-from dataloading import DistributedDataLoader, TestDataset, collate_fn
+from dataloading import DistributedDataLoader, TestDataset
 
 
 def get_args():
@@ -51,9 +51,8 @@ def get_args():
     #parser.add_argument('--input_test_bin', type=str, default='data/omgprot50/omgprot50_test_*.bin', help='input .bins to eval test loss on')   
     
     # Optimization hyperparams
-    parser.add_argument('--batch_size', type=int, default=8, help='batch size, in sequences, across all devices')
+    parser.add_argument('--batch_size', type=int, default=64*1024, help='batch size, in tokens, across all devices')
     parser.add_argument('--grad_accum', type=int, default=1, help='number of gradient accumulation steps')
-    parser.add_argument('--sequence_length', type=int, default=64*1024, help='sequence length, in tokens')
     parser.add_argument('--num_iterations', type=int, default=1480, help='number of iterations to run')
     parser.add_argument('--warmup_iters', type=int, default=0, help='number of warmup iterations')
     parser.add_argument('--cooldown_iters', type=int, default=600, help='number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule')
@@ -130,8 +129,8 @@ if __name__ == "__main__":
     print0('='*100, logonly=True)
 
     # calculate the number of steps to take in the val loop.
-    args.val_tokens = (args.val_tokens // (args.sequence_length * ddp_world_size)) * (args.sequence_length * ddp_world_size)
-    val_steps = args.val_tokens // (args.sequence_length * ddp_world_size)
+    args.val_tokens = (args.val_tokens // (args.batch_size * ddp_world_size)) * (args.batch_size * ddp_world_size)
+    val_steps = args.val_tokens // (args.batch_size * ddp_world_size)
     # calculate the steps of gradient accumulation required to attain the desired global batch size.
     if args.grad_accum > 1:
         train_accumulation_steps = args.grad_accum
@@ -139,14 +138,18 @@ if __name__ == "__main__":
     else:
         assert args.batch_size % ddp_world_size == 0
         train_accumulation_steps = args.batch_size // ddp_world_size
+        batch_size = args.batch_size // ddp_world_size
+
+    print0(f'Train accumulation steps: {train_accumulation_steps}')
+    print0(f'Adjusted batch size: {batch_size}')
 
     # load tokens
-    train_loader = DistributedDataLoader(args.input_bin, args.sequence_length, ddp_rank, ddp_world_size)
-    val_loader = DistributedDataLoader(args.input_val_bin, args.sequence_length, ddp_rank, ddp_world_size)
+    train_loader = DistributedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size)
+    val_loader = DistributedDataLoader(args.input_val_bin, batch_size, ddp_rank, ddp_world_size)
     print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
     print0(f"Validation DataLoader: total number of tokens: {val_loader.total_num_tokens} across {len(val_loader.files)} files")
     print0('='*100, logonly=True)
-    seq_train = train_loader.next_batch()
+    input_ids = train_loader.next_batch()
 
     model = ESM(model_config)
     model = model.cuda().bfloat16()
@@ -263,8 +266,8 @@ if __name__ == "__main__":
                     stack.enter_context(model.no_sync())
                 #if step >= 5:
                 #    stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
-                model(seq_train, sliding_window_size).backward()
-                seq_train = train_loader.next_batch()
+                model(input_ids, sliding_window_size).backward()
+                input_ids = train_loader.next_batch()
         if train_accumulation_steps != 1:
             for p in model.parameters():
                 p.grad /= train_accumulation_steps
@@ -294,7 +297,7 @@ if __name__ == "__main__":
     results, all_true, all_pred = [], [], []
     total_loss, count = 0.0, 0
     tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
-    test_loader = DataLoader(TestDataset(tokenizer), batch_size=args.batch_size, collate_fn=collate_fn)
+    test_loader = DataLoader(TestDataset(tokenizer, batch_size), batch_size=1)
 
     from tqdm import tqdm
     with torch.no_grad():

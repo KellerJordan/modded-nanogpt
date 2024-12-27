@@ -23,10 +23,10 @@ def _load_data_shard(path: Path, num_tokens):
 
 
 class DistributedDataLoader:
-    def __init__(self, filename_pattern, seq_len, process_rank, num_processes):
+    def __init__(self, filename_pattern, batch_size, process_rank, num_processes):
         self.process_rank = process_rank
         self.num_processes = num_processes
-        self.seq_len = seq_len
+        self.batch_size = batch_size
 
         # glob files that match the pattern
         self.files = sorted(Path.cwd().glob(filename_pattern))
@@ -34,7 +34,7 @@ class DistributedDataLoader:
 
         # load and validate all data shards, count number of tokens in total
         self.files_num_tokens = [_peek_data_shard(file) for file in self.files]
-        assert min(self.files_num_tokens) >= num_processes * seq_len + 1
+        assert min(self.files_num_tokens) >= num_processes * batch_size + 1
         self.total_num_tokens = sum(self.files_num_tokens)
 
         self.reset()
@@ -45,24 +45,24 @@ class DistributedDataLoader:
 
     def advance(self): # advance to next data shard
         self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.seq_len
+        self.current_position = self.process_rank * self.batch_size
         self.tokens = _load_data_shard(self.files[self.current_shard], self.files_num_tokens[self.current_shard])
 
     def next_batch(self):
-        batch_size = self.seq_len * self.num_processes
-        buf = self.tokens[self.current_position:self.current_position+self.seq_len+1]
+        batch_size = self.batch_size * self.num_processes
+        buf = self.tokens[self.current_position:self.current_position+self.batch_size+1]
         # host side async is sufficient;
         # no performance improvement was observed when introducing a separate stream.
-        seq = buf.to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
+        input_ids = buf.to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
         # advance current position and load next shard if necessary
         self.current_position += batch_size
         if self.current_position + batch_size + 1 >= len(self.tokens):
             self.advance()
-        return seq
+        return input_ids
     
 
 class TestDataset(torch.utils.data.Dataset):
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, batch_size):
         from huggingface_hub import hf_hub_download 
         from datasets import Dataset as HFDataset
         local_file = hf_hub_download(
@@ -76,17 +76,23 @@ class TestDataset(torch.utils.data.Dataset):
         self.sequences = sorted(sequences, key=len, reverse=True)
         self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
         self.masker = ProteinMasker(tokenizer, 0.15) # 15% masking rate like ESM2 for inference
+        self.batch_size = batch_size
+        self.current_idx = 0
 
     def __len__(self):
-        return len(self.sequences)
+        return (len(self.sequences) + self.batch_size - 1) // self.batch_size
 
     def __getitem__(self, idx):
-        input_ids = self.tokenizer(self.sequences[idx], return_tensors='pt', truncation=True, max_length=1024).input_ids
+        batch_input_ids = []
+        
+        for i in range(self.batch_size):
+            if self.current_idx >= len(self.sequences):
+                self.current_idx = 0
+            
+            input_ids = self.tokenizer(self.sequences[self.current_idx], return_tensors='pt', truncation=True, max_length=1024).input_ids
+            batch_input_ids.extend(input_ids.flatten().tolist())
+            self.current_idx += 1
+            
+        input_ids = torch.tensor(batch_input_ids)
         input_ids, labels = self.masker(input_ids)
         return input_ids, labels
-
-
-def collate_fn(batch):
-    input_ids = torch.cat([item[0].flatten() for item in batch])
-    labels = torch.cat([item[1].flatten() for item in batch]) 
-    return input_ids, labels
