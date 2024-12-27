@@ -70,9 +70,8 @@ class TestDataset(torch.utils.data.Dataset):
             repo_type="dataset"
         )
         data = HFDataset.from_parquet(local_file)
-        print(data)
         sequences = data['sequence']
-        self.sequences = sorted(sequences, key=len, reverse=True)
+        self.sequences = [seq[:1022] for seq in sequences]
         self.num_tokens = sum(len(seq) for seq in self.sequences)
         self.num_seqs = len(self.sequences)
         self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
@@ -92,7 +91,7 @@ class TestDataset(torch.utils.data.Dataset):
                 self.current_idx = 0
             
             input_ids = self.tokenizer(
-                self.sequences[self.current_idx][:1022],
+                self.sequences[self.current_idx],
                 truncation=False,
                 padding=False,
                 add_special_tokens=True).input_ids
