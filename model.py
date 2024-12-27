@@ -4,12 +4,8 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from transformers import EsmTokenizer
 from utils import ProteinMasker
+from typing import Optional, Tuple, List
 
-
-"""
-TODO
-add type setting
-"""
 
 class ModelConfig:
     def __init__(self, args):
@@ -25,7 +21,7 @@ class ModelConfig:
         self.model_dim = args.model_dim
 
 
-def norm(x):
+def norm(x: torch.Tensor) -> torch.Tensor:
     return F.rms_norm(x, (x.size(-1),))
 
 
@@ -33,7 +29,7 @@ class CastedLinear(nn.Linear):
     def __init__(self, in_features, out_features):
         super().__init__(in_features, out_features, bias=False)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight.to(x.dtype))
 
 
@@ -45,7 +41,7 @@ class Rotary(torch.nn.Module):
         self.cos_cached = None
         self.sin_cached = None
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         seq_len = x.shape[1]
         if seq_len != self.seq_len_cached:
             t = torch.arange(seq_len, device=x.device)
@@ -71,29 +67,54 @@ class SelfAttention(nn.Module):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
-        self.c_q = CastedLinear(dim, dim)
-        self.c_k = CastedLinear(dim, dim)
-        self.c_v = CastedLinear(dim, dim)
+        self.qkv = CastedLinear(dim, 3 * dim)
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
-        self.c_proj = CastedLinear(dim, dim)
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.o_proj = CastedLinear(dim, dim)
+        self.o_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
-    def forward_sdpa(self, x, vi, attention_mask=None):
-        pass
+    def forward_sdpa(self, x: torch.Tensor, vi: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        TODO
+        Question? Is this output actually different than flex attention output?
+        Likely yes because of scoremod and / or soft capping
+        Would be good to be able to do inference this way for typical PLM inference pipelines
+        https://pytorch.org/blog/flexattention/
+        """
+        B, T = x.size(0), x.size(1) # batch size, sequence length
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(B, T, self.num_heads, -1)
+        k = k.view(B, T, self.num_heads, -1)
+        v = v.view(B, T, self.num_heads, -1)
+        v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v) # @KoszarskyB & @Grad62304977
+        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = self.rotary(q), self.rotary(k)
+        y = F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            enable_gqa=True
+        )
+        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
+        y = self.o_proj(y)
+        return y
 
-    def forward(self, x, vi, block_mask):
+    def forward(self, x: torch.Tensor, vi: torch.Tensor, block_mask: torch.Tensor) -> torch.Tensor:
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q = self.c_q(x).view(B, T, self.num_heads, -1)
-        k = self.c_k(x).view(B, T, self.num_heads, -1)
-        v = self.c_v(x).view(B, T, self.num_heads, -1)
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(B, T, self.num_heads, -1)
+        k = k.view(B, T, self.num_heads, -1)
+        v = v.view(B, T, self.num_heads, -1)
         v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v) # @KoszarskyB & @Grad62304977
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, enable_gqa=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
-        y = self.c_proj(y)
+        y = self.o_proj(y)
         return y
 
 
@@ -104,7 +125,7 @@ class MLP(nn.Module):
         self.c_proj = CastedLinear(4 * dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.c_fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
@@ -118,7 +139,13 @@ class Block(nn.Module):
         self.mlp = MLP(config.model_dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x, vi, x0, block_mask):
+    def sdpa_forward(self, x: torch.Tensor, vi: torch.Tensor, x0: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        x = x + self.attn.forward_sdpa(norm(x), vi, attention_mask)
+        x = x + self.mlp(norm(x))
+        return x
+
+    def forward(self, x: torch.Tensor, vi: torch.Tensor, x0: torch.Tensor, block_mask: torch.Tensor) -> torch.Tensor:
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         x = x + self.attn(norm(x), vi, block_mask)
         x = x + self.mlp(norm(x))
@@ -133,7 +160,7 @@ class ValueEmbedding(nn.Module):
             for _ in range(config.num_layers // 2)
         ])
 
-    def forward(self, inputs) -> "list[torch.Tensor]":
+    def forward(self, inputs: torch.Tensor) -> List[torch.Tensor]:
         ve = [emb(inputs) for emb in self.embed]
         ve += reversed(ve)
         return ve
@@ -168,7 +195,39 @@ class ESM(nn.Module):
         self.lm_head.weight.data.zero_() # @Grad62304977
         self.cross_entropy = nn.CrossEntropyLoss()
 
-    def get_logits(self, input_ids: torch.Tensor, sliding_window_size: torch.Tensor):
+    def embed_forward(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        x = self.embed(input_ids[None])
+        x = norm(x) # @Grad62304977
+        x0 = x
+        ve = self.value_embeds(input_ids)
+        return x, x0, ve
+
+    def get_logits(self, x: torch.Tensor) -> torch.Tensor:
+        x = norm(x)
+        logits = self.lm_head(x)
+        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
+        logits = logits.float()
+        return logits
+
+    def sdpa_forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, None, None, :].bool()
+        
+        x, x0, ve = self.embed_forward(input_ids)
+        ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
+
+        skip_connections = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i].sdpa_forward(x, ve_enc[i], x0, attention_mask)
+            skip_connections.append(x)
+
+        for i in range(self.num_decoder_layers):
+            x = x + self.skip_weights[i] * skip_connections.pop()
+            x = self.blocks[self.num_encoder_layers + i].sdpa_forward(x, ve_dec[i], x0, attention_mask)
+
+        return self.get_logits(x)
+
+    def flex_forward(self, input_ids: torch.Tensor, sliding_window_size: torch.Tensor) -> torch.Tensor:
         input_ids = input_ids.flatten() # flex_attention needs batch 1
         docs = (input_ids == self.cls_id).cumsum(0)
 
@@ -180,10 +239,7 @@ class ESM(nn.Module):
         S = len(input_ids)
         block_mask = create_block_mask(doc_mask_mod, None, None, S, S)
 
-        x = self.embed(input_ids[None])
-        x = norm(x) # @Grad62304977
-        x0 = x
-        ve = self.value_embeds(input_ids)
+        x, x0, ve = self.embed_forward(input_ids)
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
 
         # Store outputs for U-Net skip connections
@@ -198,21 +254,17 @@ class ESM(nn.Module):
             # U-net structure on token value embeddings by @leloykun
             x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_mask)
 
-        x = norm(x)
-        logits = self.lm_head(x)
-        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
-        logits = logits.float()
-        return logits
+        return self.get_logits(x)
 
-    def inference(self, input_ids, labels=None): # premaked input_ids
+    def inference(self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None) -> Tuple[Optional[torch.Tensor], torch.Tensor]: # premaked input_ids
         sliding_window_size = torch.tensor(1024, dtype=torch.int32, device="cuda")
-        logits = self.get_logits(input_ids, sliding_window_size)
+        logits = self.flex_forward(input_ids, sliding_window_size)
         loss = None
         if labels is not None:
             loss = self.cross_entropy(logits.view(-1, self.vocab_size), labels.view(-1).long())
         return loss, logits
 
-    def forward(self, input_ids, sliding_window_size: torch.Tensor):
+    def forward(self, input_ids: torch.Tensor, sliding_window_size: torch.Tensor) -> torch.Tensor:
         input_ids, labels = self.masker(input_ids)
-        logits = self.get_logits(input_ids, sliding_window_size)
+        logits = self.flex_forward(input_ids, sliding_window_size)
         return self.cross_entropy(logits.view(-1, self.vocab_size), labels.view(-1).long())
