@@ -313,13 +313,13 @@ class ESM(nn.Module):
         logits = self.get_logits(input_ids, sliding_window_size)
         loss = None
         if labels is not None:
-            loss = self.cross_entropy(logits.view(-1, self.vocab_size), labels.view(-1))
+            loss = self.cross_entropy(logits.view(-1, self.vocab_size), labels.view(-1).long())
         return loss, logits
 
     def forward(self, input_ids, sliding_window_size: torch.Tensor):
         input_ids, labels = self.masker(input_ids)
         logits = self.get_logits(input_ids, sliding_window_size)
-        return self.cross_entropy(logits.view(-1, self.vocab_size), labels.view(-1))
+        return self.cross_entropy(logits.view(-1, self.vocab_size), labels.view(-1).long())
 
 
 # -----------------------------------------------------------------------------
