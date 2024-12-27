@@ -507,7 +507,7 @@ print0(f'{result.stdout}', logonly=True)
 print0('='*100, logonly=True)
 
 # calculate the number of steps to take in the val loop.
-assert args.val_tokens % (args.sequence_length * ddp_world_size) == 0
+args.val_tokens = (args.val_tokens // (args.sequence_length * ddp_world_size)) * (args.sequence_length * ddp_world_size)
 val_steps = args.val_tokens // (args.sequence_length * ddp_world_size)
 # calculate the steps of gradient accumulation required to attain the desired global batch size.
 assert args.batch_size % (ddp_world_size) == 0
