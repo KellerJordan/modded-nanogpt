@@ -429,7 +429,7 @@ class Hyperparameters:
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens : int = 2077660 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every = None # save every how many steps? None for no saving
 
 
