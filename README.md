@@ -10,7 +10,7 @@ git clone https://github.com/Synthyra/SpeedRunningESM2
 cd SpeedRunningESM2
 pip install -r requirements.txt
 pip install --pre torch==2.6.0.dev20241203+cu124 --index-url https://download.pytorch.org/whl/nightly/cu124 --upgrade # install torch 2.6.0
-python data/cached_omgprot50.py 10 # downloads only the first 1.0B training tokens to save time
+python data/download_omgprot50.py --num_chunks 10 # downloads only the first 1.0B training tokens to save time
 ./run.sh
 ```
 
