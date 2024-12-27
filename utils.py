@@ -5,12 +5,13 @@ from typing import Tuple
 Standardized MLM masking approach for consistency
 """
 
-class ProteinMasker:
+class ProteinMasker(torch.nn.Module):
     def __init__(self, tokenizer, mlm_probability=0.15):
         """
         Initialize the ProteinMasker with the given tokenizer and masking parameters.
         Of the masked tokens, 80% are replaced with [MASK], 10% are replaced with a random amino acid token, and 10% are unchanged.
         """
+        super().__init__()
         self.tokenizer = tokenizer
         self.mlm_probability = mlm_probability
         self.mask_token_id = tokenizer.mask_token_id
@@ -20,7 +21,7 @@ class ProteinMasker:
         self.low_range = min(canonical_amino_acids_ids)
         self.high_range = max(canonical_amino_acids_ids)
 
-    def __call__(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # modified from
         # https://github.com/huggingface/transformers/blob/v4.47.1/src/transformers/data/data_collator.py#L828
         labels = input_ids.clone()
