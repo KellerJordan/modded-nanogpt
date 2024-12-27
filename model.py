@@ -172,6 +172,8 @@ class ESM(nn.Module):
         input_ids = input_ids.flatten() # flex_attention needs batch 1
         docs = (input_ids == self.cls_id).cumsum(0)
 
+        print(input_ids.shape, (input_ids == self.cls_id).sum(), sliding_window_size)
+
         def doc_mask_mod(b, h, q_idx, kv_idx):
             bidirectional_sliding_window_mask = torch.abs(q_idx - kv_idx) < sliding_window_size
             doc_mask = docs[q_idx] == docs[kv_idx]
