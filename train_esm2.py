@@ -696,7 +696,7 @@ test_loader = DataLoader(TestDataset(tokenizer), batch_size=args.batch_size, col
 
 with torch.no_grad():
     for input_ids, labels in test_loader:
-        loss, logits = model.inference(input_ids.cuda(), labels.cuda())        
+        loss, logits = model.inference(input_ids.view(1, -1).cuda(), labels.view(1, -1).cuda())        
         total_loss += loss.item()
         count += 1
         all_true.extend(labels.cpu().numpy().flatten())
