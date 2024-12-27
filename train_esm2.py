@@ -301,7 +301,7 @@ if __name__ == "__main__":
     results, all_true, all_pred = [], [], []
     total_loss, count = 0.0, 0
     tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
-    test_loader = DataLoader(TestDataset(tokenizer, batch_size), batch_size=1)
+    test_loader = DataLoader(TestDataset(tokenizer, batch_size // 4), batch_size=1) # was getting ooms so reducing batch size
 
     from tqdm import tqdm
     with torch.no_grad():
