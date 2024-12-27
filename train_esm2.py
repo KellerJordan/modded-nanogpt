@@ -237,7 +237,7 @@ class ValueEmbedding(nn.Module):
         super().__init__()
         self.embed = nn.ModuleList([
             nn.Embedding(config.vocab_size, config.model_dim)
-            for _ in range(6)
+            for _ in range(config.num_layers // 2)
         ])
 
     def forward(self, inputs) -> "list[torch.Tensor]":
