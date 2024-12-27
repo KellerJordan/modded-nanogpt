@@ -34,7 +34,6 @@ class DistributedDataLoader:
 
         # load and validate all data shards, count number of tokens in total
         self.files_num_tokens = [_peek_data_shard(file) for file in self.files]
-        assert min(self.files_num_tokens) >= num_processes * batch_size + 1
         self.total_num_tokens = sum(self.files_num_tokens)
 
         self.reset()
@@ -50,13 +49,13 @@ class DistributedDataLoader:
 
     def next_batch(self):
         batch_size = self.batch_size * self.num_processes
-        buf = self.tokens[self.current_position:self.current_position+self.batch_size+1]
+        buf = self.tokens[self.current_position:self.current_position+self.batch_size]
         # host side async is sufficient;
         # no performance improvement was observed when introducing a separate stream.
         input_ids = buf.to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
         # advance current position and load next shard if necessary
         self.current_position += batch_size
-        if self.current_position + batch_size + 1 >= len(self.tokens):
+        if self.current_position + batch_size >= len(self.tokens):
             self.advance()
         return input_ids
     
@@ -93,10 +92,9 @@ class TestDataset(torch.utils.data.Dataset):
                 self.current_idx = 0
             
             input_ids = self.tokenizer(
-                self.sequences[self.current_idx],
-                truncation=True,
+                self.sequences[self.current_idx][:1022],
+                truncation=False,
                 padding=False,
-                max_length=1024,
                 add_special_tokens=True).input_ids
             current_length += len(input_ids)
             if current_length >= self.batch_size:
