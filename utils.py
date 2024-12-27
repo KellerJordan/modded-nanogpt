@@ -14,38 +14,33 @@ class ProteinMasker:
         self.tokenizer = tokenizer
         self.mlm_probability = mlm_probability
         self.mask_token_id = tokenizer.mask_token_id
-        self.special_tokens = set(tokenizer.all_special_ids)
+        self.special_tokens = torch.tensor(tokenizer.all_special_ids)
         canonical_amino_acids = 'ACDEFGHIKLMNPQRSTVWY'
         canonical_amino_acids_ids = tokenizer.convert_tokens_to_ids(list(canonical_amino_acids))
         self.low_range = min(canonical_amino_acids_ids)
         self.high_range = max(canonical_amino_acids_ids)
 
-    def get_special_tokens_mask(self, input_ids):
-        """
-        Create a mask for special tokens without calling tokenizer method directly
-        """
-        return [1 if token_id in self.special_tokens else 0 for token_id in input_ids]
-
     def __call__(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         labels = input_ids.clone()
-        probability_matrix = torch.full(labels.shape, self.mlm_probability)
         
-        # Create special tokens mask directly without calling tokenizer method
-        special_tokens_mask = [
-            self.get_special_tokens_mask(val) for val in labels.tolist()
-        ]
-        special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool, device=labels.device)
+        # Create special tokens mask using broadcasting
+        special_tokens = self.special_tokens.to(input_ids.device)
+        special_tokens_mask = (input_ids[..., None] == special_tokens).any(-1)
         
+        # Create probability matrix and mask special tokens
+        probability_matrix = torch.full_like(labels, self.mlm_probability, dtype=torch.float)
         probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
+        
+        # Create masked indices
         masked_indices = torch.bernoulli(probability_matrix).bool()
         labels[~masked_indices] = -100  # We only compute loss on masked tokens
         
         # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
-        indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
+        indices_replaced = torch.bernoulli(torch.full_like(probability_matrix, 0.8)).bool() & masked_indices
         input_ids[indices_replaced] = self.mask_token_id
         
         # 10% of the time, we replace masked input tokens with random word
-        indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
+        indices_random = torch.bernoulli(torch.full_like(probability_matrix, 0.5)).bool() & masked_indices & ~indices_replaced
         random_words = torch.randint(low=self.low_range, high=self.high_range, size=labels.shape, dtype=torch.long, device=labels.device)
         input_ids[indices_random] = random_words[indices_random]
         
