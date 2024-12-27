@@ -695,8 +695,9 @@ total_loss, count = 0.0, 0
 tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
 test_loader = DataLoader(TestDataset(tokenizer), batch_size=args.batch_size, collate_fn=collate_fn)
 
+from tqdm import tqdm
 with torch.no_grad():
-    for input_ids, labels in test_loader:
+    for input_ids, labels in tqdm(test_loader, total=len(test_loader), desc="Evaluating"):
         loss, logits = model.inference(input_ids.cuda(), labels.cuda())        
         total_loss += loss.item()
         count += 1
