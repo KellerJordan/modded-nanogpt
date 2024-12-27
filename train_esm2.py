@@ -52,6 +52,7 @@ def get_args():
     
     # Optimization hyperparams
     parser.add_argument('--batch_size', type=int, default=8, help='batch size, in sequences, across all devices')
+    parser.add_argument('--grad_accum', type=int, default=1, help='number of gradient accumulation steps')
     parser.add_argument('--sequence_length', type=int, default=64*1024, help='sequence length, in tokens')
     parser.add_argument('--num_iterations', type=int, default=1480, help='number of iterations to run')
     parser.add_argument('--warmup_iters', type=int, default=0, help='number of warmup iterations')
@@ -132,8 +133,12 @@ if __name__ == "__main__":
     args.val_tokens = (args.val_tokens // (args.sequence_length * ddp_world_size)) * (args.sequence_length * ddp_world_size)
     val_steps = args.val_tokens // (args.sequence_length * ddp_world_size)
     # calculate the steps of gradient accumulation required to attain the desired global batch size.
-    assert args.batch_size % (ddp_world_size) == 0
-    train_accumulation_steps = args.batch_size // ddp_world_size
+    if args.grad_accum > 1:
+        train_accumulation_steps = args.grad_accum
+        batch_size = args.batch_size // args.grad_accum
+    else:
+        assert args.batch_size % ddp_world_size == 0
+        train_accumulation_steps = args.batch_size // ddp_world_size
 
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, args.sequence_length, ddp_rank, ddp_world_size)
