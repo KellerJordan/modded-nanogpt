@@ -28,7 +28,7 @@ def write_datafile(filename, toks):
     header = np.zeros(256, dtype=np.int32)
     header[0] = 20240520 # magic
     header[1] = 1 # version
-    header[2] = len(toks) # number of tokens after the 256*4 bytes of header (each 2 bytes as uint8)
+    header[2] = len(toks) # number of tokens after the 256*4 bytes of header (each 1 byte as uint8)
     # construct the tokens numpy array, if not already
     print(f"\nwriting {len(toks):,} tokens to {filename}")
     with open(filename, "wb") as f:
