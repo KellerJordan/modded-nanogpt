@@ -41,7 +41,7 @@ class ProteinMasker:
         
         # 10% of the time, we replace masked input tokens with random word
         indices_random = torch.bernoulli(torch.full_like(probability_matrix, 0.5)).bool() & masked_indices & ~indices_replaced
-        random_words = torch.randint(low=self.low_range, high=self.high_range, size=labels.shape, dtype=torch.long, device=labels.device)
+        random_words = torch.randint(low=self.low_range, high=self.high_range, size=labels.shape, dtype=input_ids.dtype, device=labels.device)
         input_ids[indices_random] = random_words[indices_random]
         
         # The rest of the time (10% of the time) we keep the masked input tokens unchanged
