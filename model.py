@@ -6,6 +6,11 @@ from transformers import EsmTokenizer
 from utils import ProteinMasker
 
 
+"""
+TODO
+add type setting
+"""
+
 class ModelConfig:
     def __init__(self, args):
         # 33 tokens: https://huggingface.co/Synthyra/ESMplusplus_large/blob/main/modeling_esm_plusplus.py#L868-L874
@@ -57,6 +62,11 @@ class Rotary(torch.nn.Module):
 
 
 class SelfAttention(nn.Module):
+    """
+    TODO
+    Add F.spda option
+    Add causal option (flex and sdpa)
+    """
     def __init__(self, dim, num_heads):
         super().__init__()
         assert dim % num_heads == 0
@@ -68,6 +78,9 @@ class SelfAttention(nn.Module):
         self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+
+    def forward_sdpa(self, x, vi, attention_mask=None):
+        pass
 
     def forward(self, x, vi, block_mask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -126,13 +139,15 @@ class ValueEmbedding(nn.Module):
         return ve
 
 
-# -----------------------------------------------------------------------------
-# The main ESM Bert model
 class ESM(nn.Module):
+    """
+    TODO
+    Add causal option (flex and sdpa)
+    """
     def __init__(self, config: "ModelConfig"):
         super().__init__()
         tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
-        self.masker = ProteinMasker(tokenizer, 0.20)
+        self.masker = ProteinMasker(tokenizer, 0.20) # 20% masking rate https://arxiv.org/abs/2301.06568
         self.cls_id = tokenizer.cls_token_id
         self.vocab_size = tokenizer.vocab_size
         self.num_layers = config.num_layers

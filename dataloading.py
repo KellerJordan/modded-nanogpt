@@ -75,7 +75,7 @@ class TestDataset(torch.utils.data.Dataset):
         sequences = data['sequence']
         self.sequences = sorted(sequences, key=len, reverse=True)
         self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
-        self.masker = ProteinMasker(tokenizer, 0.15)
+        self.masker = ProteinMasker(tokenizer, 0.15) # 15% masking rate like ESM2 for inference
 
     def __len__(self):
         return len(self.sequences)
@@ -84,7 +84,7 @@ class TestDataset(torch.utils.data.Dataset):
         input_ids = self.tokenizer(self.sequences[idx], return_tensors='pt', truncation=True, max_length=1024).input_ids
         input_ids, labels = self.masker(input_ids)
         return input_ids, labels
-        
+
 
 def collate_fn(batch):
     input_ids = torch.cat([item[0].flatten() for item in batch])
