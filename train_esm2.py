@@ -290,7 +290,7 @@ if __name__ == "__main__":
         approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
         print0(f"step:{step+1}/{args.num_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
 
-    print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
+    print0(f"peak memory consumption training: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     torch.manual_seed(42)
@@ -301,6 +301,10 @@ if __name__ == "__main__":
     results, all_true, all_pred = [], [], []
     total_loss, count = 0.0, 0
     tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
+    """
+    TODO
+    Figure out why testing uses so much more VRAM than training
+    """
     test_loader = DataLoader(TestDataset(tokenizer, batch_size // 4), batch_size=1) # was getting ooms so reducing batch size
 
     from tqdm import tqdm
@@ -335,6 +339,8 @@ if __name__ == "__main__":
     print0(f"  Accuracy:    {accuracy:.4f}")
     print0(f"  MCC:         {mcc:.4f}")
 
+
+    print0(f"peak memory consumption testing: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
     # -------------------------------------------------------------------------
     # clean up nice
     if ddp_world_size > 1:
