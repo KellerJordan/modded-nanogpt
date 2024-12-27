@@ -413,42 +413,70 @@ def collate_fn(batch):
 
 
 # -----------------------------------------------------------------------------
-# int main
-@dataclass
-class Hyperparameters:
-    # data hyperparams
-    input_bin : str = 'data/omgprot50/omgprot50_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/omgprot50/omgprot50_valid_*.bin'  # input .bin to eval validation loss on
-    #input_test_bin : str = 'data/omgprot50/omgprot50_test_*.bin'  # input .bin to eval validation loss on
-    # optimization hyperparams
-    batch_size : int = 8 # batch size, in sequences, across all devices
-    sequence_length : int = 64*1024 # sequence length, in tokens
-    num_iterations : int = 1480 # number of iterations to run
-    warmup_iters : int = 0
-    cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
-    weight_decay : float = 0
-    # evaluation and logging hyperparams
-    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens : int = 2077660 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    save_every = None # save every how many steps? None for no saving
+import argparse
+def get_args():
+    parser = argparse.ArgumentParser(description='ESM2 training arguments')
+    
+    # Model hyperparams
+    parser.add_argument('--vocab_size', type=int, default=33,
+                        help='vocabulary size')
+    parser.add_argument('--num_layers', type=int, default=12,
+                        help='number of transformer layers')
+    parser.add_argument('--num_heads', type=int, default=6,
+                        help='number of attention heads (head dim 128 suggested by @Grad62304977)')
+    parser.add_argument('--model_dim', type=int, default=768,
+                        help='model hidden dimension size')
+    
+    # Data hyperparams
+    parser.add_argument('--input_bin', type=str, default='data/omgprot50/omgprot50_train_*.bin',
+                        help='input .bin to train on')
+    parser.add_argument('--input_val_bin', type=str, default='data/omgprot50/omgprot50_valid_*.bin',
+                        help='input .bin to eval validation loss on')
+    #parser.add_argument('--input_test_bin', type=str, default='data/omgprot50/omgprot50_test_*.bin',
+    #                    help='input .bin to eval test loss on')
+    
+    # Optimization hyperparams
+    parser.add_argument('--batch_size', type=int, default=8,
+                        help='batch size, in sequences, across all devices')
+    parser.add_argument('--sequence_length', type=int, default=64*1024,
+                        help='sequence length, in tokens')
+    parser.add_argument('--num_iterations', type=int, default=1480,
+                        help='number of iterations to run')
+    parser.add_argument('--warmup_iters', type=int, default=0,
+                        help='number of warmup iterations')
+    parser.add_argument('--cooldown_iters', type=int, default=600,
+                        help='number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule')
+    parser.add_argument('--weight_decay', type=float, default=0,
+                        help='weight decay coefficient')
+    
+    # Evaluation and logging hyperparams
+    parser.add_argument('--val_loss_every', type=int, default=125,
+                        help='every how many steps to evaluate val loss? 0 for only at the end')
+    parser.add_argument('--val_tokens', type=int, default=2077660,
+                        help='how many tokens of validation data? important to keep fixed for consistent comparisons')
+    parser.add_argument('--save_every', type=int, default=None,
+                        help='save every how many steps? None for no saving')
+
+    args = parser.parse_args()
+    return args
 
 
-@dataclass
 class ModelConfig:
-    # 33 tokens: https://huggingface.co/Synthyra/ESMplusplus_large/blob/main/modeling_esm_plusplus.py#L868-L874
-    # Depth of the number of layers is typically more important than the depth of the hidden dimension for PLMs
-    # ESM2-8M has 6 layers, 20 heads, 320 hidden dim: https://huggingface.co/facebook/esm2_t6_8M_UR50D/blob/main/config.json
-    # ESM2-35M has 12 layers, 20 heads, 480 hidden dim: https://huggingface.co/facebook/esm2_t12_35M_UR50D/blob/main/config.json
-    # ESM2-150M has 30 layers, 20 heads, 640 hidden dim: https://huggingface.co/facebook/esm2_t30_150M_UR50D/blob/main/config.json
-    # ESM2-650M has 33 layers, 20 heads, 1280 hidden dim: https://huggingface.co/facebook/esm2_t33_650M_UR50D/blob/main/config.json
-    vocab_size : int = 33
-    num_layers : int = 12
-    num_heads : int = 6 # head dim 128 suggested by @Grad62304977
-    model_dim : int = 768
+    def __init__(self, args):
+        # 33 tokens: https://huggingface.co/Synthyra/ESMplusplus_large/blob/main/modeling_esm_plusplus.py#L868-L874
+        # Depth of the number of layers is typically more important than the depth of the hidden dimension for PLMs
+        # ESM2-8M has 6 layers, 20 heads, 320 hidden dim: https://huggingface.co/facebook/esm2_t6_8M_UR50D/blob/main/config.json
+        # ESM2-35M has 12 layers, 20 heads, 480 hidden dim: https://huggingface.co/facebook/esm2_t12_35M_UR50D/blob/main/config.json
+        # ESM2-150M has 30 layers, 20 heads, 640 hidden dim: https://huggingface.co/facebook/esm2_t30_150M_UR50D/blob/main/config.json
+        # ESM2-650M has 33 layers, 20 heads, 1280 hidden dim: https://huggingface.co/facebook/esm2_t33_650M_UR50D/blob/main/config.json
+        self.vocab_size = args.vocab_size
+        self.num_layers = args.num_layers
+        self.num_heads = args.num_heads
+        self.model_dim = args.model_dim
 
 
-model_config = ModelConfig()
-args = Hyperparameters()
+args = get_args()
+model_config = ModelConfig(args)
 
 
 def get_param_count(model):
@@ -663,7 +691,8 @@ from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_sc
 model.eval()
 results, all_true, all_pred = [], [], []
 total_loss, count = 0.0, 0
-test_loader = DataLoader(TestDataset(), batch_size=args.batch_size, collate_fn=collate_fn)
+tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
+test_loader = DataLoader(TestDataset(tokenizer), batch_size=args.batch_size, collate_fn=collate_fn)
 
 with torch.no_grad():
     for input_ids, labels in test_loader:
