@@ -132,6 +132,7 @@ if __name__ == "__main__":
     val_steps = args.val_tokens // (args.batch_size * ddp_world_size)
     # calculate the steps of gradient accumulation required to attain the desired global batch size.
     train_accumulation_steps = 1
+    batch_size = args.batch_size
     if ddp_world_size > 1:
         assert args.batch_size % ddp_world_size == 0
         train_accumulation_steps = ddp_world_size
