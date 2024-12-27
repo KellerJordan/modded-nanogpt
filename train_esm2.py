@@ -14,9 +14,11 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+from torch.utils.data import DataLoader
 from transformers import EsmTokenizer
 from dataclasses import dataclass
 from pathlib import Path
+from utils import ProteinMasker
 
 
 # -----------------------------------------------------------------------------
@@ -76,8 +78,8 @@ class Muon(torch.optim.Optimizer):
         ns_steps: The number of Newton-Schulz iteration steps to use.
     """
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
-        self.world_size = int(os.environ['WORLD_SIZE'])
-        self.rank = int(os.environ['RANK'])
+        self.world_size = int(os.environ.get('WORLD_SIZE', '1'))
+        self.rank = int(os.environ.get('RANK', '0'))
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         params = list(params)
         assert all(isinstance(p, torch.Tensor) for p in params)
@@ -109,8 +111,8 @@ class Muon(torch.optim.Optimizer):
             def update_prev():
                 if params_world is None:
                     return
-                assert handle is not None
-                handle.wait()
+                if handle is not None:
+                    handle.wait()
                 for p_world, g_world in zip(params_world, update_buffers):
                     p_world.data.add_(
                         g_world.view_as(p_world),
@@ -128,7 +130,11 @@ class Muon(torch.optim.Optimizer):
                 g = g.lerp_(buf, momentum) if nesterov else buf
                 g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
                 update_prev()
-                handle = dist.all_gather(update_buffers, g, async_op=True)
+                if self.world_size > 1:
+                    handle = dist.all_gather(update_buffers, g, async_op=True)
+                else:
+                    update_buffers[0].copy_(g)
+                    handle = None
                 params_world = params[base_i : base_i + self.world_size]
             update_prev()
 
@@ -243,11 +249,11 @@ class ValueEmbedding(nn.Module):
 
 # -----------------------------------------------------------------------------
 # The main ESM Bert model
-class BERT(nn.Module):
+class ESM(nn.Module):
     def __init__(self, config: "ModelConfig"):
         super().__init__()
         tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
-        self.mask_id = tokenizer.mask_token_id
+        self.masker = ProteinMasker(tokenizer, 0.20)
         self.cls_id = tokenizer.cls_token_id
         self.vocab_size = tokenizer.vocab_size
         self.num_layers = config.num_layers
@@ -268,29 +274,6 @@ class BERT(nn.Module):
         self.lm_head.weight.data.zero_() # @Grad62304977
         self.cross_entropy = nn.CrossEntropyLoss()
 
-        # MLM mask constants from https://www.biorxiv.org/content/10.1101/2022.07.20.500902v3.full.pdf
-        self.pct_masked = 0.12    # 12% of tokens are masked
-        self.pct_replaced = 0.015 # 1.5% of tokens are randomly replaced
-        self.pct_kept = 0.015     # 1.5% of tokens are kept unchanged
-
-    def get_frac_mask(self, seq: torch.Tensor, pct: float, include=None):
-        docs = (seq == self.cls_id).cumsum(0)
-        valid_tokens_mask = (seq >= 4) & (seq <= 30)
-        if include is not None:
-            valid_tokens_mask &= include
-        random_values = torch.rand_like(docs, dtype=torch.float) * valid_tokens_mask
-
-        # Map each token to its doc index, count tokens per doc, and compute how many to mask
-        _, inv_docs = torch.unique(docs, return_inverse=True)
-        doc_counts = torch.bincount(inv_docs)  # total tokens in each doc
-        num_to_mask = (doc_counts.float() * pct).ceil().to(torch.int64)
-
-        # Rank tokens globally by random value and select num_to_mask
-        sorted_indices = torch.argsort(random_values, descending=True)
-        ranks = torch.empty_like(sorted_indices, dtype=torch.int64)
-        ranks[sorted_indices] = torch.arange(len(seq), device=seq.device)
-        return ranks < num_to_mask[inv_docs]
-
     def get_logits(self, input_seq: torch.Tensor, sliding_window_size: torch.Tensor):
         docs = (input_seq == self.cls_id).cumsum(0)
 
@@ -300,9 +283,7 @@ class BERT(nn.Module):
             return bidirectional_sliding_window_mask & doc_mask
 
         S = len(input_seq)
-        block_mask = create_block_mask(
-            doc_mask_mod, None, None, S, S,
-        )
+        block_mask = create_block_mask(doc_mask_mod, None, None, S, S)
 
         x = self.embed(input_seq[None])
         x = norm(x) # @Grad62304977
@@ -328,24 +309,18 @@ class BERT(nn.Module):
         logits = logits.float()
         return logits
 
-    def inference(self, input_seq): # premasked sequences
+    def inference(self, input_ids, labels=None): # premaked input_ids
         sliding_window_size = torch.tensor(2048, dtype=torch.int32, device="cuda")
-        return self.get_logits(input_seq, sliding_window_size)
+        logits = self.get_logits(input_ids, sliding_window_size)
+        loss = None
+        if labels is not None:
+            loss = self.cross_entropy(logits.view(-1, self.vocab_size), labels.view(-1))
+        return loss, logits
 
-    def forward(self, seq, sliding_window_size: torch.Tensor):
-        ### MLM masking logic
-        mlm_mask = self.get_frac_mask(seq, self.pct_masked, torch.ones_like(seq, dtype=torch.bool))
-        input_seq = seq.clone().masked_fill(mlm_mask, self.mask_id)
-        # substitute pct_replaced% with token id between 4 and 30 (inclusive)
-        sub_mask = self.get_frac_mask(seq, self.pct_replaced, ~mlm_mask)
-        input_seq[sub_mask] = torch.randint(4, 31, (sub_mask.sum(),), dtype=seq.dtype, device=seq.device)
-        # retain pct_kept%
-        keep_mask = self.get_frac_mask(seq, self.pct_kept, ~(sub_mask | mlm_mask))
-
-        mlm_loss_mask = mlm_mask | sub_mask | keep_mask
-        logits = self.get_logits(input_seq, sliding_window_size)
-        return self.cross_entropy(logits.view(-1, self.vocab_size), seq.masked_fill(~mlm_loss_mask, -100).long().view(-1))
-
+    def forward(self, input_ids, sliding_window_size: torch.Tensor):
+        input_ids, labels = self.masker(input_ids)
+        logits = self.get_logits(input_ids, sliding_window_size)
+        return self.cross_entropy(logits.view(-1, self.vocab_size), labels.view(-1))
 
 
 # -----------------------------------------------------------------------------
@@ -369,10 +344,6 @@ def _load_data_shard(path: Path, num_tokens):
 
 
 class DistributedDataLoader:
-    """
-    TODO
-    This may not be sufficient, as sequences may be cut off when loading
-    """
     def __init__(self, filename_pattern, seq_len, process_rank, num_processes):
         self.process_rank = process_rank
         self.num_processes = num_processes
@@ -409,6 +380,37 @@ class DistributedDataLoader:
         if self.current_position + batch_size + 1 >= len(self.tokens):
             self.advance()
         return seq
+    
+
+class TestDataset(torch.utils.data.Dataset):
+    def __init__(self, tokenizer):
+        from huggingface_hub import hf_hub_download 
+        from datasets import Dataset as HFDataset
+        local_file = hf_hub_download(
+            repo_id="Synthyra/omg_prot50",
+            filename=f"data/test-00000-of-00001.parquet",
+            repo_type="dataset"
+        )
+        data = HFDataset.from_parquet(local_file)
+        print(data)
+        sequences = data['sequence']
+        self.sequences = sorted(sequences, key=len, reverse=True)
+        self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
+        self.masker = ProteinMasker(tokenizer, 0.15)
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        input_ids = self.tokenizer(self.sequences[idx], return_tensors='pt', truncation=True, max_length=1024).input_ids
+        input_ids, labels = self.masker(input_ids)
+        return input_ids, labels
+        
+
+def collate_fn(batch):
+    input_ids = torch.stack([item[0] for item in batch])
+    labels = torch.stack([item[1] for item in batch])
+    return input_ids, labels
 
 
 # -----------------------------------------------------------------------------
@@ -418,7 +420,7 @@ class Hyperparameters:
     # data hyperparams
     input_bin : str = 'data/omgprot50/omgprot50_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/omgprot50/omgprot50_val_*.bin'  # input .bin to eval validation loss on
-    input_test_bin : str = 'data/omgprot50/omgprot50_test_*.bin'  # input .bin to eval validation loss on
+    #input_test_bin : str = 'data/omgprot50/omgprot50_test_*.bin'  # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     sequence_length : int = 64*1024 # sequence length, in tokens
@@ -455,18 +457,25 @@ def get_param_count(model):
         total_params += param.numel()
     return total_params
 
+# set up DDP (distributed data parallel) if available, otherwise single GPU
+if 'RANK' in os.environ:
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = torch.device(f'cuda:{ddp_local_rank}')
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend='nccl', device_id=device)
+    dist.barrier()
+    master_process = (ddp_rank == 0)
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0 
+    ddp_world_size = 1
+    device = torch.device('cuda:0')
+    torch.cuda.set_device(device)
+    master_process = True
 
-# set up DDP (distributed data parallel). torchrun sets this env variable
-ddp_rank = int(os.environ['RANK'])
-ddp_local_rank = int(os.environ['LOCAL_RANK'])
-ddp_world_size = int(os.environ['WORLD_SIZE'])
-assert torch.cuda.is_available()
-device = torch.device(f'cuda:{ddp_local_rank}')
-torch.cuda.set_device(device)
 print(f'using device: {device}')
-dist.init_process_group(backend='nccl', device_id=device)
-dist.barrier()
-master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
 # begin logging
 logfile = None
@@ -507,23 +516,26 @@ train_accumulation_steps = args.batch_size // ddp_world_size
 # load tokens
 train_loader = DistributedDataLoader(args.input_bin, args.sequence_length, ddp_rank, ddp_world_size)
 val_loader = DistributedDataLoader(args.input_val_bin, args.sequence_length, ddp_rank, ddp_world_size)
-test_loader = DistributedDataLoader(args.input_test_bin, args.sequence_length, ddp_rank, ddp_world_size)
+test_loader = DataLoader(TestDataset(), batch_size=args.batch_size, collate_fn=collate_fn)
 print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
 print0(f"Validation DataLoader: total number of tokens: {val_loader.total_num_tokens} across {len(val_loader.files)} files")
 print0(f"Test DataLoader: total number of tokens: {test_loader.total_num_tokens} across {len(test_loader.files)} files")
 print0('='*100, logonly=True)
 seq_train = train_loader.next_batch()
 
-model = BERT(model_config)
+model = ESM(model_config)
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
         m.float()
 config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
-# here we wrap model into DDP container
-model = DDP(model, device_ids=[ddp_local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
-raw_model = model.module # always contains the "raw" unwrapped model
+# wrap model in DDP only if using distributed training
+if ddp_world_size > 1:
+    model = DDP(model, device_ids=[ddp_local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
+    raw_model = model.module
+else:
+    raw_model = model
 
 # init the optimizer(s)
 embed_params = [*raw_model.embed.parameters(), *raw_model.value_embeds.parameters()]
@@ -591,7 +603,8 @@ for step in range(args.num_iterations + 1):
             for _ in range(val_steps):
                 seq_val = val_loader.next_batch()
                 val_loss += model(seq_val, sliding_window_size)
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        if ddp_world_size > 1:
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
         print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms perplexity:{(math.e**val_loss):.4f} param_count:{get_param_count(model):,}')
@@ -612,18 +625,14 @@ for step in range(args.num_iterations + 1):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
-    # run final test set evaluation and exit training
     if last_step:
-        model.eval()
-        test_loader.reset()
-
         break
 
     # --------------- FORWARD AND BACKWARD PASS -----------------
     model.train()
     for i in range(1, train_accumulation_steps + 1):
         with contextlib.ExitStack() as stack:
-            if i < train_accumulation_steps: # there's no need to sync gradients every accumulation step
+            if ddp_world_size > 1 and i < train_accumulation_steps: # there's no need to sync gradients every accumulation step
                 stack.enter_context(model.no_sync())
             #if step >= 5:
             #    stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
@@ -647,8 +656,49 @@ for step in range(args.num_iterations + 1):
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
 
+# Finish timing before inference
+torch.cuda.synchronize()
+torch.manual_seed(42)
+import numpy as np
+from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, matthews_corrcoef
+model.eval()
+results, all_true, all_pred = [], [], []
+total_loss, count = 0.0, 0
+
+with torch.no_grad():
+    for input_ids, labels in test_loader:
+        loss, logits = model.inference(input_ids, labels)        
+        total_loss += loss.item()
+        count += 1
+        all_true.extend(labels.cpu().numpy().flatten())
+        all_pred.extend(logits.argmax(dim=-1).cpu().numpy().flatten())
+
+average_loss = total_loss / count
+perplexity = torch.exp(torch.tensor(average_loss)).item()
+all_true = np.array(all_true)
+all_pred = np.array(all_pred)
+mask = (all_true != -100)
+all_true = all_true[mask]
+all_pred = all_pred[mask]
+
+precision = precision_score(all_true, all_pred, average='weighted')
+recall = recall_score(all_true, all_pred, average='weighted')
+f1 = f1_score(all_true, all_pred, average='weighted')
+accuracy = accuracy_score(all_true, all_pred)
+mcc = matthews_corrcoef(all_true, all_pred)
+
+print0("Final Results:")
+print0(f"  Loss:        {average_loss:.4f}")
+print0(f"  Perplexity:  {perplexity:.4f}")
+print0(f"  Precision:   {precision:.4f}")
+print0(f"  Recall:      {recall:.4f}")
+print0(f"  F1:          {f1:.4f}")
+print0(f"  Accuracy:    {accuracy:.4f}")
+print0(f"  MCC:         {mcc:.4f}")
+
 print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
 # -------------------------------------------------------------------------
 # clean up nice
-dist.destroy_process_group()
+if ddp_world_size > 1:
+    dist.destroy_process_group()
