@@ -286,12 +286,11 @@ if __name__ == "__main__":
         # null the gradients
         model.zero_grad(set_to_none=True)
         # --------------- FORWARD AND BACKWARD PASS END -------------------
-        # everything that follows now is just diagnostics, prints, logging, etc.
+        # everything that follows now is just eval, diagnostics, prints, logging, etc.
         approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
         print0(f"step:{step+1}/{args.num_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
 
-
-    # Finish timing before inference
+    print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     torch.manual_seed(42)
@@ -335,8 +334,6 @@ if __name__ == "__main__":
     print0(f"  F1:          {f1:.4f}")
     print0(f"  Accuracy:    {accuracy:.4f}")
     print0(f"  MCC:         {mcc:.4f}")
-
-    print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
     # -------------------------------------------------------------------------
     # clean up nice
