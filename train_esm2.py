@@ -131,16 +131,20 @@ if __name__ == "__main__":
     args.val_tokens = (args.val_tokens // (args.batch_size * ddp_world_size)) * (args.batch_size * ddp_world_size)
     val_steps = args.val_tokens // (args.batch_size * ddp_world_size)
     # calculate the steps of gradient accumulation required to attain the desired global batch size.
-    if args.grad_accum > 1:
-        train_accumulation_steps = args.grad_accum
-        batch_size = args.batch_size // args.grad_accum
-    else:
+    train_accumulation_steps = 1
+    if ddp_world_size > 1:
         assert args.batch_size % ddp_world_size == 0
-        train_accumulation_steps = args.batch_size // ddp_world_size
+        train_accumulation_steps = ddp_world_size
         batch_size = args.batch_size // ddp_world_size
+    
+    if args.grad_accum > 1:
+        train_accumulation_steps *= args.grad_accum
+        batch_size = args.batch_size // args.grad_accum
 
     print0(f'Train accumulation steps: {train_accumulation_steps}')
-    print0(f'Adjusted batch size: {batch_size}')
+    print0(f'Adjusted local batch size: {batch_size}')
+    print0(f'Across {ddp_world_size} GPUs')
+    print0(f'Total batch size: {args.batch_size}')
 
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size)
