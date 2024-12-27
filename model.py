@@ -205,7 +205,7 @@ class ESM(nn.Module):
         return logits
 
     def inference(self, input_ids, labels=None): # premaked input_ids
-        sliding_window_size = torch.tensor(2048, dtype=torch.int32, device="cuda")
+        sliding_window_size = torch.tensor(1024, dtype=torch.int32, device="cuda")
         logits = self.get_logits(input_ids, sliding_window_size)
         loss = None
         if labels is not None:

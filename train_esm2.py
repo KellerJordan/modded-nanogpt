@@ -143,9 +143,9 @@ if __name__ == "__main__":
         batch_size = args.batch_size // args.grad_accum
 
     print0(f'Train accumulation steps: {train_accumulation_steps}')
-    print0(f'Adjusted local batch size: {batch_size}')
+    print0(f'Adjusted local batch size: {batch_size} tokens')
     print0(f'Across {ddp_world_size} GPUs')
-    print0(f'Total batch size: {args.batch_size}')
+    print0(f'Total batch size: {args.batch_size} tokens')
 
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size)
@@ -292,6 +292,7 @@ if __name__ == "__main__":
 
 
     # Finish timing before inference
+    torch.cuda.empty_cache()
     torch.cuda.synchronize()
     torch.manual_seed(42)
     import numpy as np
@@ -307,7 +308,7 @@ if __name__ == "__main__":
     with torch.no_grad():
         for input_ids, labels in tqdm(test_loader, total=len(test_loader), desc="Evaluating"):
             loss, logits = model.inference(input_ids.cuda(), labels.cuda())        
-            total_loss += loss.item()
+            total_loss += loss.detach().cpu().item()
             count += 1
             all_true.extend(labels.cpu().numpy().flatten())
             all_pred.extend(logits.argmax(dim=-1).cpu().numpy().flatten())
