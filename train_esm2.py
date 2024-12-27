@@ -408,8 +408,8 @@ class TestDataset(torch.utils.data.Dataset):
         
 
 def collate_fn(batch):
-    input_ids = torch.stack([item[0] for item in batch])
-    labels = torch.stack([item[1] for item in batch])
+    input_ids = torch.cat([item[0].flatten() for item in batch])
+    labels = torch.cat([item[1].flatten() for item in batch]) 
     return input_ids, labels
 
 
