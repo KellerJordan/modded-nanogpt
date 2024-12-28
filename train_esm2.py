@@ -40,9 +40,9 @@ def get_args():
     
     # Model hyperparams
     parser.add_argument('--vocab_size', type=int, default=33, help='vocabulary size')
-    parser.add_argument('--num_layers', type=int, default=20, help='number of transformer layers')
-    parser.add_argument('--num_heads', type=int, default=6, help='number of attention heads (head dim 128 suggested by @Grad62304977)')
-    parser.add_argument('--model_dim', type=int, default=768, help='model hidden dimension size')
+    parser.add_argument('--num_hidden_layers', type=int, default=20, help='number of transformer layers')
+    parser.add_argument('--num_attention_heads', type=int, default=6, help='number of attention heads (head dim 128 suggested by @Grad62304977)')
+    parser.add_argument('--hidden_size', type=int, default=768, help='model hidden dimension size')
     
     # Data hyperparams
     parser.add_argument('--input_bin', type=str, default='data/omgprot50/omgprot50_train_*.bin', help='input .bins to train on')
@@ -226,7 +226,7 @@ if __name__ == "__main__":
             sw_prev = sw_size
 
         # once in a while evaluate the validation dataset
-        if args.valid_loss_every > 0 and step % args.valid_loss_every == 0:
+        if args.valid_loss_every > 0 and step % args.valid_loss_every == 0 or last_step:
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
@@ -305,7 +305,12 @@ if __name__ == "__main__":
     with torch.no_grad():
         for _ in tqdm(range(test_steps), desc="Evaluating"):
             input_ids = test_loader.next_batch()
-            logits, loss, labels = model.inference(input_ids, sliding_window_size)       
+            logits, loss, labels = model.inference(input_ids, sliding_window_size)     
+            """
+            TODO
+            Figure out why inference takes up so much more memory than training
+            Probably returning the logits and labels?
+            """  
             all_true.extend(labels.cpu().numpy().flatten())
             all_pred.extend(logits.argmax(dim=-1).cpu().numpy().flatten())
             total_loss += loss.detach().cpu().item()

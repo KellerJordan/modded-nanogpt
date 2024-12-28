@@ -2,13 +2,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-from transformers import EsmTokenizer
+from transformers import EsmTokenizer, PretrainedConfig, PreTrainedModel
 from utils import ProteinMasker
 from typing import Optional, Tuple, List, Any
 
 
-class ModelConfig:
-    def __init__(self, args):
+class ModelConfig(PretrainedConfig):
+    def __init__(
+        self,
+        args,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
         # 33 tokens: https://huggingface.co/Synthyra/ESMplusplus_large/blob/main/modeling_esm_plusplus.py#L868-L874
         # Depth of the number of layers is typically more important than the depth of the hidden dimension for PLMs
         # ESM2-8M has 6 layers, 20 heads, 320 hidden dim: https://huggingface.co/facebook/esm2_t6_8M_UR50D/blob/main/config.json
@@ -16,9 +21,9 @@ class ModelConfig:
         # ESM2-150M has 30 layers, 20 heads, 640 hidden dim: https://huggingface.co/facebook/esm2_t30_150M_UR50D/blob/main/config.json
         # ESM2-650M has 33 layers, 20 heads, 1280 hidden dim: https://huggingface.co/facebook/esm2_t33_650M_UR50D/blob/main/config.json
         self.vocab_size = args.vocab_size
-        self.num_layers = args.num_layers
-        self.num_heads = args.num_heads
-        self.model_dim = args.model_dim
+        self.num_hidden_layers = args.num_hidden_layers
+        self.num_attention_heads = args.num_attention_heads
+        self.hidden_size = args.hidden_size
 
 
 def norm(x: torch.Tensor) -> torch.Tensor:
@@ -33,7 +38,7 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype))
 
 
-class Rotary(torch.nn.Module):
+class Rotary(nn.Module):
     def __init__(self, dim, base=10000):
         super().__init__()
         self.register_buffer('inv_freq', (1 / base) ** (torch.arange(0, dim, 2) / dim))
@@ -63,13 +68,13 @@ class SelfAttention(nn.Module):
     Add F.spda option
     Add causal option (flex and sdpa)
     """
-    def __init__(self, dim, num_heads):
+    def __init__(self, dim, num_attention_heads):
         super().__init__()
-        assert dim % num_heads == 0
-        self.num_heads = num_heads
+        assert dim % num_attention_heads == 0
+        self.num_attention_heads = num_attention_heads
         self.qkv = CastedLinear(dim, 3 * dim)
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
-        self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
+        self.rotary = Rotary(dim // num_attention_heads) # dim // num_attention_heads = head_dim
         self.o_proj = CastedLinear(dim, dim)
         self.o_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
@@ -84,9 +89,9 @@ class SelfAttention(nn.Module):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, T, self.num_heads, -1)
-        k = k.view(B, T, self.num_heads, -1)
-        v = v.view(B, T, self.num_heads, -1)
+        q = q.view(B, T, self.num_attention_heads, -1)
+        k = k.view(B, T, self.num_attention_heads, -1)
+        v = v.view(B, T, self.num_attention_heads, -1)
         v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v) # @KoszarskyB & @Grad62304977
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
@@ -106,9 +111,9 @@ class SelfAttention(nn.Module):
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, T, self.num_heads, -1)
-        k = k.view(B, T, self.num_heads, -1)
-        v = v.view(B, T, self.num_heads, -1)
+        q = q.view(B, T, self.num_attention_heads, -1)
+        k = k.view(B, T, self.num_attention_heads, -1)
+        v = v.view(B, T, self.num_attention_heads, -1)
         v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v) # @KoszarskyB & @Grad62304977
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
@@ -118,25 +123,29 @@ class SelfAttention(nn.Module):
         return y
 
 
+def correction_fn(expansion_ratio: float, d_model: int) -> int:
+    return int(((expansion_ratio * d_model) + 255) // 256 * 256)
+
+
 class MLP(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.c_fc   = CastedLinear(dim, 4 * dim)
-        self.c_proj = CastedLinear(4 * dim, dim)
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.up   = CastedLinear(dim, correction_fn(8/3, dim))
+        self.down = CastedLinear(correction_fn(8/3, dim), dim)
+        self.down.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.relu = nn.ReLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.c_fc(x)
-        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
-        return x
+        # https://arxiv.org/abs/2109.08668v2
+        # ReLU squared ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        return self.down(self.relu(self.up(x)).square())
 
 
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.attn = SelfAttention(config.model_dim, config.num_heads)
-        self.mlp = MLP(config.model_dim)
+        self.attn = SelfAttention(config.hidden_size, config.num_attention_heads)
+        self.mlp = MLP(config.hidden_size)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def sdpa_forward(self, x: torch.Tensor, vi: torch.Tensor, x0: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -156,8 +165,8 @@ class ValueEmbedding(nn.Module):
     def __init__(self, config: "ModelConfig"):
         super().__init__()
         self.embed = nn.ModuleList([
-            nn.Embedding(config.vocab_size, config.model_dim)
-            for _ in range(config.num_layers // 2)
+            nn.Embedding(config.vocab_size, config.hidden_size)
+            for _ in range(config.num_hidden_layers // 2)
         ])
 
     def forward(self, inputs: torch.Tensor) -> List[torch.Tensor]:
@@ -166,33 +175,33 @@ class ValueEmbedding(nn.Module):
         return ve
 
 
-class ESM(nn.Module):
+class ESM(PreTrainedModel):
     """
     TODO
     Add causal option (flex and sdpa)
     """
-    def __init__(self, config: "ModelConfig"):
-        super().__init__()
+    def __init__(self, config: ModelConfig):
+        super().__init__(config)
         tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
         self.masker = ProteinMasker(tokenizer, 0.20) # 20% masking rate https://arxiv.org/abs/2301.06568
         self.inference_masker = ProteinMasker(tokenizer, 0.15) # 15% masking rate for inference, ESM2
         self.cls_id = tokenizer.cls_token_id
         self.vocab_size = tokenizer.vocab_size
-        self.num_layers = config.num_layers
+        self.num_hidden_layers = config.num_hidden_layers
 
         # U-net design by @brendanh0gan
-        assert config.num_layers % 2 == 0, "Number of layers should be even for U-net design"
-        self.num_encoder_layers = config.num_layers // 2 # Half of the layers for encoder
-        self.num_decoder_layers = config.num_layers - self.num_encoder_layers # Remaining for decoder
+        assert config.num_hidden_layers % 2 == 0, "Number of layers should be even for U-net design"
+        self.num_encoder_layers = config.num_hidden_layers // 2 # Half of the layers for encoder
+        self.num_decoder_layers = config.num_hidden_layers - self.num_encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
-        self.embed = nn.Embedding(self.vocab_size, config.model_dim)
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
+        self.embed = nn.Embedding(self.vocab_size, config.hidden_size)
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_hidden_layers)])
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
         # U-net structure on token value embeddings by @leloykun
         self.value_embeds = ValueEmbedding(config)
-        self.lm_head = CastedLinear(config.model_dim, self.vocab_size)
+        self.lm_head = CastedLinear(config.hidden_size, self.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
         self.cross_entropy = nn.CrossEntropyLoss()
 
@@ -269,3 +278,12 @@ class ESM(nn.Module):
         input_ids, labels = self.masker(input_ids)
         logits = self.flex_forward(input_ids, sliding_window_size)
         return self.cross_entropy(logits.view(-1, self.vocab_size), labels.view(-1).long())
+
+
+if __name__ == '__main__':
+    """
+    TODO
+    look at MSE between flex attention outputs and sdpa outputs
+    """
+
+

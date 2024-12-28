@@ -1,7 +1,5 @@
 import torch
 from pathlib import Path
-from transformers import EsmTokenizer
-from utils import ProteinMasker
 
 
 def _peek_data_shard(file: Path):
@@ -58,49 +56,3 @@ class DistributedDataLoader:
         if self.current_position + batch_size >= len(self.tokens):
             self.advance()
         return input_ids
-    
-
-class TestDataset(torch.utils.data.Dataset):
-    def __init__(self, tokenizer, batch_size):
-        from huggingface_hub import hf_hub_download 
-        from datasets import Dataset as HFDataset
-        local_file = hf_hub_download(
-            repo_id="Synthyra/omg_prot50",
-            filename=f"data/test-00000-of-00001.parquet",
-            repo_type="dataset"
-        )
-        data = HFDataset.from_parquet(local_file)
-        sequences = data['sequence']
-        self.sequences = [seq[:1022] for seq in sequences]
-        self.num_tokens = sum(len(seq) for seq in self.sequences)
-        self.num_seqs = len(self.sequences)
-        self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
-        self.masker = ProteinMasker(tokenizer, 0.15) # 15% masking rate like ESM2 for inference
-        self.batch_size = batch_size
-        self.current_idx = 0
-
-    def __len__(self):
-        return self.num_tokens // self.batch_size
-
-    def __getitem__(self, idx):
-        batch_input_ids = []
-        current_length = 0
-
-        for _ in range(self.num_seqs):
-            if self.current_idx >= self.num_seqs:
-                self.current_idx = 0
-            
-            input_ids = self.tokenizer(
-                self.sequences[self.current_idx],
-                truncation=False,
-                padding=False,
-                add_special_tokens=True).input_ids
-            current_length += len(input_ids)
-            if current_length >= self.batch_size:
-                break
-            batch_input_ids.extend(input_ids)
-            self.current_idx += 1
-            
-        input_ids = torch.tensor(batch_input_ids).view(1, -1)
-        input_ids, labels = self.masker(input_ids)
-        return input_ids, labels
