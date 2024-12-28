@@ -8,22 +8,28 @@ from typing import Optional, Tuple, List, Any
 
 
 class ModelConfig(PretrainedConfig):
+    """
+    33 tokens: https://huggingface.co/Synthyra/ESMplusplus_large/blob/main/modeling_esm_plusplus.py#L868-L874
+    ESM2-8M has 6 layers, 20 heads, 320 hidden dim: https://huggingface.co/facebook/esm2_t6_8M_UR50D/blob/main/config.json
+    ESM2-35M has 12 layers, 20 heads, 480 hidden dim: https://huggingface.co/facebook/esm2_t12_35M_UR50D/blob/main/config.json
+    ESM2-150M has 30 layers, 20 heads, 640 hidden dim: https://huggingface.co/facebook/esm2_t30_150M_UR50D/blob/main/config.json
+    ESM2-650M has 33 layers, 20 heads, 1280 hidden dim: https://huggingface.co/facebook/esm2_t33_650M_UR50D/blob/main/config.json
+    """
     def __init__(
         self,
-        args,
-        **kwargs
+        vocab_size=33,
+        hidden_size=768,
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        expansion_ratio=8/3,
+        **kwargs,
     ):
         super().__init__(**kwargs)
-        # 33 tokens: https://huggingface.co/Synthyra/ESMplusplus_large/blob/main/modeling_esm_plusplus.py#L868-L874
-        # Depth of the number of layers is typically more important than the depth of the hidden dimension for PLMs
-        # ESM2-8M has 6 layers, 20 heads, 320 hidden dim: https://huggingface.co/facebook/esm2_t6_8M_UR50D/blob/main/config.json
-        # ESM2-35M has 12 layers, 20 heads, 480 hidden dim: https://huggingface.co/facebook/esm2_t12_35M_UR50D/blob/main/config.json
-        # ESM2-150M has 30 layers, 20 heads, 640 hidden dim: https://huggingface.co/facebook/esm2_t30_150M_UR50D/blob/main/config.json
-        # ESM2-650M has 33 layers, 20 heads, 1280 hidden dim: https://huggingface.co/facebook/esm2_t33_650M_UR50D/blob/main/config.json
-        self.vocab_size = args.vocab_size
-        self.num_hidden_layers = args.num_hidden_layers
-        self.num_attention_heads = args.num_attention_heads
-        self.hidden_size = args.hidden_size
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.expansion_ratio = expansion_ratio
 
 
 def norm(x: torch.Tensor) -> torch.Tensor:
@@ -128,10 +134,10 @@ def correction_fn(expansion_ratio: float, d_model: int) -> int:
 
 
 class MLP(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, expansion_ratio):
         super().__init__()
-        self.up   = CastedLinear(dim, correction_fn(8/3, dim))
-        self.down = CastedLinear(correction_fn(8/3, dim), dim)
+        self.up   = CastedLinear(dim, correction_fn(expansion_ratio, dim))
+        self.down = CastedLinear(correction_fn(expansion_ratio, dim), dim)
         self.down.weight.data.zero_() # zero init suggested by @Grad62304977
         self.relu = nn.ReLU()
 
@@ -145,7 +151,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn = SelfAttention(config.hidden_size, config.num_attention_heads)
-        self.mlp = MLP(config.hidden_size)
+        self.mlp = MLP(config.hidden_size, config.expansion_ratio)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def sdpa_forward(self, x: torch.Tensor, vi: torch.Tensor, x0: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -180,8 +186,10 @@ class ESM(PreTrainedModel):
     TODO
     Add causal option (flex and sdpa)
     """
+    config_class = ModelConfig
     def __init__(self, config: ModelConfig):
         super().__init__(config)
+        self.config = config
         tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
         self.masker = ProteinMasker(tokenizer, 0.20) # 20% masking rate https://arxiv.org/abs/2301.06568
         self.inference_masker = ProteinMasker(tokenizer, 0.15) # 15% masking rate for inference, ESM2

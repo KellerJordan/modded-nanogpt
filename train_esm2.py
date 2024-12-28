@@ -79,7 +79,12 @@ if __name__ == "__main__":
     if args.token:
         from huggingface_hub import login
         login(args.token)
-    model_config = ModelConfig(args)
+    model_config = ModelConfig(
+        vocab_size=args.vocab_size,
+        num_hidden_layers=args.num_hidden_layers,
+        num_attention_heads=args.num_attention_heads,
+        hidden_size=args.hidden_size,
+    )
 
     # set up DDP (distributed data parallel) if available, otherwise single GPU
     if 'RANK' in os.environ:
