@@ -1,7 +1,7 @@
 import torch
 import pandas as pd
 import numpy as np
-from transformers import EsmTokenizer, EsmForMaskedLM
+from transformers import EsmTokenizer, EsmForMaskedLM, AutoModelForMaskedLM
 from datasets import Dataset
 from huggingface_hub import hf_hub_download
 from tqdm.auto import tqdm
@@ -27,20 +27,25 @@ def main():
         # Load the ESM tokenizer and model
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model_names = {
-            'facebook/esm2_t6_8M_UR50D': 'ESM2-8M',
-            'facebook/esm2_t12_35M_UR50D': 'ESM2-35M',
-            'facebook/esm2_t30_150M_UR50D': 'ESM2-150M',
-            'facebook/esm2_t33_650M_UR50D': 'ESM2-650M'
+            #'facebook/esm2_t6_8M_UR50D': 'ESM2-8M',
+            #'facebook/esm2_t12_35M_UR50D': 'ESM2-35M',
+            'Synthyra/ESMplusplus_small': 'ESMC-300M',
+            #'facebook/esm2_t30_150M_UR50D': 'ESM2-150M',
+            'Synthyra/ESMplusplus_large': 'ESMC-600M',
+            #'facebook/esm2_t33_650M_UR50D': 'ESM2-650M'
         }
 
-        tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
         mask_rate, batch_size = 0.15, 4
-
-        masker = ProteinMasker(tokenizer, mask_rate)
         results = []
         for model_name, nickname in model_names.items():
             torch.manual_seed(42)
-            model = EsmForMaskedLM.from_pretrained(model_name).to(device).eval()
+            if 'synthyra' in model_name.lower():
+                model = AutoModelForMaskedLM.from_pretrained(model_name, trust_remote_code=True, torch_dtype=torch.float16).to(device).eval()
+                tokenizer = model.tokenizer
+            else:
+                model = EsmForMaskedLM.from_pretrained(model_name).to(device).eval()
+                tokenizer = EsmTokenizer.from_pretrained(model_name)
+            masker = ProteinMasker(tokenizer, mask_rate)
             total_loss, count = 0.0, 0
             all_true, all_pred = [], []
             
