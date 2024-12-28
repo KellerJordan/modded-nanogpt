@@ -20,22 +20,24 @@ torchvision is needed to fix an import error with transformers.
 Loss is standard cross-entropy loss, perplexity $e^{loss}$. [Sequence reconstruction metrics](https://github.com/Synthyra/SpeedRunningESM2/blob/master/benchmark_esm.py) are calculated via exact match betweeen predictions and labels and weighted averages.
 
 Validation set, random 10,000 sequences from OMGprot50.
-|model    |loss  |perplexity|precision|recall|f1    |accuracy|mcc   |
-|---------|------|----------|---------|------|------|--------|------|
-|ESM2-8M  |2.4662|11.7775   |0.3074   |0.278 |0.2726|0.278   |0.2262|
-|ESM2-35M |2.3572|10.5613   |0.3464   |0.3205|0.3161|0.3205  |0.2726|
-|ESM2-150M|2.255 |9.5349    |0.3806   |0.3596|0.356 |0.3596  |0.3152|
-|ESM2-650M|2.1382|8.4841    |0.4218   |0.4024|0.4   |0.4024  |0.3615|
-
+| model     | loss   | perplexity | precision | recall | f1     | accuracy | mcc    |
+|-----------|--------|------------|-----------|--------|--------|----------|--------|
+| ESM2-8M   | 2.4662 | 11.7775    | 0.3074    | 0.2780 | 0.2726 | 0.2780   | 0.2262 |
+| ESM2-35M  | 2.3572 | 10.5613    | 0.3464    | 0.3205 | 0.3161 | 0.3205   | 0.2726 |
+| ESM2-150M | 2.2550 | 9.5349     | 0.3806    | 0.3596 | 0.3560 | 0.3596   | 0.3152 |
+| ESMC-300M | 2.1996 | 9.0214     | 0.3936    | 0.3648 | 0.3605 | 0.3648   | 0.3206 |
+| ESMC-600M | 2.1549 | 8.6267     | 0.4068    | 0.3802 | 0.3762 | 0.3802   | 0.3373 |
+| ESM2-650M | 2.1382 | 8.4841     | 0.4218    | 0.4024 | 0.4000 | 0.4024   | 0.3615 |
 
 Test set, random 10,0000 sequences from OMGprot50 and 3,000+ newly discovered sequences after OMGprot50 creation (well after ESM2 training date).
-|model    |loss  |perplexity|precision|recall|f1    |accuracy|mcc   |
-|---------|------|----------|---------|------|------|--------|------|
-|ESM2-8M  |2.452 |11.6116   |0.3079   |0.278 |0.2735|0.278   |0.2274|
-|ESM2-35M |2.3063|10.0374   |0.3616   |0.338 |0.3346|0.338   |0.2928|
-|ESM2-150M|2.1587|8.6602    |0.4149   |0.3973|0.3949|0.3973  |0.3568|
-|ESM2-650M|1.998 |7.3743    |0.4723   |0.4576|0.4561|0.4576  |0.4217|
-
+| model     | loss   | perplexity | precision | recall | f1     | accuracy | mcc    |
+|-----------|--------|------------|-----------|--------|--------|----------|--------|
+| ESM2-8M   | 2.4520 | 11.6116    | 0.3079    | 0.2780 | 0.2735 | 0.2780   | 0.2274 |
+| ESM2-35M  | 2.3063 | 10.0374    | 0.3616    | 0.3380 | 0.3346 | 0.3380   | 0.2928 |
+| ESM2-150M | 2.1587 | 8.6602     | 0.4149    | 0.3973 | 0.3949 | 0.3973   | 0.3568 |
+| ESMC-300M | 2.0523 | 7.7854     | 0.4549    | 0.4296 | 0.4278 | 0.4296   | 0.3916 |
+| ESMC-600M | 1.9942 | 7.3466     | 0.4741    | 0.4516 | 0.4498 | 0.4516   | 0.4152 |
+| ESM2-650M | 1.9980 | 7.3743     | 0.4723    | 0.4576 | 0.4561 | 0.4576   | 0.4217 |
 
 These match the [results](https://github.com/Synthyra/SpeedRunningESM2/pull/2#issue-2756280840) from the original paper well.
 
