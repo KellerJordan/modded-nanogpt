@@ -243,36 +243,16 @@ if __name__ == "__main__":
             # run validation batches
             model.eval()
             valid_loader.reset()
-            total_loss = 0.0
-            all_true, all_pred = [], []
+            val_loss = 0.0
             with torch.no_grad():
                 for _ in range(valid_steps):
                     input_ids = valid_loader.next_batch()
-                    logits, loss, labels = model.inference(input_ids, sliding_window_size)
-                    all_true.extend(labels.cpu().numpy().flatten())
-                    all_pred.extend(logits.argmax(dim=-1).cpu().numpy().flatten())
-                    total_loss += loss.detach().cpu().item()
-
-            val_loss = total_loss / valid_steps
+                    val_loss += model(input_ids, sliding_window_size)
             if ddp_world_size > 1:
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-
-            # Calculate validation metrics
-            all_true = np.array(all_true)
-            all_pred = np.array(all_pred)
-            mask = (all_true != -100)
-            all_true = all_true[mask]
-            all_pred = all_pred[mask]
-            precision = precision_score(all_true, all_pred, average='weighted')
-            recall = recall_score(all_true, all_pred, average='weighted')
-            f1 = f1_score(all_true, all_pred, average='weighted')
-            accuracy = accuracy_score(all_true, all_pred)
-            mcc = matthews_corrcoef(all_true, all_pred)
-            perplexity = math.e**val_loss
-
-            # Log everything in one print statement
-            print0(f'step:{step}/{args.num_steps} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms param_count:{get_param_count(model):,} || val_metrics: loss:{val_loss:.4f} ppl:{perplexity:.4f} prec:{precision:.4f} rec:{recall:.4f} f1:{f1:.4f} acc:{accuracy:.4f} mcc:{mcc:.4f}')
-
+            val_loss /= valid_steps
+            # log val loss to console and to logfile
+            print0(f'step:{step}/{args.num_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms perplexity:{(math.e**val_loss):.4f} param_count:{get_param_count(model):,}')
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.perf_counter()
