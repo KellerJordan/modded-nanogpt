@@ -293,8 +293,9 @@ if __name__ == "__main__":
         model.zero_grad(set_to_none=True)
         # --------------- FORWARD AND BACKWARD PASS END -------------------
         # everything that follows now is just eval, diagnostics, prints, logging, etc.
-        approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-        print0(f"step:{step+1}/{args.num_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+        if step % 100 == 0:
+            approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
+            print0(f"step:{step+1}/{args.num_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
 
     print0(f"peak memory consumption training: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
 
