@@ -40,7 +40,7 @@ def get_args():
     
     # Model hyperparams
     parser.add_argument('--vocab_size', type=int, default=33, help='vocabulary size')
-    parser.add_argument('--num_hidden_layers', type=int, default=20, help='number of transformer layers')
+    parser.add_argument('--num_hidden_layers', type=int, default=24, help='number of transformer layers')
     parser.add_argument('--num_attention_heads', type=int, default=6, help='number of attention heads (head dim 128 suggested by @Grad62304977)')
     parser.add_argument('--hidden_size', type=int, default=768, help='model hidden dimension size')
     
@@ -50,14 +50,14 @@ def get_args():
     parser.add_argument('--input_test_bin', type=str, default='data/omgprot50/omgprot50_test_*.bin', help='input .bins to eval test loss on')   
     
     # Optimization hyperparams
-    parser.add_argument('--batch_size', type=int, default=64*1024, help='batch size, in tokens, across all devices')
+    parser.add_argument('--batch_size', type=int, default=8*64*1024, help='batch size, in tokens, across all devices')
     parser.add_argument('--grad_accum', type=int, default=1, help='manually set number of gradient accumulation steps, else, will be ddp_world_size')
     parser.add_argument('--num_steps', type=int, default=25000, help='number of iterations to run')
     parser.add_argument('--warmup_steps', type=int, default=1000, help='number of warmup steps')
     parser.add_argument('--cooldown_steps', type=int, default=1000, help='number of cooldown steps')
     
     # Evaluation and logging hyperparams
-    parser.add_argument('--valid_loss_every', type=int, default=500, help='every how many steps to evaluate val loss? 0 for only at the end')
+    parser.add_argument('--valid_loss_every', type=int, default=1000, help='every how many steps to evaluate val loss? 0 for only at the end')
     parser.add_argument('--hf_model_name', type=str, default='Synthyra/esm_speedrun', help='huggingface model name')
     parser.add_argument('--token', type=str, default=None, help='huggingface token')
     parser.add_argument('--save_every', type=int, default=None, help='save every how many steps? None for no saving')
