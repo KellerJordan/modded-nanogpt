@@ -1,5 +1,5 @@
 # Replicating ESM2 at the speed of sound
-This repo is an open-source collaboration to reproduce ESM2-150M validation loss in as little time as possible inspired by the fantastic [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) repo.
+This repo is an open-source collaboration to reproduce ESM2 models with the same or less parameters in as little time as possible, inspired by the fantastic [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) repo. Mostly interested in 8xH100 or 1xH200 runs which are currently available through many vendors.
 
 ## Quick Start
 
@@ -9,14 +9,15 @@ Setup environment and train ESM2
 git clone https://github.com/Synthyra/SpeedRunningESM2
 cd SpeedRunningESM2
 pip install -r requirements.txt
-pip install --pre torch==2.6.0.dev20241203+cu124 --index-url https://download.pytorch.org/whl/nightly/cu124 --upgrade # install torch 2.6.0
-python data/download_omgprot50.py --num_chunks 10 # downloads only the first 1.0B training tokens to save time
+pip install --pre torch==2.6.0.dev20241203+cu124 torchvision --index-url https://download.pytorch.org/whl/nightly/cu124 --upgrade # install torch 2.6.0
+python data/download_omgprot50.py # --num_chunks 10 you can download less chunks to save time
 ./run.sh
 ```
+torchvision is needed to fix an import error with transformers.
 
 ## Benchmarks to match
 [OMGprot50](https://huggingface.co/datasets/Synthyra/omg_prot50) validation and test sets, 15% BERT-like MLM objective.
-Loss is standard cross-entropy loss, perplexity $e^{loss}$. Sequence reconstruction metrics are calculated via exact match betweeen predictions and labels.
+Loss is standard cross-entropy loss, perplexity $e^{loss}$. [Sequence reconstruction metrics](https://github.com/Synthyra/SpeedRunningESM2/blob/master/benchmark_esm.py) are calculated via exact match betweeen predictions and labels and weighted averages.
 
 Validation set, random 10,000 sequences from OMGprot50.
 |model    |loss  |perplexity|precision|recall|f1    |accuracy|mcc   |
@@ -37,3 +38,12 @@ Test set, random 10,0000 sequences from OMGprot50 and 3,000+ newly discovered se
 
 
 These match the [results](https://github.com/Synthyra/SpeedRunningESM2/pull/2#issue-2756280840) from the original paper well.
+
+
+## Successful runs showcase
+
+|Matches |Parameters|Time      |Hardware |Log |
+|--------|----------|----------|---------|----|
+|ESM2-150|140M      |9.44 hours|1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs/f48932cb-f41f-4c0c-8f24-90c839e9dc9e.txt)|
+
+
