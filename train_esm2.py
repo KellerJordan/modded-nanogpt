@@ -79,6 +79,7 @@ if __name__ == "__main__":
     if args.token:
         from huggingface_hub import login
         login(args.token)
+        args.token = None
     model_config = ModelConfig(
         vocab_size=args.vocab_size,
         num_hidden_layers=args.num_hidden_layers,
