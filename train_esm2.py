@@ -58,6 +58,8 @@ def get_args():
     
     # Evaluation and logging hyperparams
     parser.add_argument('--valid_loss_every', type=int, default=500, help='every how many steps to evaluate val loss? 0 for only at the end')
+    parser.add_argument('--hf_model_name', type=str, default='Synthyra/esm_speedrun', help='huggingface model name')
+    parser.add_argument('--token', type=str, default=None, help='huggingface token')
     parser.add_argument('--save_every', type=int, default=None, help='save every how many steps? None for no saving')
     args = parser.parse_args()
     return args
@@ -72,6 +74,9 @@ def get_param_count(model):
 
 if __name__ == "__main__":
     args = get_args()
+    if args.token:
+        from huggingface_hub import login
+        login(args.token)
     model_config = ModelConfig(args)
 
     # set up DDP (distributed data parallel) if available, otherwise single GPU
@@ -292,6 +297,13 @@ if __name__ == "__main__":
         print0(f"step:{step+1}/{args.num_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
 
     print0(f"peak memory consumption training: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
+
+    # save the model to huggingface
+    try:
+        model.push_to_hub(args.hf_model_name)
+    except Exception as e:
+        print(e)
+
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     torch.manual_seed(42)
@@ -337,7 +349,6 @@ if __name__ == "__main__":
     print0(f"  F1:          {f1:.4f}")
     print0(f"  Accuracy:    {accuracy:.4f}")
     print0(f"  MCC:         {mcc:.4f}")
-
 
     print0(f"peak memory consumption testing: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
     # -------------------------------------------------------------------------
