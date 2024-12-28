@@ -146,7 +146,7 @@ if __name__ == "__main__":
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size)
     valid_loader = DistributedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size)
-    test_loader = DistributedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size)
+    test_loader = DistributedDataLoader(args.input_test_bin, batch_size // 4, ddp_rank, ddp_world_size)
     print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
     print0(f"Validation DataLoader: total number of tokens: {valid_loader.total_num_tokens} across {len(valid_loader.files)} files")
     print0(f"Testing DataLoader: total number of tokens: {test_loader.total_num_tokens} across {len(test_loader.files)} files")
