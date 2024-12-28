@@ -130,6 +130,9 @@ if __name__ == "__main__":
     print0(f'{result.stdout}', logonly=True)
     print0('='*100, logonly=True)
 
+    print0(f'Model config: {model_config}')
+    print0(f'Args: {args.__dict__}')
+
     # calculate the steps of gradient accumulation required to attain the desired global batch size
     # args.batch_size should refer to the total amount of tokens per backward pass
     train_accumulation_steps = 1
