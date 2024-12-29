@@ -270,7 +270,7 @@ if __name__ == "__main__":
                 training_time_ms += 1000 * (time.perf_counter() - t0)
                 # save the state of the training process
                 log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-                torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+                torch.save(log, 'logs/state_step%06d.pt' % step)
 
                 try:
                     if ddp_world_size > 1:
