@@ -422,6 +422,7 @@ class DistributedDataLoader:
 @click.option("--muon_lr", type=float, default=0.05, help="Learning rate for Muon optimizer")
 @click.option("--adam_lr", type=float, default=0.04, help="Learning rate for Adam optimizer for blocks and scalar params")
 @click.option("--lm_head_lr", type=float, default=0.008, help="Learning rate for the language model head")
+@click.option("--enable_muon_momentum_warmup", type=bool, default=True, help="Enable momentum warmup for Muon optimizer")
 @click.option("--val_loss_every", type=int, default=125, help="Evaluate val loss every this many steps. 0 for only at the end")
 @click.option("--val_tokens", type=int, default=10485760, help="Number of tokens in the validation dataset")  # Note: it's important to keep this fixed for consistent comparisons
 def train(
@@ -440,6 +441,7 @@ def train(
     muon_lr: float,
     adam_lr: float,
     lm_head_lr: float,
+    enable_muon_momentum_warmup: bool,
     val_loss_every: int,
     val_tokens: int,
 ):
@@ -616,10 +618,10 @@ def train(
         if train_accumulation_steps != 1:
             for p in model.parameters():
                 p.grad /= train_accumulation_steps
-        # momentum warmup for Muon
-        frac = min(step/300, 1)
-        for group in optimizer3.param_groups:
-            group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+        if enable_muon_momentum_warmup:
+            frac = min(step/300, 1)
+            for group in optimizer3.param_groups:
+                group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
         # step the optimizers and schedulers
         for opt, sched in zip(optimizers, schedulers):
             opt.step()
