@@ -274,6 +274,42 @@ class ESM(PreTrainedModel):
 
         return self.get_logits(x)
 
+    def get_vector_embeddings(self, input_ids: torch.Tensor, sliding_window_size: torch.Tensor) -> torch.Tensor:
+        input_ids = input_ids.flatten()
+        docs = (input_ids == self.cls_id).cumsum(dim=0)  # shape: [S]
+        
+        def doc_mask_mod(b, h, q_idx, kv_idx):
+            bidirectional_sliding_window_mask = torch.abs(q_idx - kv_idx) < sliding_window_size
+            doc_mask = docs[q_idx] == docs[kv_idx]
+            return bidirectional_sliding_window_mask & doc_mask
+        
+        S = len(input_ids)
+        block_mask = create_block_mask(doc_mask_mod, None, None, S, S)
+        x, x0, ve = self.embed_forward(input_ids)  # x shape: [S, hidden_size]
+        ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
+        skip_connections = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, ve_enc[i], x0, block_mask)
+            skip_connections.append(x)
+
+        for i in range(self.num_decoder_layers):
+            x = x + self.skip_weights[i] * skip_connections.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_mask)
+        
+        # At this point, x is shape [S, hidden_size]
+        # We want to mean-pool across each document index.
+        # Convert docs to 0-based so we can do nice indexing
+        num_docs = docs.max().item()
+        doc_ids = docs - 1  # Now documents are labeled [0, 1, 2, ...]
+        # Mean-pool across tokens belonging to each doc
+        doc_embeds = []
+        for doc_idx in range(num_docs):
+            mask = (doc_ids == doc_idx)
+            # Collect all token embeddings for this doc and average
+            doc_embeds.append(x[mask].mean(dim=0))
+        # Stack into [num_documents, hidden_size]
+        return torch.stack(doc_embeds, dim=0)
+
     def inference(self, input_ids: torch.Tensor, sliding_window_size: torch.Tensor = None) -> Tuple[torch.Tensor, Any, Any]:
         input_ids, labels = self.inference_masker(input_ids)
         logits = self.flex_forward(input_ids, sliding_window_size)
@@ -293,5 +329,3 @@ if __name__ == '__main__':
     TODO
     look at MSE between flex attention outputs and sdpa outputs
     """
-
-
