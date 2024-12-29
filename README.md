@@ -44,8 +44,9 @@ These match the [results](https://github.com/Synthyra/SpeedRunningESM2/pull/2#is
 
 ## Successful runs showcase
 
-|Matches |Parameters|Time      |Hardware |Log |
+|~Matches |Parameters|Time      |Hardware |Log |
 |--------|----------|----------|---------|----|
 |ESM2-150|140M      |9.44 hours|1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs/f48932cb-f41f-4c0c-8f24-90c839e9dc9e.txt)|
+|ESM2-150|132M      |9.00 hours|1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs/e631bf18-f202-492b-a3b8-fbae2cb7484a.txt)|
 
 
