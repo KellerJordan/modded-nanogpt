@@ -272,7 +272,15 @@ if __name__ == "__main__":
                 # save the state of the training process
                 log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
                 torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
-                # start the clock again
+
+                try:
+                    if ddp_world_size > 1:
+                        model.module.push_to_hub(args.hf_model_name, subfolder='step%06d' % step)
+                    else:
+                        model.push_to_hub(args.hf_model_name, subfolder='step%06d' % step)
+                except Exception as e:
+                    print(e)
+
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
 
@@ -312,7 +320,10 @@ if __name__ == "__main__":
 
     # save the model to huggingface
     try:
-        model.push_to_hub(args.hf_model_name)
+        if ddp_world_size > 1:
+            model.module.push_to_hub(args.hf_model_name)
+        else:
+            model.push_to_hub(args.hf_model_name)
     except Exception as e:
         print(e)
 
