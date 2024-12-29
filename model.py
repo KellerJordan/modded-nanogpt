@@ -296,6 +296,7 @@ class ESM(PreTrainedModel):
             x = x + self.skip_weights[i] * skip_connections.pop()
             x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_mask)
         
+        x = x.view(-1, self.config.hidden_size)
         # At this point, x is shape [S, hidden_size]
         # We want to mean-pool across each document index.
         # Convert docs to 0-based so we can do nice indexing
