@@ -195,6 +195,7 @@ class CausalSelfAttention(nn.Module):
         q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, enable_gqa=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
+        y /= self.lambdas[0] + self.lambdas[1] + 1e-8
         y = self.c_proj(y)
         return y
 
