@@ -20,7 +20,7 @@ torchvision is needed to fix an import error with transformers.
 Loss is standard cross-entropy loss, perplexity $e^{loss}$. [Sequence reconstruction metrics](https://github.com/Synthyra/SpeedRunningESM2/blob/master/benchmark_esm.py) are calculated via exact match betweeen predictions and labels and weighted averages.
 
 Validation set, random 10,000 sequences from OMGprot50.
-| model     | loss   | perplexity | precision | recall | f1     | accuracy | mcc    |
+| model | loss &darr;   | perplexity &darr; | precision &uarr; | recall &uarr; | f1 &uarr; | accuracy &uarr; | mcc &uarr;|
 |-----------|--------|------------|-----------|--------|--------|----------|--------|
 | ESM2-8M   | 2.4662 | 11.7775    | 0.3074    | 0.2780 | 0.2726 | 0.2780   | 0.2262 |
 | ESM2-35M  | 2.3572 | 10.5613    | 0.3464    | 0.3205 | 0.3161 | 0.3205   | 0.2726 |
@@ -30,7 +30,7 @@ Validation set, random 10,000 sequences from OMGprot50.
 | ESM2-650M | 2.1382 | 8.4841     | 0.4218    | 0.4024 | 0.4000 | 0.4024   | 0.3615 |
 
 Test set, random 10,0000 sequences from OMGprot50 and 3,000+ newly discovered sequences after OMGprot50 creation (well after ESM2 training date).
-| model     | loss   | perplexity | precision | recall | f1     | accuracy | mcc    |
+| model | loss &darr; | perplexity &darr; | precision &uarr; | recall &uarr; | f1 &uarr; | accuracy &uarr; | mcc &uarr;|
 |-----------|--------|------------|-----------|--------|--------|----------|--------|
 | ESM2-8M   | 2.4520 | 11.6116    | 0.3079    | 0.2780 | 0.2735 | 0.2780   | 0.2274 |
 | ESM2-35M  | 2.3063 | 10.0374    | 0.3616    | 0.3380 | 0.3346 | 0.3380   | 0.2928 |
@@ -44,9 +44,9 @@ These match the [results](https://github.com/Synthyra/SpeedRunningESM2/pull/2#is
 
 ## Successful runs showcase
 
-|~Matches |Parameters|Time      |Hardware |Log |
-|--------|----------|----------|---------|----|
-|ESM2-150|140M      |9.44 hours|1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs/f48932cb-f41f-4c0c-8f24-90c839e9dc9e.txt)|
-|ESM2-150|132M      |9.00 hours|1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs/e631bf18-f202-492b-a3b8-fbae2cb7484a.txt)|
+|~Matches |Parameters|Time      |Hardware |Log | Val loss | Test loss |
+|--------|----------|----------|---------|----|-----------|-----------|
+|ESM2-150|140M      |9.44 hours|1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs/f48932cb-f41f-4c0c-8f24-90c839e9dc9e.txt)| 2.2272 | Bugged |
+|ESM2-150|132M      |9.00 hours|1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs/e631bf18-f202-492b-a3b8-fbae2cb7484a.txt)| 2.2137 | 2.2093 |
 
 
