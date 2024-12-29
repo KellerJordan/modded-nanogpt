@@ -30,7 +30,6 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
-from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, matthews_corrcoef
 
 from optimizer import Muon
 from model import ModelConfig, ESM, CastedLinear
