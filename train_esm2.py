@@ -162,7 +162,7 @@ if __name__ == "__main__":
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size)
     valid_loader = DistributedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size)
-    test_loader = DistributedDataLoader(args.input_test_bin, batch_size // 4, ddp_rank, ddp_world_size)
+    test_loader = DistributedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size)
     print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
     print0(f"Validation DataLoader: total number of tokens: {valid_loader.total_num_tokens} across {len(valid_loader.files)} files")
     print0(f"Testing DataLoader: total number of tokens: {test_loader.total_num_tokens} across {len(test_loader.files)} files")
@@ -320,45 +320,18 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     torch.manual_seed(42)
     model.eval()
-    results, all_true, all_pred = [], [], []
-    total_loss = 0.0
-
-    from tqdm import tqdm
+    test_loader.reset()
+    test_loss = 0.0
     with torch.no_grad():
-        for _ in tqdm(range(test_steps), desc="Evaluating"):
+        for _ in range(test_steps):
             input_ids = test_loader.next_batch()
-            logits, loss, labels = model.inference(input_ids, sliding_window_size)     
-            """
-            TODO
-            Figure out why inference takes up so much more memory than training
-            Probably returning the logits and labels?
-            """  
-            all_true.extend(labels.cpu().numpy().flatten())
-            all_pred.extend(logits.argmax(dim=-1).cpu().numpy().flatten())
-            total_loss += loss.detach().cpu().item()
+            test_loss += model(input_ids, sliding_window_size)
 
-    average_loss = total_loss / test_steps
+    average_loss = test_loss / test_steps
     perplexity = torch.exp(torch.tensor(average_loss)).item()
-    all_true = np.array(all_true)
-    all_pred = np.array(all_pred)
-    mask = (all_true != -100)
-    all_true = all_true[mask]
-    all_pred = all_pred[mask]
-
-    precision = precision_score(all_true, all_pred, average='weighted')
-    recall = recall_score(all_true, all_pred, average='weighted')
-    f1 = f1_score(all_true, all_pred, average='weighted')
-    accuracy = accuracy_score(all_true, all_pred)
-    mcc = matthews_corrcoef(all_true, all_pred)
-
-    print0("Final Results:")
-    print0(f"  Loss:        {average_loss:.4f}")
-    print0(f"  Perplexity:  {perplexity:.4f}")
-    print0(f"  Precision:   {precision:.4f}")
-    print0(f"  Recall:      {recall:.4f}")
-    print0(f"  F1:          {f1:.4f}")
-    print0(f"  Accuracy:    {accuracy:.4f}")
-    print0(f"  MCC:         {mcc:.4f}")
+    print0(f"Test results | Loss: {average_loss:.4f} | Perplexity: {perplexity:.4f}")
+    print0(f"Total train time (min): {training_time_ms / 60000:.2f}")
+    print0(f"Total train time (hours): {training_time_ms / 3600000:.2f}")
 
     print0(f"peak memory consumption testing: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
     # -------------------------------------------------------------------------
