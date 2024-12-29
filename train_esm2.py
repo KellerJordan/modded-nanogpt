@@ -327,9 +327,8 @@ if __name__ == "__main__":
             input_ids = test_loader.next_batch()
             test_loss += model(input_ids, sliding_window_size)
 
-    average_loss = test_loss / test_steps
-    perplexity = torch.exp(torch.tensor(average_loss)).item()
-    print0(f"Test results | Loss: {average_loss:.4f} | Perplexity: {perplexity:.4f}")
+    test_loss /= test_steps
+    print0(f"Test results | Loss: {test_loss:.4f} | Perplexity: {math.e**test_loss:.4f}")
     print0(f"Total train time (min): {training_time_ms / 60000:.2f}")
     print0(f"Total train time (hours): {training_time_ms / 3600000:.2f}")
 
