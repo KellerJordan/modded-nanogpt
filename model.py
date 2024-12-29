@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from transformers import EsmTokenizer, PretrainedConfig, PreTrainedModel
-from utils import ProteinMasker
 from typing import Optional, Tuple, List, Any
+from .utils import ProteinMasker
 
 
 class ModelConfig(PretrainedConfig):
