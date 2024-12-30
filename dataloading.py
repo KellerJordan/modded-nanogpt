@@ -61,10 +61,8 @@ class DistributedDataLoader:
 class DistributedPaddedDataLoader(DistributedDataLoader):
     def __init__(self, filename_pattern, seq_len, process_rank, num_processes, eos_id, pad_id):
         super().__init__(filename_pattern, seq_len, process_rank, num_processes)
-        assert (eos_id is None) == (pad_id is None)
         self.eos_id = eos_id
         self.pad_id = pad_id
-        self.padding = (eos_id is not None) and (pad_id is not None)
 
     def reset(self):
         self.current_shard = self.process_rank - self.num_processes
@@ -77,7 +75,7 @@ class DistributedPaddedDataLoader(DistributedDataLoader):
 
     def next_batch(self):
         end_pos = self.current_position + self.batch_size
-        buf = self.tokens[self.current_position : end_pos]
+        buf = self.tokens[self.current_position:end_pos]
         input_ids = buf.to(device="cuda", dtype=torch.int32, non_blocking=True)
         keep = (input_ids == self.eos_id).cumsum(dim=0).argmax().item()
         keep = max(keep or 0, self.batch_size - 2048)
