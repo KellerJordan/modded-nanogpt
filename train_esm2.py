@@ -33,7 +33,7 @@ from pathlib import Path
 
 from optimizer import Muon
 from model import ModelConfig, ESM, CastedLinear
-from dataloading import DistributedDataLoader
+from dataloading import DistributedDataLoader, DistributedPaddedDataLoader
 
 
 def get_args():
@@ -161,7 +161,8 @@ if __name__ == "__main__":
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size)
     valid_loader = DistributedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size)
-    test_loader = DistributedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size)
+    test_loader = DistributedDataLoader(args.input_test_bin, batch_size // 8, ddp_rank, ddp_world_size)
+    test_loader_padded = DistributedPaddedDataLoader(args.input_test_bin, batch_size // 8, ddp_rank, ddp_world_size, eos_id=2, pad_id=1)
     print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
     print0(f"Validation DataLoader: total number of tokens: {valid_loader.total_num_tokens} across {len(valid_loader.files)} files")
     print0(f"Testing DataLoader: total number of tokens: {test_loader.total_num_tokens} across {len(test_loader.files)} files")
@@ -331,14 +332,26 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     model.eval()
     test_loader.reset()
+
     test_loss = 0.0
     with torch.no_grad():
         for _ in range(test_steps):
             input_ids = test_loader.next_batch()
             test_loss += model(input_ids, sliding_window_size)
-
     test_loss /= test_steps
     print0(f"Test results | Loss: {test_loss:.4f} | Perplexity: {math.e**test_loss:.4f}")
+
+    # TODO: Remove
+    test_loader_padded.reset()
+    test_loss_padded = 0.0
+    with torch.no_grad():
+        for _ in range(test_steps):
+            input_ids = test_loader_padded.next_batch()
+            test_loss_padded += model(input_ids, sliding_window_size)
+    test_loss_padded /= test_steps
+    print0(f"Test (Padded) results | Loss: {test_loss_padded:.4f} | Perplexity: {math.e**test_loss_padded:.4f}")
+    #############
+
     print0(f"Total train time (min): {training_time_ms / 60000:.2f}")
     print0(f"Total train time (hours): {training_time_ms / 3600000:.2f}")
 
