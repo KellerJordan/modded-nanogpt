@@ -432,7 +432,6 @@ val_loader = DistributedDataLoader(args.val_bin)
 print0(f'Training dataloader files: {train_loader.files}')
 print0(f'Validation dataloader files: {val_loader.files}')
 print0('='*100)
-inputs_train, targets_train = train_loader.next_batch(args.batch_size)
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
@@ -529,8 +528,8 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     model.train()
-    ddp_model(inputs_train, targets_train, sliding_window_num_blocks).backward()
     inputs_train, targets_train = train_loader.next_batch(args.batch_size)
+    ddp_model(inputs_train, targets_train, sliding_window_num_blocks).backward()
     # momentum warmup for Muon
     frac = min(step/300, 1)
     for group in optimizer2.param_groups:
