@@ -14,7 +14,6 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
-config.coordinate_descent_tuning = True # suggested by @Chillee
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.attention.flex_attention import BlockMask, flex_attention #KoszarskyB
 
