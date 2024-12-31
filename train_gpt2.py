@@ -246,14 +246,6 @@ class GPT(nn.Module):
 
     def __init__(self, vocab_size, num_layers, num_heads, model_dim):
         super().__init__()
-        self.num_layers = num_layers
-
-        # U-net design by @brendanh0gan
-        self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
-        self.num_decoder_layers = num_layers - self.num_encoder_layers # Remaining for decoder
-        # Add learnable skip connection weights for decoder layers
-        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
-
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.blocks = nn.ModuleList([Block(model_dim, num_heads) for _ in range(num_layers)])
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
@@ -261,6 +253,11 @@ class GPT(nn.Module):
         self.value_embeds = ValueEmbedding(vocab_size, model_dim)
         self.lm_head = CastedLinear(model_dim, vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
+        # U-net design by @brendanh0gan
+        self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
+        self.num_decoder_layers = num_layers - self.num_encoder_layers # Remaining for decoder
+        # Add learnable skip connection weights for decoder layers
+        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
     def forward(self, inputs, targets, sliding_window_num_blocks):
         BLOCK_SIZE = 128
@@ -453,6 +450,7 @@ val_loader = DistributedDataLoader(args.val_bin)
 print0(f'Training dataloader files: {train_loader.files}')
 print0(f'Validation dataloader files: {val_loader.files}')
 print0('='*100)
+inputs_train, targets_train = train_loader.next_batch(batch_size)
 
 # calculate the number of steps to take in the val loop.
 assert args.val_tokens % (args.sequence_length * world_size) == 0
@@ -471,16 +469,18 @@ model = torch.compile(model)
 model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
 raw_model = model.module # always contains the "raw" unwrapped model
 
+# collect the parameters to optimize
+hidden_matrix_params = [p for p in raw_model.blocks.parameters() if p.ndim == 2]
+embed_params = [raw_model.embed.weight, *raw_model.value_embeds.parameters()]
+scalar_params = [p for p in raw_model.parameters() if p.ndim < 2]
+lm_head_params = [raw_model.lm_head_weight]
 # init the optimizer(s)
-embed_params = [*raw_model.embed.parameters(), *raw_model.value_embeds.parameters()]
-optimizer1 = torch.optim.Adam(embed_params, lr=0.6, betas=(0.8, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
-params = list(raw_model.blocks.parameters())
-matrix_params = [p for p in params if p.ndim == 2]
-scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
-optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+param_groups = [dict(params=embed_params, lr=0.6),
+                dict(params=lm_head_params, lr=0.008),
+                dict(params=scalar_params, lr=0.04)]
+optimizer1 = torch.optim.Adam(param_groups, betas=(0.8, 0.95), fused=True)
+optimizer2 = Muon(matrix_params, lr=0.05, momentum=0.95)
+optimizers = [optimizer1, optimizer2]
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -521,7 +521,7 @@ for step in range(args.num_iterations + 1):
         sliding_window_num_blocks.copy_(sw_num_blocks, non_blocking=True)
         sw_num_blocks_prev = sw_num_blocks
 
-    # ------------- VALIDATION SECTION BEGIN ---------------
+    # ------------- VALIDATION SECTION ---------------
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
         # stop the clock
         torch.cuda.synchronize()
@@ -549,13 +549,13 @@ for step in range(args.num_iterations + 1):
     if last_step:
         break
 
-    # --------------- TRAINING SECTION BEGIN -----------------
+    # --------------- TRAINING SECTION -----------------
     model.train()
     model(inputs_train, targets_train, sliding_window_num_blocks).backward()
     inputs_train, targets_train = train_loader.next_batch(batch_size)
     # momentum warmup for Muon
     frac = min(step/300, 1)
-    for group in optimizer3.param_groups:
+    for group in optimizer2.param_groups:
         group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
