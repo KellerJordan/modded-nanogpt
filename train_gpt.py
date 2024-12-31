@@ -380,7 +380,6 @@ class Hyperparameters:
     device_batch_size : int = 64*1024 # batch size per device in tokens
     num_iterations : int = 1490 # number of iterations to run
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
-    bf16_embeds : bool = True
     # evaluation and logging
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
@@ -438,11 +437,10 @@ inputs_train, targets_train = train_loader.next_batch(args.batch_size)
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 model = GPT(vocab_size=50304, num_layers=12, num_heads=6, model_dim=768)
-model = model.cuda()
-if args.bf16_embeds:
-    for m in model.modules():
-        if isinstance(m, nn.Embedding):
-            m.bfloat16()
+model = model.cuda().bfloat16()
+for m in model.modules():
+    if isinstance(m, CastedLinear):
+        m.float()
 model = torch.compile(model)
 ddp_model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
 sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device='cuda')
