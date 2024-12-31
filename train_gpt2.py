@@ -337,7 +337,7 @@ def _peek_data_shard(path):
     # only reads the header, returns header data
     # header is 256 int32
     header = torch.from_file(str(path), False, 256, dtype=torch.int32)
-    assert header[0] == 20240520, 'magic number mismatch in data .bin file'
+    assert header[0] == 20240520, 'magic number mismatch in the data .bin file'
     assert header[1] == 1, 'unsupported version'
     return int(header[2])
 
