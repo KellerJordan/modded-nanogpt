@@ -460,14 +460,13 @@ if args.bf16_embeds:
             m.bfloat16()
 config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
-model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
-raw_model = model.module
+ddp_model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
 
 # collect the parameters to optimize
-hidden_matrix_params = [p for p in raw_model.blocks.parameters() if p.ndim == 2]
-embed_params = [raw_model.embed.weight, *raw_model.value_embeds.parameters()]
-scalar_params = [p for p in raw_model.parameters() if p.ndim < 2]
-head_params = [raw_model.lm_head.weight]
+hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim == 2]
+embed_params = [model.embed.weight, *model.value_embeds.parameters()]
+scalar_params = [p for p in model.parameters() if p.ndim < 2]
+head_params = [model.lm_head.weight]
 # init the optimizer(s)
 optimizer1 = torch.optim.Adam([dict(params=embed_params, lr=0.6),
                                dict(params=head_params, lr=0.008),
@@ -528,7 +527,7 @@ for step in range(train_steps + 1):
         for _ in range(val_steps):
             with torch.no_grad():
                 inputs_val, targets_val = val_loader.next_batch(batch_size)
-                val_loss += model(inputs_val, targets_val, sliding_window_num_blocks)
+                val_loss += ddp_model(inputs_val, targets_val, sliding_window_num_blocks)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # logging
@@ -543,7 +542,7 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     model.train()
-    model(inputs_train, targets_train, sliding_window_num_blocks).backward()
+    ddp_model(inputs_train, targets_train, sliding_window_num_blocks).backward()
     inputs_train, targets_train = train_loader.next_batch(batch_size)
     # momentum warmup for Muon
     frac = min(step/300, 1)
