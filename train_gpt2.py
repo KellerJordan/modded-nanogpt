@@ -470,8 +470,7 @@ def get_lr(it):
         return 1.0
     # 2) then linear cooldown
     else:
-        decay_ratio = (args.num_iterations - it) / args.cooldown_iters
-        return decay_ratio
+        return (args.num_iterations - it) / args.cooldown_iters
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
 # Start training loop
