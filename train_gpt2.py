@@ -94,7 +94,6 @@ class Muon(torch.optim.Optimizer):
             update_buffers = group['update_buffer']
             # generate weight updates in distributed fashion
             params = group['params']
-            assert len(params) % self.world_size == 0
             handle = None
             params_world = None
             def update_prev():
