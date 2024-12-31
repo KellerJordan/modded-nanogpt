@@ -382,7 +382,7 @@ class Hyperparameters:
     batch_size = 8*64*1024 # batch size in tokens
     max_device_batch_size = 64*1024 # batch size per device in tokens
     num_iterations = 1490 # number of iterations to run
-    cooldown_iters = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
+    cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
@@ -461,13 +461,14 @@ optimizers = [optimizer1, optimizer2]
 
 # learning rate decay scheduler (stable then decay)
 def get_lr(it):
-    assert it <= args.num_iterations
+    t = 1 - it / args.num_iterations # time remaining in training
+    assert 1 >= t > 0
     # 1) constant lr for first part of training
-    if it < args.num_iterations - args.cooldown_iters:
+    if t >= args.cooldown_frac:
         return 1.0
     # 2) then linear cooldown
     else:
-        return (args.num_iterations - it) / args.cooldown_iters
+        return t / args.cooldown_frac
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
 # Start training loop
