@@ -387,6 +387,9 @@ class Hyperparameters:
     save_checkpoint : bool = False
 args = Hyperparameters()
 
+assert args.batch_size % world_size == 0
+micro_bs = args.max_device_batch_size
+
 # set up DDP (distributed data parallel). torchrun sets this env variable
 rank = int(os.environ['RANK'])
 local_rank = int(os.environ['LOCAL_RANK'])
@@ -396,9 +399,6 @@ torch.cuda.set_device(local_rank)
 dist.init_process_group(backend='nccl', device_id=torch.device(local_rank))
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
-
-assert args.batch_size % world_size == 0
-micro_bs = args.max_device_batch_size
 
 # begin logging
 logfile = None
