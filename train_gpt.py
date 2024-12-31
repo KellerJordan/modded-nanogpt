@@ -542,7 +542,8 @@ for step in range(train_steps + 1):
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
-        sched.step()
+        if step != train_steps-1:
+            sched.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
     # logging
