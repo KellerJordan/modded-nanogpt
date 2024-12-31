@@ -377,7 +377,7 @@ class Hyperparameters:
     val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization
     batch_size : int = 8*64*1024 # batch size in tokens
-    device_batch_size : int = 64*1024 # batch size per device in tokens
+    max_device_batch_size : int = 64*1024 # batch size per device in tokens
     num_iterations : int = 1490 # number of iterations to run
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     # evaluation and logging
@@ -397,8 +397,8 @@ dist.init_process_group(backend='nccl', device_id=torch.device(local_rank))
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
-assert args.batch_size % args.device_batch_size == 0
-assert (args.batch_size // args.device_batch_size) == world_size
+assert batch_size % world_size == 0
+micro_bs = args.max_device_batch_size
 
 # begin logging
 logfile = None
@@ -505,11 +505,12 @@ for step in range(train_steps + 1):
         val_loader.reset()
         val_loss = 0.0
         # calculate the number of steps to take in the val loop.
-        assert args.val_tokens % args.batch_size == 0
-        val_steps = args.val_tokens // args.batch_size
+        val_batch_size = world_size * micro_bs
+        assert args.val_tokens % val_batch_size == 0
+        val_steps = args.val_tokens // val_batch_size
         for _ in range(val_steps):
             with torch.no_grad():
-                inputs_val, targets_val = val_loader.next_batch(args.batch_size)
+                inputs_val, targets_val = val_loader.next_batch(val_batch_size)
                 val_loss += ddp_model(inputs_val, targets_val, sliding_window_num_blocks)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
@@ -530,6 +531,9 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     model.train()
     ddp_model(inputs_train, targets_train, sliding_window_num_blocks).backward()
+    assert inputs_train.numel() <= micro_bs or inputs_train.numel() % micro_bs == 0
+    for m_inputs_train, m_targets_train in zip(inputs_train.split(micro_bs), targets_train.split(micro_bs)):
+        ddp_model(m_inputs_train, m_targets_train, sliding_window_num_blocks).backward()
     inputs_train, targets_train = train_loader.next_batch(args.batch_size)
     # momentum warmup for Muon
     frac = min(step/300, 1)
