@@ -445,10 +445,6 @@ print0(f'Validation dataloader files: {val_loader.files}')
 print0('='*100)
 inputs_train, targets_train = train_loader.next_batch(args.batch_size)
 
-# calculate the number of steps to take in the val loop.
-assert args.val_tokens % args.batch_size == 0
-val_steps = args.val_tokens // args.batch_size
-
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 model = GPT(vocab_size=50304, num_layers=12, num_heads=6, model_dim=768)
@@ -519,6 +515,9 @@ for step in range(train_steps + 1):
         model.eval()
         val_loader.reset()
         val_loss = 0.0
+        # calculate the number of steps to take in the val loop.
+        assert args.val_tokens % args.batch_size == 0
+        val_steps = args.val_tokens // args.batch_size
         for _ in range(val_steps):
             with torch.no_grad():
                 inputs_val, targets_val = val_loader.next_batch(args.batch_size)
