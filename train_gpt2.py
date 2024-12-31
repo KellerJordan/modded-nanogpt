@@ -504,8 +504,9 @@ training_time_ms = 0
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
-for step in range(args.num_iterations + 1):
-    last_step = (step == args.num_iterations)
+train_steps = args.num_iterations
+for step in range(train_steps + 1):
+    last_step = (step == train_steps)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
     # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
     # steps with dummy data first, and then re-initialize the model and reset the loader.
@@ -515,7 +516,7 @@ for step in range(args.num_iterations + 1):
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
     # Linearly increase the sliding window size over training in chunks of 128 from 128 -> 1856. By @fernbear.bsky.social
-    frac_done = step / args.num_iterations # training progress
+    frac_done = step / train_steps # training progress
     sw_num_blocks = int(((1 - frac_done) * 128 + frac_done * 1856) // 128)
     if sw_num_blocks != sw_num_blocks_prev:
         sliding_window_num_blocks.copy_(sw_num_blocks, non_blocking=True)
@@ -537,7 +538,7 @@ for step in range(args.num_iterations + 1):
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # logging
-        print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms', console=True)
+        print0(f'step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms', console=True)
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -562,7 +563,7 @@ for step in range(args.num_iterations + 1):
     model.zero_grad(set_to_none=True)
     # logging
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f'step:{step+1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms', console=True)
+    print0(f'step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms', console=True)
 
 print0(f'peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB')
 dist.destroy_process_group()
