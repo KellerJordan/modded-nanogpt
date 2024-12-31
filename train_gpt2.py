@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+torch.empty(1, device='cuda', requires_grad=True).backward()
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -335,13 +336,15 @@ class GPT(nn.Module):
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
 
-def _load_data_shard(path: Path):
+def _peek_data_shard(path):
     # only reads the header, returns header data
     # header is 256 int32
     header = torch.from_file(str(path), False, 256, dtype=torch.int32)
     assert header[0] == 20240520, 'magic number mismatch in data .bin file'
     assert header[1] == 1, 'unsupported version'
-    num_tokens = int(header[2])
+    return int(header[2])
+
+def _load_data_shard(path, num_tokens):
     with path.open('rb', buffering=0) as f:
         tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
         f.seek(256 * 4)
@@ -357,6 +360,7 @@ class DistributedDataLoader:
 
         self.files = sorted(Path.cwd().glob(filename_pattern))
         assert len(self.files) > 0, f'did not find any files that matched the pattern {filename_pattern}'
+        self.file_sizes = [_peek_data_shard(file) for file in self.files]
 
         self.reset()
 
@@ -367,7 +371,7 @@ class DistributedDataLoader:
     def advance(self):
         self.current_shard = (self.current_shard + 1) % len(self.files)
         self.current_position = 0 
-        self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.tokens = _load_data_shard(self.files[self.current_shard], self.file_sizes[self.current_shard])
 
     def next_batch(self, batch_size):
         assert batch_size % self.world_size == 0
@@ -398,6 +402,7 @@ class Hyperparameters:
     warmup_iters : int = 0
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
+    bf16_embeds : bool = True
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
@@ -421,33 +426,26 @@ logfile = None
 if master_process:
     run_id = uuid.uuid4()
     Path('logs').mkdir(exist_ok=True)
-    # logdir = Path('logs') / f'{run_id}'
-    # logdir.mkdir()
     logfile = Path('logs') / f'{run_id}.txt'
     print(logfile.stem)
-    # create the log file
-    with logfile.open('w') as f:
-        # begin the log by printing this file (the Python code)
-        print(code, file=f)
-        print('=' * 100, file=f)
+
 def print0(s, console=False):
     if master_process:
         with logfile.open('a') as f:
             if console:
                 print(s)
             print(s, file=f)
+
+# begin by printing this file (the Python code)
+print0(code)
+print0('='*100)
 # log information about the hardware/software environment this is running on
-# and print the full `nvidia-smi` to file
-print0(f'Running python {sys.version}')
-print0(f'Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}')
+print0(f'Running Python {sys.version}')
+print0(f'Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}')
 import subprocess
 result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 print0(f'{result.stdout}')
 print0('='*100)
-
-# calculate the number of steps to take in the val loop.
-assert args.val_tokens % (args.sequence_length * world_size) == 0
-val_steps = args.val_tokens // (args.sequence_length * world_size)
 
 # load data
 train_loader = DistributedDataLoader(args.train_bin)
@@ -455,19 +453,21 @@ val_loader = DistributedDataLoader(args.val_bin)
 print0(f'Training dataloader files: {train_loader.files}')
 print0(f'Validation dataloader files: {val_loader.files}')
 print0('='*100)
-inputs_train, targets_train = train_loader.next_batch(batch_size)
+
+# calculate the number of steps to take in the val loop.
+assert args.val_tokens % (args.sequence_length * world_size) == 0
+val_steps = args.val_tokens // (args.sequence_length * world_size)
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
-num_vocab = 50304
-model = GPT(vocab_size=num_vocab, num_layers=12, num_heads=6, model_dim=768)
+model = GPT(vocab_size=50304, num_layers=12, num_heads=6, model_dim=768)
 model = model.cuda().bfloat16()
-for m in model.modules():
-    if isinstance(m, CastedLinear):
-        m.float()
+if args.bf16_embeds:
+    for m in model.modules():
+        if isinstance(m, nn.Embedding):
+            m.bfloat16()
 config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
-# here we wrap model into DDP container
 model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
 raw_model = model.module # always contains the "raw" unwrapped model
 
@@ -521,7 +521,7 @@ for step in range(args.num_iterations + 1):
         sliding_window_num_blocks.copy_(sw_num_blocks, non_blocking=True)
         sw_num_blocks_prev = sw_num_blocks
 
-    # once in a while evaluate the validation dataset
+    # ------------- VALIDATION SECTION BEGIN ---------------
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
         # stop the clock
         torch.cuda.synchronize()
@@ -536,8 +536,8 @@ for step in range(args.num_iterations + 1):
                 val_loss += model(inputs_val, targets_val, sliding_window_num_blocks)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
-        # log val loss to console and to logfile
-        print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+        # logging
+        print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms', console=True)
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -563,13 +563,9 @@ for step in range(args.num_iterations + 1):
         sched.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
-    # --------------- TRAINING SECTION END -------------------
-    # everything that follows now is just diagnostics, prints, logging, etc.
+    # logging
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+    print0(f"step:{step+1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms", console=True)
 
 print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
-
-# -------------------------------------------------------------------------
-# clean up nice
 dist.destroy_process_group()
