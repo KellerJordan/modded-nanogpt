@@ -390,7 +390,6 @@ class Hyperparameters:
     save_checkpoint = False
 args = Hyperparameters()
 
-assert args.batch_size % world_size == 0
 micro_bs = args.max_device_batch_size
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -531,6 +530,7 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     model.train()
+    assert args.batch_size % world_size == 0
     inputs_train, targets_train = train_loader.next_batch(args.batch_size)
     assert len(inputs_train) <= micro_bs or len(inputs_train) % micro_bs == 0
     for micro_inputs_train, micro_targets_train in zip(inputs_train.split(micro_bs), targets_train.split(micro_bs)):
