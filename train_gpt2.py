@@ -475,10 +475,10 @@ embed_params = [raw_model.embed.weight, *raw_model.value_embeds.parameters()]
 scalar_params = [p for p in raw_model.parameters() if p.ndim < 2]
 lm_head_params = [raw_model.lm_head.weight]
 # init the optimizer(s)
-param_groups = [dict(params=embed_params, lr=0.6),
-                dict(params=lm_head_params, lr=0.008),
-                dict(params=scalar_params, lr=0.04)]
-optimizer1 = torch.optim.Adam(param_groups, betas=(0.8, 0.95), fused=True)
+optimizer1 = torch.optim.Adam([dict(params=embed_params, lr=0.6),
+                               dict(params=lm_head_params, lr=0.008),
+                               dict(params=scalar_params, lr=0.04)],
+                              betas=(0.8, 0.95), fused=True)
 optimizer2 = Muon(matrix_params, lr=0.05, momentum=0.95)
 optimizers = [optimizer1, optimizer2]
 # learning rate decay scheduler (linear warmup and cooldown)
