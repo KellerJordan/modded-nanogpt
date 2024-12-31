@@ -388,12 +388,10 @@ class Hyperparameters:
     train_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 8 # batch size, in sequences, across all devices
-    sequence_length : int = 64*1024 # sequence length, in tokens
+    batch_size : int = 8*64*1024 # batch size in tokens
+    device_batch_size : int = 64*1024 # batch size per device in tokens
     num_iterations : int = 1480 # number of iterations to run
-    warmup_iters : int = 0
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
-    weight_decay : float = 0
     bf16_embeds : bool = True
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -410,8 +408,8 @@ dist.init_process_group(backend='nccl', device_id=torch.device(local_rank))
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
-assert args.batch_size == world_size
-batch_size = args.batch_size * args.sequence_length
+assert args.batch_size % args.device_batch_size == 0
+assert (args.batch_size // args.device_batch_size) == world_size
 
 # begin logging
 logfile = None
@@ -445,11 +443,11 @@ val_loader = DistributedDataLoader(args.val_bin)
 print0(f'Training dataloader files: {train_loader.files}')
 print0(f'Validation dataloader files: {val_loader.files}')
 print0('='*100)
-inputs_train, targets_train = train_loader.next_batch(batch_size)
+inputs_train, targets_train = train_loader.next_batch(args.batch_size)
 
 # calculate the number of steps to take in the val loop.
-assert args.val_tokens % (args.sequence_length * world_size) == 0
-val_steps = args.val_tokens // (args.sequence_length * world_size)
+assert args.val_tokens % args.batch_size == 0
+val_steps = args.val_tokens // args.batch_size
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
@@ -477,13 +475,10 @@ optimizers = [optimizer1, optimizer2]
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
     assert it <= args.num_iterations
-    # 1) linear warmup for warmup_iters steps
-    if it < args.warmup_iters:
-        return (it+1) / args.warmup_iters
-    # 2) constant lr for a while
-    elif it < args.num_iterations - args.cooldown_iters:
+    # 1) constant lr for first part of training
+    if it < args.num_iterations - args.cooldown_iters:
         return 1.0
-    # 3) linear cooldown
+    # 2) then linear cooldown
     else:
         decay_ratio = (args.num_iterations - it) / args.cooldown_iters
         return decay_ratio
@@ -526,7 +521,7 @@ for step in range(train_steps + 1):
         val_loss = 0.0
         for _ in range(val_steps):
             with torch.no_grad():
-                inputs_val, targets_val = val_loader.next_batch(batch_size)
+                inputs_val, targets_val = val_loader.next_batch(args.batch_size)
                 val_loss += ddp_model(inputs_val, targets_val, sliding_window_num_blocks)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
@@ -543,7 +538,7 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     model.train()
     ddp_model(inputs_train, targets_train, sliding_window_num_blocks).backward()
-    inputs_train, targets_train = train_loader.next_batch(batch_size)
+    inputs_train, targets_train = train_loader.next_batch(args.batch_size)
     # momentum warmup for Muon
     frac = min(step/300, 1)
     for group in optimizer2.param_groups:
