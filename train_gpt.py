@@ -423,8 +423,7 @@ print0('='*100)
 # log information about the hardware/software environment this is running on
 print0(f'Running Python {sys.version}')
 print0(f'Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}')
-result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-print0(f'{result.stdout}')
+print0(subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout)
 print0('='*100)
 
 # load data
