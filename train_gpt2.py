@@ -183,13 +183,13 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
-    def forward(self, x, vi, block_mask):
+    def forward(self, x, ve, block_mask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         q = self.c_q(x).view(B, T, self.num_heads, -1)
         k = self.c_k(x).view(B, T, self.num_heads, -1)
         v = self.c_v(x).view(B, T, self.num_heads, -1)
-        v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v) # @KoszarskyB & @Grad62304977
+        v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, enable_gqa=True)
@@ -213,15 +213,15 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, model_dim, num_heads):
         super().__init__()
-        self.attn = CausalSelfAttention(config.model_dim, config.num_heads)
+        self.attn = CausalSelfAttention(model_dim, num_heads)
         self.mlp = MLP(config.model_dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x, vi, x0, block_mask):
+    def forward(self, x, ve, x0, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x = x + self.attn(norm(x), vi, block_mask)
+        x = x + self.attn(norm(x), ve, block_mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -261,7 +261,7 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
         self.embed = nn.Embedding(config.vocab_size, config.model_dim)
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
+        self.blocks = nn.ModuleList([Block(config.model_dim, config.num_heads) for _ in range(config.num_layers)])
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
         # U-net structure on token value embeddings by @leloykun
         self.value_embeds = ValueEmbedding(config)
@@ -345,7 +345,7 @@ class GPT(nn.Module):
 def _load_data_shard(path: Path):
     # only reads the header, returns header data
     # header is 256 int32
-    header = torch.from_file(path, False, 256, dtype=torch.int32)
+    header = torch.from_file(str(path), False, 256, dtype=torch.int32)
     assert header[0] == 20240520, 'magic number mismatch in data .bin file'
     assert header[1] == 1, 'unsupported version'
     num_tokens = int(header[2])
@@ -374,7 +374,7 @@ class DistributedDataLoader:
     def advance(self):
         self.current_shard = (self.current_shard + 1) % len(self.files)
         self.current_position = 0 
-        self.tokens = _load_data_shard(self.files[self.current_shard], self.files_num_tokens[self.current_shard])
+        self.tokens = _load_data_shard(self.files[self.current_shard])
 
     def next_batch(self, batch_size):
         assert batch_size % self.world_size == 0
