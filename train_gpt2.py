@@ -226,10 +226,10 @@ class Block(nn.Module):
         return x
 
 class ValueEmbedding(nn.Module):
-    def __init__(self, config):
+    def __init__(self, vocab_size, model_dim):
         super().__init__()
         self.embed = nn.ModuleList([
-            nn.Embedding(config.vocab_size, config.model_dim)
+            nn.Embedding(vocab_size, model_dim)
             for _ in range(6)
         ])
 
@@ -241,31 +241,24 @@ class ValueEmbedding(nn.Module):
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
 
-@dataclass
-class GPTConfig:
-    vocab_size : int = 50304
-    num_layers : int = 12
-    num_heads : int = 6 # head dim 128 suggested by @Grad62304977
-    model_dim : int = 768
-
 class GPT(nn.Module):
 
-    def __init__(self, config: GPTConfig):
+    def __init__(self, vocab_size, num_layers, num_heads, model_dim):
         super().__init__()
-        self.num_layers = config.num_layers
+        self.num_layers = num_layers
 
         # U-net design by @brendanh0gan
-        self.num_encoder_layers = config.num_layers // 2 # Half of the layers for encoder
-        self.num_decoder_layers = config.num_layers - self.num_encoder_layers # Remaining for decoder
+        self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
+        self.num_decoder_layers = num_layers - self.num_encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
-        self.embed = nn.Embedding(config.vocab_size, config.model_dim)
-        self.blocks = nn.ModuleList([Block(config.model_dim, config.num_heads) for _ in range(config.num_layers)])
+        self.embed = nn.Embedding(vocab_size, model_dim)
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads) for _ in range(num_layers)])
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
         # U-net structure on token value embeddings by @leloykun
-        self.value_embeds = ValueEmbedding(config)
-        self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
+        self.value_embeds = ValueEmbedding(vocab_size, model_dim)
+        self.lm_head = CastedLinear(model_dim, vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
     def forward(self, inputs, targets, sliding_window_num_blocks):
@@ -437,20 +430,20 @@ if master_process:
         # begin the log by printing this file (the Python code)
         print(code, file=f)
         print('=' * 100, file=f)
-def print0(s, logonly=False):
+def print0(s, console=False):
     if master_process:
         with logfile.open('a') as f:
-            if not logonly:
+            if console:
                 print(s)
             print(s, file=f)
 # log information about the hardware/software environment this is running on
 # and print the full `nvidia-smi` to file
 print0(f'Running python {sys.version}')
-print0(f'Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:')
+print0(f'Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}')
 import subprocess
 result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-print0(f'{result.stdout}', logonly=True)
-print0('='*100, logonly=True)
+print0(f'{result.stdout}')
+print0('='*100)
 
 # calculate the number of steps to take in the val loop.
 assert args.val_tokens % (args.sequence_length * world_size) == 0
@@ -467,7 +460,7 @@ inputs_train, targets_train = train_loader.next_batch(batch_size)
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, num_layers=12, num_heads=6, model_dim=768))
+model = GPT(vocab_size=num_vocab, num_layers=12, num_heads=6, model_dim=768)
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
