@@ -384,16 +384,16 @@ class DistributedDataLoader:
 
 @dataclass
 class Hyperparameters:
-    # data hyperparams
+    # data
     train_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
-    # optimization hyperparams
+    # optimization
     batch_size : int = 8*64*1024 # batch size in tokens
     device_batch_size : int = 64*1024 # batch size per device in tokens
     num_iterations : int = 1480 # number of iterations to run
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     bf16_embeds : bool = True
-    # evaluation and logging hyperparams
+    # evaluation and logging
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
 args = Hyperparameters()
