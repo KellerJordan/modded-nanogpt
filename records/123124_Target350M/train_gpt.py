@@ -224,7 +224,7 @@ class ValueEmbedding(nn.Module):
 
     def forward(self, inputs):
         ve = [emb(inputs) for emb in self.embed]
-        ve = [ve[0], ve[1], ve[2], None, None, None, None, None, None, ve[0], ve[1], ve[2]]
+        ve = [ve[0], ve[1], ve[2], None, None, None, None, None, None, None, None, None, None, ve[0], ve[1], ve[2]]
         return ve
 
 # -----------------------------------------------------------------------------
@@ -378,8 +378,8 @@ class Hyperparameters:
     # optimization
     batch_size : int = 8*64*1024 # batch size in tokens
     device_batch_size : int = 64*1024 # batch size per device in tokens
-    num_iterations : int = 9000 # number of iterations to run
-    cooldown_iters : int = 3000 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
+    num_iterations : int = 6000 # number of iterations to run
+    cooldown_iters : int = 2000 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     bf16_embeds : bool = True
     # evaluation and logging
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -437,7 +437,7 @@ inputs_train, targets_train = train_loader.next_batch(args.batch_size)
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
-model = GPT(vocab_size=50304, num_layers=12, num_heads=8, model_dim=1024)
+model = GPT(vocab_size=50304, num_layers=16, num_heads=8, model_dim=1024)
 model = model.cuda()
 if args.bf16_embeds:
     for m in model.modules():
@@ -455,11 +455,11 @@ scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([dict(params=embed_params, lr=0.3),
-                               dict(params=head_params, lr=0.0035),
+optimizer1 = torch.optim.Adam([dict(params=embed_params, lr=0.35),
+                               dict(params=head_params, lr=0.004),
                                dict(params=scalar_params, lr=0.02)],
                               betas=(0.8, 0.95), fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95)
+optimizer2 = Muon(hidden_matrix_params, lr=0.03, momentum=0.95)
 optimizers = [optimizer1, optimizer2]
 
 # learning rate decay scheduler (stable then decay)
