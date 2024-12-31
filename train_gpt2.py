@@ -186,7 +186,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, ve, block_mask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
-        assert B == 1, "Must use batch size = 1 for FlexAttention"
+        assert B == 1, 'Must use batch size = 1 for FlexAttention'
         q = self.c_q(x).view(B, T, self.num_heads, -1)
         k = self.c_k(x).view(B, T, self.num_heads, -1)
         v = self.c_v(x).view(B, T, self.num_heads, -1)
@@ -280,7 +280,7 @@ class GPT(nn.Module):
             return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
         def create_doc_swc_block_mask(sliding_window_num_blocks):
-            kv_idx = block_idx = torch.arange(total_num_blocks, dtype=torch.int32, device="cuda")
+            kv_idx = block_idx = torch.arange(total_num_blocks, dtype=torch.int32, device='cuda')
             q_idx = block_idx[:, None]
             causal_bm = q_idx >= kv_idx
             causal_full_bm = q_idx > kv_idx
@@ -467,7 +467,7 @@ if args.bf16_embeds:
 config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
 model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
-raw_model = model.module # always contains the "raw" unwrapped model
+raw_model = model.module
 
 # collect the parameters to optimize
 hidden_matrix_params = [p for p in raw_model.blocks.parameters() if p.ndim == 2]
@@ -496,7 +496,7 @@ def get_lr(it):
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
-sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device="cuda")
+sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device='cuda')
 sw_num_blocks_prev = 1
 # Start training loop
 training_time_ms = 0
@@ -565,7 +565,7 @@ for step in range(args.num_iterations + 1):
     model.zero_grad(set_to_none=True)
     # logging
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms", console=True)
+    print0(f'step:{step+1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms', console=True)
 
-print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+print0(f'peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB')
 dist.destroy_process_group()
