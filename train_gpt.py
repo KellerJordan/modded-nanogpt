@@ -373,18 +373,18 @@ class DistributedDataLoader:
 @dataclass
 class Hyperparameters:
     # data
-    train_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-    val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    train_bin = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
+    val_bin = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization
-    batch_size : int = 8*64*1024 # batch size in tokens
-    max_device_batch_size : int = 64*1024 # batch size per device in tokens
-    num_iterations : int = 1490 # number of iterations to run
-    cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
+    batch_size = 8*64*1024 # batch size in tokens
+    max_device_batch_size = 64*1024 # batch size per device in tokens
+    num_iterations = 1490 # number of iterations to run
+    cooldown_iters = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     # evaluation and logging
-    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # implementation
-    save_checkpoint : bool = False
+    save_checkpoint = False
 args = Hyperparameters()
 
 assert args.batch_size % world_size == 0
