@@ -13,7 +13,6 @@ torch.empty(1, device='cuda', requires_grad=True).backward()
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
-import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.attention.flex_attention import BlockMask, flex_attention #KoszarskyB
 
