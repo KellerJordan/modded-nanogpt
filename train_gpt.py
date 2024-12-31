@@ -5,6 +5,7 @@ with open(sys.argv[0]) as f:
 import uuid
 import time
 import glob
+import subprocess
 import contextlib
 from dataclasses import dataclass
 
@@ -120,7 +121,7 @@ class Muon(torch.optim.Optimizer):
                     g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
                 else:
                     g = update_buffers[rank]
-                update_prev()
+                update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
                 handle = dist.all_gather(update_buffers, g, async_op=True)
                 params_world = params[base_i : base_i + self.world_size]
             update_prev()
@@ -143,10 +144,11 @@ class Rotary(nn.Module):
 
     def __init__(self, dim, max_seq_len=65536):
         super().__init__()
-        inv_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
-        inv_freq = torch.cat([inv_freq, inv_freq.new_zeros(dim//4)])
+        # half-truncate RoPE by @YouJiacheng
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
         t = torch.arange(max_seq_len, dtype=torch.float32)
-        theta = torch.einsum('i,j -> ij', t, inv_freq)
+        theta = torch.einsum('i,j -> ij', t, angular_freq)
         self.cos = nn.Buffer(theta.cos(), persistent=False)
         self.sin = nn.Buffer(theta.sin(), persistent=False)
 
@@ -179,11 +181,11 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(x).view(B, T, self.num_heads, -1)
         if ve is not None:
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
-        else:
+        else: # skip mid-layers token value embeddings by @YouJiacheng
             v = self.lambdas[0] * v
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, enable_gqa=True)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -192,7 +194,7 @@ class MLP(nn.Module):
 
     def __init__(self, dim):
         super().__init__()
-        self.c_fc   = CastedLinear(dim, 4 * dim)
+        self.c_fc = CastedLinear(dim, 4 * dim)
         self.c_proj = CastedLinear(4 * dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
@@ -224,6 +226,7 @@ class ValueEmbedding(nn.Module):
 
     def forward(self, inputs):
         ve = [emb(inputs) for emb in self.embed]
+        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
         ve = [ve[0], ve[1], ve[2], None, None, None, None, None, None, ve[0], ve[1], ve[2]]
         return ve
 
@@ -235,6 +238,7 @@ class GPT(nn.Module):
     def __init__(self, vocab_size, num_layers, num_heads, model_dim):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
+        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, use_attn=(i != 7))
                                      for i in range(num_layers)])
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
@@ -274,7 +278,7 @@ class GPT(nn.Module):
             causal_bm = q_idx >= kv_idx
             causal_full_bm = q_idx > kv_idx
             window_bm = q_idx - kv_idx < sliding_window_num_blocks
-            window_full_bm = window_bm
+            window_full_bm = window_bm # block-wise sliding window by @YouJiacheng
             # document_bm = (docs_low[q_idx] <= docs_high[kv_idx]) & (docs_low[kv_idx] <= docs_high[q_idx])
             document_bm = (docs_low[:, None] <= docs_high) & (docs_low <= docs_high[:, None])
             document_full_bm = (docs_low[:, None] == docs_high) & (docs_low == docs_high[:, None])
@@ -293,8 +297,7 @@ class GPT(nn.Module):
 
         block_mask = create_doc_swc_block_mask(sliding_window_num_blocks)
 
-        # forward the GPT model itself
-        x = self.embed(inputs[None]) # token embeddings of shape (b, t, model_dim)
+        x = self.embed(inputs[None])
         x = norm(x) # @Grad62304977
         x0 = x
         ve = self.value_embeds(inputs)
@@ -330,9 +333,9 @@ def _load_data_shard(path):
     assert header[1] == 1, 'unsupported version'
     num_tokens = int(header[2]) # number of tokens (claimed)
     with open(path, 'rb', buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
         f.seek(256 * 4)
-        nbytes = f.readinto(tokens.numpy())
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
         assert nbytes == 2 * num_tokens, 'number of tokens read does not match header'
     return tokens
 
@@ -421,7 +424,6 @@ print0('='*100)
 # log information about the hardware/software environment this is running on
 print0(f'Running Python {sys.version}')
 print0(f'Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}')
-import subprocess
 result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 print0(f'{result.stdout}')
 print0('='*100)
