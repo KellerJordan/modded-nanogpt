@@ -216,7 +216,7 @@ class Block(nn.Module):
     def __init__(self, model_dim, num_heads):
         super().__init__()
         self.attn = CausalSelfAttention(model_dim, num_heads)
-        self.mlp = MLP(config.model_dim)
+        self.mlp = MLP(model_dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x, ve, x0, block_mask):
