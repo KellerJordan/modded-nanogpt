@@ -4,9 +4,9 @@ with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
 import time
+import glob
 import contextlib
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 torch.empty(1, device='cuda', requires_grad=True).backward()
@@ -333,16 +333,14 @@ class GPT(nn.Module):
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
 
-def _peek_data_shard(path):
+def _load_data_shard(path):
     # only reads the header, returns header data
     # header is 256 int32
-    header = torch.from_file(str(path), False, 256, dtype=torch.int32)
+    header = torch.from_file(path, False, 256, dtype=torch.int32)
     assert header[0] == 20240520, 'magic number mismatch in the data .bin file'
     assert header[1] == 1, 'unsupported version'
-    return int(header[2]) # number of tokens (claimed)
-
-def _load_data_shard(path, num_tokens):
-    with path.open('rb', buffering=0) as f:
+    num_tokens int(header[2]) # number of tokens (claimed)
+    with open(path, 'rb', buffering=0) as f:
         tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy())
@@ -354,11 +352,7 @@ class DistributedDataLoader:
     def __init__(self, filename_pattern):
         self.rank = int(os.environ['RANK'])
         self.world_size = int(os.environ['WORLD_SIZE'])
-
-        self.files = sorted(Path.cwd().glob(filename_pattern))
-        assert len(self.files) > 0, f'did not find any files that matched the pattern {filename_pattern}'
-        self.file_sizes = [_peek_data_shard(file) for file in self.files]
-
+        self.files = sorted(glob.glob(filename_pattern))
         self.reset()
 
     def reset(self):
@@ -368,7 +362,7 @@ class DistributedDataLoader:
     def advance(self):
         self.current_shard = (self.current_shard + 1) % len(self.files)
         self.current_position = 0 
-        self.tokens = _load_data_shard(self.files[self.current_shard], self.file_sizes[self.current_shard])
+        self.tokens = _load_data_shard(self.files[self.current_shard])
 
     def next_batch(self, batch_size):
         assert batch_size % self.world_size == 0
