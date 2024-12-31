@@ -362,7 +362,7 @@ class DistributedDataLoader:
 
     def advance(self):
         self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = 0 
+        self.current_position = 0
         self.tokens = _load_data_shard(self.files[self.current_shard])
 
     def next_batch(self, batch_size):
