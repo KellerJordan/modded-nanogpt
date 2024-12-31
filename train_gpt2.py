@@ -421,6 +421,7 @@ dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 assert args.batch_size == world_size
+batch_size = args.batch_size * args.sequence_length
 
 # begin logging
 logfile = None
@@ -461,7 +462,7 @@ val_loader = DistributedDataLoader(args.val_bin)
 print0(f'Training dataloader files: {train_loader.files}')
 print0(f'Validation dataloader files: {val_loader.files}')
 print0('='*100)
-inputs_train, targets_train = train_loader.next_batch()
+inputs_train, targets_train = train_loader.next_batch(batch_size)
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
@@ -538,7 +539,7 @@ for step in range(args.num_iterations + 1):
         val_loss = 0.0
         for _ in range(val_steps):
             with torch.no_grad():
-                inputs_val, targets_val = val_loader.next_batch()
+                inputs_val, targets_val = val_loader.next_batch(batch_size)
                 val_loss += model(inputs_val, targets_val, sliding_window_num_blocks)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
@@ -558,7 +559,7 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     model(inputs_train, targets_train, sliding_window_num_blocks).backward()
-    inputs_train, targets_train = train_loader.next_batch()
+    inputs_train, targets_train = train_loader.next_batch(batch_size)
     # momentum warmup for Muon
     frac = min(step/300, 1)
     for group in optimizer3.param_groups:
