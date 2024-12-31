@@ -473,7 +473,7 @@ raw_model = model.module
 hidden_matrix_params = [p for p in raw_model.blocks.parameters() if p.ndim == 2]
 embed_params = [raw_model.embed.weight, *raw_model.value_embeds.parameters()]
 scalar_params = [p for p in raw_model.parameters() if p.ndim < 2]
-lm_head_params = [raw_model.lm_head_weight]
+lm_head_params = [raw_model.lm_head.weight]
 # init the optimizer(s)
 param_groups = [dict(params=embed_params, lr=0.6),
                 dict(params=lm_head_params, lr=0.008),
