@@ -530,7 +530,7 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     model.train()
     inputs_train, targets_train = train_loader.next_batch(args.batch_size)
-    assert inputs_train.numel() <= micro_bs or inputs_train.numel() % micro_bs == 0
+    assert len(inputs_train) <= micro_bs or len(inputs_train) % micro_bs == 0
     for micro_inputs_train, micro_targets_train in zip(inputs_train.split(micro_bs), targets_train.split(micro_bs)):
         ddp_model(micro_inputs_train, micro_targets_train, sliding_window_num_blocks).backward()
     # momentum warmup for Muon
