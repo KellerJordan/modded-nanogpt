@@ -448,7 +448,7 @@ inputs_train, targets_train = train_loader.next_batch(args.batch_size)
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 model = GPT(vocab_size=50304, num_layers=12, num_heads=6, model_dim=768)
-model = model.cuda().bfloat16()
+model = model.cuda()
 if args.bf16_embeds:
     for m in model.modules():
         if isinstance(m, nn.Embedding):
