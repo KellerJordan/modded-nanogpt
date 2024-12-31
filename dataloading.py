@@ -21,41 +21,35 @@ def _load_data_shard(path: Path, num_tokens):
 
 
 class DistributedDataLoader:
-    def __init__(self, filename_pattern, batch_size, process_rank, num_processes):
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        self.batch_size = batch_size
-
-        # glob files that match the pattern
+    def __init__(self, filename_pattern: str, batch_size: int, rank: int, world_size: int):
+        assert batch_size % world_size == 0
+        self.world_size = world_size
+        self.rank = rank
         self.files = sorted(Path.cwd().glob(filename_pattern))
-        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
-
-        # load and validate all data shards, count number of tokens in total
-        self.files_num_tokens = [_peek_data_shard(file) for file in self.files]
-        self.total_num_tokens = sum(self.files_num_tokens)
-
+        self.batch_size = batch_size
         self.reset()
 
     def reset(self):
-        self.current_shard = -1
+        self.next_shard = 0
         self.advance()
 
     def advance(self): # advance to next data shard
-        self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.batch_size
-        self.tokens = _load_data_shard(self.files[self.current_shard], self.files_num_tokens[self.current_shard])
+        self.pos = 0
+        self.tokens = _load_data_shard(self.files[self.next_shard])
+        self.next_shard = (self.next_shard + 1) % len(self.files)
 
     def next_batch(self):
-        batch_size = self.batch_size * self.num_processes
-        buf = self.tokens[self.current_position:self.current_position+self.batch_size]
-        # host side async is sufficient;
+        local_batch_size = self.batch_size // self.world_size
+        buf = self.tokens[self.pos + self.rank * local_batch_size:][:local_batch_size + 1]
+        # by @YouJiacheng: host side async is sufficient;
         # no performance improvement was observed when introducing a separate stream.
-        input_ids = buf.to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # targets
         # advance current position and load next shard if necessary
-        self.current_position += batch_size
-        if self.current_position + batch_size >= len(self.tokens):
+        self.pos += self.batch_size
+        if self.pos + self.batch_size + 1 >= len(self.tokens):
             self.advance()
-        return input_ids
+        return inputs, targets
 
 
 class DistributedPaddedDataLoader(DistributedDataLoader):
