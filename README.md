@@ -3,7 +3,7 @@
 This is a modified variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in only:
 * 0.8B tokens instead of 10B
-* 3.8 minutes on 8xH100 instead of 45
+* 3.57 minutes on 8xH100 instead of 45
 
 It has been hyperoptimized by the community, and has become a good baseline from which to perform research on the architecture/optimizer/etc.
 
@@ -37,7 +37,7 @@ python data/cached_fineweb10B.py 10 # downloads only the first 1.0B training tok
 ./run.sh
 ```
 
-The result will be a transformer with 124M active parameters trained for 1480 steps on 0.75B tokens of Fineweb [1], achieving ~3.278 mean validation loss (w/ up to 0.005 inter-run stddev).
+The result will be a transformer with 124M active parameters trained for 1490 steps on 0.75B tokens of Fineweb [1], achieving ~3.278 mean validation loss (w/ up to 0.005 inter-run stddev).
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
 **Note: torch.compile will take a long time on the first run.**
@@ -55,7 +55,7 @@ Note: an NVIDIA driver must already be installed on the system (useful if only t
 
 ```bash
 sudo docker build -t modded-nanogpt .
-sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt python data/cached_fineweb10B.py 18
+sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt python data/cached_fineweb10B.py 10
 sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt sh run.sh
 ```
 ---
@@ -82,7 +82,7 @@ The following is the progression of world records for the task of *training a mo
 14 | 4.41 minutes | [Value Embeddings](https://x.com/KoszarskyB/status/1864746625572257852) | 12/04/24 | [log](./records/120424_ValueEmbed) | @KoszarskyB
 15 | 3.95 minutes | [U-net pattern for value embeds, assorted code improvements](https://x.com/YouJiacheng/status/1865761473886347747) | 12/08/24 | [log](records/120824_UNetValueEmbedsTweaks) | @leloykun, @YouJiacheng
 16 | 3.80 minutes | [MFU tweaks](https://x.com/YouJiacheng/status/1866734331559071981) | 12/10/24 | [log](records/121024_MFUTweaks) | @YouJiacheng
-17 | 3.66 minutes | [Sparsify value embeds & improve rotary & drop attn layer](https://x.com/YouJiacheng/status/1868938024731787640) | 12/17/24 | tbd | @YouJiacheng
+17 | 3.57 minutes | [Sparsify value embeds & improve rotary & drop attn layer](https://x.com/YouJiacheng/status/1868938024731787640) | 12/17/24 | [log](https://gist.github.com/YouJiacheng/dff723d9a362303f4dca6d71a6469555) | @YouJiacheng
 
 ### Speedrun rules
 
