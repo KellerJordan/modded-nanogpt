@@ -11,9 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+import torch._inductor.config as config
 import torch.distributed as dist
 import torch.nn.functional as F
-import torch._inductor.config as config
 from torch import Tensor, nn
 
 # Use of FlexAttention contributed by @KoszarskyB
@@ -106,10 +106,9 @@ class Muon(torch.optim.Optimizer):
                 assert handle is not None
                 handle.wait()
                 for p_world, g_world in zip(params_world, update_buffers):
-                    param_lr = getattr(p_world, "lr", 1.0)
                     p_world.data.add_(
                         g_world.view_as(p_world),
-                        alpha=-lr * param_lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
+                        alpha=-lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
                     )
             for base_i in range(len(params))[::world_size]:
                 if base_i + rank < len(params):
