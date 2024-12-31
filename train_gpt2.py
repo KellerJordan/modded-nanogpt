@@ -14,6 +14,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
+config.coordinate_descent_tuning = True # suggested by @Chillee
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.attention.flex_attention import BlockMask, flex_attention #KoszarskyB
 
@@ -458,7 +459,6 @@ if args.bf16_embeds:
     for m in model.modules():
         if isinstance(m, nn.Embedding):
             m.bfloat16()
-config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
 ddp_model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
 
