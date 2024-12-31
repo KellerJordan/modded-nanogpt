@@ -542,11 +542,8 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-    # bit confusing: we want to make sure to eval on 0th iteration
-    # but also after the very last iteration. so we loop for step <= num_iterations
-    # instead of just < num_iterations (one extra due to <=), only to do
-    # the validation/sampling one last time, and then we break right here as we're done.
     if last_step:
+        # the last step only has the validation loop, so break to avoid training
         break
 
     # --------------- TRAINING SECTION -----------------
