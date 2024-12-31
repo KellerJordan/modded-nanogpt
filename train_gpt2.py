@@ -226,14 +226,14 @@ class Block(nn.Module):
         return x
 
 class ValueEmbedding(nn.Module):
-    def __init__(self, config: "GPTConfig"):
+    def __init__(self, config):
         super().__init__()
         self.embed = nn.ModuleList([
             nn.Embedding(config.vocab_size, config.model_dim)
             for _ in range(6)
         ])
 
-    def forward(self, inputs) -> "list[torch.Tensor]":
+    def forward(self, inputs):
         ve = [emb(inputs) for emb in self.embed]
         ve += reversed(ve)
         return ve
@@ -268,12 +268,7 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(
-        self,
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-        sliding_window_num_blocks: torch.Tensor,
-    ):
+    def forward(self, inputs, targets, sliding_window_num_blocks):
         BLOCK_SIZE = 128
         seq_len = len(inputs)
         assert seq_len % BLOCK_SIZE == 0
@@ -288,12 +283,12 @@ class GPT(nn.Module):
             document_mask = docs[q_idx] == docs[kv_idx]
             return causal_mask & document_mask
 
-        def dense_to_ordered(dense_mask: torch.Tensor):
+        def dense_to_ordered(dense_mask):
             num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
             indices = dense_mask.argsort(dim=-1, descending=True, stable=True).to(torch.int32)
             return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
-        def create_doc_swc_block_mask(sliding_window_num_blocks: torch.Tensor):
+        def create_doc_swc_block_mask(sliding_window_num_blocks):
             kv_idx = block_idx = torch.arange(total_num_blocks, dtype=torch.int32, device="cuda")
             q_idx = block_idx[:, None]
             causal_bm = q_idx >= kv_idx
@@ -347,36 +342,28 @@ class GPT(nn.Module):
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
 
-def _peek_data_shard(file: Path):
+def _load_data_shard(path: Path):
     # only reads the header, returns header data
     # header is 256 int32
-    header = torch.from_file(f"{file}", False, 256, dtype=torch.int32)
-    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-    assert header[1] == 1, "unsupported version"
-    return int(header[2]) # number of tokens (claimed)
-
-def _load_data_shard(path: Path, num_tokens):
-    with path.open("rb", buffering=0) as f:
+    header = torch.from_file(path, False, 256, dtype=torch.int32)
+    assert header[0] == 20240520, 'magic number mismatch in data .bin file'
+    assert header[1] == 1, 'unsupported version'
+    num_tokens = int(header[2])
+    with path.open('rb', buffering=0) as f:
         tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy())
-        assert nbytes == 2 * num_tokens, "number of tokens read does not match header?"
+        assert nbytes == 2 * num_tokens, 'number of tokens read does not match header'
     return tokens
 
 class DistributedDataLoader:
-    def __init__(self, filename_pattern, seq_len, process_rank, num_processes):
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        self.seq_len = seq_len
 
-        # glob files that match the pattern
+    def __init__(self, filename_pattern):
+        self.rank = int(os.environ['RANK'])
+        self.world_size = int(os.environ['WORLD_SIZE'])
+
         self.files = sorted(Path.cwd().glob(filename_pattern))
-        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
-
-        # load and validate all data shards, count number of tokens in total
-        self.files_num_tokens = [_peek_data_shard(file) for file in self.files]
-        assert min(self.files_num_tokens) >= num_processes * seq_len + 1
-        self.total_num_tokens = sum(self.files_num_tokens)
+        assert len(self.files) > 0, f'did not find any files that matched the pattern {filename_pattern}'
 
         self.reset()
 
@@ -384,22 +371,23 @@ class DistributedDataLoader:
         self.current_shard = -1
         self.advance()
 
-    def advance(self): # advance to next data shard
+    def advance(self):
         self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.seq_len
+        self.current_position = 0 
         self.tokens = _load_data_shard(self.files[self.current_shard], self.files_num_tokens[self.current_shard])
 
-    def next_batch(self):
-        batch_size = self.seq_len * self.num_processes
-        buf = self.tokens[self.current_position:self.current_position+self.seq_len+1]
-        # host side async is sufficient;
-        # no performance improvement was observed when introducing a separate stream.
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # targets
-        # advance current position and load next shard if necessary
-        self.current_position += batch_size
+    def next_batch(self, batch_size):
+        assert batch_size % self.world_size == 0
+        device_batch_size = batch_size // self.world_size
+        # load next shard if necessary
         if self.current_position + batch_size + 1 >= len(self.tokens):
             self.advance()
+        pos = self.current_position + self.rank * device_batch_size
+        device_batch_tokens = self.tokens[pos:pos+device_batch_size+1]
+        # advance current position
+        self.current_position += batch_size
+        inputs = device_batch_tokens[:-1].to(device='cuda', dtype=torch.int32, non_blocking=True)
+        targets = device_batch_tokens[1:].to(device='cuda', dtype=torch.int64, non_blocking=True)
         return inputs, targets
 
 # -----------------------------------------------------------------------------
@@ -408,8 +396,8 @@ class DistributedDataLoader:
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    train_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
+    val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     sequence_length : int = 64*1024 # sequence length, in tokens
@@ -423,16 +411,16 @@ class Hyperparameters:
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
-ddp_rank = int(os.environ['RANK'])
-ddp_local_rank = int(os.environ['LOCAL_RANK'])
-ddp_world_size = int(os.environ['WORLD_SIZE'])
+rank = int(os.environ['RANK'])
+local_rank = int(os.environ['LOCAL_RANK'])
+world_size = int(os.environ['WORLD_SIZE'])
 assert torch.cuda.is_available()
-device = torch.device(f'cuda:{ddp_local_rank}')
-torch.cuda.set_device(device)
-print(f'using device: {device}')
-dist.init_process_group(backend='nccl', device_id=device)
+torch.cuda.set_device(local_rank)
+dist.init_process_group(backend='nccl', device_id=local_rank)
 dist.barrier()
-master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+master_process = (rank == 0) # this process will do logging, checkpointing etc.
+
+assert args.batch_size == world_size
 
 # begin logging
 logfile = None
@@ -464,18 +452,15 @@ print0(f'{result.stdout}', logonly=True)
 print0('='*100, logonly=True)
 
 # calculate the number of steps to take in the val loop.
-assert args.val_tokens % (args.sequence_length * ddp_world_size) == 0
-val_steps = args.val_tokens // (args.sequence_length * ddp_world_size)
-# calculate the steps of gradient accumulation required to attain the desired global batch size.
-assert args.batch_size % (ddp_world_size) == 0
-train_accumulation_steps = args.batch_size // ddp_world_size
+assert args.val_tokens % (args.sequence_length * world_size) == 0
+val_steps = args.val_tokens // (args.sequence_length * world_size)
 
-# load tokens
-train_loader = DistributedDataLoader(args.input_bin, args.sequence_length, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, args.sequence_length, ddp_rank, ddp_world_size)
-print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
-print0(f"Validation DataLoader: total number of tokens: {val_loader.total_num_tokens} across {len(val_loader.files)} files")
-print0('='*100, logonly=True)
+# load data
+train_loader = DistributedDataLoader(args.train_bin)
+val_loader = DistributedDataLoader(args.val_bin)
+print0(f'Training dataloader files: {train_loader.files}')
+print0(f'Validation dataloader files: {val_loader.files}')
+print0('='*100)
 inputs_train, targets_train = train_loader.next_batch()
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
@@ -489,7 +474,7 @@ for m in model.modules():
 config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
 # here we wrap model into DDP container
-model = DDP(model, device_ids=[ddp_local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
+model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
 raw_model = model.module # always contains the "raw" unwrapped model
 
 # init the optimizer(s)
@@ -563,19 +548,6 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-    # uncomment if you want to save any checkpoints
-    #save_every = 1000
-    #if master_process and (last_step or (save_every > 0 and step % save_every == 0)):
-    #    # stop the clock
-    #    torch.cuda.synchronize()
-    #    training_time_ms += 1000 * (time.perf_counter() - t0)
-    #    # save the state of the training process
-    #    log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-    #    torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
-    #    # start the clock again
-    #    torch.cuda.synchronize()
-    #    t0 = time.perf_counter()
-
     # bit confusing: we want to make sure to eval on 0th iteration
     # but also after the very last iteration. so we loop for step <= num_iterations
     # instead of just < num_iterations (one extra due to <=), only to do
@@ -585,17 +557,8 @@ for step in range(args.num_iterations + 1):
 
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
-    for i in range(1, train_accumulation_steps + 1):
-        with contextlib.ExitStack() as stack:
-            if i < train_accumulation_steps: # there's no need to sync gradients every accumulation step
-                stack.enter_context(model.no_sync())
-            if step >= 5:
-                stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
-            model(inputs_train, targets_train, sliding_window_num_blocks).backward()
-            inputs_train, targets_train = train_loader.next_batch()
-    if train_accumulation_steps != 1:
-        for p in model.parameters():
-            p.grad /= train_accumulation_steps
+    model(inputs_train, targets_train, sliding_window_num_blocks).backward()
+    inputs_train, targets_train = train_loader.next_batch()
     # momentum warmup for Muon
     frac = min(step/300, 1)
     for group in optimizer3.param_groups:
