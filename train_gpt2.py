@@ -396,6 +396,8 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    # implementation
+    save_checkpoint : bool = False
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -416,7 +418,7 @@ logfile = None
 if master_process:
     run_id = uuid.uuid4()
     os.makedirs('logs', exist_ok=True)
-    logfile = 'logs/%s.txt' % run_id
+    logfile = f'logs/{run_id}.txt'
     print(logfile)
 
 def print0(s, console=False):
@@ -533,6 +535,10 @@ for step in range(train_steps + 1):
         t0 = time.perf_counter()
 
     if last_step:
+        if master_process and args.save_checkpoint:
+            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            os.makedirs(f'logs/{run_id}', exist_ok=True)
+            torch.save(log, f'logs/{run_id}/state_step{step:06d}.pt')
         # the last step only has the validation loop, so break to avoid training
         break
 
