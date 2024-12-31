@@ -339,7 +339,7 @@ def _load_data_shard(path):
     header = torch.from_file(path, False, 256, dtype=torch.int32)
     assert header[0] == 20240520, 'magic number mismatch in the data .bin file'
     assert header[1] == 1, 'unsupported version'
-    num_tokens int(header[2]) # number of tokens (claimed)
+    num_tokens = int(header[2]) # number of tokens (claimed)
     with open(path, 'rb', buffering=0) as f:
         tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
         f.seek(256 * 4)
@@ -416,13 +416,13 @@ batch_size = args.batch_size * args.sequence_length
 logfile = None
 if master_process:
     run_id = uuid.uuid4()
-    Path('logs').mkdir(exist_ok=True)
-    logfile = Path('logs') / f'{run_id}.txt'
-    print(logfile.stem)
+    os.makedirs('logs', exist_ok=True)
+    logfile = 'logs/%s.txt' % run_id
+    print(logfile)
 
 def print0(s, console=False):
     if master_process:
-        with logfile.open('a') as f:
+        with open(logfile, 'a') as f:
             if console:
                 print(s)
             print(s, file=f)
