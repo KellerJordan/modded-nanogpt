@@ -455,12 +455,15 @@ if args.bf16_embeds:
             m.bfloat16()
 model = torch.compile(model)
 ddp_model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
+sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device='cuda')
+sw_num_blocks_prev = 1
 
 # collect the parameters to optimize
 hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim == 2]
 embed_params = [model.embed.weight, *model.value_embeds.parameters()]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
+
 # init the optimizer(s)
 optimizer1 = torch.optim.Adam([dict(params=embed_params, lr=0.6),
                                dict(params=head_params, lr=0.008),
@@ -468,7 +471,8 @@ optimizer1 = torch.optim.Adam([dict(params=embed_params, lr=0.6),
                               betas=(0.8, 0.95), fused=True)
 optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95)
 optimizers = [optimizer1, optimizer2]
-# learning rate decay scheduler (linear warmup and cooldown)
+
+# learning rate decay scheduler (stable then decay)
 def get_lr(it):
     assert it <= args.num_iterations
     # 1) constant lr for first part of training
@@ -480,8 +484,6 @@ def get_lr(it):
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
-sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device='cuda')
-sw_num_blocks_prev = 1
 # Start training loop
 training_time_ms = 0
 # start the clock
