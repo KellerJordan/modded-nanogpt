@@ -76,19 +76,11 @@ class Muon(torch.optim.Optimizer):
         self.world_size = int(os.environ['WORLD_SIZE'])
         self.rank = int(os.environ['RANK'])
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
-        params = list(params)
         assert all(isinstance(p, torch.Tensor) for p in params)
         sizes = {p.numel() for p in params}
-        param_groups = [
-            {
-                'params': [p for p in params if p.numel() == size],
-                'update_buffer': [
-                    torch.empty(size, device='cuda', dtype=torch.bfloat16)
-                    for _ in range(self.world_size)
-                ],
-            }
-            for size in sizes
-        ]
+        param_groups = [dict(params=[p for p in params if p.numel() == size],
+                             update_buffer=[torch.empty(size, device='cuda', dtype=torch.bfloat16) for _ in range(self.world_size)])
+                        for size in sizes]
         super().__init__(param_groups, defaults)
 
     def step(self):
@@ -116,16 +108,19 @@ class Muon(torch.optim.Optimizer):
                         alpha=-lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
                     )
             for base_i in range(len(params))[::self.world_size]:
-                p = params[base_i + self.rank]
-                g = p.grad
-                assert g is not None
-                state = self.state[p]
-                if 'momentum_buffer' not in state:
-                    state['momentum_buffer'] = torch.zeros_like(g)
-                buf = state['momentum_buffer']
-                buf.lerp_(g, 1 - momentum)
-                g = g.lerp_(buf, momentum) if nesterov else buf
-                g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
+                if base_i + rank < len(params):
+                    p = params[base_i + self.rank]
+                    g = p.grad
+                    assert g is not None
+                    state = self.state[p]
+                    if 'momentum_buffer' not in state:
+                        state['momentum_buffer'] = torch.zeros_like(g)
+                    buf = state['momentum_buffer']
+                    buf.lerp_(g, 1 - momentum)
+                    g = g.lerp_(buf, momentum) if nesterov else buf
+                    g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
+                else:
+                    g = update_buffers[rank]
                 update_prev()
                 handle = dist.all_gather(update_buffers, g, async_op=True)
                 params_world = params[base_i : base_i + self.world_size]
@@ -145,26 +140,20 @@ class CastedLinear(nn.Linear):
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
 
-class Rotary(torch.nn.Module):
+class Rotary(nn.Module):
 
-    def __init__(self, dim, base=10000):
+    def __init__(self, dim, max_seq_len=65536):
         super().__init__()
-        self.register_buffer('inv_freq', (1 / base) ** (torch.arange(0, dim, 2) / dim))
-        self.seq_len_cached = None
-        self.cos_cached = None
-        self.sin_cached = None
+        inv_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        inv_freq = torch.cat([inv_freq, inv_freq.new_zeros(dim//4)])
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        theta = torch.einsum('i,j -> ij', t, inv_freq)
+        self.cos = nn.Buffer(theta.cos(), persistent=False)
+        self.sin = nn.Buffer(theta.sin(), persistent=False)
 
     def forward(self, x):
-        seq_len = x.shape[1]
-        if seq_len != self.seq_len_cached:
-            t = torch.arange(seq_len, device=x.device)
-            freqs = torch.outer(t, self.inv_freq)
-            self.seq_len_cached = seq_len
-            self.cos_cached = freqs.cos()
-            self.sin_cached = freqs.sin()
-        cos, sin = self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
-        # apply_rotary_emb(x, cos, sin)
-        x1, x2 = x.chunk(2, dim=3)
+        cos, sin = self.cos[None, :x.size(-3), None, :], self.sin[None, :x.size(-3), None, :]
+        x1, x2 = x.float().chunk(2, dim=-1)
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x)
@@ -189,7 +178,10 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).view(B, T, self.num_heads, -1)
         k = self.c_k(x).view(B, T, self.num_heads, -1)
         v = self.c_v(x).view(B, T, self.num_heads, -1)
-        v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+        if ve is not None:
+            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+        else:
+            v = self.lambdas[0] * v
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, enable_gqa=True)
@@ -213,29 +205,27 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, model_dim, num_heads):
+    def __init__(self, model_dim, num_heads, use_attn=True):
         super().__init__()
-        self.attn = CausalSelfAttention(model_dim, num_heads)
+        self.attn = CausalSelfAttention(model_dim, num_heads) if use_attn else None
         self.mlp = MLP(model_dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x, ve, x0, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x = x + self.attn(norm(x), ve, block_mask)
+        if self.attn is not None:
+            x = x + self.attn(norm(x), ve, block_mask)
         x = x + self.mlp(norm(x))
         return x
 
 class ValueEmbedding(nn.Module):
     def __init__(self, vocab_size, model_dim):
         super().__init__()
-        self.embed = nn.ModuleList([
-            nn.Embedding(vocab_size, model_dim)
-            for _ in range(6)
-        ])
+        self.embed = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
 
     def forward(self, inputs):
         ve = [emb(inputs) for emb in self.embed]
-        ve += reversed(ve)
+        ve = [ve[0], ve[1], ve[2], None, None, None, None, None, None, ve[0], ve[1], ve[2]]
         return ve
 
 # -----------------------------------------------------------------------------
@@ -246,7 +236,8 @@ class GPT(nn.Module):
     def __init__(self, vocab_size, num_layers, num_heads, model_dim):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads) for _ in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, use_attn=(i != 7))
+                                     for i in range(num_layers)])
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
         # U-net structure on token value embeddings by @leloykun
         self.value_embeds = ValueEmbedding(vocab_size, model_dim)
@@ -290,7 +281,7 @@ class GPT(nn.Module):
             document_full_bm = (docs_low[:, None] == docs_high) & (docs_low == docs_high[:, None])
             nonzero_bm = causal_bm & window_bm & document_bm
             full_bm  = causal_full_bm & window_full_bm & document_full_bm
-            kv_num_blocks, kv_indices = dense_to_ordered(nonzero_bm ^ full_bm)
+            kv_num_blocks, kv_indices = dense_to_ordered(nonzero_bm & ~full_bm)
             full_kv_num_blocks, full_kv_indices = dense_to_ordered(full_bm)
             return BlockMask.from_kv_blocks(
                 kv_num_blocks,
@@ -388,7 +379,7 @@ class Hyperparameters:
     # optimization
     batch_size : int = 8*64*1024 # batch size in tokens
     device_batch_size : int = 64*1024 # batch size per device in tokens
-    num_iterations : int = 1480 # number of iterations to run
+    num_iterations : int = 1490 # number of iterations to run
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     bf16_embeds : bool = True
     # evaluation and logging
