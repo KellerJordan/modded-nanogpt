@@ -183,7 +183,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
-        assert B == 1, "Must use batch size = 1 for FlexAttention"
+        assert B == 1, 'Must use batch size = 1 for FlexAttention'
         q = self.c_q(x).view(B, T, self.num_heads, -1)
         k = self.c_k(x).view(B, T, self.num_heads, -1)
         v = self.c_v(x).view(B, T, self.num_heads, -1)
@@ -353,14 +353,14 @@ def _load_data_shard(file: Path):
     # only reads the header, returns header data
     # header is 256 int32
     header = torch.from_file(f"{file}", False, 256, dtype=torch.int32)
-    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-    assert header[1] == 1, "unsupported version"
+    assert header[0] == 20240520, 'magic number mismatch in the data .bin file'
+    assert header[1] == 1, 'unsupported version'
     num_tokens = int(header[2]) # number of tokens (claimed)
-    with file.open("rb", buffering=0) as f:
+    with file.open('rb', buffering=0) as f:
         tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
-        assert nbytes == 2 * num_tokens, "number of tokens read does not match header?"
+        assert nbytes == 2 * num_tokens, 'number of tokens read does not match header?'
     return tokens
 
 class DistributedDataLoader:
@@ -441,7 +441,7 @@ print0('='*100)
 print0(f'Running Python {sys.version}')
 print0(f'Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}')
 def nvidia_smi():
-    import subprocess # avoid top level import
+    import subprocess  # avoid top level import
     return subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
 print0('='*100)
