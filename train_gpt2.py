@@ -339,7 +339,7 @@ def _peek_data_shard(path):
     header = torch.from_file(str(path), False, 256, dtype=torch.int32)
     assert header[0] == 20240520, 'magic number mismatch in the data .bin file'
     assert header[1] == 1, 'unsupported version'
-    return int(header[2])
+    return int(header[2]) # number of tokens (claimed)
 
 def _load_data_shard(path, num_tokens):
     with path.open('rb', buffering=0) as f:
