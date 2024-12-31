@@ -522,7 +522,7 @@ for step in range(train_steps + 1):
         sliding_window_num_blocks.copy_(sw_num_blocks, non_blocking=True)
         sw_num_blocks_prev = sw_num_blocks
 
-    # ------------- VALIDATION SECTION ---------------
+    # --------------- VALIDATION SECTION -----------------
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
         # stop the clock
         torch.cuda.synchronize()
