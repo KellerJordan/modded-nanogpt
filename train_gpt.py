@@ -531,8 +531,8 @@ for step in range(train_steps + 1):
     model.train()
     inputs_train, targets_train = train_loader.next_batch(args.batch_size)
     assert inputs_train.numel() <= micro_bs or inputs_train.numel() % micro_bs == 0
-    for m_inputs_train, m_targets_train in zip(inputs_train.split(micro_bs), targets_train.split(micro_bs)):
-        ddp_model(m_inputs_train, m_targets_train, sliding_window_num_blocks).backward()
+    for micro_inputs_train, micro_targets_train in zip(inputs_train.split(micro_bs), targets_train.split(micro_bs)):
+        ddp_model(micro_inputs_train, micro_targets_train, sliding_window_num_blocks).backward()
     # momentum warmup for Muon
     frac = min(step/300, 1)
     for group in optimizer2.param_groups:
