@@ -225,7 +225,7 @@ class ValueEmbedding(nn.Module):
         self.embed = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
 
     def forward(self, inputs):
-        ve = [emb(inputs) for emb in self.embed]
+        ve = [emb(inputs).bfloat16() for emb in self.embed]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
         ve = [ve[0], ve[1], ve[2], None, None, None, None, None, None, ve[0], ve[1], ve[2]]
         return ve
@@ -297,7 +297,7 @@ class GPT(nn.Module):
 
         block_mask = create_doc_swc_block_mask(sliding_window_num_blocks)
 
-        x0 = norm(self.embed(inputs[None])) # use of norm here by @Grad62304977
+        x0 = norm(self.embed(inputs[None]).bfloat16()) # use of norm here by @Grad62304977
         x = x0
         ve = self.value_embeds(inputs)
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
@@ -382,6 +382,7 @@ class Hyperparameters:
     max_device_batch_size = 64*1024 # batch size per device in tokens
     num_iterations = 1490 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
+    bf16_embeds = True
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
@@ -436,9 +437,10 @@ print0('='*100)
 # this originates from Karpathy's experiments.
 model = GPT(vocab_size=50304, num_layers=12, num_heads=6, model_dim=768)
 model = model.cuda()
-for m in model.modules():
-    if isinstance(m, nn.Embedding):
-        m.bfloat16()
+if args.bf16_embeds:
+    for m in model.modules():
+        if isinstance(m, nn.Embedding):
+            m.bfloat16()
 model = torch.compile(model)
 ddp_model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
 sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device='cuda')
