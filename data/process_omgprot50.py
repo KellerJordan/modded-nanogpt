@@ -38,7 +38,7 @@ def write_datafile(filename, toks):
 
 def tokenize(doc, tokenizer, max_length):
     # tokenizes a single document and returns a numpy array of uint8 tokens
-    # uint8 can hold the 33 tokens but causes a bug
+    # uint8 can hold the 33 tokens
     return np.array(tokenizer.encode(doc["sequence"], add_special_tokens=True, truncation=True, max_length=max_length), dtype=np.uint8)
 
 
