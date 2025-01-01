@@ -459,7 +459,7 @@ optimizer1 = torch.optim.Adam([dict(params=embed_params, lr=0.6),
 optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95)
 optimizers = [optimizer1, optimizer2]
 
-# learning rate decay scheduler (stable then decay)
+# learning rate schedule: stable then decay
 def get_lr(it):
     t = 1 - it / args.num_iterations # time remaining in training
     assert 1 >= t > 0
@@ -530,8 +530,9 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     model.train()
-    assert args.batch_size % world_size == 0
-    inputs_train, targets_train = train_loader.next_batch(args.batch_size)
+    batch_size = args.batch_size
+    assert batch_size % world_size == 0
+    inputs_train, targets_train = train_loader.next_batch(batch_size)
     assert len(inputs_train) <= micro_bs or len(inputs_train) % micro_bs == 0
     for micro_inputs_train, micro_targets_train in zip(inputs_train.split(micro_bs), targets_train.split(micro_bs)):
         ddp_model(micro_inputs_train, micro_targets_train, sliding_window_num_blocks).backward()
