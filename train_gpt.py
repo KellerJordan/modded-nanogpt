@@ -498,7 +498,7 @@ for step in range(train_steps + 1):
     sliding_window_num_blocks.copy_(get_sliding_window_blocks(step))
 
     # --------------- VALIDATION SECTION -----------------
-    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
