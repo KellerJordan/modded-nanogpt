@@ -15,7 +15,8 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.nn.attention.flex_attention import BlockMask, flex_attention #KoszarskyB
+# use of FlexAttention contributed by @KoszarskyB
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
