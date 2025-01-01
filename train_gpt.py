@@ -1,5 +1,6 @@
 import os
 import sys
+from typing import override
 
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
@@ -138,7 +139,8 @@ def norm(x):
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int):
         super().__init__(in_features, out_features, bias=False)
-    
+
+    @override
     def reset_parameters(self) -> None:
         # leave for future tuning
         # 0.5 is a bit better than the default 1/sqrt(3)
@@ -556,9 +558,7 @@ for step in range(train_steps + 1):
     with contextlib.ExitStack() as stack:
         if step >= 5:
             stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
-        loss = ddp_model(inputs_train, targets_train, sliding_window_num_blocks)
-        loss.backward()
-        del loss
+        ddp_model(inputs_train, targets_train, sliding_window_num_blocks).backward()
         inputs_train, targets_train = train_loader.next_batch()
     # momentum warmup for Muon
     frac = min(step/300, 1)
