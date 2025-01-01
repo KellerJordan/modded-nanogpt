@@ -475,7 +475,7 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 # sliding window size schedule: linear increase over training in chunks of 128 from 128 -> 1792. By @fernbear.bsky.social
 def get_sliding_window_blocks(it):
     x = step / train_steps # training progress
-    assert 0 <= x < 1
+    assert 0 <= x <= 1
     return int(((1 - x) * 128 + x * 1856) // 128)
 sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device='cuda')
 
