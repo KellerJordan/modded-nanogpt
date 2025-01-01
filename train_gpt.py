@@ -318,7 +318,7 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets)
         return loss
 
 # -----------------------------------------------------------------------------
