@@ -59,10 +59,11 @@ class DistributedDataLoader:
 
 
 class DistributedPaddedDataLoader(DistributedDataLoader):
-    def __init__(self, filename_pattern, seq_len, process_rank, num_processes, eos_id, pad_id):
+    def __init__(self, filename_pattern, seq_len, process_rank, num_processes, eos_id, pad_id, max_length=1024):
         super().__init__(filename_pattern, seq_len, process_rank, num_processes)
         self.eos_id = eos_id
         self.pad_id = pad_id
+        self.max_length = max_length
 
     def reset(self):
         self.current_shard = self.process_rank - self.num_processes
@@ -78,7 +79,7 @@ class DistributedPaddedDataLoader(DistributedDataLoader):
         buf = self.tokens[self.current_position:end_pos]
         input_ids = buf.to(device="cuda", dtype=torch.int32, non_blocking=True)
         keep = (input_ids == self.eos_id).cumsum(dim=0).argmax().item()
-        keep = max(keep or 0, self.batch_size - 2048)
+        keep = max(keep or 0, self.batch_size - self.max_length)
         input_ids[keep + 1:] = self.pad_id
         # advance current position and load next shard if necessary
         self.current_position += keep
