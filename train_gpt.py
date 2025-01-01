@@ -435,10 +435,10 @@ print0('='*100)
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 model = GPT(vocab_size=50304, num_layers=12, num_heads=6, model_dim=768)
-model = model.cuda().bfloat16()
+model = model.cuda()
 for m in model.modules():
-    if isinstance(m, CastedLinear):
-        m.float()
+    if isinstance(m, nn.Embedding):
+        m.bfloat16()
 model = torch.compile(model)
 ddp_model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
 sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device='cuda')
