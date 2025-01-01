@@ -300,6 +300,7 @@ class GPT(nn.Module):
         x0 = norm(self.embed(inputs[None]).bfloat16()) # use of norm here by @Grad62304977
         x = x0
         ve = self.value_embeds(inputs)
+        assert len(ve) == len(self.blocks)
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
 
         # Store outputs for U-Net skip connections
