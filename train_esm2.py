@@ -56,7 +56,8 @@ def get_args():
     parser.add_argument('--num_steps', type=int, default=25000, help='number of iterations to run')
     parser.add_argument('--warmup_steps', type=int, default=1000, help='number of warmup steps')
     parser.add_argument('--cooldown_steps', type=int, default=1000, help='number of cooldown steps')
-    
+    parser.add_argument('--max_length', type=int, default=1024, help='maximum sequence length')
+
     # Evaluation and logging hyperparams
     parser.add_argument('--valid_loss_every', type=int, default=1000, help='every how many steps to evaluate val loss? 0 for only at the end')
     parser.add_argument('--hf_model_name', type=str, default='Synthyra/esm_speedrun', help='huggingface model name')
@@ -233,9 +234,9 @@ if __name__ == "__main__":
             t0 = time.perf_counter()
         timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-        # Linearly increase the sliding window size over training in chunks of 128 from 1024 -> 2048. By @fernbear.bsky.social
+        # Linearly increase the sliding window size over training in chunks of 128 from 512 -> max_length. By @fernbear.bsky.social
         frac_done = step / args.num_steps # training progress
-        sw_size = int(((1 - frac_done) * 1023 + frac_done * 2048) // 128) * 128
+        sw_size = int(((1 - frac_done) * 512 + frac_done * args.max_length) // 128) * 128
         if sw_size != sw_prev:
             sliding_window_size.copy_(sw_size, non_blocking=True)
             sw_prev = sw_size
@@ -252,7 +253,7 @@ if __name__ == "__main__":
             with torch.no_grad():
                 for _ in range(valid_steps):
                     input_ids = valid_loader.next_batch()
-                    val_loss += model(input_ids, sliding_window_size)
+                    val_loss += model(input_ids, sliding_window_size, mlm_probability=0.15)
             if ddp_world_size > 1:
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
             val_loss /= valid_steps
@@ -294,7 +295,7 @@ if __name__ == "__main__":
                     stack.enter_context(model.no_sync())
                 #if step >= 5:
                 #    stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
-                model(input_ids, sliding_window_size).backward()
+                model(input_ids, sliding_window_size, mlm_probability=0.20).backward()
                 input_ids = train_loader.next_batch()
         if train_accumulation_steps != 1:
             for p in model.parameters():
@@ -335,7 +336,7 @@ if __name__ == "__main__":
     with torch.no_grad():
         for _ in range(test_steps):
             input_ids = test_loader.next_batch()
-            test_loss += model(input_ids, sliding_window_size)
+            test_loss += model(input_ids, sliding_window_size, mlm_probability=0.15)
 
     test_loss /= test_steps
     print0(f"Test results | Loss: {test_loss:.4f} | Perplexity: {math.e**test_loss:.4f}")
