@@ -444,8 +444,6 @@ if args.bf16_embeds:
             m.bfloat16()
 model = torch.compile(model)
 ddp_model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
-sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device='cuda')
-sw_num_blocks_prev = 1
 
 # collect the parameters to optimize
 hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim == 2]
@@ -473,6 +471,13 @@ def get_lr(it):
         return t / args.cooldown_frac
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
+# sliding window size schedule: linear increase over training in chunks of 128 from 128 -> 1792. By @fernbear.bsky.social
+def get_sliding_window_blocks(it):
+    x = step / train_steps # training progress
+    assert 0 <= x < 1
+    return int(((1 - x) * 128 + x * 1856) // 128)
+sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device='cuda')
+
 # Start training loop
 training_time_ms = 0
 # start the clock
@@ -490,12 +495,7 @@ for step in range(train_steps + 1):
         t0 = time.perf_counter()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-    # Linearly increase the sliding window size over training in chunks of 128 from 128 -> 1792. By @fernbear.bsky.social
-    frac_done = step / train_steps # training progress
-    sw_num_blocks = int(((1 - frac_done) * 128 + frac_done * 1856) // 128)
-    if sw_num_blocks != sw_num_blocks_prev:
-        sliding_window_num_blocks.copy_(sw_num_blocks, non_blocking=True)
-        sw_num_blocks_prev = sw_num_blocks
+    sliding_window_num_blocks.copy_(get_sliding_window_blocks(step))
 
     # --------------- VALIDATION SECTION -----------------
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
