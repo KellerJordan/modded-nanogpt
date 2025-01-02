@@ -24,7 +24,6 @@ import uuid
 import time
 import contextlib
 import math
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch._inductor.config as config
