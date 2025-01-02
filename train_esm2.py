@@ -24,16 +24,16 @@ import uuid
 import time
 import contextlib
 import math
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch._inductor.config as config
+from transformers import EsmTokenizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
 
 from optimizer import Muon
 from model import ModelConfig, ESM, CastedLinear
-from dataloading import DistributedDataLoader, DistributedPaddedDataLoader
+from dataloading import DistributedPaddedDataLoader
 
 
 def get_args():
@@ -159,9 +159,11 @@ if __name__ == "__main__":
     print0(f'Total batch size: {args.batch_size} tokens')
 
     # load tokens
-    train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size, eos_id=2, pad_id=1)
-    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size, eos_id=2, pad_id=1)
-    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size // 8, ddp_rank, ddp_world_size, eos_id=2, pad_id=1)
+    tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
+    eos_id, pad_id = tokenizer.eos_token_id, tokenizer.pad_token_id
+    train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
+    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
+    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size // 8, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
     print0(f"Training DataLoader: {len(train_loader.files)} files")
     print0(f"Validation DataLoader: {len(valid_loader.files)} files")
     print0(f"Testing DataLoader: {len(test_loader.files)} files")
