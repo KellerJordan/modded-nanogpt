@@ -36,54 +36,58 @@ def write_datafile(filename, toks):
         f.write(toks.tobytes())
 
 
-def tokenize(doc, tokenizer):
+def tokenize(doc, tokenizer, max_length):
     # tokenizes a single document and returns a numpy array of uint8 tokens
-    # uint8 can hold the 33 tokens but causes a bug
-    return np.array(tokenizer.encode(doc["sequence"], add_special_tokens=True), dtype=np.uint8)
+    # uint8 can hold the 33 tokens
+    return np.array(tokenizer.encode(doc["sequence"], add_special_tokens=True, truncation=True, max_length=max_length), dtype=np.uint8)
 
 
-def tokenize_fw(fw, split='train'):
-    # tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
+def tokenize_fw(fw, split='train', max_length=1024):
+    # tokenize all documents and write output shards, each of approximately shard_size tokens
+    # ensures each shard contains complete sequences only
     tokenizer = EsmTokenizer.from_pretrained("facebook/esm2_t6_8M_UR50D")
-    nprocs = max(1, os.cpu_count() - 4) # don't hog the entire system
+    nprocs = max(1, os.cpu_count() - 2) # don't hog the entire system
     with mp.Pool(nprocs) as pool:
         shard_index = 0
-        # preallocate buffer to hold current shard
-        all_tokens_np = np.empty((args.shard_size,), dtype=np.uint8)
-        token_count = 0
+        current_shard = []
+        current_size = 0
         progress_bar = None
-        tokenize_fn = partial(tokenize, tokenizer=tokenizer)
-        for tokens in pool.imap(tokenize_fn, fw, chunksize=16):
-            # is there enough space in the current shard for the new tokens?
-            if token_count + len(tokens) < args.shard_size:
-                # simply append tokens to current shard
-                all_tokens_np[token_count:token_count+len(tokens)] = tokens
-                token_count += len(tokens)
-                # update progress bar
-                if progress_bar is None:
-                    progress_bar = tqdm(total=args.shard_size, unit="tokens", desc=f"Shard {shard_index}")
-                progress_bar.update(len(tokens))
-            else:
-                filename = os.path.join(DATA_CACHE_DIR, f"omgprot50_{split}_{shard_index:06d}.bin") # this probably needs to be changed
-                # split the document into whatever fits in this shard; the remainder goes to next one
-                remainder = args.shard_size - token_count
-                progress_bar.update(remainder)
-                all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
-                write_datafile(filename, all_tokens_np)
-                shard_index += 1
-                progress_bar = None
-                # populate the next shard with the leftovers of the current doc
-                all_tokens_np[0:len(tokens)-remainder] = tokens[remainder:]
-                token_count = len(tokens)-remainder
+        tokenize_fn = partial(tokenize, tokenizer=tokenizer, max_length=max_length)
 
-        # write any remaining tokens as the last shard
-        if token_count != 0:
+        for tokens in pool.imap(tokenize_fn, fw, chunksize=16):
+            # Update progress bar
+            if progress_bar is None:
+                progress_bar = tqdm(total=args.shard_size, unit="tokens", desc=f"Shard {shard_index}")
+            
+            # If adding this sequence would exceed shard size, write current shard and start new one
+            if current_size + len(tokens) > args.shard_size and current_size > 0:
+                # Convert accumulated tokens to numpy array and write
+                all_tokens_np = np.concatenate(current_shard)
+                filename = os.path.join(DATA_CACHE_DIR, f"omgprot50_{split}_{shard_index:06d}.bin")
+                write_datafile(filename, all_tokens_np)
+                
+                # Reset for next shard
+                shard_index += 1
+                current_shard = []
+                current_size = 0
+                progress_bar = None
+            
+            # Add sequence to current shard
+            current_shard.append(tokens)
+            current_size += len(tokens)
+            if progress_bar:
+                progress_bar.update(len(tokens))
+
+        # Write final shard if there are remaining sequences
+        if current_size > 0:
+            all_tokens_np = np.concatenate(current_shard)
             filename = os.path.join(DATA_CACHE_DIR, f"omgprot50_{split}_{shard_index:06d}.bin")
-            write_datafile(filename, all_tokens_np[:token_count])
+            write_datafile(filename, all_tokens_np)
 
 
 parser = argparse.ArgumentParser(description="FineWeb dataset preprocessing")
 parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of each shard in tokens")
+parser.add_argument("-m", "--max_length", type=int, default=1024, help="Maximum sequence length")
 
 
 if __name__ == "__main__":
@@ -98,6 +102,6 @@ if __name__ == "__main__":
     train_fw = load_dataset("Synthyra/omg_prot50", split="train")
     valid_fw = load_dataset("Synthyra/omg_prot50", split="valid")
     test_fw = load_dataset("Synthyra/omg_prot50", split="test")
-    tokenize_fw(valid_fw, split='valid')
-    tokenize_fw(test_fw, split='test')
-    tokenize_fw(train_fw, split='train')
+    tokenize_fw(valid_fw, split='valid', max_length=args.max_length)
+    tokenize_fw(test_fw, split='test', max_length=args.max_length)
+    tokenize_fw(train_fw, split='train', max_length=args.max_length)

@@ -56,7 +56,8 @@ def get_args():
     parser.add_argument('--num_steps', type=int, default=25000, help='number of iterations to run')
     parser.add_argument('--warmup_steps', type=int, default=1000, help='number of warmup steps')
     parser.add_argument('--cooldown_steps', type=int, default=1000, help='number of cooldown steps')
-    
+    parser.add_argument('--max_length', type=int, default=1024, help='maximum sequence length')
+
     # Evaluation and logging hyperparams
     parser.add_argument('--valid_loss_every', type=int, default=1000, help='every how many steps to evaluate val loss? 0 for only at the end')
     parser.add_argument('--hf_model_name', type=str, default='Synthyra/esm_speedrun', help='huggingface model name')
@@ -225,14 +226,16 @@ if __name__ == "__main__":
         # This effectively ignores timing first 10 steps, which are slower for weird reasons.
         # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
         # steps with dummy data first, and then re-initialize the model and reset the loader.
+        # TODO
+        # We should add this before the hackathon
         if step == 10:
             training_time_ms = 0
             t0 = time.perf_counter()
         timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-        # Linearly increase the sliding window size over training in chunks of 128 from 1024 -> 2048. By @fernbear.bsky.social
+        # Linearly increase the sliding window size over training in chunks of 128 from 512 -> max_length. By @fernbear.bsky.social
         frac_done = step / args.num_steps # training progress
-        sw_size = int(((1 - frac_done) * 1023 + frac_done * 2048) // 128) * 128
+        sw_size = int(((1 - frac_done) * 512 + frac_done * args.max_length) // 128) * 128
         if sw_size != sw_prev:
             sliding_window_size.copy_(sw_size, non_blocking=True)
             sw_prev = sw_size
