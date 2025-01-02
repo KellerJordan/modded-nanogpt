@@ -246,19 +246,20 @@ if __name__ == "__main__":
             model.eval()
             valid_loader.reset()
             val_loss = 0.0
-            valid_steps = 0
             valid_tokens = 0
             with torch.no_grad():
-                while (val_input_ids := valid_loader.next_batch()) is not None:
-                    valid_steps += 1
-                    valid_tokens += (val_input_ids != 1).sum()
-                    val_loss += model(val_input_ids, sliding_window_size)
+                val_input_ids = valid_loader.next_batch()
+                while val_input_ids.numel():
+                    batch_valid_tokens = (val_input_ids != 1).sum()
+                    valid_tokens += batch_valid_tokens
+                    val_loss += model(val_input_ids, sliding_window_size) * batch_valid_tokens
+                    val_input_ids = valid_loader.next_batch()
             if ddp_world_size > 1:
-                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+                dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
                 dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
-            val_loss /= valid_steps
+            val_loss /= valid_tokens
             # log val loss to console and to logfile
-            print0(f'step:{step}/{args.num_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms perplexity:{(math.e**val_loss):.4f} param_count:{get_param_count(model):,} tokens: {valid_tokens.item()}')
+            print0(f'step:{step}/{args.num_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms perplexity:{(math.e**val_loss):.4f} param_count:{get_param_count(model):,} tokens: {valid_tokens.item():,}')
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -334,14 +335,18 @@ if __name__ == "__main__":
     test_loader.reset()
 
     test_loss = 0.0
-    test_steps = 0
     test_tokens = 0
     with torch.no_grad():
-        while (input_ids := valid_loader.next_batch()) is not None:
-            test_steps += 1
-            test_loss += model(input_ids, sliding_window_size)
-    # TODO: do we need all-reduce?
-    test_loss /= test_steps
+        test_input_ids = test_loader.next_batch()
+        while test_input_ids.numel():
+            batch_test_tokens = (test_input_ids != 1).sum()
+            test_tokens += batch_test_tokens
+            test_loss += model(test_input_ids, sliding_window_size) * batch_test_tokens
+            test_input_ids = test_loader.next_batch()
+    if ddp_world_size > 1:
+        dist.all_reduce(test_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(test_tokens, op=dist.ReduceOp.SUM)
+    test_loss /= test_tokens
 
     print0(f"Test results | Loss: {test_loss:.4f} | Perplexity: {math.e**test_loss:.4f}")
     print0(f"Total train time (min): {training_time_ms / 60000:.2f}")
