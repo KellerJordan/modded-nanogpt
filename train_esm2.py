@@ -24,39 +24,40 @@ import uuid
 import time
 import contextlib
 import math
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch._inductor.config as config
+from transformers import EsmTokenizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
 
 from optimizer import Muon
 from model import ModelConfig, ESM, CastedLinear
-from dataloading import DistributedDataLoader, DistributedPaddedDataLoader
+from dataloading import DistributedPaddedDataLoader
 
 
 def get_args():
     parser = argparse.ArgumentParser(description='ESM2 training arguments')
-    
+
     # Model hyperparams
     parser.add_argument('--vocab_size', type=int, default=33, help='vocabulary size')
     parser.add_argument('--num_hidden_layers', type=int, default=24, help='number of transformer layers')
     parser.add_argument('--num_attention_heads', type=int, default=6, help='number of attention heads (head dim 128 suggested by @Grad62304977)')
     parser.add_argument('--hidden_size', type=int, default=768, help='model hidden dimension size')
-    
+
     # Data hyperparams
     parser.add_argument('--input_bin', type=str, default='data/omgprot50/omgprot50_train_*.bin', help='input .bins to train on')
     parser.add_argument('--input_valid_bin', type=str, default='data/omgprot50/omgprot50_valid_*.bin', help='input .bins to eval validation loss on')
-    parser.add_argument('--input_test_bin', type=str, default='data/omgprot50/omgprot50_test_*.bin', help='input .bins to eval test loss on')   
-    
+    parser.add_argument('--input_test_bin', type=str, default='data/omgprot50/omgprot50_test_*.bin', help='input .bins to eval test loss on')
+
     # Optimization hyperparams
     parser.add_argument('--batch_size', type=int, default=8*64*1024, help='batch size, in tokens, across all devices')
     parser.add_argument('--grad_accum', type=int, default=1, help='manually set number of gradient accumulation steps, else, will be ddp_world_size')
     parser.add_argument('--num_steps', type=int, default=25000, help='number of iterations to run')
     parser.add_argument('--warmup_steps', type=int, default=1000, help='number of warmup steps')
     parser.add_argument('--cooldown_steps', type=int, default=1000, help='number of cooldown steps')
-    
+    parser.add_argument('--max_length', type=int, default=1024, help='maximum sequence length')
+
     # Evaluation and logging hyperparams
     parser.add_argument('--valid_loss_every', type=int, default=1000, help='every how many steps to evaluate val loss? 0 for only at the end')
     parser.add_argument('--hf_model_name', type=str, default='Synthyra/esm_speedrun', help='huggingface model name')
@@ -98,7 +99,7 @@ if __name__ == "__main__":
         master_process = (ddp_rank == 0)
     else:
         ddp_rank = 0
-        ddp_local_rank = 0 
+        ddp_local_rank = 0
         ddp_world_size = 1
         device = torch.device('cuda:0')
         torch.cuda.set_device(device)
@@ -148,7 +149,7 @@ if __name__ == "__main__":
     assert ddp_world_size == 1 or args.grad_accum == 1, "Cannot currently use both DDP and gradient accumulation"
     if ddp_world_size > 1:
         train_accumulation_steps = ddp_world_size
-        batch_size = args.batch_size // ddp_world_size 
+        batch_size = args.batch_size // ddp_world_size
     elif args.grad_accum > 1:
         train_accumulation_steps *= args.grad_accum
         batch_size = args.batch_size // args.grad_accum
@@ -159,15 +160,15 @@ if __name__ == "__main__":
     print0(f'Total batch size: {args.batch_size} tokens')
 
     # load tokens
-    train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size, eos_id=2, pad_id=1)
-    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size, eos_id=2, pad_id=1)
-    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size // 8, ddp_rank, ddp_world_size, eos_id=2, pad_id=1)
+    tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
+    eos_id, pad_id = tokenizer.eos_token_id, tokenizer.pad_token_id
+    train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
+    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
+    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size // 8, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
     print0(f"Training DataLoader: {len(train_loader.files)} files")
     print0(f"Validation DataLoader: {len(valid_loader.files)} files")
     print0(f"Testing DataLoader: {len(test_loader.files)} files")
     print0('='*100, logonly=True)
-
-    input_ids = train_loader.next_batch()
 
     model = ESM(model_config)
     model = model.cuda().bfloat16()
@@ -225,14 +226,16 @@ if __name__ == "__main__":
         # This effectively ignores timing first 10 steps, which are slower for weird reasons.
         # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
         # steps with dummy data first, and then re-initialize the model and reset the loader.
+        # TODO
+        # We should add this before the hackathon
         if step == 10:
             training_time_ms = 0
             t0 = time.perf_counter()
         timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-        # Linearly increase the sliding window size over training in chunks of 128 from 1024 -> 2048. By @fernbear.bsky.social
+        # Linearly increase the sliding window size over training in chunks of 128 from 512 -> max_length. By @fernbear.bsky.social
         frac_done = step / args.num_steps # training progress
-        sw_size = int(((1 - frac_done) * 1023 + frac_done * 2048) // 128) * 128
+        sw_size = int(((1 - frac_done) * 512 + frac_done * args.max_length) // 128) * 128
         if sw_size != sw_prev:
             sliding_window_size.copy_(sw_size, non_blocking=True)
             sw_prev = sw_size
@@ -296,8 +299,8 @@ if __name__ == "__main__":
                     stack.enter_context(model.no_sync())
                 #if step >= 5:
                 #    stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
-                model(input_ids, sliding_window_size).backward()
                 input_ids = train_loader.next_batch()
+                model(input_ids, sliding_window_size).backward()
         if train_accumulation_steps != 1:
             for p in model.parameters():
                 p.grad /= train_accumulation_steps
@@ -348,6 +351,7 @@ if __name__ == "__main__":
         dist.all_reduce(test_tokens, op=dist.ReduceOp.SUM)
     test_loss /= test_tokens
 
+    print0(f"Test tokens: {test_tokens.item()}")
     print0(f"Test results | Loss: {test_loss:.4f} | Perplexity: {math.e**test_loss:.4f}")
     print0(f"Total train time (min): {training_time_ms / 60000:.2f}")
     print0(f"Total train time (hours): {training_time_ms / 3600000:.2f}")

@@ -72,11 +72,6 @@ class Rotary(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    """
-    TODO
-    Add F.spda option
-    Add causal option (flex and sdpa)
-    """
     def __init__(self, dim, num_attention_heads):
         super().__init__()
         assert dim % num_attention_heads == 0
@@ -85,35 +80,7 @@ class SelfAttention(nn.Module):
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(dim // num_attention_heads) # dim // num_attention_heads = head_dim
         self.o_proj = CastedLinear(dim, dim)
-        self.o_proj.weight.data.zero_() # zero init suggested by @Grad62304977
-
-    def forward_sdpa(self, x: torch.Tensor, vi: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        TODO
-        Question? Is this output actually different than flex attention output?
-        Likely yes because of scoremod and / or soft capping
-        Would be good to be able to do inference this way for typical PLM inference pipelines
-        https://pytorch.org/blog/flexattention/
-        """
-        B, T = x.size(0), x.size(1) # batch size, sequence length
-        qkv = self.qkv(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, T, self.num_attention_heads, -1)
-        k = k.view(B, T, self.num_attention_heads, -1)
-        v = v.view(B, T, self.num_attention_heads, -1)
-        v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v) # @KoszarskyB & @Grad62304977
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
-        q, k = self.rotary(q), self.rotary(k)
-        y = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            enable_gqa=True
-        )
-        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
-        y = self.o_proj(y)
-        return y
+        self.o_proj.weight.data.zero_() # zero init suggested by @Grad6230497
 
     def forward(self, x: torch.Tensor, vi: torch.Tensor, block_mask: torch.Tensor) -> torch.Tensor:
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -185,17 +152,12 @@ class ValueEmbedding(nn.Module):
 
 
 class ESM(PreTrainedModel):
-    """
-    TODO
-    Add causal option (flex and sdpa)
-    """
     config_class = ModelConfig
     def __init__(self, config: ModelConfig):
         super().__init__(config)
         self.config = config
         tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
-        self.masker = ProteinMasker(tokenizer, 0.20) # 20% masking rate https://arxiv.org/abs/2301.06568
-        self.inference_masker = ProteinMasker(tokenizer, 0.15) # 15% masking rate for inference, ESM2
+        self.masker = ProteinMasker(tokenizer)
         self.cls_id = tokenizer.cls_token_id
         self.vocab_size = tokenizer.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
@@ -229,24 +191,6 @@ class ESM(PreTrainedModel):
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
         return logits
-
-    def sdpa_forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if attention_mask is not None:
-            attention_mask = attention_mask[:, None, None, :].bool()
-        
-        x, x0, ve = self.embed_forward(input_ids)
-        ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
-
-        skip_connections = []
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i].sdpa_forward(x, ve_enc[i], x0, attention_mask)
-            skip_connections.append(x)
-
-        for i in range(self.num_decoder_layers):
-            x = x + self.skip_weights[i] * skip_connections.pop()
-            x = self.blocks[self.num_encoder_layers + i].sdpa_forward(x, ve_dec[i], x0, attention_mask)
-
-        return self.get_logits(x)
 
     def flex_forward(self, input_ids: torch.Tensor, sliding_window_size: torch.Tensor) -> torch.Tensor:
         input_ids = input_ids.flatten() # flex_attention needs batch 1
@@ -314,22 +258,23 @@ class ESM(PreTrainedModel):
         # Stack into [num_documents, hidden_size]
         return torch.stack(doc_embeds, dim=0)
 
-    def inference(self, input_ids: torch.Tensor, sliding_window_size: torch.Tensor = None) -> Tuple[torch.Tensor, Any, Any]:
-        input_ids, labels = self.inference_masker(input_ids)
+    def inference(
+            self,
+            input_ids: torch.Tensor,
+            sliding_window_size: torch.Tensor = None,
+            mlm_probability: float = 0.15) -> Tuple[torch.Tensor, Any, Any]:
+        input_ids, labels = self.masker(input_ids, mlm_probability)
         logits = self.flex_forward(input_ids, sliding_window_size)
         loss = None
         if labels is not None:
             loss = self.cross_entropy(logits.view(-1, self.vocab_size), labels.view(-1).long())
         return logits, loss, labels
 
-    def forward(self, input_ids: torch.Tensor, sliding_window_size: torch.Tensor) -> torch.Tensor:
-        input_ids, labels = self.masker(input_ids)
+    def forward(
+            self,
+            input_ids: torch.Tensor,
+            sliding_window_size: torch.Tensor,
+            mlm_probability: float = 0.15) -> torch.Tensor:
+        input_ids, labels = self.masker(input_ids, mlm_probability)
         logits = self.flex_forward(input_ids, sliding_window_size)
         return self.cross_entropy(logits.view(-1, self.vocab_size), labels.view(-1).long())
-
-
-if __name__ == '__main__':
-    """
-    TODO
-    look at MSE between flex attention outputs and sdpa outputs
-    """

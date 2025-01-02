@@ -6,13 +6,12 @@ Standardized MLM masking approach for consistency
 """
 
 class ProteinMasker:
-    def __init__(self, tokenizer, mlm_probability=0.15):
+    def __init__(self, tokenizer):
         """
         Initialize the ProteinMasker with the given tokenizer and masking parameters.
         Of the masked tokens, 80% are replaced with [MASK], 10% are replaced with a random amino acid token, and 10% are unchanged.
         """
         self.tokenizer = tokenizer
-        self.mlm_probability = mlm_probability
         self.mask_token_id = tokenizer.mask_token_id
         self.special_tokens = torch.tensor(tokenizer.all_special_ids)
         canonical_amino_acids = 'ACDEFGHIKLMNPQRSTVWY'
@@ -20,7 +19,7 @@ class ProteinMasker:
         self.low_range = min(canonical_amino_acids_ids)
         self.high_range = max(canonical_amino_acids_ids)
 
-    def __call__(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __call__(self, input_ids: torch.Tensor, mlm_probability: float = 0.15) -> Tuple[torch.Tensor, torch.Tensor]:
         labels = input_ids.clone()
         
         # Create special tokens mask using broadcasting
@@ -28,7 +27,7 @@ class ProteinMasker:
         special_tokens_mask = (input_ids[..., None] == special_tokens).any(-1)
         
         # Create probability matrix and mask special tokens
-        probability_matrix = torch.full_like(labels, self.mlm_probability, dtype=torch.float)
+        probability_matrix = torch.full_like(labels, mlm_probability, dtype=torch.float)
         probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
         
         # Create masked indices
@@ -56,7 +55,7 @@ if __name__ == "__main__":
         'MYRTALYFTVCSIWLCQIITGVLSLKCKCDLCKDKNYTCITDGYCYTSATLKDGVILYNYRCLDLNFPMRNPMFCHKQIPIHHEFTLECCNDRDFCNIRLVPKLTPKDNATSDTSLGTIEIAVVIILPTLVICIIAMAIYLYYQNKRSTHHHLGLGDDSIEAPDHPILNGVSLKHMIEMTTSGSGSGLPLLVQRSIARQIQLVEIIGQGRYGEVWRGRWRGENVAVKIFSSREERSWFREAEIYQTVMLRHDNILGFIAADNKGVLSLKCKCDLCKDKNYTCITDGYCYTSATLKDGVILYNYRQLGASLNRFXVYALGLIFWEISRRCNVGGIYDEYQLPFYDAVPSDPTIEEMRRVVCVERQRPSIPNRWQSCEALHVMSKLMKECWYHNATARLTALRIKKTLANFRASEELKM'
     ]
     test_ids = tokenizer(test_seqs, return_tensors="pt", padding=True).input_ids
-    masker = ProteinMasker(tokenizer, mlm_probability=0.5)
+    masker = ProteinMasker(tokenizer)
     print(masker.mask_token_id)
     print(masker.special_tokens)
     print(masker.low_range, masker.high_range)
