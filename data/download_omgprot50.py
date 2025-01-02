@@ -17,5 +17,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     get("omgprot50_valid_%06d.bin" % 0)
     get("omgprot50_test_%06d.bin" % 0)
-    for i in range(1, args.num_chunks+1):
+    for i in range(0, args.num_chunks+1):
         get("omgprot50_train_%06d.bin" % i)

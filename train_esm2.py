@@ -159,17 +159,13 @@ if __name__ == "__main__":
     print0(f'Total batch size: {args.batch_size} tokens')
 
     # load tokens
-    train_loader = DistributedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size)
-    valid_loader = DistributedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size)
-    test_loader = DistributedDataLoader(args.input_test_bin, batch_size // 8, ddp_rank, ddp_world_size)
-    test_loader_padded = DistributedPaddedDataLoader(args.input_test_bin, batch_size // 8, ddp_rank, ddp_world_size, eos_id=2, pad_id=1)
-    print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
-    print0(f"Validation DataLoader: total number of tokens: {valid_loader.total_num_tokens} across {len(valid_loader.files)} files")
-    print0(f"Testing DataLoader: total number of tokens: {test_loader.total_num_tokens} across {len(test_loader.files)} files")
+    train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size, eos_id=2, pad_id=1)
+    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size, eos_id=2, pad_id=1)
+    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size // 8, ddp_rank, ddp_world_size, eos_id=2, pad_id=1)
+    print0(f"Training DataLoader: {len(train_loader.files)} files")
+    print0(f"Validation DataLoader: {len(valid_loader.files)} files")
+    print0(f"Testing DataLoader: {len(test_loader.files)} files")
     print0('='*100, logonly=True)
-
-    valid_steps = valid_loader.total_num_tokens // args.batch_size
-    test_steps = test_loader.total_num_tokens // args.batch_size
 
     input_ids = train_loader.next_batch()
 
@@ -250,15 +246,19 @@ if __name__ == "__main__":
             model.eval()
             valid_loader.reset()
             val_loss = 0.0
+            valid_steps = 0
+            valid_tokens = 0
             with torch.no_grad():
-                for _ in range(valid_steps):
-                    input_ids = valid_loader.next_batch()
-                    val_loss += model(input_ids, sliding_window_size)
+                while (val_input_ids := valid_loader.next_batch()) is not None:
+                    valid_steps += 1
+                    valid_tokens += (val_input_ids != 1).sum()
+                    val_loss += model(val_input_ids, sliding_window_size)
             if ddp_world_size > 1:
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+                dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
             val_loss /= valid_steps
             # log val loss to console and to logfile
-            print0(f'step:{step}/{args.num_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms perplexity:{(math.e**val_loss):.4f} param_count:{get_param_count(model):,}')
+            print0(f'step:{step}/{args.num_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms perplexity:{(math.e**val_loss):.4f} param_count:{get_param_count(model):,} tokens: {valid_tokens.item()}')
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -334,24 +334,16 @@ if __name__ == "__main__":
     test_loader.reset()
 
     test_loss = 0.0
+    test_steps = 0
+    test_tokens = 0
     with torch.no_grad():
-        for _ in range(test_steps):
-            input_ids = test_loader.next_batch()
+        while (input_ids := valid_loader.next_batch()) is not None:
+            test_steps += 1
             test_loss += model(input_ids, sliding_window_size)
+    # TODO: do we need all-reduce?
     test_loss /= test_steps
+
     print0(f"Test results | Loss: {test_loss:.4f} | Perplexity: {math.e**test_loss:.4f}")
-
-    # TODO: Remove
-    test_loader_padded.reset()
-    test_loss_padded = 0.0
-    with torch.no_grad():
-        for _ in range(test_steps):
-            input_ids = test_loader_padded.next_batch()
-            test_loss_padded += model(input_ids, sliding_window_size)
-    test_loss_padded /= test_steps
-    print0(f"Test (Padded) results | Loss: {test_loss_padded:.4f} | Perplexity: {math.e**test_loss_padded:.4f}")
-    #############
-
     print0(f"Total train time (min): {training_time_ms / 60000:.2f}")
     print0(f"Total train time (hours): {training_time_ms / 3600000:.2f}")
 
