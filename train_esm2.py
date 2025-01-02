@@ -74,7 +74,7 @@ def get_param_count(model):
     return total_params
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     args = get_args()
     if args.token:
         from huggingface_hub import login
@@ -146,7 +146,7 @@ if __name__ == "__main__":
     train_accumulation_steps = 1
     batch_size = args.batch_size
 
-    assert ddp_world_size == 1 or args.grad_accum == 1, "Cannot currently use both DDP and gradient accumulation"
+    assert ddp_world_size == 1 or args.grad_accum == 1, 'Cannot currently use both DDP and gradient accumulation'
     if ddp_world_size > 1:
         train_accumulation_steps = ddp_world_size
         batch_size = args.batch_size // ddp_world_size 
@@ -165,9 +165,9 @@ if __name__ == "__main__":
     train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
     valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
     test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size // 8, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
-    print0(f"Training DataLoader: {len(train_loader.files)} files")
-    print0(f"Validation DataLoader: {len(valid_loader.files)} files")
-    print0(f"Testing DataLoader: {len(test_loader.files)} files")
+    print0(f'Training DataLoader: {len(train_loader.files)} files')
+    print0(f'Validation DataLoader: {len(valid_loader.files)} files')
+    print0(f'Testing DataLoader: {len(test_loader.files)} files')
     print0('='*100, logonly=True)
 
     model = ESM(model_config)
@@ -212,7 +212,7 @@ if __name__ == "__main__":
 
     schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
-    sliding_window_size = torch.tensor(1024 - 128, dtype=torch.int32, device="cuda")
+    sliding_window_size = torch.tensor(1024 - 128, dtype=torch.int32, device='cuda')
     sw_prev = 1024 - 128
     # Start training loop
     training_time_ms = 0
@@ -253,7 +253,7 @@ if __name__ == "__main__":
                 while (input_ids := valid_loader.next_batch()) is not None:
                     valid_steps += 1
                     valid_tokens += (input_ids != 1).sum()
-                    val_loss += model(input_ids, sliding_window_size)
+                    val_loss += model(input_ids, sliding_window_size, mlm_probability=0.15)
             if ddp_world_size > 1:
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
                 dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
@@ -297,7 +297,7 @@ if __name__ == "__main__":
                 #if step >= 5:
                 #    stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
                 input_ids = train_loader.next_batch()
-                model(input_ids, sliding_window_size).backward()
+                model(input_ids, sliding_window_size, mlm_probability=0.20).backward()
         if train_accumulation_steps != 1:
             for p in model.parameters():
                 p.grad /= train_accumulation_steps
@@ -315,9 +315,9 @@ if __name__ == "__main__":
         # everything that follows now is just eval, diagnostics, prints, logging, etc.
         if step % 100 == 0:
             approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-            print0(f"step:{step+1}/{args.num_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+            print0(f'step:{step+1}/{args.num_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms')
 
-    print0(f"peak memory consumption training: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
+    print0(f'peak memory consumption training: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB')
 
     # save the model to huggingface
     try:
@@ -335,22 +335,41 @@ if __name__ == "__main__":
     test_loader.reset()
 
     test_loss, test_steps, test_tokens = 0.0, 0, 0
+    all_logits, all_labels = [], []
     with torch.no_grad():
         while (input_ids := test_loader.next_batch()) is not None:
             test_steps += 1
             test_tokens += (input_ids != 1).sum()
-            test_loss += model(input_ids, sliding_window_size)
+            logits, loss, labels = model.inference(input_ids, sliding_window_size, mlm_probability=0.15)
+            all_logits.extend(logits.detach().cpu().flatten().tolist())
+            all_labels.extend(labels.detach().cpu().flatten().tolist())
             if ddp_world_size > 1:
                 dist.all_reduce(test_loss, op=dist.ReduceOp.AVG)
                 dist.all_reduce(test_tokens, op=dist.ReduceOp.SUM)
     test_loss /= test_steps
 
-    print0(f"Test tokens: {test_tokens.item()}")
-    print0(f"Test results | Loss: {test_loss:.4f} | Perplexity: {math.e**test_loss:.4f}")
-    print0(f"Total train time (min): {training_time_ms / 60000:.2f}")
-    print0(f"Total train time (hours): {training_time_ms / 3600000:.2f}")
+    import numpy as np
+    from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, matthews_corrcoef
+    all_labels = np.array(all_labels)
+    all_logits = np.array(all_logits)
+    mask = (all_labels != -100)
+    all_labels = all_labels[mask]
+    all_logits = all_logits[mask]
 
-    print0(f"peak memory consumption testing: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
+    test_precision = precision_score(all_labels, all_logits, average='weighted')
+    test_recall = recall_score(all_labels, all_logits, average='weighted')
+    test_f1 = f1_score(all_labels, all_logits, average='weighted')
+    test_accuracy = accuracy_score(all_labels, all_logits)
+    test_mcc = matthews_corrcoef(all_labels, all_logits)
+
+    print0(f'Test tokens: {test_tokens.item()}')
+    print0(f'Loss: {test_loss:.4f} | Perplexity: {math.e**test_loss:.4f}')
+    print0(f'Precision: {test_precision:.4f} | Recall: {test_recall:.4f} | F1: {test_f1:.4f} | Accuracy: {test_accuracy:.4f} | MCC: {test_mcc:.4f}')
+    print0(f'Train Time: {training_time_ms:.0f}ms | Step Avg: {training_time_ms/(timed_steps-1):.2f}ms | Param Count: {get_param_count(model):,}')p
+    print0(f'Total train time (min): {training_time_ms / 60000:.2f}')
+    print0(f'Total train time (hours): {training_time_ms / 3600000:.2f}')
+
+    print0(f'peak memory consumption testing: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB')
     # -------------------------------------------------------------------------
     # clean up nice
     if ddp_world_size > 1:
