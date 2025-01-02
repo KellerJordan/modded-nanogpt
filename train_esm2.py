@@ -228,6 +228,8 @@ if __name__ == "__main__":
         # This effectively ignores timing first 10 steps, which are slower for weird reasons.
         # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
         # steps with dummy data first, and then re-initialize the model and reset the loader.
+        # TODO
+        # We should add this before the hackathon
         if step == 10:
             training_time_ms = 0
             t0 = time.perf_counter()
