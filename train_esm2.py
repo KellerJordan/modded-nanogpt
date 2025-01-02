@@ -167,8 +167,6 @@ if __name__ == "__main__":
     print0(f"Testing DataLoader: {len(test_loader.files)} files")
     print0('='*100, logonly=True)
 
-    input_ids = train_loader.next_batch()
-
     model = ESM(model_config)
     model = model.cuda().bfloat16()
     for m in model.modules():
@@ -245,14 +243,12 @@ if __name__ == "__main__":
             # run validation batches
             model.eval()
             valid_loader.reset()
-            val_loss = 0.0
-            valid_steps = 0
-            valid_tokens = 0
+            val_loss, valid_steps, valid_tokens = 0.0, 0, 0
             with torch.no_grad():
-                while (val_input_ids := valid_loader.next_batch()) is not None:
+                while (input_ids := valid_loader.next_batch()) is not None:
                     valid_steps += 1
-                    valid_tokens += (val_input_ids != 1).sum()
-                    val_loss += model(val_input_ids, sliding_window_size)
+                    valid_tokens += (input_ids != 1).sum()
+                    val_loss += model(input_ids, sliding_window_size)
             if ddp_world_size > 1:
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
                 dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
@@ -295,8 +291,8 @@ if __name__ == "__main__":
                     stack.enter_context(model.no_sync())
                 #if step >= 5:
                 #    stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
-                model(input_ids, sliding_window_size).backward()
                 input_ids = train_loader.next_batch()
+                model(input_ids, sliding_window_size).backward()
         if train_accumulation_steps != 1:
             for p in model.parameters():
                 p.grad /= train_accumulation_steps
@@ -333,16 +329,18 @@ if __name__ == "__main__":
     model.eval()
     test_loader.reset()
 
-    test_loss = 0.0
-    test_steps = 0
-    test_tokens = 0
+    test_loss, test_steps, test_tokens = 0.0, 0, 0
     with torch.no_grad():
-        while (input_ids := valid_loader.next_batch()) is not None:
+        while (input_ids := test_loader.next_batch()) is not None:
             test_steps += 1
+            test_tokens += (input_ids != 1).sum()
             test_loss += model(input_ids, sliding_window_size)
-    # TODO: do we need all-reduce?
+            if ddp_world_size > 1:
+                dist.all_reduce(test_loss, op=dist.ReduceOp.AVG)
+                dist.all_reduce(test_tokens, op=dist.ReduceOp.SUM)
     test_loss /= test_steps
 
+    print0(f"Test tokens: {test_tokens.item()}")
     print0(f"Test results | Loss: {test_loss:.4f} | Perplexity: {math.e**test_loss:.4f}")
     print0(f"Total train time (min): {training_time_ms / 60000:.2f}")
     print0(f"Total train time (hours): {training_time_ms / 3600000:.2f}")
