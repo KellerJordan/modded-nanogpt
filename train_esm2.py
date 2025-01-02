@@ -27,12 +27,13 @@ import math
 import torch
 import torch.distributed as dist
 import torch._inductor.config as config
+from transformers import EsmTokenizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
 
 from optimizer import Muon
 from model import ModelConfig, ESM, CastedLinear
-from dataloading import DistributedDataLoader
+from dataloading import DistributedPaddedDataLoader
 
 
 def get_args():
@@ -159,18 +160,15 @@ if __name__ == "__main__":
     print0(f'Total batch size: {args.batch_size} tokens')
 
     # load tokens
-    train_loader = DistributedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size)
-    valid_loader = DistributedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size)
-    test_loader = DistributedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size)
-    print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
-    print0(f"Validation DataLoader: total number of tokens: {valid_loader.total_num_tokens} across {len(valid_loader.files)} files")
-    print0(f"Testing DataLoader: total number of tokens: {test_loader.total_num_tokens} across {len(test_loader.files)} files")
+    tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
+    eos_id, pad_id = tokenizer.eos_token_id, tokenizer.pad_token_id
+    train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
+    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
+    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size // 8, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
+    print0(f"Training DataLoader: {len(train_loader.files)} files")
+    print0(f"Validation DataLoader: {len(valid_loader.files)} files")
+    print0(f"Testing DataLoader: {len(test_loader.files)} files")
     print0('='*100, logonly=True)
-
-    valid_steps = valid_loader.total_num_tokens // args.batch_size
-    test_steps = test_loader.total_num_tokens // args.batch_size
-
-    input_ids = train_loader.next_batch()
 
     model = ESM(model_config)
     model = model.cuda().bfloat16()
@@ -250,16 +248,18 @@ if __name__ == "__main__":
             # run validation batches
             model.eval()
             valid_loader.reset()
-            val_loss = 0.0
+            val_loss, valid_steps, valid_tokens = 0.0, 0, 0
             with torch.no_grad():
-                for _ in range(valid_steps):
-                    input_ids = valid_loader.next_batch()
-                    val_loss += model(input_ids, sliding_window_size, mlm_probability=0.15)
+                while (input_ids := valid_loader.next_batch()) is not None:
+                    valid_steps += 1
+                    valid_tokens += (input_ids != 1).sum()
+                    val_loss += model(input_ids, sliding_window_size)
             if ddp_world_size > 1:
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+                dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
             val_loss /= valid_steps
             # log val loss to console and to logfile
-            print0(f'step:{step}/{args.num_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms perplexity:{(math.e**val_loss):.4f} param_count:{get_param_count(model):,}')
+            print0(f'step:{step}/{args.num_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms perplexity:{(math.e**val_loss):.4f} param_count:{get_param_count(model):,} tokens: {valid_tokens.item()}')
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -296,8 +296,8 @@ if __name__ == "__main__":
                     stack.enter_context(model.no_sync())
                 #if step >= 5:
                 #    stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
-                model(input_ids, sliding_window_size, mlm_probability=0.20).backward()
                 input_ids = train_loader.next_batch()
+                model(input_ids, sliding_window_size).backward()
         if train_accumulation_steps != 1:
             for p in model.parameters():
                 p.grad /= train_accumulation_steps
@@ -333,13 +333,19 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     model.eval()
     test_loader.reset()
-    test_loss = 0.0
-    with torch.no_grad():
-        for _ in range(test_steps):
-            input_ids = test_loader.next_batch()
-            test_loss += model(input_ids, sliding_window_size, mlm_probability=0.15)
 
+    test_loss, test_steps, test_tokens = 0.0, 0, 0
+    with torch.no_grad():
+        while (input_ids := test_loader.next_batch()) is not None:
+            test_steps += 1
+            test_tokens += (input_ids != 1).sum()
+            test_loss += model(input_ids, sliding_window_size)
+            if ddp_world_size > 1:
+                dist.all_reduce(test_loss, op=dist.ReduceOp.AVG)
+                dist.all_reduce(test_tokens, op=dist.ReduceOp.SUM)
     test_loss /= test_steps
+
+    print0(f"Test tokens: {test_tokens.item()}")
     print0(f"Test results | Loss: {test_loss:.4f} | Perplexity: {math.e**test_loss:.4f}")
     print0(f"Total train time (min): {training_time_ms / 60000:.2f}")
     print0(f"Total train time (hours): {training_time_ms / 3600000:.2f}")
