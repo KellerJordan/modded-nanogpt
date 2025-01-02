@@ -109,13 +109,4 @@ class DistributedPaddedDataLoader(DistributedDataLoader):
             return None
 
         seq = super().next_batch()
-
-        # TODO: for verification of proper padding, can remove
-        if False:
-            # first token has to be BOS or there is no BOS
-            assert seq[0] == 0 or (seq == 0).sum() == 0, "first bos or no bos"
-            # last token has to be EOS or there is no EOS
-            first_pad_idx = (seq == self.pad_id).nonzero(as_tuple=True)[0][0].item()
-            assert (seq == self.eos_id).sum() == 0 or seq[first_pad_idx-1] == self.eos_id
-
         return seq
