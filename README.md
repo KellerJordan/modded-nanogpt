@@ -9,7 +9,7 @@ Setup environment and train ESM2
 git clone https://github.com/Synthyra/SpeedRunningESM2
 cd SpeedRunningESM2
 pip install -r requirements.txt
-pip install --pre torch==2.6.0.dev20241204+cu124 torchvision==0.20.0dev20241204 --index-url https://download.pytorch.org/whl/nightly/cu124 --upgrade
+pip install --pre torch==2.6.0.dev20241231+cu124 torchvision --index-url https://download.pytorch.org/whl/nightly/cu124 --upgrade
 python data/download_omgprot50.py # --num_chunks 10 you can download less chunks to save time
 ./run.sh
 ```
