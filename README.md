@@ -48,5 +48,8 @@ These match the [results](https://github.com/Synthyra/SpeedRunningESM2/pull/2#is
 |--------|----------|----------|---------|----|-----------|-----------|
 |ESM2-150|140M      |9.44 hours|1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs/f48932cb-f41f-4c0c-8f24-90c839e9dc9e.txt)| 2.2272 | Bugged |
 |ESM2-150|132M      |9.00 hours|1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs/e631bf18-f202-492b-a3b8-fbae2cb7484a.txt)| 2.2137 | 2.2093 |
+|ESM2-650|132M      |45.16 hours|1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs/a0a3dc4e-6f27-43e0-96fb-b1c2372a164b.txt)| 2.1044 | 2.1058 |
+
+
 
 

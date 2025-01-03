@@ -124,12 +124,6 @@ class Block(nn.Module):
         self.mlp = MLP(config.hidden_size, config.expansion_ratio)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def sdpa_forward(self, x: torch.Tensor, vi: torch.Tensor, x0: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x = x + self.attn.forward_sdpa(norm(x), vi, attention_mask)
-        x = x + self.mlp(norm(x))
-        return x
-
     def forward(self, x: torch.Tensor, vi: torch.Tensor, x0: torch.Tensor, block_mask: torch.Tensor) -> torch.Tensor:
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         x = x + self.attn(norm(x), vi, block_mask)
