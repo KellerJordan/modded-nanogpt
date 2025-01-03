@@ -255,8 +255,10 @@ class ESM(PreTrainedModel):
     def inference(
             self,
             input_ids: torch.Tensor,
-            sliding_window_size: torch.Tensor,
+            sliding_window_blocks: torch.Tensor,
             mlm_probability: torch.Tensor) -> Tuple[torch.Tensor, Any, Any]:
+        BLOCK_SIZE = 128
+        sliding_window_size = (sliding_window_blocks * BLOCK_SIZE)
         input_ids, labels = self.masker(input_ids, mlm_probability)
         logits = self.flex_forward(input_ids, sliding_window_size)
         loss = None
@@ -267,8 +269,10 @@ class ESM(PreTrainedModel):
     def forward(
             self,
             input_ids: torch.Tensor,
-            sliding_window_size: torch.Tensor,
+            sliding_window_blocks: torch.Tensor,
             mlm_probability: torch.Tensor) -> torch.Tensor:
+        BLOCK_SIZE = 128
+        sliding_window_size = (sliding_window_blocks * BLOCK_SIZE)
         input_ids, labels = self.masker(input_ids, mlm_probability)
         logits = self.flex_forward(input_ids, sliding_window_size)
         return self.cross_entropy(logits.view(-1, self.vocab_size), labels.view(-1).long())
