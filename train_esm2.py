@@ -357,15 +357,15 @@ def main(args):
     t0 = time.perf_counter()
     test_loader.reset()
     test_loss, test_tokens = 0.0, 0
-    all_logits, all_labels = [], []
+    all_preds, all_labels = [], []
     with torch.no_grad():
         input_ids = test_loader.next_batch()
         while input_ids.numel():
             batch_test_tokens = (input_ids != pad_id).sum()
             test_tokens += batch_test_tokens
-            logits, loss, labels = model.inference(input_ids, sliding_window_num_blocks, mlm_probability=eval_prob)
+            preds, loss, labels = model.inference(input_ids, sliding_window_num_blocks, mlm_probability=eval_prob)
             test_loss += loss * batch_test_tokens
-            all_logits.extend(logits.detach().cpu().flatten().tolist())
+            all_preds.extend(preds.detach().cpu().flatten().tolist())
             all_labels.extend(labels.detach().cpu().flatten().tolist())
             input_ids = test_loader.next_batch()
             if ddp_world_size > 1:
@@ -376,16 +376,16 @@ def main(args):
     import numpy as np
     from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, matthews_corrcoef
     all_labels = np.array(all_labels).flatten()
-    all_logits = np.array(all_logits).flatten()
+    all_preds = np.array(all_preds).flatten()
     mask = (all_labels != -100)
     all_labels = all_labels[mask]
-    all_logits = all_logits[mask]
+    all_preds = all_preds[mask]
 
-    test_precision = precision_score(all_labels, all_logits, average='weighted')
-    test_recall = recall_score(all_labels, all_logits, average='weighted')
-    test_f1 = f1_score(all_labels, all_logits, average='weighted')
-    test_accuracy = accuracy_score(all_labels, all_logits)
-    test_mcc = matthews_corrcoef(all_labels, all_logits)
+    test_precision = precision_score(all_labels, all_preds, average='weighted')
+    test_recall = recall_score(all_labels, all_preds, average='weighted')
+    test_f1 = f1_score(all_labels, all_preds, average='weighted')
+    test_accuracy = accuracy_score(all_labels, all_preds)
+    test_mcc = matthews_corrcoef(all_labels, all_preds)
 
     print0(f"Test results (inference pass): {test_tokens.item()}")
     print0(f'Test tokens: {test_tokens.item()}')

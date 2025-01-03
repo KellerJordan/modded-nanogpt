@@ -260,11 +260,11 @@ class ESM(PreTrainedModel):
         BLOCK_SIZE = 128
         sliding_window_size = (sliding_window_blocks * BLOCK_SIZE)
         input_ids, labels = self.masker(input_ids, mlm_probability)
-        logits = self.flex_forward(input_ids, sliding_window_size)
+        logits = self.flex_forward(input_ids, sliding_window_size).view(-1, self.vocab_size)
         loss = None
         if labels is not None:
-            loss = self.cross_entropy(logits.view(-1, self.vocab_size), labels.view(-1).long())
-        return logits, loss, labels
+            loss = self.cross_entropy(logits, labels.view(-1).long())
+        return logits.argmax(dim=-1), loss, labels
 
     def forward(
             self,
