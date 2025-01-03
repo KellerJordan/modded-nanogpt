@@ -179,9 +179,9 @@ def main(args):
     scalar_params = [p for p in raw_model.parameters() if p.ndim < 2]
     head_params = [raw_model.lm_head.weight]
 
-    # init the optimizer(s)
+    # init the optimizer(s) with ratios based on modded-nanoGPT2
     optimizer1 = torch.optim.Adam([
-        dict(params=embed_params, lr=args.lr),
+        dict(params=embed_params, lr=args.lr/4), # we device by 4 because the vocab size is much smaller
         dict(params=head_params, lr=args.lr/75), # 0.6/75
         dict(params=scalar_params, lr=args.lr/15) # 0.6/15
     ], betas=(0.8, 0.95), fused=True)
@@ -375,8 +375,8 @@ def main(args):
 
     import numpy as np
     from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, matthews_corrcoef
-    all_labels = np.array(all_labels)
-    all_logits = np.array(all_logits)
+    all_labels = np.array(all_labels).flatten()
+    all_logits = np.array(all_logits).flatten()
     mask = (all_labels != -100)
     all_labels = all_labels[mask]
     all_logits = all_logits[mask]
