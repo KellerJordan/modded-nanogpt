@@ -48,7 +48,7 @@ def get_args():
     parser.add_argument('--input_bin', type=str, default='data/omgprot50/omgprot50_train_*.bin', help='input .bins to train on')
     parser.add_argument('--input_valid_bin', type=str, default='data/omgprot50/omgprot50_valid_*.bin', help='input .bins to eval validation loss on')
     parser.add_argument('--input_test_bin', type=str, default='data/omgprot50/omgprot50_test_*.bin', help='input .bins to eval test loss on')
-    parser.add_argument('--start_mlm_prob', type=float, default=0.50, help='start mlm probability')
+    parser.add_argument('--start_mlm_prob', type=float, default=0.40, help='start mlm probability')
     parser.add_argument('--end_mlm_prob', type=float, default=0.15, help='end mlm probability')
 
     # Optimization hyperparams
@@ -156,7 +156,7 @@ def main(args):
     eos_id, pad_id = tokenizer.eos_token_id, tokenizer.pad_token_id
     train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
     valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
-    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size // 8, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
+    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
     print0(f'Training DataLoader: {len(train_loader.files)} files')
     print0(f'Validation DataLoader: {len(valid_loader.files)} files')
     print0(f'Testing DataLoader: {len(test_loader.files)} files')
@@ -199,13 +199,14 @@ def main(args):
             decay_ratio = (args.num_steps - it) / args.cooldown_steps
             return decay_ratio
 
-    # sliding window size schedule: linear increase over training in chunks of 128 from 128 -> 1024. By @fernbear.bsky.social
-    # TODO
-    # Not sure if sliding window will be helpful for proteins
+    # sliding window size schedule: linear increase over training in chunks of 128 from 256 -> 2048. By @fernbear.bsky.social
     def get_sliding_window_blocks(it):
         x = it / args.num_steps # training progress
         assert 0 <= x <= 1
-        return 1024 // 128 # disabling for now
+        min_blocks = 2  # 256 tokens
+        max_blocks = 16 # 2048 tokens
+        blocks = min_blocks + (max_blocks - min_blocks) * x
+        return max(min_blocks, min(max_blocks, round(blocks)))
     
     # mlm probability schedule: linear decrease over training from start_mlm_prob to end_mlm_prob. By @lapp0
     def get_mlm_probability(it):
@@ -349,55 +350,14 @@ def main(args):
         dist.all_reduce(test_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(test_tokens, op=dist.ReduceOp.SUM)
     test_loss /= test_tokens
-
-    original_test_loss = test_loss
-    print0(f"Original test loss (regular forward pass): {original_test_loss:.4f}")
-
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    test_loader.reset()
-    test_loss, test_tokens = 0.0, 0
-    all_preds, all_labels = [], []
-    with torch.no_grad():
-        input_ids = test_loader.next_batch()
-        while input_ids.numel():
-            batch_test_tokens = (input_ids != pad_id).sum()
-            test_tokens += batch_test_tokens
-            preds, loss, labels = model.inference(input_ids, sliding_window_num_blocks, mlm_probability=eval_prob)
-            test_loss += loss * batch_test_tokens
-            all_preds.extend(preds.detach().cpu().flatten().tolist())
-            all_labels.extend(labels.detach().cpu().flatten().tolist())
-            input_ids = test_loader.next_batch()
-            if ddp_world_size > 1:
-                dist.all_reduce(test_loss, op=dist.ReduceOp.SUM)
-                dist.all_reduce(test_tokens, op=dist.ReduceOp.SUM)
-    test_loss /= test_tokens
-
-    import numpy as np
-    from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, matthews_corrcoef
-    all_labels = np.array(all_labels).flatten()
-    all_preds = np.array(all_preds).flatten()
-    mask = (all_labels != -100)
-    all_labels = all_labels[mask]
-    all_preds = all_preds[mask]
-
-    test_precision = precision_score(all_labels, all_preds, average='weighted')
-    test_recall = recall_score(all_labels, all_preds, average='weighted')
-    test_f1 = f1_score(all_labels, all_preds, average='weighted')
-    test_accuracy = accuracy_score(all_labels, all_preds)
-    test_mcc = matthews_corrcoef(all_labels, all_preds)
-
-    print0(f"Test results (inference pass): {test_tokens.item()}")
     print0(f'Test tokens: {test_tokens.item()}')
     print0(f'Loss: {test_loss:.4f} | Perplexity: {math.e**test_loss:.4f}')
-    print0(f'Precision: {test_precision:.4f} | Recall: {test_recall:.4f} | F1: {test_f1:.4f} | Accuracy: {test_accuracy:.4f} | MCC: {test_mcc:.4f}')
-   
     print0(f"peak memory consumption testing: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
     # -------------------------------------------------------------------------
     # clean up nice
     if ddp_world_size > 1:
         dist.destroy_process_group()
-    return val_loss, test_loss, test_precision, test_recall, test_f1, test_accuracy, test_mcc
+    return val_loss, test_loss
 
 
 if __name__ == '__main__':
@@ -406,4 +366,4 @@ if __name__ == '__main__':
         from huggingface_hub import login
         login(args.token)
         args.token = None
-    metrics = main(args) # so we can do easier hyperparameter tuning
+    val_loss, test_loss = main(args) # so we can do easier hyperparameter tuning
