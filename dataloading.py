@@ -38,13 +38,13 @@ class DistributedDataLoader:
         self.next_shard = (self.next_shard + 1) % len(self.files)
 
     def next_batch(self):
-        buf = self.tokens[self.pos + self.rank * self.local_batch_size:][:self.local_batch_size + 1]
+        buf = self.tokens[self.pos + self.rank * self.local_batch_size:][:self.local_batch_size]
         # by @YouJiacheng: host side async is sufficient;
         # no performance improvement was observed when introducing a separate stream.
         sequence = buf.to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
         # advance current position and load next shard if necessary
         self.pos += self.batch_size
-        if self.pos + self.batch_size + 1 >= len(self.tokens):
+        if self.pos + self.batch_size >= len(self.tokens):
             self.advance()
         return sequence
 
@@ -60,25 +60,27 @@ class DistributedPaddedDataLoader(DistributedDataLoader):
     def advance(self):
         self.pos = 0
 
-        if self.next_shard // len(self.files) >= self.max_epochs:
-            raw_tokens = self._leftover_tokens
-        else:
-            self.next_shard += 1
+        # handle epoch limit
+        if self.next_shard // len(self.files) < self.max_epochs:
             raw_tokens = _load_data_shard(self.files[self.next_shard % len(self.files)])
             raw_tokens = torch.cat([self._leftover_tokens, raw_tokens], dim=0)
-
+            self.next_shard += 1
+        else:
+            raw_tokens = self._leftover_tokens
         if not raw_tokens.numel():
             self._leftover_tokens = torch.empty(0, dtype=torch.uint8)
-            self.tokens = None
+            self.tokens = torch.empty(0, dtype=torch.uint8)
             return
 
         processed_chunks = []
         curr_batch_len = 0
 
         eos_positions = (raw_tokens == self.eos_id).nonzero(as_tuple=True)[0]
-        for i in range(len(eos_positions)-1):
-            sample_end = eos_positions[i+1]
-            sample = raw_tokens[eos_positions[i]+1:sample_end+1]  # One sample: "CLS ... EOS"
+
+        for i in range(len(eos_positions)):
+            curr_eos = eos_positions[i]
+            prev_eos_plus_one = 0 if i == 0 else eos_positions[i-1] + 1  # EOS_idx + 1 = CLS_idx
+            sample = raw_tokens[prev_eos_plus_one:curr_eos+1]  # One sample: "CLS ... EOS"
 
             assert sample[0] == 0 and sample[-1] == 2, (sample[0], sample[-1])
             assert curr_batch_len < self.local_batch_size, curr_batch_len
@@ -101,12 +103,5 @@ class DistributedPaddedDataLoader(DistributedDataLoader):
             processed_chunks.append(sample)
             curr_batch_len += len(sample)
 
-        self._leftover_tokens = raw_tokens[sample_end+1:]
+        self._leftover_tokens = raw_tokens[curr_eos+1:]
         self.tokens = torch.cat(processed_chunks, dim=0)
-
-    def next_batch(self):
-        if self.tokens is None:
-            return None
-
-        seq = super().next_batch()
-        return seq
