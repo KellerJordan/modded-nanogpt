@@ -41,7 +41,7 @@ def get_args():
 
     # Model hyperparams
     parser.add_argument('--vocab_size', type=int, default=33, help='vocabulary size')
-    parser.add_argument('--num_hidden_layers', type=int, default=24, help='number of transformer layers')
+    parser.add_argument('--num_hidden_layers', type=int, default=12, help='number of transformer layers')
     parser.add_argument('--num_attention_heads', type=int, default=6, help='number of attention heads (head dim 128 suggested by @Grad62304977)')
     parser.add_argument('--hidden_size', type=int, default=768, help='model hidden dimension size')
 
@@ -51,11 +51,11 @@ def get_args():
     parser.add_argument('--input_test_bin', type=str, default='data/omgprot50/omgprot50_test_*.bin', help='input .bins to eval test loss on')
 
     # Optimization hyperparams
-    parser.add_argument('--batch_size', type=int, default=8*64*1024, help='batch size, in tokens, across all devices')
+    parser.add_argument('--batch_size', type=int, default=4*64*1024, help='batch size, in tokens, across all devices')
     parser.add_argument('--grad_accum', type=int, default=1, help='manually set number of gradient accumulation steps, else, will be ddp_world_size')
-    parser.add_argument('--num_steps', type=int, default=25000, help='number of iterations to run')
-    parser.add_argument('--warmup_steps', type=int, default=1000, help='number of warmup steps')
-    parser.add_argument('--cooldown_steps', type=int, default=1000, help='number of cooldown steps')
+    parser.add_argument('--num_steps', type=int, default=20000, help='number of iterations to run')
+    parser.add_argument('--warmup_steps', type=int, default=100, help='number of warmup steps')
+    parser.add_argument('--cooldown_steps', type=int, default=2000, help='number of cooldown steps')
     parser.add_argument('--max_length', type=int, default=1024, help='maximum sequence length')
 
     # Evaluation and logging hyperparams
@@ -190,10 +190,10 @@ if __name__ == '__main__':
     params = list(raw_model.blocks.parameters())
     matrix_params = [p for p in params if p.ndim == 2]
     scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-    optimizer1 = torch.optim.Adam(embed_params, lr=0.6, betas=(0.8, 0.95), fused=True)
-    optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
-    optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
-    optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
+    optimizer1 = torch.optim.Adam(embed_params, lr=0.3, betas=(0.8, 0.95), fused=True)
+    optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.001, betas=(0.8, 0.95), fused=True)
+    optimizer3 = Muon(matrix_params, lr=0.01, momentum=0.95)
+    optimizer4 = torch.optim.Adam(scalar_params, lr=0.01, betas=(0.8, 0.95), fused=True)
     optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 
     # learning rate decay scheduler (linear warmup and cooldown)
@@ -212,6 +212,7 @@ if __name__ == '__main__':
 
     schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
+    initial_mask_rate, final_mask_rate = 0.50, 0.15
     sliding_window_size = torch.tensor(1024 - 128, dtype=torch.int32, device='cuda')
     sw_prev = 1024 - 128
     # Start training loop
@@ -239,6 +240,7 @@ if __name__ == '__main__':
         if sw_size != sw_prev:
             sliding_window_size.copy_(sw_size, non_blocking=True)
             sw_prev = sw_size
+        mlm_probability = initial_mask_rate + (final_mask_rate - initial_mask_rate) * frac_done
 
         # once in a while evaluate the validation dataset
         if args.valid_loss_every > 0 and step % args.valid_loss_every == 0 or last_step:
@@ -254,7 +256,7 @@ if __name__ == '__main__':
                 while input_ids.numel():
                     batch_valid_tokens = (input_ids != pad_id).sum()
                     valid_tokens += batch_valid_tokens
-                    val_loss += model(input_ids, sliding_window_size) * batch_valid_tokens
+                    val_loss += model(input_ids, sliding_window_size, mlm_probability=0.15) * batch_valid_tokens
                     input_ids = valid_loader.next_batch()
             if ddp_world_size > 1:
                 dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
@@ -299,7 +301,7 @@ if __name__ == '__main__':
                 #if step >= 5:
                 #    stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
                 input_ids = train_loader.next_batch()
-                model(input_ids, sliding_window_size, mlm_probability=0.20).backward()
+                model(input_ids, sliding_window_size, mlm_probability=mlm_probability).backward()
         if train_accumulation_steps != 1:
             for p in model.parameters():
                 p.grad /= train_accumulation_steps
