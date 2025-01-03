@@ -11,8 +11,6 @@ def get(fname):
             hf_hub_download(repo_id="Synthyra/omg_prot50_packed", filename=fname, repo_type="dataset", local_dir=local_dir)
         except Exception as e:
             print(f"Error downloading {fname}: {e}")
-            print('Forcing download...')
-            hf_hub_download(repo_id="Synthyra/omg_prot50_packed", filename=fname, repo_type="dataset", local_dir=local_dir, force_download=True)
 
 
 if __name__ == "__main__":
