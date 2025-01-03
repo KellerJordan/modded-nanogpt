@@ -255,8 +255,8 @@ class ESM(PreTrainedModel):
     def inference(
             self,
             input_ids: torch.Tensor,
-            sliding_window_size: torch.Tensor = None,
-            mlm_probability: float = 0.15) -> Tuple[torch.Tensor, Any, Any]:
+            sliding_window_size: torch.Tensor,
+            mlm_probability: torch.Tensor) -> Tuple[torch.Tensor, Any, Any]:
         input_ids, labels = self.masker(input_ids, mlm_probability)
         logits = self.flex_forward(input_ids, sliding_window_size)
         loss = None
@@ -268,7 +268,7 @@ class ESM(PreTrainedModel):
             self,
             input_ids: torch.Tensor,
             sliding_window_size: torch.Tensor,
-            mlm_probability: float = 0.15) -> torch.Tensor:
+            mlm_probability: torch.Tensor) -> torch.Tensor:
         input_ids, labels = self.masker(input_ids, mlm_probability)
         logits = self.flex_forward(input_ids, sliding_window_size)
         return self.cross_entropy(logits.view(-1, self.vocab_size), labels.view(-1).long())

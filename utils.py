@@ -19,7 +19,7 @@ class ProteinMasker:
         self.low_range = min(canonical_amino_acids_ids)
         self.high_range = max(canonical_amino_acids_ids)
 
-    def __call__(self, input_ids: torch.Tensor, mlm_probability: float = 0.15) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __call__(self, input_ids: torch.Tensor, mlm_probability: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         labels = input_ids.clone()
         
         # Create special tokens mask using broadcasting
@@ -27,7 +27,7 @@ class ProteinMasker:
         special_tokens_mask = (input_ids[..., None] == special_tokens).any(-1)
         
         # Create probability matrix and mask special tokens
-        probability_matrix = torch.full_like(labels, mlm_probability, dtype=torch.float)
+        probability_matrix = torch.full_like(labels, mlm_probability.item(), dtype=torch.float)
         probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
         
         # Create masked indices

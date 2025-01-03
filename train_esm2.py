@@ -212,7 +212,8 @@ if __name__ == '__main__':
 
     schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
-    initial_mask_rate, final_mask_rate = 0.50, 0.15
+    initial_mask_rate, final_mask_rate = torch.tensor(0.50, device='cuda'), torch.tensor(0.15, device='cuda')
+    mlm_probability = torch.tensor(0.50, device='cuda')
     sliding_window_size = torch.tensor(1024 - 128, dtype=torch.int32, device='cuda')
     sw_prev = 1024 - 128
     # Start training loop
@@ -240,7 +241,7 @@ if __name__ == '__main__':
         if sw_size != sw_prev:
             sliding_window_size.copy_(sw_size, non_blocking=True)
             sw_prev = sw_size
-        mlm_probability = initial_mask_rate + (final_mask_rate - initial_mask_rate) * frac_done
+        mlm_probability.copy_(initial_mask_rate + (final_mask_rate - initial_mask_rate) * frac_done, non_blocking=True)
 
         # once in a while evaluate the validation dataset
         if args.valid_loss_every > 0 and step % args.valid_loss_every == 0 or last_step:
@@ -256,7 +257,7 @@ if __name__ == '__main__':
                 while input_ids.numel():
                     batch_valid_tokens = (input_ids != pad_id).sum()
                     valid_tokens += batch_valid_tokens
-                    val_loss += model(input_ids, sliding_window_size, mlm_probability=0.15) * batch_valid_tokens
+                    val_loss += model(input_ids, sliding_window_size, mlm_probability=final_mask_rate) * batch_valid_tokens
                     input_ids = valid_loader.next_batch()
             if ddp_world_size > 1:
                 dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
@@ -344,7 +345,7 @@ if __name__ == '__main__':
         while input_ids.numel():
             batch_test_tokens = (input_ids != pad_id).sum()
             test_tokens += batch_test_tokens
-            test_loss += model(input_ids, sliding_window_size, mlm_probability=0.15) * batch_test_tokens
+            test_loss += model(input_ids, sliding_window_size, mlm_probability=final_mask_rate) * batch_test_tokens
             input_ids = test_loader.next_batch()
     if ddp_world_size > 1:
         dist.all_reduce(test_loss, op=dist.ReduceOp.SUM)
@@ -361,7 +362,7 @@ if __name__ == '__main__':
         while input_ids.numel():
             batch_test_tokens = (input_ids != pad_id).sum()
             test_tokens += batch_test_tokens
-            logits, loss, labels = model.inference(input_ids, sliding_window_size, mlm_probability=0.15)
+            logits, loss, labels = model.inference(input_ids, sliding_window_size, mlm_probability=final_mask_rate)
             test_loss += loss * batch_test_tokens
             all_logits.extend(logits.detach().cpu().flatten().tolist())
             all_labels.extend(labels.detach().cpu().flatten().tolist())
