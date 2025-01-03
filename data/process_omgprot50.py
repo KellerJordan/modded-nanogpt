@@ -39,7 +39,7 @@ def write_datafile(filename, toks):
 def tokenize(doc, tokenizer, max_length):
     # tokenizes a single document and returns a numpy array of uint8 tokens
     # uint8 can hold the 33 tokens
-    return np.array(tokenizer.encode(doc["sequence"], add_special_tokens=True, truncation=True, max_length=max_length), dtype=np.uint8)
+    return np.array(tokenizer.encode(doc["sequence"], add_special_tokens=True, truncation=True, padding=False, max_length=max_length), dtype=np.uint8)
 
 
 def tokenize_fw(fw, split='train', max_length=1024):
@@ -104,4 +104,4 @@ if __name__ == "__main__":
     test_fw = load_dataset("Synthyra/omg_prot50", split="test")
     tokenize_fw(valid_fw, split='valid', max_length=args.max_length)
     tokenize_fw(test_fw, split='test', max_length=args.max_length)
-    tokenize_fw(train_fw, split='train', max_length=args.max_length)
+    tokenize_fw(train_fw, split='train', max_length=100000) # don't trim training data
