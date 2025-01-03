@@ -389,7 +389,7 @@ if __name__ == '__main__':
     print0(f'Test tokens: {test_tokens.item()}')
     print0(f'Loss: {test_loss:.4f} | Perplexity: {math.e**test_loss:.4f}')
     print0(f'Precision: {test_precision:.4f} | Recall: {test_recall:.4f} | F1: {test_f1:.4f} | Accuracy: {test_accuracy:.4f} | MCC: {test_mcc:.4f}')
-    print0(f'Train Time: {training_time_ms:.0f}ms | Step Avg: {training_time_ms/(timed_steps-1):.2f}ms | Param Count: {get_param_count(model):,}')p
+    print0(f'Train Time: {training_time_ms:.0f}ms | Step Avg: {training_time_ms/(timed_steps-1):.2f}ms | Param Count: {get_param_count(model):,}')
     print0(f'Total train time (min): {training_time_ms / 60000:.2f}')
     print0(f'Total train time (hours): {training_time_ms / 3600000:.2f}')
     print0(f"peak memory consumption testing: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
