@@ -89,23 +89,32 @@ if __name__ == '__main__':
 
     # set up DDP (distributed data parallel) if available, otherwise single GPU
     if 'RANK' in os.environ:
+        # Initialize process group first
+        dist.init_process_group(backend='nccl')
+        
+        # Get DDP variables
         ddp_rank = int(os.environ['RANK'])
         ddp_local_rank = int(os.environ['LOCAL_RANK'])
         ddp_world_size = int(os.environ['WORLD_SIZE'])
-        device = torch.device(f'cuda:{ddp_local_rank}')
+        
+        # Set device and make it current
+        device = f'cuda:{ddp_local_rank}'
         torch.cuda.set_device(device)
-        dist.init_process_group(backend='nccl', device_id=device)
-        dist.barrier()
+        
         master_process = (ddp_rank == 0)
+        
+        # Wait for all processes to be ready
+        dist.barrier()
     else:
         ddp_rank = 0
         ddp_local_rank = 0
         ddp_world_size = 1
-        device = torch.device('cuda:0')
+        device = 'cuda:0'
         torch.cuda.set_device(device)
         master_process = True
 
-    print(f'using device: {device}')
+    device = torch.device(device)
+    print(f'Process {ddp_rank}: using device: {device}')
 
     # begin logging
     logfile = None
