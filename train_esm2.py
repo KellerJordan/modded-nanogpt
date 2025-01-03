@@ -248,15 +248,14 @@ if __name__ == "__main__":
             # run validation batches
             model.eval()
             valid_loader.reset()
-            val_loss = 0.0
-            valid_tokens = 0
+            val_loss, valid_tokens = 0.0, 0
             with torch.no_grad():
-                val_input_ids = valid_loader.next_batch()
-                while val_input_ids.numel():
-                    batch_valid_tokens = (val_input_ids != 1).sum()
+                input_ids = valid_loader.next_batch()
+                while input_ids.numel():
+                    batch_valid_tokens = (input_ids != pad_id).sum()
                     valid_tokens += batch_valid_tokens
-                    val_loss += model(val_input_ids, sliding_window_size) * batch_valid_tokens
-                    val_input_ids = valid_loader.next_batch()
+                    val_loss += model(input_ids, sliding_window_size) * batch_valid_tokens
+                    input_ids = valid_loader.next_batch()
             if ddp_world_size > 1:
                 dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
                 dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
