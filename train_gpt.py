@@ -318,7 +318,7 @@ class GPT(nn.Module):
 
         x = norm(x)
         logits = self.lm_head(x)
-        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
+        logits = 15 * torch.tanh(logits / 15) # @Grad62304977 added tanh softcapping, @KoszarskyB reduced it from 30 to 15
         logits = logits.float()
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets)
         return loss
@@ -382,7 +382,7 @@ class Hyperparameters:
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
     max_device_batch_size = 64*1024 # batch size per device in tokens
-    num_iterations = 1490 # number of iterations to run
+    num_iterations = 1390 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     bf16_embeds = True
     # evaluation and logging
