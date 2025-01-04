@@ -41,12 +41,7 @@ For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss 
 
 **Note: torch.compile will take a long time on the first run.**
 
-## Running it on fewer GPUs or with less memory
-
-* To run on fewer GPUs, just modify `run.sh` to have a different `--nproc_per_node`. (this does not change the expected behavior of the training)
-* If you're running out of memory, you may need to reduce the sequence length for FlexAttention (which does change the training. see [here](https://github.com/KellerJordan/modded-nanogpt/pull/38) for a guide)
-
-## Running with Docker
+## Alternative: Running with Docker
 
 For cases where CUDA or NCCL versions aren't compatible with your current system setup, Docker can be a helpful alternative.
 This approach standardizes versions for CUDA, NCCL, CUDNN, and Python, reducing dependency issues and simplifying setup. 
@@ -57,6 +52,7 @@ sudo docker build -t modded-nanogpt .
 sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt python data/cached_fineweb10B.py 10
 sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt sh run.sh
 ```
+
 ---
 
 ## World record history
@@ -206,21 +202,10 @@ compared to Shampoo.
 
 ---
 
-## Startup script
+## Running on fewer GPUs
 
-Here's a good startup script for a fresh 8xH100 instance.
-
-```
-sudo apt-get update
-sudo apt-get install vim tmux python3-pip python-is-python3 -y
-git clone https://github.com/KellerJordan/modded-nanogpt.git
-cd modded-nanogpt
-tmux
-
-pip install numpy==1.23.5 huggingface-hub tqdm
-pip install --upgrade torch &
-python data/cached_fineweb10B.py 18
-```
+* To run experiments on fewer GPUs, simply modify `run.sh` to have a different `--nproc_per_node`. This should not change the behavior of the training.
+* If you're running out of memory, you may need to reduce the sequence length for FlexAttention (which does change the training. see [here](https://github.com/KellerJordan/modded-nanogpt/pull/38) for a guide)
 
 ---
 
