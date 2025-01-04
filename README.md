@@ -32,7 +32,7 @@ To install and execute the training, run the following commands.
 git clone https://github.com/KellerJordan/modded-nanogpt.git & cd modded-nanogpt
 pip install -r requirements.txt
 pip install --pre torch==2.6.0.dev20241231+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade # install torch 2.6.0
-python data/cached_fineweb10B.py 10 # downloads only the first 1.0B training tokens to save time
+python data/cached_fineweb10B.py 8 # downloads only the first 0.8B training tokens to save time
 ./run.sh
 ```
 
