@@ -27,7 +27,7 @@ Contributors to the SOTA: [@Grad62304977](https://x.com/Grad62304977),
 
 ## Running the current record
 
-To install and execute the training, run the following commands.
+To run the current record, run the following commands.
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git & cd modded-nanogpt
 pip install -r requirements.txt
