@@ -26,9 +26,9 @@ Contributors to the SOTA: [@Grad62304977](https://x.com/Grad62304977),
 
 ## Running the current record
 
-To run the current record, run the following commands.
+To run the current record, run the following commands in an environment.
 ```bash
-git clone https://github.com/KellerJordan/modded-nanogpt.git & cd modded-nanogpt
+git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install -r requirements.txt
 pip install --pre torch==2.6.0.dev20241231+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade # install torch 2.6.0
 python data/cached_fineweb10B.py 8 # downloads only the first 0.8B training tokens to save time
