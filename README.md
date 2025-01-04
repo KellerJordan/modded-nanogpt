@@ -2,8 +2,8 @@
 
 This is a modified variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in only:
-* 0.8B tokens instead of 10B
-* 3.57 minutes on 8xH100 instead of 45
+* 0.7B tokens instead of 10B
+* 3.4 minutes on 8xH100 instead of 45
 
 It has been hyperoptimized by the community, and has become a good baseline from which to perform research on the architecture/optimizer/etc.
 
@@ -90,10 +90,9 @@ The following is the progression of world records for the task of *training a mo
 All new record attempts:
 
 1. Must not modify the train or validation data pipelines. (Except to change batch size, seqlen, attention structure etc. I.e., just don't change the underlying tokens.)
-2. Must use ≤ 124M active parameters per token. (So MoE is fine; and extra embedding layers can be added since they only contribute hidden_dim active params.)
-3. Must attain ≤ 3.28 val loss. Unfortunately, due to high inter-run variance, new record attempts must provide enough run logs to attain a statistical significance level of p<0.01 that their average val loss is lower than 3.28. You see see how to conduct a t-test [here](./records/120424_ValueEmbed).
+2. Must attain ≤ 3.28 val loss. Unfortunately, due to high inter-run variance, new record attempts must provide enough run logs to attain a statistical significance level of p<0.01 that their average val loss is lower than 3.28. You see see how to conduct a t-test [here](./records/120424_ValueEmbed).
 
-Other than that, go crazy! Anything is fair game
+Other than that, go crazy! Anything is fair game (e.g., MoE is fair, but will probably require implementing fast kernels to be competitive).
 
 <!--Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
 So it's no surprise that there is room to improve; as @karpathy has said, 'llm.c still has a lot of pending optimizations.'
