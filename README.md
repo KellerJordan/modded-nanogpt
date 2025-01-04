@@ -10,14 +10,14 @@ The current iteration reaches the same performance as Karpathy's original traine
 * 0.7B tokens (original trainer needed 10B)
 
 This improvement in training performance is due to the following techniques:
-* Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
-* Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[standalone implementation](https://github.com/KellerJordan/Muon)].
-* Untied head from embedding.
-* Initialized projection and classification layers to zero (muP-like).
-* Added tanh soft logit capping (following Gemma 2).
-* Inserted skip connection from the embedding to every layer.
-* Added extra embeddings which are mixed into the value in attention layers.
-* Used FlexAttention with window size warmup.
+* Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2
+* Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[standalone implementation](https://github.com/KellerJordan/Muon)]
+* Untied head from embedding
+* Initialized projection and classification layers to zero (muP-like)
+* Added tanh soft logit capping (following Gemma 2)
+* Inserted skip connection from the embedding to every layer
+* Added extra embeddings which are mixed into the value in attention layers
+* Used FlexAttention with window size warmup
 
 The training has attained this speed due to the contributions of meself, [@Grad62304977](https://x.com/Grad62304977),
 [@jxbz](https://x.com/jxbz), [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan),
