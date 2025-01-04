@@ -17,7 +17,7 @@ This improvement in training performance is due to the following techniques:
 * Added tanh soft logit capping (following Gemma 2)
 * Inserted skip connection from the embedding to every layer
 * Added extra embeddings which are mixed into the values in attention layers
-* Used FlexAttention with window size warmup
+* Switched from 1024-seqlen dense causal attention to FlexAttention with window size warmup
 
 The training has attained this speed due to the contributions of meself, [@Grad62304977](https://x.com/Grad62304977),
 [@jxbz](https://x.com/jxbz), [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan),
