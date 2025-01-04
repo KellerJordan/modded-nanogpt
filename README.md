@@ -1,22 +1,23 @@
 # Modded-NanoGPT
 
-This is a modified variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
-Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in only:
-* 0.7B tokens instead of 10B
-* 3.4 minutes on 8xH100 instead of 45
+The purpose of this repository is to collaboratively determine the optimal way to train small-scale language models.
 
-It has been hyperoptimized by the community, and has become a good baseline from which to perform research on the architecture/optimizer/etc.
+We began with Andrej Karpathy's [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py)
+from [llm.c](https://github.com/karpathy/llm.c), which attains 3.28 validation loss on the FineWeb dataset after training for 45 minutes on 8 NVIDIA H100 GPUs.
+We then iteratively improved the trainer in order to attain the same level of performance in less wallclock time.
+The current iteration reaches the same performance as Karpathy's original trainer in:
+* 3.4 minutes on 8xH100 (original trainer needed 45)
+* 0.7B tokens (original trainer needed 10B)
 
-It uses the following techniques:
+This improvement in training performance is due to the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
 * New optimizer: [Muon - Momentum Orthogonalized by Newton-schulz](https://kellerjordan.github.io/posts/muon/) [[standalone implementation](https://github.com/KellerJordan/Muon)].
 * Untied head from embedding.
-* Projection and classification layers initialized to zero (muP-like).
-* Architectural shortcuts: value residual and embedding shortcut (partially following https://arxiv.org/abs/2410.17897).
-* Momentum warmup.
-* Tanh soft logit capping (following Gemma 2).
-* FlexAttention with window size warmup.
-* Extra embeddings which are fed into intermediate attention layers.
+* Initialized projection and classification layers to zero (muP-like).
+* Added tanh soft logit capping (following Gemma 2).
+* Inserted skip connection from the embedding to every layer.
+* Added extra embeddings which are mixed into the value in attention layers.
+* Used FlexAttention with window size warmup.
 
 The training has attained this speed due to the contributions of meself, [@Grad62304977](https://x.com/Grad62304977),
 [@jxbz](https://x.com/jxbz), [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan),
