@@ -12,11 +12,11 @@ This improvement in training performance is due to the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2
 * Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[code](https://github.com/KellerJordan/Muon)]
 * Untied head from embedding
-* Initialized projection and classification layers to zero (muP-like)
-* Added tanh soft logit capping (following Gemma 2)
-* Inserted skip connection from the embedding to every layer
-* Added extra embeddings which are mixed into the values in attention layers
-* Switched from 1024-seqlen causal attention to FlexAttention with window size warmup
+* Projection and classification layers initialized to zero (muP-like)
+* Tanh soft logit capping (following Gemma 2)
+* Skip connections from the embedding to every layer
+* Extra embeddings which are mixed into the values in attention layers
+* FlexAttention with window size warmup
 
 Contributors to the SOTA: [@Grad62304977](https://x.com/Grad62304977),
 [@jxbz](https://x.com/jxbz), [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan),
