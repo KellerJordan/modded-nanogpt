@@ -27,9 +27,7 @@ Contributors to the SOTA: [@Grad62304977](https://x.com/Grad62304977),
 
 ## Running the current record
 
-To install and execute the training, run the following four commands.
-They should all complete within <20min on an 8xH100 with decent internet connection.
-If the torch install command updates your cuda installation, you many need to reboot.
+To install and execute the training, run the following commands.
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git & cd modded-nanogpt
 pip install -r requirements.txt
@@ -38,7 +36,7 @@ python data/cached_fineweb10B.py 10 # downloads only the first 1.0B training tok
 ./run.sh
 ```
 
-The result will be a transformer with 124M active parameters trained for 1490 steps on 0.75B tokens of Fineweb [1], achieving ~3.278 mean validation loss (w/ up to 0.005 inter-run stddev).
+The result will be a transformer with 124M active parameters trained for 1390 steps on 0.73B tokens of Fineweb [1], achieving ~3.279 mean validation loss (with 0.002 inter-run stddev).
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
 **Note: torch.compile will take a long time on the first run.**
