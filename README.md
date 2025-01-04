@@ -11,7 +11,7 @@ The current iteration reaches the same performance as Karpathy's original traine
 
 This improvement in training performance is due to the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
-* New optimizer: [Muon - Momentum Orthogonalized by Newton-schulz](https://kellerjordan.github.io/posts/muon/) [[standalone implementation](https://github.com/KellerJordan/Muon)].
+* Muon optimizer [[writeup]((https://kellerjordan.github.io/posts/muon/)] [[standalone implementation](https://github.com/KellerJordan/Muon)].
 * Untied head from embedding.
 * Initialized projection and classification layers to zero (muP-like).
 * Added tanh soft logit capping (following Gemma 2).
