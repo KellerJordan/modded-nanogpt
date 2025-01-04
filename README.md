@@ -90,7 +90,7 @@ The following is the progression of world records for the task of *training a mo
 All new record attempts:
 
 1. Must not modify the train or validation data pipelines. (Except to change batch size, seqlen, attention structure etc. I.e., just don't change the underlying tokens.)
-2. Must attain ≤ 3.28 val loss. Unfortunately, due to high inter-run variance, new record attempts must provide enough run logs to attain a statistical significance level of p<0.01 that their average val loss is lower than 3.28. You see see how to conduct a t-test [here](./records/120424_ValueEmbed).
+2. Must attain ≤ 3.28 val loss. Unfortunately, due to high inter-run variance, new record attempts must provide enough run logs to attain a statistical significance level of p<0.01 that their average val loss is lower than 3.28. You see see how to conduct a t-test [here](records/120424_ValueEmbed).
 
 Other than that, go crazy! Anything is fair game (e.g., MoE is fair, but will probably require implementing fast kernels to be competitive).
 
