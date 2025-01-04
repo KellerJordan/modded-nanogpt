@@ -1,7 +1,6 @@
 # Modded-NanoGPT
 
 The purpose of this repository is to collaboratively determine the optimal way to train small-scale language models.
-
 We began with Andrej Karpathy's [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py)
 from [llm.c](https://github.com/karpathy/llm.c), which attains 3.28 validation loss on the FineWeb dataset after training for 45 minutes on 8 NVIDIA H100 GPUs.
 We then iteratively improved the trainer in order to attain the same level of performance in less wallclock time.
@@ -11,7 +10,7 @@ The current iteration reaches the same performance as Karpathy's original traine
 
 This improvement in training performance is due to the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2
-* Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[standalone implementation](https://github.com/KellerJordan/Muon)]
+* Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[code](https://github.com/KellerJordan/Muon)]
 * Untied head from embedding
 * Initialized projection and classification layers to zero (muP-like)
 * Added tanh soft logit capping (following Gemma 2)
