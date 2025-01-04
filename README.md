@@ -15,7 +15,7 @@ This improvement in training performance is due to the following techniques:
 * Projection and classification layers initialized to zero (muP-like)
 * Tanh soft logit capping (following Gemma 2)
 * Skip connections from the embedding to every layer
-* Extra embeddings which are mixed into the values in attention layers
+* Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
 * FlexAttention with window size warmup
 
 Contributors to the SOTA: [@Grad62304977](https://x.com/Grad62304977),
@@ -217,6 +217,7 @@ compared to Shampoo.
 5. [Vineet Gupta, Tomer Koren, and Yoram Singer. "Shampoo: Preconditioned stochastic tensor optimization." International Conference on Machine Learning. PMLR, 2018.](https://arxiv.org/abs/1802.09568)
 6. [Anil, Rohan, et al. "Scalable second order optimization for deep learning." arXiv preprint arXiv:2002.09018 (2020).](https://arxiv.org/abs/2002.09018)
 7. [Hägele, Alexander, et al. "Scaling Laws and Compute-Optimal Training Beyond Fixed Training Durations." arXiv preprint arXiv:2405.18392 (2024).](https://arxiv.org/abs/2405.18392)
+8. [Zhou, Zhanchao, et al. "Value Residual Learning For Alleviating Attention Concentration In Transformers." arXiv preprint arXiv:2410.17897 (2024).](https://arxiv.org/abs/2410.17897)
 
 ## Citation
 
