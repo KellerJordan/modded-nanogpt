@@ -1,4 +1,4 @@
-# Softer softcap
+# Sparsify embeds
 
 Running this new record by Jiacheng You 1261 times yielded the following series of val losses:
 ```
