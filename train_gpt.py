@@ -382,13 +382,13 @@ class Hyperparameters:
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
-    max_device_batch_size = 64*1024 # batch size per device in tokens
     num_iterations = 1390 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     bf16_embeds = True
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
+    max_device_batch_size = 64*1024 # batch size per device in tokens
     save_checkpoint = False
 args = Hyperparameters()
 
