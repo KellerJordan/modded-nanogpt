@@ -377,8 +377,9 @@ class DistributedDataLoader:
 @dataclass
 class Hyperparameters:
     # data
-    train_bin = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-    val_bin = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    train_files = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
+    val_files = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
     max_device_batch_size = 64*1024 # batch size per device in tokens
@@ -387,7 +388,6 @@ class Hyperparameters:
     bf16_embeds = True
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # implementation
     save_checkpoint = False
 args = Hyperparameters()
@@ -429,8 +429,8 @@ print0(subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.
 print0('='*100)
 
 # load data
-train_loader = DistributedDataLoader(args.train_bin)
-val_loader = DistributedDataLoader(args.val_bin)
+train_loader = DistributedDataLoader(args.train_files)
+val_loader = DistributedDataLoader(args.val_files)
 print0(f'Training dataloader files: {train_loader.files}')
 print0(f'Validation dataloader files: {val_loader.files}')
 print0('='*100)
