@@ -3,7 +3,7 @@
 This record, by Braden Koszarsky, increases the degree of logit softcapping, yielding a 7% speedup.
 
 Previously, logits were softcapped (via tanh) to be at most 30. The new record lowers that to 15,
-allowing the step count to be reduced from 1490 to 1390.
+which boosts performance such that the step count can be reduced from 1490 to 1390.
 
 Running this new record 80 times yielded the following series of val losses:
 ```
