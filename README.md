@@ -77,7 +77,7 @@ The following is the progression of world records for the task of *training a mo
 15 | 3.95 minutes | [U-net pattern for value embeds, assorted code improvements](https://x.com/YouJiacheng/status/1865761473886347747) | 12/08/24 | [log](records/120824_UNetValueEmbedsTweaks) | @leloykun, @YouJiacheng
 16 | 3.80 minutes | [MFU tweaks](https://x.com/YouJiacheng/status/1866734331559071981) | 12/10/24 | [log](records/121024_MFUTweaks) | @YouJiacheng
 17 | 3.57 minutes | [Sparsify value embeds & improve rotary & drop attn layer](https://x.com/YouJiacheng/status/1868938024731787640) | 12/17/24 | [log](records/121724_SparsifyEmbeds) | @YouJiacheng
-18 | 3.4 minutes | Lower logit softcapping from 30 to 15 | 01/04/25 | [log](records/010425_SoftCap/31d6c427-f1f7-4d8a-91be-a67b5dcd13fd.txt) | @KoszarskyB
+18 | 3.4 minutes | Lower logit softcap from 30 to 15 | 01/04/25 | [log](records/010425_SoftCap/31d6c427-f1f7-4d8a-91be-a67b5dcd13fd.txt) | @KoszarskyB
 
 ### Speedrun rules
 
