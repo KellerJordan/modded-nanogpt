@@ -76,7 +76,6 @@ class Muon(torch.optim.Optimizer):
     """
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
         self.world_size = int(os.environ['WORLD_SIZE'])
-        self.rank = int(os.environ['RANK'])
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         assert all(isinstance(p, torch.Tensor) for p in params)
         sizes = {p.numel() for p in params}
@@ -110,7 +109,7 @@ class Muon(torch.optim.Optimizer):
                     )
             for base_i in range(len(params))[::self.world_size]:
                 if base_i + rank < len(params):
-                    p = params[base_i + self.rank]
+                    p = params[base_i + rank]
                     g = p.grad
                     assert g is not None
                     state = self.state[p]
@@ -343,7 +342,6 @@ def _load_data_shard(path):
 class DistributedDataLoader:
 
     def __init__(self, filename_pattern):
-        self.rank = int(os.environ['RANK'])
         self.world_size = int(os.environ['WORLD_SIZE'])
         self.files = sorted(glob.glob(filename_pattern))
         self.reset()
@@ -363,7 +361,7 @@ class DistributedDataLoader:
         # load next shard if necessary
         if self.current_position + batch_size + 1 >= len(self.tokens):
             self.advance()
-        pos = self.current_position + self.rank * device_batch_size
+        pos = self.current_position + rank * device_batch_size
         device_batch_tokens = self.tokens[pos:pos+device_batch_size+1]
         # advance current position
         self.current_position += batch_size
