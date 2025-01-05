@@ -380,8 +380,8 @@ class Hyperparameters:
     train_bin = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     val_bin = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization
-    batch_size = 8*64*1024 # batch size in tokens
-    max_device_batch_size = 64*1024 # batch size per device in tokens
+    max_device_batch_size = 32*1024 # batch size per device in tokens  # KS: modified from 64 for smaller memory
+    batch_size = 4*max_device_batch_size # batch size in tokens    # KS: now directly  from max_dbs + adapted to GPU-numbers
     num_iterations = 1390 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     bf16_embeds = True
