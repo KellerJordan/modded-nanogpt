@@ -1,7 +1,7 @@
 # Softer softcap
 
 This record, by Braden Koszarsky, increases the degree of logit softcapping, yielding a 7% speedup.
-[Reproducible log](31d6c427-f1f7-4d8a-91be-a67b5dcd13fd.txt)
+[reproducible log](31d6c427-f1f7-4d8a-91be-a67b5dcd13fd.txt)
 
 Previously, logits were softcapped (via tanh) to be at most 30. The new record lowers that to 15,
 which boosts performance such that the step count can be reduced from 1490 to 1390.
