@@ -1,53 +1,46 @@
 # Modded-NanoGPT
 
-This is a modified variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
-Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in only:
-* 0.7B tokens instead of 10B
-* 3.4 minutes on 8xH100 instead of 45
+The purpose of this repository is to collaboratively determine the optimal way to train small-scale language models.
+We began with Andrej Karpathy's [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py)
+from [llm.c](https://github.com/karpathy/llm.c), which attains 3.28 validation loss on the FineWeb dataset after training for 45 minutes on 8 NVIDIA H100 GPUs.
+Then we iteratively improved the trainer in order to attain the same level of performance in less wallclock time.
+The current iteration reaches the same performance as Karpathy's original trainer in:
+* 3.4 minutes on 8xH100 (original trainer needed 45)
+* 0.7B tokens (original trainer needed 10B)
 
-It has been hyperoptimized by the community, and has become a good baseline from which to perform research on the architecture/optimizer/etc.
+This improvement in training performance is due to the following techniques:
+* Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2
+* Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[code](https://github.com/KellerJordan/Muon)]
+* Untied head from embedding
+* Projection and classification layers initialized to zero (muP-like)
+* Tanh soft logit capping (following Gemma 2)
+* Skip connections from the embedding to every layer
+* Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
+* FlexAttention with window size warmup
 
-It uses the following techniques:
-* Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
-* New optimizer: [Muon - Momentum Orthogonalized by Newton-schulz](https://kellerjordan.github.io/posts/muon/) [[standalone implementation](https://github.com/KellerJordan/Muon)].
-* Untied head from embedding.
-* Projection and classification layers initialized to zero (muP-like).
-* Architectural shortcuts: value residual and embedding shortcut (partially following https://arxiv.org/abs/2410.17897).
-* Momentum warmup.
-* Tanh soft logit capping (following Gemma 2).
-* FlexAttention with window size warmup.
-* Extra embeddings which are fed into intermediate attention layers.
-
-The training has attained this speed due to the contributions of meself, [@Grad62304977](https://x.com/Grad62304977),
+Contributors to the SOTA: [@Grad62304977](https://x.com/Grad62304977),
 [@jxbz](https://x.com/jxbz), [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan),
-[@KoszarskyB](https://x.com/KoszarskyB), & [@fernbear.bsky.social](https://bsky.app/profile/fernbear.bsky.social).
+[@KoszarskyB](https://x.com/KoszarskyB), [@fernbear.bsky.social](https://bsky.app/profile/fernbear.bsky.social), & @kellerjordan0
 
 ---
 
 ## Running the current record
 
-To install and execute the training, run the following four commands.
-They should all complete within <20min on an 8xH100 with decent internet connection.
-If the torch install command updates your cuda installation, you many need to reboot.
+To run the current record, run the following commands.
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git & cd modded-nanogpt
 pip install -r requirements.txt
 pip install --pre torch==2.6.0.dev20241231+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade # install torch 2.6.0
-python data/cached_fineweb10B.py 10 # downloads only the first 1.0B training tokens to save time
+python data/cached_fineweb10B.py 8 # downloads only the first 0.8B training tokens to save time
 ./run.sh
 ```
 
-The result will be a transformer with 124M active parameters trained for 1490 steps on 0.75B tokens of Fineweb [1], achieving ~3.278 mean validation loss (w/ up to 0.005 inter-run stddev).
+The result will be a transformer with 124M active parameters trained for 1390 steps on 0.73B tokens of Fineweb [1], achieving ~3.279 mean validation loss (with 0.002 inter-run stddev).
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
 **Note: torch.compile will take a long time on the first run.**
 
-## Running it on fewer GPUs or with less memory
-
-* To run on fewer GPUs, just modify `run.sh` to have a different `--nproc_per_node`. (this does not change the expected behavior of the training)
-* If you're running out of memory, you may need to reduce the sequence length for FlexAttention (which does change the training. see [here](https://github.com/KellerJordan/modded-nanogpt/pull/38) for a guide)
-
-## Running with Docker
+## Alternative: Running with Docker
 
 For cases where CUDA or NCCL versions aren't compatible with your current system setup, Docker can be a helpful alternative.
 This approach standardizes versions for CUDA, NCCL, CUDNN, and Python, reducing dependency issues and simplifying setup. 
@@ -58,6 +51,7 @@ sudo docker build -t modded-nanogpt .
 sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt python data/cached_fineweb10B.py 10
 sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt sh run.sh
 ```
+
 ---
 
 ## World record history
@@ -83,7 +77,7 @@ The following is the progression of world records for the task of *training a mo
 15 | 3.95 minutes | [U-net pattern for value embeds, assorted code improvements](https://x.com/YouJiacheng/status/1865761473886347747) | 12/08/24 | [log](records/120824_UNetValueEmbedsTweaks) | @leloykun, @YouJiacheng
 16 | 3.80 minutes | [MFU tweaks](https://x.com/YouJiacheng/status/1866734331559071981) | 12/10/24 | [log](records/121024_MFUTweaks) | @YouJiacheng
 17 | 3.57 minutes | [Sparsify value embeds & improve rotary & drop attn layer](https://x.com/YouJiacheng/status/1868938024731787640) | 12/17/24 | [log](https://gist.github.com/YouJiacheng/dff723d9a362303f4dca6d71a6469555) | @YouJiacheng
-18 | 3.4 minutes | Intensified softcapping | 01/04/25 | [log](records/010425_SoftCap/31d6c427-f1f7-4d8a-91be-a67b5dcd13fd.txt) | @KoszarskyB
+18 | 3.4 minutes | Softcapping 30 → 15 | 01/04/25 | [log](records/010425_SoftCap/31d6c427-f1f7-4d8a-91be-a67b5dcd13fd.txt) | @KoszarskyB
 
 ### Speedrun rules
 
@@ -192,7 +186,7 @@ In particular, we experimentally obtained the following practices:
 * Using Nesterov momentum inside the update, with orthogonalization applied after momentum.
 * Using a specifically quintic Newton-Schulz iteration as the method of orthogonalization.
 * Using non-convergent coefficients for the quintic polynomial in order to maximize slope at zero, and thereby minimize the number of necessary Newton-Schulz iterations.
-It turns out that the variance doesn't actually matter that much, so we end up with a quintic that (rapidly) converges to the range 0.68, 1.13 upon repeated application, rather than to 1.
+It turns out that the variance doesn't actually matter that much, so we end up with a quintic that rapidly converges to the range 0.68, 1.13 upon repeated application, rather than converging more slowly to 1.
 * Running the Newton-Schulz iteration in bfloat16 (whereas Shampoo implementations often depend on inverse-pth-roots run in fp32 or fp64).
 
 Our use of a Newton-Schulz iteration for orthogonalization traces to [Bernstein & Newhouse (2024)](https://arxiv.org/abs/2409.20325),
@@ -207,33 +201,23 @@ compared to Shampoo.
 
 ---
 
-## Startup script
+## Running on fewer GPUs
 
-Here's a good startup script for a fresh 8xH100 instance.
-
-```
-sudo apt-get update
-sudo apt-get install vim tmux python3-pip python-is-python3 -y
-git clone https://github.com/KellerJordan/modded-nanogpt.git
-cd modded-nanogpt
-tmux
-
-pip install numpy==1.23.5 huggingface-hub tqdm
-pip install --upgrade torch &
-python data/cached_fineweb10B.py 18
-```
+* To run experiments on fewer GPUs, simply modify `run.sh` to have a different `--nproc_per_node`. This should not change the behavior of the training.
+* If you're running out of memory, you may need to reduce the sequence length for FlexAttention (which does change the training. see [here](https://github.com/KellerJordan/modded-nanogpt/pull/38) for a guide)
 
 ---
 
 ## References
 
-1. [Penedo, Guilherme, et al. "The fineweb datasets: Decanting the web for the finest text data at scale." arXiv preprint arXiv:2406.17557 (2024).](https://arxiv.org/abs/2406.17557)
-2. Nicholas J. Higham. Functions of Matrices. Society for Industrial and Applied Mathematics, 2008. Equation 5.22.
-3. Günther Schulz. Iterative Berechnung der reziproken Matrix. Z. Angew. Math. Mech., 13:57–59, 1933.
+1. [Guilherme Penedo et al. "The fineweb datasets: Decanting the web for the finest text data at scale." arXiv preprint arXiv:2406.17557 (2024).](https://arxiv.org/abs/2406.17557)
+2. Nicholas J. Higham. Functions of Matrices. Society for Industrial and Applied Mathematics (2008). Equation 5.22.
+3. Günther Schulz. Iterative Berechnung der reziproken Matrix. Z. Angew. Math. Mech., 13:57–59 (1933).
 4. [Jeremy Bernstein and Laker Newhouse. "Old Optimizer, New Norm: An Anthology." arxiv preprint arXiv:2409.20325 (2024).](https://arxiv.org/abs/2409.20325)
 5. [Vineet Gupta, Tomer Koren, and Yoram Singer. "Shampoo: Preconditioned stochastic tensor optimization." International Conference on Machine Learning. PMLR, 2018.](https://arxiv.org/abs/1802.09568)
-6. [Anil, Rohan, et al. "Scalable second order optimization for deep learning." arXiv preprint arXiv:2002.09018 (2020).](https://arxiv.org/abs/2002.09018)
-7. [Hägele, Alexander, et al. "Scaling Laws and Compute-Optimal Training Beyond Fixed Training Durations." arXiv preprint arXiv:2405.18392 (2024).](https://arxiv.org/abs/2405.18392)
+6. [Rohan Anil et al. "Scalable second order optimization for deep learning." arXiv preprint arXiv:2002.09018 (2020).](https://arxiv.org/abs/2002.09018)
+7. [Alexander Hägele et al. "Scaling Laws and Compute-Optimal Training Beyond Fixed Training Durations." arXiv preprint arXiv:2405.18392 (2024).](https://arxiv.org/abs/2405.18392)
+8. [Zhanchao Zhou et al. "Value Residual Learning For Alleviating Attention Concentration In Transformers." arXiv preprint arXiv:2410.17897 (2024).](https://arxiv.org/abs/2410.17897)
 
 ## Citation
 
