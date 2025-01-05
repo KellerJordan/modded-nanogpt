@@ -13,3 +13,5 @@ print(torch.std_mean(torch.tensor(accs)))
 # (tensor(0.0018), tensor(3.2794))
 ```
 
+![](loss_hist_121724.png)
+

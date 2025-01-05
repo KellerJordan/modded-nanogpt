@@ -28,3 +28,5 @@ print(torch.std_mean(torch.tensor(accs)))
 # (tensor(0.0019), tensor(3.2791))
 ```
 
+![](curves_010425.png)
+
