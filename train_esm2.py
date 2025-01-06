@@ -131,9 +131,9 @@ def main(args, model_config):
     # load tokens
     tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
     cls_id, eos_id, pad_id = tokenizer.cls_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id
-    train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size, cls_id=cls_id, eos_id=eos_id, pad_id=pad_id)
-    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size, cls_id=cls_id, eos_id=eos_id, pad_id=pad_id)
-    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size, cls_id=cls_id, eos_id=eos_id, pad_id=pad_id)
+    train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size, cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=100)
+    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size, cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
+    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size, cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
     print0(f'Training DataLoader: {len(train_loader.files)} files')
     print0(f'Validation DataLoader: {len(valid_loader.files)} files')
     print0(f'Testing DataLoader: {len(test_loader.files)} files')
