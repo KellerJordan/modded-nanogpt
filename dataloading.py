@@ -14,7 +14,7 @@ def _load_data_shard(file: Path):
         tokens = torch.empty(num_tokens, dtype=torch.uint8, pin_memory=True)
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy())
-        assert nbytes == num_tokens, 'number of tokens read does not match header?'
+        assert nbytes == 2 * num_tokens, 'number of tokens read does not match header?'
     return tokens
 
 
@@ -26,46 +26,58 @@ class DistributedDataLoader:
         self.files = sorted(Path.cwd().glob(filename_pattern))
         self.batch_size = batch_size
         self.local_batch_size = self.batch_size // self.world_size
-        self.epoch = 0
         self.reset()
 
     def reset(self):
         self.next_shard = 0
-        random.seed(self.epoch)
-        random.shuffle(self.files)
-        self.epoch += 1
         self.advance()
 
     def advance(self): # advance to next data shard
         self.pos = 0
         self.tokens = _load_data_shard(self.files[self.next_shard])
-        self.next_shard += 1
-        if self.next_shard == len(self.files) + 1:
-            self.reset()
+        self.next_shard = (self.next_shard + 1) % len(self.files)
 
     def next_batch(self):
-        buf = self.tokens[self.pos + self.rank * self.local_batch_size:self.pos + self.rank * self.local_batch_size + self.local_batch_size]
-        input_ids = buf.to(device="cuda", dtype=torch.int32, non_blocking=True)
+        buf = self.tokens[self.pos + self.rank * self.local_batch_size:][:self.local_batch_size]
+        # by @YouJiacheng: host side async is sufficient;
+        # no performance improvement was observed when introducing a separate stream.
+        sequence = buf.to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
+        # advance current position and load next shard if necessary
         self.pos += self.batch_size
         if self.pos + self.batch_size >= len(self.tokens):
             self.advance()
-        return input_ids
+        return sequence
 
 
 class DistributedPaddedDataLoader(DistributedDataLoader):
-    def __init__(self, filename_pattern, seq_len, process_rank, num_processes, cls_id, eos_id, pad_id):
+    def __init__(self, filename_pattern, seq_len, process_rank, num_processes, cls_id, eos_id, pad_id, max_epochs=1):
         self.cls_id = cls_id
         self.eos_id = eos_id
         self.pad_id = pad_id
+        self._leftover_tokens = torch.empty(0, dtype=torch.uint8)
+        self.max_epochs = max_epochs
         super().__init__(filename_pattern, seq_len, process_rank, num_processes)
 
     def advance(self):
         self.pos = 0
 
-        raw_tokens = _load_data_shard(self.files[self.next_shard])
-        self.next_shard += 1
-        if self.next_shard == len(self.files) + 1:
-            self.reset()
+        # handle epoch limit
+        if self.next_shard // len(self.files) < self.max_epochs:
+            raw_tokens = _load_data_shard(self.files[self.next_shard % len(self.files)])
+            raw_tokens = torch.cat([self._leftover_tokens, raw_tokens], dim=0)
+            self.next_shard += 1
+        else:
+            raw_tokens = self._leftover_tokens
+        if not raw_tokens.numel():
+            self._leftover_tokens = torch.empty(0, dtype=torch.uint8)
+            self.tokens = torch.empty(0, dtype=torch.uint8)
+            return
+        
+        # shuffle each epoch
+        if self.next_shard % len(self.files) == 0:
+            self.epoch += 1
+            random.seed(self.epoch)
+            random.shuffle(self.files)
 
         processed_chunks = []
         curr_batch_len = 0
@@ -78,6 +90,7 @@ class DistributedPaddedDataLoader(DistributedDataLoader):
 
             if not sample[0] == self.cls_id and sample[-1] == self.eos_id:
                 print(f"Warning: sample[0]=={sample[0]}, sample[-1]=={sample[-1]}, sample.numel()=={sample.numel()}")
+                print(f"\ti={i}, eos_positions[:i]=={eos_positions[:i]}")
             assert curr_batch_len < self.local_batch_size, str((curr_batch_len, self.local_batch_size))
 
             # if adding sample exceeds the batch size resulting in truncation, pad to end of batch, starting a fresh batch
