@@ -84,7 +84,7 @@ The following is the progression of world records for the task of *training a ne
 New record submissions must:
 
 1. Not modify the train or validation data pipelines. (You can change the batch size, sequence length, attention structure etc.; just don't change the underlying streams of tokens.)
-2. Attain ≤ 3.28 mean val loss. (Due to inter-run variance, submissions must provide enough run logs to attain a statistical significance level of p<0.01 that their mean val loss is ≤ 3.28. Example code to conduct a t-test can be found [here](records/120424_ValueEmbed).)
+2. Attain ≤ 3.28 mean val loss. (Due to inter-run variance, submissions must provide enough run logs to attain a statistical significance level of p<0.01 that their mean val loss is ≤ 3.28. Example code to conduct a t-test can be found [here](records/010425_SoftCap#softer-softcap).)
 
 Other than that, anything and everything is fair game!
 
