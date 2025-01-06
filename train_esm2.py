@@ -52,6 +52,8 @@ class TrainingArguments:
     hf_model_name: Optional[str] = None
     save_every: Optional[int] = None
 
+    token: Optional[str] = None
+
 
 def get_param_count(model):
     total_params = 0
