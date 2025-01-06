@@ -14,7 +14,7 @@ This improvement in training performance was brought about by the following tech
 * Untied head from embedding
 * Projection and classification layers initialized to zero (muP-like)
 * Logit softcapping (following Gemma 2)
-* Skip connections from the embedding to every layer
+* Skip connections from the embedding to residual stream junctions
 * Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
 * FlexAttention with window size warmup
 
