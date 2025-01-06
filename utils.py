@@ -14,8 +14,14 @@ class ProteinMasker(nn.Module):
         super().__init__()
         self.mask_token_id = tokenizer.mask_token_id
         standard_tokens = [tokenizer.convert_tokens_to_ids(tok) for tok in tokenizer.all_tokens if tok not in tokenizer.all_special_tokens]
+        canonical_amino_acids = 'ACDEFGHIKLMNPQRSTVWY'
+        canonical_amino_acids_ids = tokenizer.convert_tokens_to_ids(list(canonical_amino_acids))
+        low_range = min(canonical_amino_acids_ids)
+        high_range = max(canonical_amino_acids_ids)
         self.register_buffer("standard_tokens", torch.tensor(standard_tokens, dtype=torch.int32))
         self.register_buffer("special_tokens", torch.tensor(tokenizer.all_special_ids, dtype=torch.int32))
+        self.register_buffer("low_range", torch.tensor(low_range, dtype=torch.int32))
+        self.register_buffer("high_range", torch.tensor(high_range, dtype=torch.int32))
 
     def __call__(
             self, input_ids: torch.Tensor, mask_prob: torch.Tensor, keep_replace_prob: torch.Tensor
@@ -45,7 +51,7 @@ class ProteinMasker(nn.Module):
             torch.full_like(probability_matrix, 0.5)
         ).bool() & masked_indices & ~indices_replaced
         random_token_idxs = torch.randint(
-            0, self.standard_tokens.numel(), (replacement_idxs.sum(),),
+            self.low_range, self.high_range, (replacement_idxs.sum(),),
             dtype=input_ids.dtype, device=replacement_idxs.device
         )
         input_ids[replacement_idxs] = self.standard_tokens[random_token_idxs]
