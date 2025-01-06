@@ -75,8 +75,7 @@ class DistributedPaddedDataLoader(DistributedDataLoader):
         
         # shuffle each epoch
         if self.next_shard % len(self.files) == 0:
-            self.epoch += 1
-            random.seed(self.epoch)
+            random.seed(self.next_shard)
             random.shuffle(self.files)
 
         processed_chunks = []
