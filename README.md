@@ -103,10 +103,6 @@ The only possible 'benefit' I can think of for any empirical field to abandon be
 Hilarious to think about how, in the often-commented-upon and ongoing collapse of the peer review system, people blame the *reviewers* --
 yeah, those guys doing free labor who everyone constantly musters all of their intelligence to lie to, it's *their* fault! My bad, you caught me monologuing.-->
 
-### Notes
-* For the llm.c baseline: The 90 minute time is on 8xA100; it's 45 minutes on 8xH100. This baseline is essentially a hardware-optimized GPT-2-small replication using better training data.
-* All runs before 11/19/24 can be run with PyTorch 2.5.1. Runs including and after 11/19/24 require PyTorch 2.6.0 (nightly) to use FlexAttention.
-
 ---
 
 ### Notable forks
