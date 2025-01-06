@@ -1,23 +1,11 @@
 import os
 import sys
-with open(sys.argv[0]) as f:
-    code = f.read() # read the code of this file ASAP, for logging
 
-with open('optimizer.py', 'r', encoding='utf-8') as f:
-    source_code = f.read()
-    code += source_code
-
-with open('model.py', 'r', encoding='utf-8') as f:
-    source_code = f.read()
-    code += source_code
-
-with open('utils.py', 'r', encoding='utf-8') as f:
-    source_code = f.read()
-    code += source_code
-
-with open('dataloading.py', 'r', encoding='utf-8') as f:
-    source_code = f.read()
-    code += source_code
+code = open(sys.argv[0]).read()
+code += open('optimizer.py', 'r', encoding='utf-8').read()
+code += open('model.py', 'r', encoding='utf-8').read()
+code += open('dataloading.py', 'r', encoding='utf-8').read()
+code += open('utils.py', 'r', encoding='utf-8').read()
 
 import argparse
 import uuid
@@ -26,6 +14,8 @@ import contextlib
 import math
 import torch
 import torch.distributed as dist
+from dataclasses import dataclass, fields, MISSING
+from typing import get_origin, get_args, Union, Optional
 from transformers import EsmTokenizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
@@ -35,37 +25,32 @@ from model import ModelConfig, ESM
 from dataloading import DistributedPaddedDataLoader
 
 
-def get_args():
-    parser = argparse.ArgumentParser(description='ESM2 training arguments')
-
-    # Model hyperparams
-    parser.add_argument('--vocab_size', type=int, default=33, help='vocabulary size')
-    parser.add_argument('--num_hidden_layers', type=int, default=12, help='number of transformer layers')
-    parser.add_argument('--num_attention_heads', type=int, default=6, help='number of attention heads (head dim 128 suggested by @Grad62304977)')
-    parser.add_argument('--hidden_size', type=int, default=768, help='model hidden dimension size')
-
+@dataclass
+class TrainingArguments:
     # Data hyperparams
-    parser.add_argument('--input_bin', type=str, default='data/omgprot50/omgprot50_train_*.bin', help='input .bins to train on')
-    parser.add_argument('--input_valid_bin', type=str, default='data/omgprot50/omgprot50_valid_*.bin', help='input .bins to eval validation loss on')
-    parser.add_argument('--input_test_bin', type=str, default='data/omgprot50/omgprot50_test_*.bin', help='input .bins to eval test loss on')
-    parser.add_argument('--start_mlm_prob', type=float, default=0.40, help='start mlm probability')
-    parser.add_argument('--end_mlm_prob', type=float, default=0.15, help='end mlm probability')
+    input_bin: str = 'data/omgprot50/omgprot50_train_*.bin'
+    input_valid_bin: str = 'data/omgprot50/omgprot50_valid_*.bin'
+    input_test_bin: str = 'data/omgprot50/omgprot50_test_*.bin'
 
     # Optimization hyperparams
-    parser.add_argument('--batch_size', type=int, default=4*64*1024, help='batch size, in tokens, across all devices')
-    parser.add_argument('--lr', type=float, default=0.6, help='Largest learning rate')
-    parser.add_argument('--grad_accum', type=int, default=1, help='manually set number of gradient accumulation steps, else, will be ddp_world_size')
-    parser.add_argument('--num_steps', type=int, default=20000, help='number of iterations to run')
-    parser.add_argument('--cooldown_steps', type=int, default=2000, help='number of cooldown steps')
-    parser.add_argument('--max_length', type=int, default=1024, help='maximum sequence length')
+    batch_size: int = 8*64*1024
+    grad_accum: int = 8
+    num_steps: int = 20000
+    cooldown_steps: int = 5000
+    max_length: int = 4096
+
+    # adam
+    #lr_embed: float = 0.01
+    #lr_scalar: float = 0.005
+    # muon
+    #lr_hidden: float = 0.005
+    lr: float = 0.5
+    muon_momentum_warmup_steps: int = 300  # steps for warmup momentum, 0.85 -> 0.95
 
     # Evaluation and logging hyperparams
-    parser.add_argument('--valid_loss_every', type=int, default=1000, help='every how many steps to evaluate val loss? 0 for only at the end')
-    parser.add_argument('--hf_model_name', type=str, default='Synthyra/esm_speedrun', help='huggingface model name')
-    parser.add_argument('--token', type=str, default=None, help='huggingface token')
-    parser.add_argument('--save_every', type=int, default=None, help='save every how many steps? None for no saving')
-    args = parser.parse_args()
-    return args
+    valid_loss_every: int = 250
+    hf_model_name: Optional[str] = None
+    save_every: Optional[int] = None
 
 
 def get_param_count(model):
@@ -75,14 +60,7 @@ def get_param_count(model):
     return total_params
 
 
-def main(args):
-    model_config = ModelConfig(
-        vocab_size=args.vocab_size,
-        num_hidden_layers=args.num_hidden_layers,
-        num_attention_heads=args.num_attention_heads,
-        hidden_size=args.hidden_size,
-    )
-
+def main(args, model_config):
     # set up DDP (distributed data parallel) if available, otherwise single GPU
     # requires torchrun or equivalent
     if 'RANK' in os.environ:
@@ -140,23 +118,20 @@ def main(args):
 
     # calculate the steps of gradient accumulation required to attain the desired global batch size
     # args.batch_size should refer to the total amount of tokens per backward pass
-    train_accumulation_steps = args.grad_accum
-    if ddp_world_size > 1:
-        batch_size = args.batch_size // (ddp_world_size * train_accumulation_steps)
-    else:
-        batch_size = args.batch_size // train_accumulation_steps
+    # reducing batch_size by ddp_world_size is done in the data loader
+    batch_size = args.batch_size // args.grad_accum
 
-    print0(f'Train accumulation steps: {train_accumulation_steps}')
+    print0(f'Train accumulation steps: {args.grad_accum}')
     print0(f'Adjusted local batch size: {batch_size} tokens')
     print0(f'Across {ddp_world_size} GPUs')
     print0(f'Total batch size: {args.batch_size} tokens')
 
     # load tokens
     tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
-    eos_id, pad_id = tokenizer.eos_token_id, tokenizer.pad_token_id
-    train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
-    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
-    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size, eos_id=eos_id, pad_id=pad_id)
+    cls_id, eos_id, pad_id = tokenizer.cls_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id
+    train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size, cls_id=cls_id, eos_id=eos_id, pad_id=pad_id)
+    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size, cls_id=cls_id, eos_id=eos_id, pad_id=pad_id)
+    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size, cls_id=cls_id, eos_id=eos_id, pad_id=pad_id)
     print0(f'Training DataLoader: {len(train_loader.files)} files')
     print0(f'Validation DataLoader: {len(valid_loader.files)} files')
     print0(f'Testing DataLoader: {len(test_loader.files)} files')
@@ -199,25 +174,28 @@ def main(args):
             decay_ratio = (args.num_steps - it) / args.cooldown_steps
             return decay_ratio
 
-    # sliding window size schedule: linear increase over training in chunks of 128 from 256 -> 2048. By @fernbear.bsky.social
-    def get_sliding_window_blocks(it):
-        x = it / args.num_steps # training progress
-        assert 0 <= x <= 1
-        min_blocks = 2  # 256 tokens
-        max_blocks = 16 # 2048 tokens
-        blocks = min_blocks + (max_blocks - min_blocks) * x
-        return max(min_blocks, min(max_blocks, round(blocks)))
-    
-    # mlm probability schedule: linear decrease over training from start_mlm_prob to end_mlm_prob. By @lapp0
-    def get_mlm_probability(it):
-        x = it / args.num_steps # training progress
-        assert 0 <= x <= 1
-        return (1 - x) * args.start_mlm_prob + x * args.end_mlm_prob
+    class LerpTensor:
+        def __init__(self, start_val, end_val, precision):
+            self.start, self.end, self.prec = start_val, end_val, precision
+            self.prev_val = None
+            dtype = torch.int32 if isinstance(precision, int) else torch.float
+            self.gpu_val = torch.tensor(0, dtype=dtype, device="cuda")
+
+        def __call__(self, frac_done):
+            val = ((1 - frac_done) * self.start + frac_done * self.end) // self.prec * self.prec
+            if val != self.prev_val:
+                self.gpu_val.copy_(val, non_blocking=True)
+                self.prev_val = val
+            return self.gpu_val
+
+    final_mask_prob = torch.tensor(0.12, device='cuda')
+    final_keep_replace_prob = torch.tensor(0.015, device='cuda')
+
+    lerp_mask_prob = LerpTensor(start_val=0.4, end_val=0.12, precision=0.01)
+    lerp_keep_replace_prob = LerpTensor(start_val=0.09, end_val=0.015, precision=0.0075)
+    lerp_sw_size = LerpTensor(start_val=512, end_val=args.max_length, precision=128)
 
     schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
-    mlm_probability = torch.tensor(args.start_mlm_prob, device='cuda')
-    eval_prob = torch.tensor(0.15, device='cuda')
-    sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device='cuda')
 
     training_time_ms = 0
     # start the clock
@@ -237,8 +215,10 @@ def main(args):
             t0 = time.perf_counter()
         timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-        sliding_window_num_blocks.copy_(get_sliding_window_blocks(step))
-        mlm_probability.copy_(get_mlm_probability(step))
+        frac_done = step / args.num_steps  # training progress
+        mask_prob = lerp_mask_prob(frac_done)
+        keep_replace_prob = lerp_keep_replace_prob(frac_done)
+        sliding_window_size = lerp_sw_size(frac_done)
 
         # once in a while evaluate the validation dataset
         if args.valid_loss_every > 0 and step % args.valid_loss_every == 0 or last_step:
@@ -254,7 +234,7 @@ def main(args):
                 while input_ids.numel():
                     batch_valid_tokens = (input_ids != pad_id).sum()
                     valid_tokens += batch_valid_tokens
-                    val_loss += model(input_ids, sliding_window_num_blocks, mlm_probability=eval_prob) * batch_valid_tokens
+                    val_loss += model(input_ids, sliding_window_size, final_mask_prob, final_keep_replace_prob) * batch_valid_tokens
                     input_ids = valid_loader.next_batch()
             if ddp_world_size > 1:
                 dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
@@ -276,13 +256,14 @@ def main(args):
                 log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
                 torch.save(log, 'logs/state_step%06d.pt' % step)
 
-                try:
-                    if ddp_world_size > 1:
-                        model.module.push_to_hub(args.hf_model_name, subfolder='step%06d' % step)
-                    else:
-                        model.push_to_hub(args.hf_model_name, subfolder='step%06d' % step)
-                except Exception as e:
-                    print(e)
+                if args.hf_model_name:
+                    try:
+                        if ddp_world_size > 1:
+                            model.module.push_to_hub(args.hf_model_name, subfolder='step%06d' % step)
+                        else:
+                            model.push_to_hub(args.hf_model_name, subfolder='step%06d' % step)
+                    except Exception as e:
+                        print0(e)
 
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
@@ -292,19 +273,19 @@ def main(args):
 
         # --------------- FORWARD AND BACKWARD PASS -----------------
         model.train()
-        for i in range(train_accumulation_steps):
+        for i in range(args.grad_accum):
             with contextlib.ExitStack() as stack:
                 # Only sync gradients on last accumulation step
-                if ddp_world_size > 1 and i < train_accumulation_steps - 1:
+                if ddp_world_size > 1 and i < args.grad_accum - 1:
                     stack.enter_context(model.no_sync())
                 input_ids = train_loader.next_batch()
-                (model(input_ids, sliding_window_num_blocks, mlm_probability=mlm_probability) / train_accumulation_steps).backward()
+                (model(input_ids, sliding_window_size, mask_prob, keep_replace_prob) / args.grad_accum).backward()
                 # TODO
                 # Not sure if there is an advantage to scale the loss instead of the gradients, but this should improve total step speed.
                 # TODO
                 # Should we consider gradient clipping?
         # momentum warmup for Muon
-        frac = min(step/300, 1)
+        frac = min(step/args.muon_momentum_warmup_steps, 1)
         for group in optimizer2.param_groups:
             group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
         # step the optimizers and schedulers
@@ -344,7 +325,7 @@ def main(args):
         while input_ids.numel():
             batch_test_tokens = (input_ids != pad_id).sum()
             test_tokens += batch_test_tokens
-            test_loss += model(input_ids, sliding_window_num_blocks, mlm_probability=eval_prob) * batch_test_tokens
+            test_loss += model(input_ids, sliding_window_size, final_mask_prob, final_keep_replace_prob) * batch_test_tokens
             input_ids = test_loader.next_batch()
     if ddp_world_size > 1:
         dist.all_reduce(test_loss, op=dist.ReduceOp.SUM)
@@ -360,10 +341,53 @@ def main(args):
     return val_loss, test_loss
 
 
+def parse_args(dataclass_map=None):
+    parser = argparse.ArgumentParser()
+    dataclass_map = dataclass_map or {"train": TrainingArguments, "model": ModelConfig}
+
+    def resolve_type(field):
+        origin = get_origin(field.type)
+        if origin is Union:
+            args = get_args(field.type)
+            non_none_types = [arg for arg in args if arg is not type(None)]  # Exclude NoneType
+            if len(non_none_types) == 1:
+                return non_none_types[0]
+        return field.type
+
+    # Dynamically add arguments for each dataclass
+    for prefix, dataclass_type in dataclass_map.items():
+        for field in fields(dataclass_type):
+            arg_name = f"--{prefix}.{field.name}"
+            arg_type = resolve_type(field)
+            if field.default != MISSING:
+                default = field.default
+            elif field.default_factory != MISSING:  # Handle default_factory
+                default = field.default_factory()
+            else:
+                default = None
+            parser.add_argument(
+                arg_name,
+                type=arg_type,
+                default=default,
+                help=f"{field.name} for {prefix} (type: {arg_type.__name__})"
+            )
+    args = parser.parse_args()
+    result = {}
+    for prefix, dataclass_type in dataclass_map.items():
+        kwargs = {
+            field.name: getattr(args, f"{prefix}.{field.name}")
+            for field in fields(dataclass_type)
+        }
+        result[prefix] = dataclass_type(**kwargs)
+    return result
+
+
 if __name__ == '__main__':
-    args = get_args()
+    cl_args = parse_args()
+    args = cl_args['train']
+    model_config = cl_args['model']
     if args.token:
         from huggingface_hub import login
         login(args.token)
         args.token = None
-    val_loss, test_loss = main(args) # so we can do easier hyperparameter tuning
+    val_loss, test_loss = main(args, model_config)
