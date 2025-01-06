@@ -8,7 +8,7 @@ The current iteration reaches the same performance as Karpathy's original GPT-2 
 * 3.4 minutes on 8xH100 (original trainer needed 45)
 * 0.7B tokens (original trainer needed 10B)
 
-This improvement in training performance is due to the following techniques:
+This improvement in training performance was brought about by the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2
 * Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[code](https://github.com/KellerJordan/Muon)]
 * Untied head from embedding
@@ -18,7 +18,7 @@ This improvement in training performance is due to the following techniques:
 * Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
 * FlexAttention with window size warmup
 
-Contributors to the SOTA: [@Grad62304977](https://x.com/Grad62304977),
+Contributors list (growing with each new record): [@Grad62304977](https://x.com/Grad62304977),
 [@jxbz](https://x.com/jxbz), [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan),
 [@KoszarskyB](https://x.com/KoszarskyB), [@fernbear.bsky.social](https://bsky.app/profile/fernbear.bsky.social), & [@kellerjordan0](https://x.com/kellerjordan0)
 
