@@ -26,7 +26,7 @@ class ModelConfig(PretrainedConfig):
         hidden_size=768,
         num_hidden_layers=12,
         num_attention_heads=6,
-        expansion_ratio=8/3,
+        expansion_ratio=3/2,
         **kwargs,
     ):
         super().__init__(**kwargs)

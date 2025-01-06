@@ -14,6 +14,7 @@ import contextlib
 import math
 import torch
 import torch.distributed as dist
+import torch._inductor.config as config
 from dataclasses import dataclass, fields, MISSING
 from typing import get_origin, get_args, Union, Optional
 from transformers import EsmTokenizer
@@ -21,7 +22,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
 
 from optimizer import Muon
-from model import ModelConfig, ESM
+from model import ModelConfig, ESM, CastedLinear
 from dataloading import DistributedPaddedDataLoader
 
 
@@ -33,25 +34,26 @@ class TrainingArguments:
     input_test_bin: str = 'data/omgprot50/omgprot50_test_*.bin'
 
     # Optimization hyperparams
-    batch_size: int = 8*64*1024
-    grad_accum: int = 8
+    batch_size: int = 4*64*1024
+    grad_accum: int = 4
     num_steps: int = 20000
     cooldown_steps: int = 5000
-    max_length: int = 4096
+    max_length: int = 2048
 
     # adam
-    #lr_embed: float = 0.01
-    #lr_scalar: float = 0.005
+    lr_embed: float = 0.06
+    lr_head: float = 0.0008
+    lr_scalar: float = 0.04
     # muon
-    #lr_hidden: float = 0.005
-    lr: float = 0.5
+    lr_hidden: float = 0.05
     muon_momentum_warmup_steps: int = 300  # steps for warmup momentum, 0.85 -> 0.95
 
     # Evaluation and logging hyperparams
-    valid_loss_every: int = 250
+    valid_loss_every: int = 500
     hf_model_name: Optional[str] = None
     save_every: Optional[int] = None
 
+    # Logging / saving
     token: Optional[str] = None
 
 
@@ -131,9 +133,12 @@ def main(args, model_config):
     # load tokens
     tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
     cls_id, eos_id, pad_id = tokenizer.cls_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id
-    train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size, cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=100)
-    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size, cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
-    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size, cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
+    train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size,
+                                               cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=100)
+    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size,
+                                               cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
+    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size,
+                                              cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
     print0(f'Training DataLoader: {len(train_loader.files)} files')
     print0(f'Validation DataLoader: {len(valid_loader.files)} files')
     print0(f'Testing DataLoader: {len(test_loader.files)} files')
@@ -141,6 +146,10 @@ def main(args, model_config):
 
     model = ESM(model_config)
     model = model.cuda().bfloat16()
+    for m in model.modules():
+        if isinstance(m, CastedLinear):
+            m.float()
+    config.coordinate_descent_tuning = True # suggested by @Chillee
     model = torch.compile(model)
 
     # wrap model in DDP only if using distributed training
@@ -156,13 +165,13 @@ def main(args, model_config):
     scalar_params = [p for p in raw_model.parameters() if p.ndim < 2]
     head_params = [raw_model.lm_head.weight]
 
-    # init the optimizer(s) with ratios based on modded-nanoGPT2
+    # init the optimizer(s)
     optimizer1 = torch.optim.Adam([
-        dict(params=embed_params, lr=args.lr/4), # we device by 4 because the vocab size is much smaller
-        dict(params=head_params, lr=args.lr/75), # 0.6/75
-        dict(params=scalar_params, lr=args.lr/15) # 0.6/15
+        dict(params=embed_params, lr=args.lr_embed),
+        dict(params=head_params, lr=args.lr_head),
+        dict(params=scalar_params, lr=args.lr_scalar)
     ], betas=(0.8, 0.95), fused=True)
-    optimizer2 = Muon(hidden_matrix_params, lr=args.lr/12, momentum=0.95) # 0.6/12
+    optimizer2 = Muon(hidden_matrix_params, lr=args.lr_hidden, momentum=0.95)
     optimizers = [optimizer1, optimizer2]
 
     # learning rate decay scheduler (linear warmup and cooldown)
@@ -193,8 +202,8 @@ def main(args, model_config):
     final_mask_prob = torch.tensor(0.12, device='cuda')
     final_keep_replace_prob = torch.tensor(0.015, device='cuda')
 
-    lerp_mask_prob = LerpTensor(start_val=0.4, end_val=0.12, precision=0.01)
-    lerp_keep_replace_prob = LerpTensor(start_val=0.09, end_val=0.015, precision=0.0075)
+    lerp_mask_prob = LerpTensor(start_val=0.3, end_val=0.12, precision=0.01)
+    lerp_keep_replace_prob = LerpTensor(start_val=0.1, end_val=0.015, precision=0.0075)
     lerp_sw_size = LerpTensor(start_val=512, end_val=args.max_length, precision=128)
 
     schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
