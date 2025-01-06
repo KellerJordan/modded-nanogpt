@@ -14,7 +14,7 @@ def _load_data_shard(file: Path):
         tokens = torch.empty(num_tokens, dtype=torch.uint8, pin_memory=True)
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy())
-        assert nbytes == 2 * num_tokens, 'number of tokens read does not match header?'
+        assert nbytes == num_tokens, 'number of tokens read does not match header?'
     return tokens
 
 
