@@ -2,7 +2,7 @@
 
 The goal of this repository is to collaboratively determine the optimal way to train small-scale language models.
 We begin with Andrej Karpathy's [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py)
-from [llm.c](https://github.com/karpathy/llm.c), which attains 3.28 validation loss on the FineWeb dataset after training for 45 minutes on 8 NVIDIA H100 GPUs.
+from [llm.c](https://github.com/karpathy/llm.c), which attains 3.28 validation cross-entropy loss on the FineWeb dataset after training for 45 minutes on 8 NVIDIA H100 GPUs.
 We then iteratively improve the trainer in order to attain the same level of performance in less wallclock time.
 The current iteration reaches the same performance as Karpathy's original GPT-2 trainer in:
 * 3.4 minutes on 8xH100 (original trainer needed 45)
