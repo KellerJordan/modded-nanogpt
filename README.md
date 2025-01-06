@@ -6,7 +6,7 @@ from [llm.c](https://github.com/karpathy/llm.c), which attains 3.28 validation c
 We then iteratively improve the trainer in order to attain the same level of performance in less wallclock time.
 The current iteration reaches the same performance as Karpathy's original GPT-2 trainer in:
 * 3.4 minutes on 8xH100 (original trainer needed 45)
-* 0.7B tokens (original trainer needed 10B)
+* 0.73B tokens (original trainer needed 10B)
 
 This improvement in training performance was brought about by the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2
