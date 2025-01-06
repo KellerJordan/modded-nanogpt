@@ -86,7 +86,7 @@ New record submissions must:
 1. Not modify the train or validation data pipelines. (You can change the batch size, sequence length, attention structure etc.; just don't change the underlying streams of tokens.)
 2. Attain ≤ 3.28 mean val loss. (Due to inter-run variance, submissions must provide enough run logs to attain a statistical significance level of p<0.01 that the mean val loss of their trainer is lower than 3.28. Example code to conduct a t-test can be found [here](records/120424_ValueEmbed).)
 
-Other than that, go crazy! Anything is fair game (e.g., MoE is fair, but will probably require implementing fast kernels to be competitive).
+Other than that, anything and everything is fair game!
 
 <!--Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
 So it's no surprise that there is room to improve; as @karpathy has said, 'llm.c still has a lot of pending optimizations.'
