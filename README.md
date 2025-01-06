@@ -230,8 +230,7 @@ compared to Shampoo.
                   Franz Cesista and Braden Koszarsky and @Grad62304977},
   title        = {modded-nanogpt: Speedrunning the NanoGPT baseline},
   year         = {2024},
-  url          = {https://github.com/KellerJordan/modded-nanogpt},
-  note         = {Accessed: 2024-12-09}
+  url          = {https://github.com/KellerJordan/modded-nanogpt}
 }
 ```
 
