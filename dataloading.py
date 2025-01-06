@@ -39,8 +39,8 @@ class DistributedDataLoader:
     def advance(self): # advance to next data shard
         self.pos = 0
         self.tokens = _load_data_shard(self.files[self.next_shard])
-        self.next_shard = self.next_shard + 1
-        if self.next_shard == len(self.files):
+        self.next_shard += 1
+        if self.next_shard == len(self.files) + 1:
             self.reset()
 
     def next_batch(self):
@@ -64,7 +64,7 @@ class DistributedPaddedDataLoader(DistributedDataLoader):
 
         raw_tokens = _load_data_shard(self.files[self.next_shard])
         self.next_shard += 1
-        if self.next_shard == len(self.files):
+        if self.next_shard == len(self.files) + 1:
             self.reset()
 
         processed_chunks = []
