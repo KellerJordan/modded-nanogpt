@@ -81,10 +81,10 @@ The following is the progression of world records for the task of *training a ne
 
 ### Speedrun rules
 
-All new record attempts:
+New record submissions must:
 
-1. Must not modify the train or validation data pipelines. (Except to change batch size, seqlen, attention structure etc. I.e., just don't change the underlying tokens.)
-2. Must attain ≤ 3.28 val loss. Unfortunately, due to high inter-run variance, new record attempts must provide enough run logs to attain a statistical significance level of p<0.01 that their average val loss is lower than 3.28. You see see how to conduct a t-test [here](records/120424_ValueEmbed).
+1. Not modify the train or validation data pipelines. (You can change the batch size, sequence length, attention structure etc.; just don't change the underlying streams of tokens.)
+2. Attain ≤ 3.28 mean val loss. (Due to inter-run variance, submissions must provide enough run logs to attain a statistical significance level of p<0.01 that the mean val loss of their trainer is lower than 3.28. Example code to conduct a t-test can be found [here](records/120424_ValueEmbed).)
 
 Other than that, go crazy! Anything is fair game (e.g., MoE is fair, but will probably require implementing fast kernels to be competitive).
 
