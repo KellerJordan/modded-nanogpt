@@ -9,11 +9,11 @@ Setup environment and train ESM2
 git clone https://github.com/Synthyra/SpeedRunningESM2
 cd SpeedRunningESM2
 pip install -r requirements.txt
-pip install --pre torch==2.6.0.dev20241231+cu124 torchvision --index-url https://download.pytorch.org/whl/nightly/cu124 --upgrade
+pip install --pre torch==2.6.0.dev20241203+cu124 torchvision --index-url https://download.pytorch.org/whl/nightly/cu124 --upgrade
 python data/download_omgprot50.py # --num_chunks 10 you can download less chunks to save time
 ./run.sh
 ```
-torchvision is needed to fix an import error with transformers.
+torchvision is needed to fix an import error with transformers. You might need a different version of torch for consumer cards, all the code is tested on Hopper GPUs.
 
 ## Benchmarks to match
 [OMGprot50](https://huggingface.co/datasets/Synthyra/omg_prot50) validation and test sets, 15% BERT-like MLM objective.
