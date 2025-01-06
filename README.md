@@ -13,7 +13,7 @@ This improvement in training performance was brought about by the following tech
 * Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[code](https://github.com/KellerJordan/Muon)]
 * Untied head from embedding
 * Projection and classification layers initialized to zero (muP-like)
-* Tanh logit softcapping (following Gemma 2)
+* Logit softcapping (following Gemma 2)
 * Skip connections from the embedding to every layer
 * Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
 * FlexAttention with window size warmup
