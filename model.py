@@ -23,7 +23,7 @@ class ModelConfig(PretrainedConfig):
         vocab_size=33,
         hidden_size=768,
         num_hidden_layers=12,
-        num_attention_heads=12,
+        num_attention_heads=6,
         expansion_ratio=8/3,
         **kwargs,
     ):
