@@ -79,7 +79,7 @@ The following is the progression of world records for the task of *training a ne
 17 | 3.57 minutes | [Sparsify value embeddings, improve rotary, drop an attn layer](https://x.com/YouJiacheng/status/1868938024731787640) | 12/17/24 | [log](records/121724_SparsifyEmbeds) | @YouJiacheng
 18 | 3.4 minutes | [Lower logit softcap from 30 to 15](https://x.com/kellerjordan0/status/1876048851158880624) | 01/04/25 | [log](records/010425_SoftCap/31d6c427-f1f7-4d8a-91be-a67b5dcd13fd.txt) | @KoszarskyB
 
-### Speedrun rules
+## Submission rules
 
 New record submissions must:
 
