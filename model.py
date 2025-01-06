@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from transformers import EsmTokenizer, PretrainedConfig, PreTrainedModel
 from typing import Tuple, List, Any
@@ -10,6 +11,7 @@ except ImportError:
     from utils import ProteinMasker
 
 
+@dataclass
 class ModelConfig(PretrainedConfig):
     """
     33 tokens: https://huggingface.co/Synthyra/ESMplusplus_large/blob/main/modeling_esm_plusplus.py#L868-L874
