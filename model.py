@@ -178,7 +178,7 @@ class ESM(PreTrainedModel):
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_hidden_layers)])
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
         # U-net structure on token value embeddings by @leloykun
-        self.value_embeds = ValueEmbedding(config, padding_idx=tokenizer.pad_token_id)
+        self.value_embeds = ValueEmbedding(config)
         self.lm_head = CastedLinear(config.hidden_size, self.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
         self.cross_entropy = nn.CrossEntropyLoss()
