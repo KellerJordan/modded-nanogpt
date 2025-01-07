@@ -147,7 +147,7 @@ class ValueEmbedding(nn.Module):
     def __init__(self, config: "ModelConfig"):
         super().__init__()
         self.embed = nn.ModuleList([
-            CastedEmbedding(config.vocab_size, config.hidden_size)
+            nn.Embedding(config.vocab_size, config.hidden_size)
             for _ in range(config.num_hidden_layers // 2)
         ])
 
@@ -175,7 +175,7 @@ class ESM(PreTrainedModel):
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
-        self.embed = CastedEmbedding(self.vocab_size, config.hidden_size)
+        self.embed = nn.Embedding(config.vocab_size, config.hidden_size)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_hidden_layers)])
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
         # U-net structure on token value embeddings by @leloykun
