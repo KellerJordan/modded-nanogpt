@@ -50,11 +50,12 @@ class CastedLinear(nn.Linear):
 
 
 class CastedEmbedding(nn.Embedding):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, main_dtype=torch.bfloat16, **kwargs):
         super().__init__(*args, **kwargs)
+        self.main_dtype = main_dtype
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.embedding(x, self.weight.to(x.dtype))
+        return F.embedding(x, self.weight.to(self.main_dtype))
 
 
 class Rotary(nn.Module):
