@@ -49,6 +49,14 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype))
 
 
+class CastedEmbedding(nn.Embedding):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.embedding(x, self.weight.to(x.dtype))
+
+
 class Rotary(nn.Module):
     def __init__(self, dim, base=10000):
         super().__init__()
@@ -135,10 +143,10 @@ class Block(nn.Module):
 
 
 class ValueEmbedding(nn.Module):
-    def __init__(self, config: "ModelConfig", padding_idx):
+    def __init__(self, config: "ModelConfig"):
         super().__init__()
         self.embed = nn.ModuleList([
-            nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=padding_idx)
+            CastedEmbedding(config.vocab_size, config.hidden_size)
             for _ in range(config.num_hidden_layers // 2)
         ])
 
@@ -166,7 +174,7 @@ class ESM(PreTrainedModel):
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
-        self.embed = nn.Embedding(self.vocab_size, config.hidden_size, padding_idx=tokenizer.pad_token_id)
+        self.embed = CastedEmbedding(self.vocab_size, config.hidden_size)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_hidden_layers)])
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
         # U-net structure on token value embeddings by @leloykun

@@ -22,7 +22,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
 
 from optimizer import Muon
-from model import ModelConfig, ESM, CastedLinear
+from model import ModelConfig, ESM, CastedLinear, CastedEmbedding
 from dataloading import DistributedPaddedDataLoader
 
 
@@ -147,7 +147,7 @@ def main(args, model_config):
     model = ESM(model_config)
     model = model.cuda().bfloat16()
     for m in model.modules():
-        if isinstance(m, CastedLinear):
+        if isinstance(m, CastedLinear) or isinstance(m, CastedEmbedding):
             m.float()
     config.coordinate_descent_tuning = True # suggested by @Chillee
     model = torch.compile(model)
