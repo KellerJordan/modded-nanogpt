@@ -5,6 +5,9 @@ with open(sys.argv[0]) as f:
 import uuid
 import time
 import glob
+import gc
+import functools
+import threading
 import subprocess
 import contextlib
 from dataclasses import dataclass
@@ -17,6 +20,67 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
+
+PROFILE_SAVE_DIR = "./"
+
+
+# From https://github.com/pytorch/pytorch/pull/131949/
+from typing import Callable, Dict, Sequence, Tuple
+def register_multi_post_accumulate_grad_hook(
+    tensors: Sequence[torch.Tensor], fn: Callable[[Tuple[torch.Tensor, ...]], None]
+) -> torch.autograd.graph.RemovableHandle:
+    r"""Register a multi-post-accumulate-grad backward hook.
+
+    The hook ``fn`` will run after all gradients of all tensors in
+    :attr:`tensors` have been accumulated, where all tensors must be leaf
+    tensors. If a tensor is in :attr:`tensors` but is not part of the graph or
+    not needed to compute the gradients for any ``inputs`` specified for the
+    current ``.backward()`` or ``.grad()`` call, this tensor will be ignored,
+    and the hook will not wait for its gradient to be accumulated.
+
+    The hook ``fn`` should have the following signature::
+
+        fn(tensors: Tuple[torch.Tensor, ...]) -> None
+
+    The hook ``fn`` will get the ``tensors`` passed as :attr:`tensors`. The
+    hook is like an "all" multi-hook version of
+    :meth:`torch.Tensor.register_post_accumulate_grad_hook`, where the hook
+    only runs after each tensor's post-accumulate-grad hook has run.
+    """
+    if any(not t.requires_grad for t in tensors):
+        raise ValueError(
+            "cannot register a hook on a tensor that doesn't require gradient"
+        )
+    if not all(t.is_leaf for t in tensors):
+        raise ValueError("requires all tensors to be leaf tensors")
+    if len(tensors) == 0:
+        return torch.autograd.graph._MultiHandle(tuple())
+
+    acc_grads = [torch.autograd.graph._get_grad_fn_or_grad_acc(t) for t in tensors]
+    count: Dict[int, int] = dict()
+    nb_calls = None
+    lock = threading.Lock()
+
+    @functools.wraps(fn)
+    def wrapped_fn(tensor: torch.Tensor) -> None:
+        nonlocal count, nb_calls
+        id = torch._C._current_graph_task_id()
+        assert id != -1, "expected this hook to be called inside a backward call"
+        count[id] = count.get(id, 0)
+
+        with lock:
+            curr_count, count[id] = count[id], count[id] + 1
+            if curr_count == 0:
+                # On the first call, compute the actual nb_calls
+                nb_calls = sum(map(torch._C._will_engine_execute_node, acc_grads))
+
+        assert nb_calls is not None
+        if curr_count == nb_calls - 1:
+            fn(tuple(tensors))
+            del count[id]
+
+    handles = tuple(t.register_post_accumulate_grad_hook(wrapped_fn) for t in tensors)
+    return torch.autograd.graph._MultiHandle(handles)
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -81,10 +145,11 @@ class Muon(torch.optim.Optimizer):
         assert all(isinstance(p, torch.Tensor) for p in params)
         sizes = {p.numel() for p in params}
         param_groups = [dict(params=[p for p in params if p.numel() == size],
-                             update_buffer=[torch.empty(size, device='cuda', dtype=torch.bfloat16) for _ in range(self.world_size)])
+                             update_buffer=torch.empty((self.world_size, size), device='cuda', dtype=torch.bfloat16))
                         for size in sizes]
         super().__init__(param_groups, defaults)
 
+    @torch.no_grad()
     def step(self):
 
         for group in self.param_groups:
@@ -93,7 +158,12 @@ class Muon(torch.optim.Optimizer):
             momentum = group['momentum']
             nesterov = group['nesterov']
             ns_steps = group['ns_steps']
-            update_buffers = group['update_buffer']
+            update_buffer = group['update_buffer']
+            if "update_buffer_views" not in group:
+                group["update_buffer_views"] = [
+                    update_buffer[i].view(-1) for i in range(self.world_size)
+                ]
+            update_buffer_views = group["update_buffer_views"]
             # generate weight updates in distributed fashion
             params = group['params']
             handle = None
@@ -103,7 +173,7 @@ class Muon(torch.optim.Optimizer):
                     return
                 assert handle is not None
                 handle.wait()
-                for p_world, g_world in zip(params_world, update_buffers):
+                for p_world, g_world in zip(params_world, update_buffer_views):
                     p_world.data.add_(
                         g_world.view_as(p_world),
                         alpha=-lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
@@ -121,9 +191,9 @@ class Muon(torch.optim.Optimizer):
                     g = g.lerp_(buf, momentum) if nesterov else buf
                     g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
                 else:
-                    g = update_buffers[rank]
+                    g = update_buffer_views[rank]
                 update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
-                handle = dist.all_gather(update_buffers, g, async_op=True)
+                handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
                 params_world = params[base_i : base_i + self.world_size]
             update_prev()
 
@@ -444,21 +514,65 @@ if args.bf16_embeds:
         if isinstance(m, nn.Embedding):
             m.bfloat16()
 model = torch.compile(model)
-ddp_model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
+embed_params = [model.embed.weight, *model.value_embeds.parameters()]
+embed_params_set = set(embed_params)
+param_names_to_ignore = set()
+for param_name, param in model.named_parameters():
+    if param in embed_params_set:
+        param_names_to_ignore.add(param_name)
+DDP._set_params_and_buffers_to_ignore_for_model(model, param_names_to_ignore)
+embed_param_sizes = [p.size() for p in embed_params]
+embed_flat_grad = torch.empty(
+    sum(s.numel() for s in embed_param_sizes), dtype=torch.bfloat16, device="cuda"
+)
+embed_flat_grad_views = []
+offset = 0
+for embed_param_size in embed_param_sizes:
+    view = embed_flat_grad[offset : offset + embed_param_size.numel()].view(embed_param_size)
+    embed_flat_grad_views.append(view)
+    offset += embed_param_size.numel()
+embed_pg = torch.distributed.new_group(backend="nccl")
+
+def all_reduce_embed_grads_async(
+    embed_params, embed_flat_grad_views, embed_flat_grad, embed_pg, *unused
+):
+    assert len(embed_params) == len(embed_flat_grad_views)
+    embed_grads = [p.grad for p in embed_params]
+    torch._foreach_copy_(embed_flat_grad_views, embed_grads)
+    handle = dist.all_reduce(
+        embed_flat_grad, async_op=True, op=dist.ReduceOp.AVG, group=embed_pg
+    )
+    for param, grad_view in zip(embed_params, embed_flat_grad_views):
+        param.grad = grad_view
+    return handle
+
+embed_grad_all_reduce_handle = None
+hook_fn = functools.partial(
+    all_reduce_embed_grads_async, embed_params, embed_flat_grad_views, embed_flat_grad, embed_pg
+)
+multi_grad_hook_handle = register_multi_post_accumulate_grad_hook(embed_params, hook_fn)
+ddp_model = DDP(
+    model,
+    device_ids=[local_rank],
+    broadcast_buffers=False,
+    gradient_as_bucket_view=True,
+)
 
 # collect the parameters to optimize
 hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim == 2]
-embed_params = [model.embed.weight, *model.value_embeds.parameters()]
+# embed_params = [model.embed.weight, *model.value_embeds.parameters()]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([dict(params=embed_params, lr=0.6),
-                               dict(params=head_params, lr=0.008),
+adam_kwargs = {"betas": (0.8, 0.95), "fused": True}
+# optimizer1 = torch.optim.Adam([dict(params=embed_params, lr=0.6),
+optimizer1 = torch.optim.Adam([dict(params=head_params, lr=0.008),
                                dict(params=scalar_params, lr=0.04)],
-                              betas=(0.8, 0.95), fused=True)
+                              **adam_kwargs)
 optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95)
-optimizers = [optimizer1, optimizer2]
+embed_optimizer = torch.optim.Adam(embed_params, lr=0.6, **adam_kwargs)
+optimizers = [optimizer1, optimizer2, embed_optimizer]
 
 # learning rate schedule: stable then decay
 def get_lr(it):
@@ -486,73 +600,113 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
-for step in range(train_steps + 1):
-    last_step = (step == train_steps)
-    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
-    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
-    # steps with dummy data first, and then re-initialize the model and reset the loader.
-    if step == 10:
-        training_time_ms = 0
-        t0 = time.perf_counter()
-    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+rank = torch.distributed.get_rank()
+wait, warmup, active = 1, 1, 2
+gc.disable()
+gc.collect()
+next_inputs_train = next_targets_train = None
+use_profiler = False
+# use_profiler = True
+with torch.profiler.profile(
+    activities=[
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ],
+    schedule=torch.profiler.schedule(
+        wait=wait, warmup=warmup, active=active, repeat=1, skip_first=1
+    ),
+    on_trace_ready=torch.profiler.tensorboard_trace_handler(PROFILE_SAVE_DIR)
+    if not rank  # only save on rank 0
+    else None,
+    record_shapes=True,
+    profile_memory=False,
+    with_stack=False,
+    with_flops=True,
+    with_modules=False,
+) if use_profiler else contextlib.nullcontext() as prof:
+    for step in range(train_steps + 1):
+        last_step = (step == train_steps)
+        # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+        # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+        # steps with dummy data first, and then re-initialize the model and reset the loader.
+        if step == 10:
+            training_time_ms = 0
+            t0 = time.perf_counter()
+        timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-    sliding_window_num_blocks.fill_(get_sliding_window_blocks(step))
+        sliding_window_num_blocks.fill_(get_sliding_window_blocks(step))
 
-    # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-        # stop the clock
-        torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.perf_counter() - t0)
-        # run validation batches
-        model.eval()
-        val_loader.reset()
-        val_loss = 0.0
-        # calculate the number of steps to take in the val loop.
-        val_batch_size = world_size * micro_bs
-        assert args.val_tokens % val_batch_size == 0
-        val_steps = args.val_tokens // val_batch_size
-        for _ in range(val_steps):
-            with torch.no_grad():
-                inputs_val, targets_val = val_loader.next_batch(val_batch_size)
-                val_loss += ddp_model(inputs_val, targets_val, sliding_window_num_blocks)
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        val_loss /= val_steps
+        # --------------- VALIDATION SECTION -----------------
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            # run validation batches
+            model.eval()
+            val_loader.reset()
+            val_loss = 0.0
+            # calculate the number of steps to take in the val loop.
+            val_batch_size = world_size * micro_bs
+            assert args.val_tokens % val_batch_size == 0
+            val_steps = args.val_tokens // val_batch_size
+            for _ in range(val_steps):
+                with torch.no_grad():
+                    inputs_val, targets_val = val_loader.next_batch(val_batch_size)
+                    val_loss += ddp_model(inputs_val, targets_val, sliding_window_num_blocks)
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            val_loss /= val_steps
+            # logging
+            print0(f'step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms', console=True)
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        if last_step:
+            if master_process and args.save_checkpoint:
+                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+                os.makedirs(f'logs/{run_id}', exist_ok=True)
+                torch.save(log, f'logs/{run_id}/state_step{step:06d}.pt')
+            # the last step only has the validation loop, so break to avoid training
+            break
+
+        # --------------- TRAINING SECTION -----------------
+        model.train()
+        batch_size = args.batch_size
+        assert batch_size % world_size == 0
+        if next_inputs_train is not None:
+            assert next_targets_train is not None
+            inputs_train = next_inputs_train
+            targets_train = next_targets_train
+        else:
+            inputs_train, targets_train = train_loader.next_batch(batch_size)
+        assert len(inputs_train) <= micro_bs or len(inputs_train) % micro_bs == 0
+        for micro_inputs_train, micro_targets_train in zip(inputs_train.split(micro_bs), targets_train.split(micro_bs)):
+            ddp_model(micro_inputs_train, micro_targets_train, sliding_window_num_blocks).backward()
+        # momentum warmup for Muon
+        frac = min(step/300, 1)
+        for group in optimizer2.param_groups:
+            group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+        # step the optimizers and schedulers
+        for opt, sched in zip(optimizers, schedulers):
+            if opt is embed_optimizer:
+                if step + 1 < train_steps:
+                    next_inputs_train, next_targets_train = train_loader.next_batch(batch_size)
+                else:
+                    next_inputs_train = next_targets_train = None
+                if embed_grad_all_reduce_handle is not None:
+                    embed_grad_all_reduce_handle.wait()
+            opt.step()
+            if step != train_steps-1:
+                sched.step()
+        # null the gradients
+        model.zero_grad(set_to_none=True)
+        if step > 0 and step % 1500 == 0:
+            gc.collect()
+        if use_profiler:
+            prof.step()
         # logging
-        print0(f'step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms', console=True)
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-
-    if last_step:
-        if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-            os.makedirs(f'logs/{run_id}', exist_ok=True)
-            torch.save(log, f'logs/{run_id}/state_step{step:06d}.pt')
-        # the last step only has the validation loop, so break to avoid training
-        break
-
-    # --------------- TRAINING SECTION -----------------
-    model.train()
-    batch_size = args.batch_size
-    assert batch_size % world_size == 0
-    inputs_train, targets_train = train_loader.next_batch(batch_size)
-    assert len(inputs_train) <= micro_bs or len(inputs_train) % micro_bs == 0
-    for micro_inputs_train, micro_targets_train in zip(inputs_train.split(micro_bs), targets_train.split(micro_bs)):
-        ddp_model(micro_inputs_train, micro_targets_train, sliding_window_num_blocks).backward()
-    # momentum warmup for Muon
-    frac = min(step/300, 1)
-    for group in optimizer2.param_groups:
-        group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
-    # step the optimizers and schedulers
-    for opt, sched in zip(optimizers, schedulers):
-        opt.step()
-        if step != train_steps-1:
-            sched.step()
-    # null the gradients
-    model.zero_grad(set_to_none=True)
-    # logging
-    approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f'step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms', console=True)
+        approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
+        print0(f'step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms', console=True)
 
 print0(f'peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB')
 dist.destroy_process_group()
