@@ -496,7 +496,7 @@ for step in range(train_steps + 1):
         t0 = time.perf_counter()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-    sliding_window_num_blocks.copy_(get_sliding_window_blocks(step))
+    sliding_window_num_blocks.fill_(get_sliding_window_blocks(step))
 
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
