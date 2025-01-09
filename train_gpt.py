@@ -605,108 +605,87 @@ wait, warmup, active = 1, 1, 2
 gc.disable()
 gc.collect()
 next_inputs_train = next_targets_train = None
-use_profiler = False
-# use_profiler = True
-with torch.profiler.profile(
-    activities=[
-        torch.profiler.ProfilerActivity.CPU,
-        torch.profiler.ProfilerActivity.CUDA,
-    ],
-    schedule=torch.profiler.schedule(
-        wait=wait, warmup=warmup, active=active, repeat=1, skip_first=1
-    ),
-    on_trace_ready=torch.profiler.tensorboard_trace_handler(PROFILE_SAVE_DIR)
-    if not rank  # only save on rank 0
-    else None,
-    record_shapes=True,
-    profile_memory=False,
-    with_stack=False,
-    with_flops=True,
-    with_modules=False,
-) if use_profiler else contextlib.nullcontext() as prof:
-    for step in range(train_steps + 1):
-        last_step = (step == train_steps)
-        # This effectively ignores timing first 10 steps, which are slower for weird reasons.
-        # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
-        # steps with dummy data first, and then re-initialize the model and reset the loader.
-        if step == 10:
-            training_time_ms = 0
-            t0 = time.perf_counter()
-        timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+for step in range(train_steps + 1):
+    last_step = (step == train_steps)
+    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+    # steps with dummy data first, and then re-initialize the model and reset the loader.
+    if step == 10:
+        training_time_ms = 0
+        t0 = time.perf_counter()
+    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-        sliding_window_num_blocks.fill_(get_sliding_window_blocks(step))
+    sliding_window_num_blocks.fill_(get_sliding_window_blocks(step))
 
-        # --------------- VALIDATION SECTION -----------------
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-            # stop the clock
-            torch.cuda.synchronize()
-            training_time_ms += 1000 * (time.perf_counter() - t0)
-            # run validation batches
-            model.eval()
-            val_loader.reset()
-            val_loss = 0.0
-            # calculate the number of steps to take in the val loop.
-            val_batch_size = world_size * micro_bs
-            assert args.val_tokens % val_batch_size == 0
-            val_steps = args.val_tokens // val_batch_size
-            for _ in range(val_steps):
-                with torch.no_grad():
-                    inputs_val, targets_val = val_loader.next_batch(val_batch_size)
-                    val_loss += ddp_model(inputs_val, targets_val, sliding_window_num_blocks)
-            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-            val_loss /= val_steps
-            # logging
-            print0(f'step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms', console=True)
-            # start the clock again
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-
-        if last_step:
-            if master_process and args.save_checkpoint:
-                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-                os.makedirs(f'logs/{run_id}', exist_ok=True)
-                torch.save(log, f'logs/{run_id}/state_step{step:06d}.pt')
-            # the last step only has the validation loop, so break to avoid training
-            break
-
-        # --------------- TRAINING SECTION -----------------
-        model.train()
-        batch_size = args.batch_size
-        assert batch_size % world_size == 0
-        if next_inputs_train is not None:
-            assert next_targets_train is not None
-            inputs_train = next_inputs_train
-            targets_train = next_targets_train
-        else:
-            inputs_train, targets_train = train_loader.next_batch(batch_size)
-        assert len(inputs_train) <= micro_bs or len(inputs_train) % micro_bs == 0
-        for micro_inputs_train, micro_targets_train in zip(inputs_train.split(micro_bs), targets_train.split(micro_bs)):
-            ddp_model(micro_inputs_train, micro_targets_train, sliding_window_num_blocks).backward()
-        # momentum warmup for Muon
-        frac = min(step/300, 1)
-        for group in optimizer2.param_groups:
-            group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
-        # step the optimizers and schedulers
-        for opt, sched in zip(optimizers, schedulers):
-            if opt is embed_optimizer:
-                if step + 1 < train_steps:
-                    next_inputs_train, next_targets_train = train_loader.next_batch(batch_size)
-                else:
-                    next_inputs_train = next_targets_train = None
-                if embed_grad_all_reduce_handle is not None:
-                    embed_grad_all_reduce_handle.wait()
-            opt.step()
-            if step != train_steps-1:
-                sched.step()
-        # null the gradients
-        model.zero_grad(set_to_none=True)
-        if step > 0 and step % 1500 == 0:
-            gc.collect()
-        if use_profiler:
-            prof.step()
+    # --------------- VALIDATION SECTION -----------------
+    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.perf_counter() - t0)
+        # run validation batches
+        model.eval()
+        val_loader.reset()
+        val_loss = 0.0
+        # calculate the number of steps to take in the val loop.
+        val_batch_size = world_size * micro_bs
+        assert args.val_tokens % val_batch_size == 0
+        val_steps = args.val_tokens // val_batch_size
+        for _ in range(val_steps):
+            with torch.no_grad():
+                inputs_val, targets_val = val_loader.next_batch(val_batch_size)
+                val_loss += ddp_model(inputs_val, targets_val, sliding_window_num_blocks)
+        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        val_loss /= val_steps
         # logging
-        approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-        print0(f'step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms', console=True)
+        print0(f'step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms', console=True)
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+    if last_step:
+        if master_process and args.save_checkpoint:
+            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            os.makedirs(f'logs/{run_id}', exist_ok=True)
+            torch.save(log, f'logs/{run_id}/state_step{step:06d}.pt')
+        # the last step only has the validation loop, so break to avoid training
+        break
+
+    # --------------- TRAINING SECTION -----------------
+    model.train()
+    batch_size = args.batch_size
+    assert batch_size % world_size == 0
+    if next_inputs_train is not None:
+        assert next_targets_train is not None
+        inputs_train = next_inputs_train
+        targets_train = next_targets_train
+    else:
+        inputs_train, targets_train = train_loader.next_batch(batch_size)
+    assert len(inputs_train) <= micro_bs or len(inputs_train) % micro_bs == 0
+    for micro_inputs_train, micro_targets_train in zip(inputs_train.split(micro_bs), targets_train.split(micro_bs)):
+        ddp_model(micro_inputs_train, micro_targets_train, sliding_window_num_blocks).backward()
+    # momentum warmup for Muon
+    frac = min(step/300, 1)
+    for group in optimizer2.param_groups:
+        group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+    # step the optimizers and schedulers
+    for opt, sched in zip(optimizers, schedulers):
+        if opt is embed_optimizer:
+            if step + 1 < train_steps:
+                next_inputs_train, next_targets_train = train_loader.next_batch(batch_size)
+            else:
+                next_inputs_train = next_targets_train = None
+            if embed_grad_all_reduce_handle is not None:
+                embed_grad_all_reduce_handle.wait()
+        opt.step()
+        if step != train_steps-1:
+            sched.step()
+    # null the gradients
+    model.zero_grad(set_to_none=True)
+    if step > 0 and step % 1500 == 0:
+        gc.collect()
+    # logging
+    approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
+    print0(f'step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms', console=True)
 
 print0(f'peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB')
 dist.destroy_process_group()
