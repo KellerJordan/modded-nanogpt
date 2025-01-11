@@ -647,14 +647,14 @@ if master_process:
 
     if args.lm_head == "euc":
         suffix = "euc"
-    elif args.lm_head == "hyp" and not args.k_lr:
-        suffix = f"hyp_{args.curvature}"
+    elif args.lm_head == "hyp" and not args.learnable:
+        suffix = f"hyp_{args.curvature}_fixed"
     elif args.lm_head == "hyp":
         suffix = f"hyp_{args.curvature}_lr_{args.k_lr:.0e}"
     else:
         raise ValueError(f"Invalid lm_head name format.")
     # Construct the new folder name
-    run_id = f"{run_id}_{suffix}"
+    run_id = f"{run_id}_{suffix}_seed{args.seed}"
     
     # Create log directory and file
     logdir = f'runs/{run_id}/'
