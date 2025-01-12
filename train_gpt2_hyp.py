@@ -654,7 +654,7 @@ if master_process:
     else:
         raise ValueError(f"Invalid lm_head name format.")
     # Construct the new folder name
-    run_id = f"{run_id}_{suffix}_seed{args.seed}"
+    run_id = f"{run_id}_{suffix}_{args.seed}"
     
     # Create log directory and file
     logdir = f'runs/{run_id}/'

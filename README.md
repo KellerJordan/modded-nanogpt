@@ -1,44 +1,97 @@
 # Modded-NanoGPT
 
-This is a fast variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
-Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in:
-* 2.67B tokens instead of 10B
-* 12 minutes on 8xH100 instead of 45
+The purpose of this repository is to collaboratively determine the optimal way to train small-scale language models.
+We begin with Andrej Karpathy's [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py)
+from [llm.c](https://github.com/karpathy/llm.c), which attains 3.28 validation cross-entropy loss on the FineWeb dataset after training for 45 minutes on 8 NVIDIA H100 GPUs.
+We then iteratively improve the trainer in order to attain the same level of performance in less wallclock time.
+The current iteration reaches the same performance as Karpathy's original GPT-2 trainer in:
+* 3.4 minutes on 8xH100 (original trainer needed 45)
+* 0.73B tokens (original trainer needed 10B)
 
-It uses the following techniques:
-* Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
-* Projection layers initialized to zero (muP-like).
-* New optimizer: Muon - Momentum Orthogonalized by Newton-schulz.
+This improvement in training performance was brought about by the following techniques:
+* Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2
+* Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[code](https://github.com/KellerJordan/Muon)]
+* Untied head from embedding
+* Projection and classification layers initialized to zero (muP-like)
+* Logit softcapping (following Gemma 2)
+* Skip connections from the embedding to residual stream junctions
+* Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
+* FlexAttention with window size warmup
 
-To execute the training, run the following three commands.
-They should all complete within <20min on an 8xH100 with decent internet connection.
+Contributors list (growing with each new record): [@Grad62304977](https://x.com/Grad62304977),
+[@jxbz](https://x.com/jxbz), [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan),
+[@KoszarskyB](https://x.com/KoszarskyB), [@fernbear.bsky.social](https://bsky.app/profile/fernbear.bsky.social), [@leloykun](https://x.com/@leloykun), [@YouJiacheng](https://x.com/YouJiacheng), & [@kellerjordan0](https://x.com/kellerjordan0)
+
+---
+
+## Running the current record
+
+To run the current record, run the following commands.
 ```bash
+git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install -r requirements.txt
-python data/cached_fineweb10B.py 27 # downloads only the first 2.7B training tokens to save time
+pip install --pre torch==2.6.0.dev20241231+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade # install torch 2.6.0
+python data/cached_fineweb10B.py 8 # downloads only the first 0.8B training tokens to save time
 ./run.sh
 ```
 
-The result will be a 124M-parameter transformer trained for 5100 steps on 2.67B tokens of Fineweb [1], achieving ~3.277 validation loss.
+The result will be a transformer with 124M active parameters trained for 1390 steps on 0.73B tokens of Fineweb [1], achieving ~3.279 mean validation loss (with 0.002 inter-run stddev).
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
+
+**Note: torch.compile will take a long time on the first run.**
+
+## Alternative: Running with Docker
+
+For cases where CUDA or NCCL versions aren't compatible with your current system setup, Docker can be a helpful alternative.
+This approach standardizes versions for CUDA, NCCL, CUDNN, and Python, reducing dependency issues and simplifying setup. 
+Note: an NVIDIA driver must already be installed on the system (useful if only the NVIDIA driver and Docker are available).
+
+```bash
+sudo docker build -t modded-nanogpt .
+sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt python data/cached_fineweb10B.py 10
+sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt sh run.sh
+```
+
+---
 
 ## World record history
 
-The following is the progression of world records for the task of *training a model that attains 3.28 validation loss on FineWeb in the minimal amount of time on an 8xH100 machine.*
+The following is the progression of world records for the task of *training a neural network to 3.28 validation loss on FineWeb in the minimal amount of time on an 8xH100 machine.*
 
-1. [45 minutes: llm.c baseline](https://github.com/karpathy/llm.c/discussions/481) (05/28/24) [[training log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101324_llmc/main.log)] (note: the 90 minute time is on 8xA100; it's 45 minutes on 8xH100)
-2. [31.4 minutes: Architectural modernizations and learning rate tuning](https://x.com/kellerjordan0/status/1798863559243513937) (06/06/24) [[training log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/060624_AdamW/f66d43d7-e449-4029-8adf-e8537bab49ea.log)] (note: this uses half the tokens as the baseline but isn't yet twice as fast since it's slower PyTorch code rather than raw CUDA. also note: by far the biggest improvement here came from simply tripling the learning rate.)
-3. [24.9 minutes: Introduced the Muon optimizer](https://x.com/kellerjordan0/status/1842300916864844014) (10/04/24)
-4. [22.3 minutes: Muon improvements](https://x.com/kellerjordan0/status/1844820919061287009) (10/11/24) [[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101024_Muon/eb5659d0-fb6a-49e5-a311-f1f89412f726.txt)]
-5. [15.2 minutes: Pad embeddings & architectural modernizations](https://x.com/kellerjordan0/status/1845865698532450646) (10/14/24) [[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101424_ModernArch/dabaaddd-237c-4ec9-939d-6608a9ed5e27.txt)]
-6. [13.1 minutes: Distributed the overhead of Muon](https://x.com/kellerjordan0/status/1847291684016783746) (10/18/24) [[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101724_DistributedMuon/22d24867-eb5a-4fcc-ae2c-263d0277dfd1.txt)]
-7. [12.0 minutes: Upgraded PyTorch from 2.4.1 to 2.5.0](https://x.com/kellerjordan0/status/1847358578686152764) (10/18/24) [[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/101824_PyTorch25/d4bfb25f-688d-4da5-8743-33926fad4842.txt)] (note: this now runs at the same speed per step as the CUDA llm.c trainer!)
+| # | Record time | Description | Date | Log | Contributors |
+| - | - | - | - | - | - |
+1 | 45 minutes | [llm.c baseline](https://github.com/karpathy/llm.c/discussions/481) | 05/28/24 | [log](records/101324_llmc/main.log) | @karpathy, llm.c contributors
+2 | 31.4 minutes | [Architectural modernizations & tuned learning rate](https://x.com/kellerjordan0/status/1798863559243513937) | 06/06/24 | [log](records/060624_AdamW/f66d43d7-e449-4029-8adf-e8537bab49ea.log) | @kellerjordan0
+3 | 24.9 minutes | [Introduced the Muon optimizer](https://x.com/kellerjordan0/status/1842300916864844014) | 10/04/24 | none | @kellerjordan0, @jxbz
+4 | 22.3 minutes | [Muon improvements](https://x.com/kellerjordan0/status/1844820919061287009) | 10/11/24 | [log](records/101024_Muon/eb5659d0-fb6a-49e5-a311-f1f89412f726.txt) | @kellerjordan0, @bozavlado
+5 | 15.2 minutes | [Pad embeddings & architectural improvements](https://x.com/kellerjordan0/status/1845865698532450646) | 10/14/24 | [log](records/101424_ModernArch/dabaaddd-237c-4ec9-939d-6608a9ed5e27.txt) | @Grad62304977, @kellerjordan0
+6 | 13.1 minutes | [Distributed the overhead of Muon](https://x.com/kellerjordan0/status/1847291684016783746) | 10/18/24 | [log](records/101724_DistributedMuon/22d24867-eb5a-4fcc-ae2c-263d0277dfd1.txt) | @kellerjordan0
+7 | 12.0 minutes | [Upgraded PyTorch from 2.4.1 to 2.5.0](https://x.com/kellerjordan0/status/1847358578686152764) | 10/18/24 | [log](records/101824_PyTorch25/d4bfb25f-688d-4da5-8743-33926fad4842.txt) | @kellerjordan0
+8 | 10.8 minutes | [Untied embed and lm_head](https://x.com/kellerjordan0/status/1853188916704387239) | 11/03/24 | [log](records/110324_UntieEmbed/d6b50d71-f419-4d26-bb39-a60d55ae7a04.txt) | @Grad62304977, @kellerjordan0
+9 | 8.2 minutes | [Shortcuts & tweaks](https://x.com/kellerjordan0/status/1854296101303800108) | 11/06/24 | [log](records/110624_ShortcutsTweaks/dd7304a6-cc43-4d5e-adb8-c070111464a1.txt) | @Grad62304977, @kellerjordan0
+10 | 7.8 minutes | [Bfloat16 activations](https://x.com/kellerjordan0/status/1855267054774865980) | 11/08/24 | [log](records/110824_CastBf16/a833bed8-2fa8-4cfe-af05-58c1cc48bc30.txt) | @kellerjordan0
+11 | 7.2 minutes | [U-net & 2x lr](https://x.com/kellerjordan0/status/1856053121103093922) | 11/10/24 | [log](records/111024_UNetDoubleLr/c87bb826-797b-4f37-98c7-d3a5dad2de74.txt) | @brendanh0gan
+12 | 5.03 minutes | [FlexAttention](https://x.com/kellerjordan0/status/1859331370268623321) | 11/19/24 | [log](records/111924_FlexAttention/8384493d-dba9-4991-b16b-8696953f5e6d.txt) | @KoszarskyB
+13 | 4.66 minutes | [Attention window warmup](https://x.com/hi_tysam/status/1860851011797053450) | 11/24/24 | [log](records/112424_WindowWarmup/cf9e4571-c5fc-4323-abf3-a98d862ec6c8.txt) | @fernbear.bsky.social
+14 | 4.41 minutes | [Value Embeddings](https://x.com/KoszarskyB/status/1864746625572257852) | 12/04/24 | [log](records/120424_ValueEmbed) | @KoszarskyB
+15 | 3.95 minutes | [U-net pattern for value embeds, assorted code improvements](https://x.com/YouJiacheng/status/1865761473886347747) | 12/08/24 | [log](records/120824_UNetValueEmbedsTweaks) | @leloykun, @YouJiacheng
+16 | 3.80 minutes | [Various code optimizations](https://x.com/YouJiacheng/status/1866734331559071981) | 12/10/24 | [log](records/121024_MFUTweaks) | @YouJiacheng
+17 | 3.57 minutes | [Sparsify value embeddings, improve rotary, drop an attn layer](https://x.com/YouJiacheng/status/1868938024731787640) | 12/17/24 | [log](records/121724_SparsifyEmbeds) | @YouJiacheng
+18 | 3.4 minutes | [Lower logit softcap from 30 to 15](https://x.com/kellerjordan0/status/1876048851158880624) | 01/04/25 | [log](records/010425_SoftCap/31d6c427-f1f7-4d8a-91be-a67b5dcd13fd.txt) | @KoszarskyB
 
-Direct contributors to these records: @Grad62304977, @bozavlado, myself
+## Submission rules
 
-Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
+New record submissions must:
+
+1. Not modify the train or validation data pipelines. (You can change the batch size, sequence length, attention structure etc.; just don't change the underlying streams of tokens.)
+2. Attain ≤ 3.28 mean val loss. (Due to inter-run variance, submissions must provide enough run logs to attain a statistical significance level of p<0.01 that their mean val loss is ≤ 3.28. Example code to compute p-value can be found [here](records/010425_SoftCap#softer-softcap).)
+
+Other than that, anything and everything is fair game!
+
+<!--Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
 So it's no surprise that there is room to improve; as @karpathy has said, 'llm.c still has a lot of pending optimizations.'
 In addition, many of the techniques used in these records are completely standard, such as rotary embeddings.
-The goal of this benchmark/speedrun is simply to find out which techniques actually work, and maybe come up with some new ones.
+The goal of this benchmark/speedrun is simply to find out which techniques actually work, and maybe come up with some new ones.-->
 <!--The goal of this benchmark is simply to find out all the techniques which actually work, because I'm going crazy reading all these
 LLM training papers
 which claim a huge benefit but then use their own idiosyncratic non-competitive benchmark and therefore no one in the community has any idea if it's legit for months.-->
@@ -49,6 +102,19 @@ were in the ImageNet days.
 The only possible 'benefit' I can think of for any empirical field to abandon benchmarks is that it would make it easier to publish false results. Oh, I guess that's why it happened.
 Hilarious to think about how, in the often-commented-upon and ongoing collapse of the peer review system, people blame the *reviewers* --
 yeah, those guys doing free labor who everyone constantly musters all of their intelligence to lie to, it's *their* fault! My bad, you caught me monologuing.-->
+
+---
+
+### Notable forks
+
+* [https://github.com/BlinkDL/modded-nanogpt-rwkv](https://github.com/BlinkDL/modded-nanogpt-rwkv)
+* [https://github.com/nikhilvyas/modded-nanogpt-SOAP](https://github.com/nikhilvyas/modded-nanogpt-SOAP)
+
+---
+
+### Q: What is the point of NanoGPT speedrunning?
+
+A: The officially stated goal of NanoGPT speedrunning is as follows: `gotta go fast`. But for something a little more verbose involving an argument for good benchmarking, here's some kind of manifesto, adorned with a blessing from the master. [https://x.com/karpathy/status/1846790537262571739](https://x.com/karpathy/status/1846790537262571739)
 
 ### Q: What makes "NanoGPT speedrunning" not just another idiosyncratic benchmark?
 
@@ -67,16 +133,19 @@ So if you're rational, the result probably just dies with you and no one else le
 
 ### Q: NanoGPT speedrunning is cool and all, but meh it probably won't scale and is just overfitting to val loss
 
-A: Ok, well, "at scale" is an infinite category (what if the methods stop working only for >100T models?), so it's impossible for me to conclusively refute the allegation that whatever we're doing here doesn't work at scale.
-But if you care about 1.5B models, then you might be convinced by this result:
+A: This is hard to refute, since "at scale" is an infinite category (what if the methods stop working only for >100T models?), making it impossible to fully prove.
+Also, I would agree that some of the methods used in the speedrun are unlikely to scale, particularly those which *impose additional structure* on the network, such as logit softcapping.
+But if the reader cares about 1.5B models, they might be convinced by this result:
 
-*Straightforwardly scaling up the speedrun to 1.5B parameters yields a model with GPT-2 (1.5B)-level quality 2.5x more cheaply than [@karpathy's baseline](https://github.com/karpathy/llm.c/discussions/677) ($233 instead of $576):*
+*Straightforwardly scaling up the speedrun (10/18/24 version) to 1.5B parameters yields a model with GPT-2 (1.5B)-level HellaSwag performance 2.5x more cheaply than [@karpathy's baseline](https://github.com/karpathy/llm.c/discussions/677) ($233 instead of $576):*
 
 ![](img/nanogpt_speedrun51.png)
 [[reproducible log](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/102024_ScaleUp1B/ad8d7ae5-7b2d-4ee9-bc52-f912e9174d7a.txt)]
 ![](img/nanogpt_speedrun52.png)
 
-## Muon optimizer
+---
+
+## [Muon optimizer](https://github.com/KellerJordan/Muon)
 
 Muon is defined as follows:
 
@@ -92,17 +161,17 @@ def zeroth_power_via_newtonschulz5(G, steps=5, eps=1e-7):
     if G.size(0) > G.size(1):
         X = X.T 
     for _ in range(steps):
-        A = X @ X.T 
-        B = A @ X 
-        X = a * X + b * B + c * A @ B 
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
     if G.size(0) > G.size(1):
         X = X.T 
     return X.to(G.dtype)
 ```
 
 For this training scenario, Muon has the following favorable properties:
-* Less memory usage than Adam
-* ~1.5x faster training
+* Lower memory usage than Adam
+* ~1.5x better sample-efficiency
 * <2% wallclock overhead
 
 
@@ -113,8 +182,8 @@ In particular, we experimentally obtained the following practices:
 * Using Nesterov momentum inside the update, with orthogonalization applied after momentum.
 * Using a specifically quintic Newton-Schulz iteration as the method of orthogonalization.
 * Using non-convergent coefficients for the quintic polynomial in order to maximize slope at zero, and thereby minimize the number of necessary Newton-Schulz iterations.
-It turns out that the variance doesn't actually matter that much, so we end up with a quintic that (rapidly) converges to the range 0.68, 1.13 upon repeated application, rather than to 1.
-* Running the Newton-Schulz iteration in bfloat16 (whereas Shampoo implementations often compute the preconditioners via inverse-pth-roots in fp32 or fp64).
+It turns out that the variance doesn't actually matter that much, so we end up with a quintic that rapidly converges to the range 0.68, 1.13 upon repeated application, rather than converging more slowly to 1.
+* Running the Newton-Schulz iteration in bfloat16 (whereas Shampoo implementations often depend on inverse-pth-roots run in fp32 or fp64).
 
 Our use of a Newton-Schulz iteration for orthogonalization traces to [Bernstein & Newhouse (2024)](https://arxiv.org/abs/2409.20325),
 who suggested it as a way to compute Shampoo [5, 6] preconditioners, and theoretically explored Shampoo without preconditioner accumulation.
@@ -128,40 +197,38 @@ compared to Shampoo.
 
 ---
 
-## Startup script
+## Running on fewer GPUs
 
-Here's a good startup script for a fresh instance. If you get `torchrun not found` after this upon running then just close and reopen your tmux tab.
-
-```
-sudo apt-get update
-sudo apt-get install vim tmux python3-pip python-is-python3 -y
-git clone https://github.com/KellerJordan/modded-nanogpt.git
-cd modded-nanogpt
-tmux
-
-pip install numpy==1.23.5 huggingface-hub tqdm
-pip install --upgrade torch &
-python data/cached_fineweb10B.py 30
-```
-
-## Running on fewer GPUs or with less memory
-
-To run on fewer GPUs, just modify the 1-liner `run.sh` to have a different `--nproc_per_node`. If you don't have enough memory to fit the batch size, then
-go into `train_gpt2.py` and scale down the `device_batch_size` by either 1/2 or 1/4.
-Both of these changes will have no effect on the training - you should get the exact same loss curve as the most recent record, because the training code
-will automatically adjust the gradient accumulation in order to have the same total batch size.
+* To run experiments on fewer GPUs, simply modify `run.sh` to have a different `--nproc_per_node`. This should not change the behavior of the training.
+* If you're running out of memory, you may need to reduce the sequence length for FlexAttention (which does change the training. see [here](https://github.com/KellerJordan/modded-nanogpt/pull/38) for a guide)
 
 ---
 
 ## References
 
-1. [Penedo, Guilherme, et al. "The fineweb datasets: Decanting the web for the finest text data at scale." arXiv preprint arXiv:2406.17557 (2024).](https://arxiv.org/abs/2406.17557)
-2. Nicholas J. Higham. Functions of Matrices. Society for Industrial and Applied Mathematics, 2008. Equation 5.22.
-3. Günther Schulz. Iterative Berechnung der reziproken Matrix. Z. Angew. Math. Mech., 13:57–59, 1933.
+1. [Guilherme Penedo et al. "The fineweb datasets: Decanting the web for the finest text data at scale." arXiv preprint arXiv:2406.17557 (2024).](https://arxiv.org/abs/2406.17557)
+2. Nicholas J. Higham. Functions of Matrices. Society for Industrial and Applied Mathematics (2008). Equation 5.22.
+3. Günther Schulz. Iterative Berechnung der reziproken Matrix. Z. Angew. Math. Mech., 13:57–59 (1933).
 4. [Jeremy Bernstein and Laker Newhouse. "Old Optimizer, New Norm: An Anthology." arxiv preprint arXiv:2409.20325 (2024).](https://arxiv.org/abs/2409.20325)
 5. [Vineet Gupta, Tomer Koren, and Yoram Singer. "Shampoo: Preconditioned stochastic tensor optimization." International Conference on Machine Learning. PMLR, 2018.](https://arxiv.org/abs/1802.09568)
-6. [Anil, Rohan, et al. "Scalable second order optimization for deep learning." arXiv preprint arXiv:2002.09018 (2020).](https://arxiv.org/abs/2002.09018)
-7. [Hägele, Alexander, et al. "Scaling Laws and Compute-Optimal Training Beyond Fixed Training Durations." arXiv preprint arXiv:2405.18392 (2024).](https://arxiv.org/abs/2405.18392)
+6. [Rohan Anil et al. "Scalable second order optimization for deep learning." arXiv preprint arXiv:2002.09018 (2020).](https://arxiv.org/abs/2002.09018)
+7. [Alexander Hägele et al. "Scaling Laws and Compute-Optimal Training Beyond Fixed Training Durations." arXiv preprint arXiv:2405.18392 (2024).](https://arxiv.org/abs/2405.18392)
+8. [Zhanchao Zhou et al. "Value Residual Learning For Alleviating Attention Concentration In Transformers." arXiv preprint arXiv:2410.17897 (2024).](https://arxiv.org/abs/2410.17897)
+9. [Team, Gemma, et al. "Gemma 2: Improving open language models at a practical size." arXiv preprint arXiv:2408.00118 (2024).](https://arxiv.org/abs/2408.00118)
+10. [Alec Radford et al. "Language models are unsupervised multitask learners." OpenAI blog 1.8 (2019).](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf)
+
+## Citation
+
+```
+@misc{modded_nanogpt_2024,
+  author       = {Keller Jordan and Jeremy Bernstein and Brendan Rappazzo and
+                  @fernbear.bsky.social and Boza Vlado and You Jiacheng and
+                  Franz Cesista and Braden Koszarsky and @Grad62304977},
+  title        = {modded-nanogpt: Speedrunning the NanoGPT baseline},
+  year         = {2024},
+  url          = {https://github.com/KellerJordan/modded-nanogpt}
+}
+```
 
 <img src="img/dofa.jpg" alt="itsover_wereback" style="width:100%;">
 
