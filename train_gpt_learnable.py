@@ -162,11 +162,10 @@ class Rotary(nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, dim, num_heads, layer_id):
+    def __init__(self, dim, num_heads):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
-        self.layer_id = layer_id
         self.c_q = CastedLinear(dim, dim)
         self.c_k = CastedLinear(dim, dim)
         self.c_v = CastedLinear(dim, dim)
@@ -174,7 +173,7 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
-        self.attn_scale = 0.13 + 0.01 * min(layer_id, 11 - layer_id)  # unet pattern attention scale by @leloykun
+        self.attn_scale = nn.Parameter(torch.tensor(1.0 / (dim // num_heads) ** 0.5))
 
     def forward(self, x, ve, block_mask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -188,7 +187,7 @@ class CausalSelfAttention(nn.Module):
             v = self.lambdas[0] * v
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale)
+        y = flex_attention(q.transpose(1, 2) * self.attn_scale, k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=1.)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -209,9 +208,9 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, model_dim, num_heads, layer_id, use_attn=True):
+    def __init__(self, model_dim, num_heads, use_attn=True):
         super().__init__()
-        self.attn = CausalSelfAttention(model_dim, num_heads, layer_id) if use_attn else None
+        self.attn = CausalSelfAttention(model_dim, num_heads) if use_attn else None
         self.mlp = MLP(model_dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
@@ -242,8 +241,8 @@ class GPT(nn.Module):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_id=layer_id, use_attn=(layer_id != 7))
-                                     for layer_id in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, use_attn=(i != 7))
+                                     for i in range(num_layers)])
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
         # U-net structure on token value embeddings by @leloykun
         self.value_embeds = ValueEmbedding(vocab_size, model_dim)
@@ -384,7 +383,7 @@ class Hyperparameters:
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
-    num_iterations = 1375 # number of iterations to run
+    num_iterations = 1370 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     bf16_embeds = True
     # evaluation and logging
