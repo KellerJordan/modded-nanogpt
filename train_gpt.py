@@ -243,10 +243,10 @@ class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len=65536):
         super().__init__()
         # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
-        angular_freq = (1 / 1024) ** torch.linspace(0.0, 1.0, steps=dim // 4, dtype=torch.float32)
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim // 4)])
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
         t = torch.arange(max_seq_len, dtype=torch.float32)
-        theta = torch.einsum("i, j -> ij", t, angular_freq)
+        theta = torch.einsum('i,j -> ij', t, angular_freq)
         self.cos = nn.Buffer(theta.cos(), persistent=False)
         self.sin = nn.Buffer(theta.sin(), persistent=False)
 
@@ -429,7 +429,7 @@ def _load_data_shard(file: Path):
         tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
-        assert nbytes == 2 * num_tokens, 'number of tokens read does not match header?'
+        assert nbytes == 2 * num_tokens, 'number of tokens read does not match header'
     return tokens
 
 def distributed_data(filename_pattern: str, batch_size: int):
