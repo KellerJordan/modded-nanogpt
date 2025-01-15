@@ -453,13 +453,13 @@ def distributed_data(filename_pattern: str, batch_size: int):
 @dataclass
 class Hyperparameters:
     # data
-    train_bin = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-    val_bin = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    train_files = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
+    val_files = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
     num_iterations = 1395 # number of iterations to run
-    cooldown_frac = 0.4 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
+    cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
@@ -503,8 +503,8 @@ print0(nvidia_smi())
 print0('='*100)
 
 # load data
-train_loader = distributed_data(args.train_bin, args.batch_size)
-val_loader = partial(distributed_data, args.val_bin)
+train_loader = distributed_data(args.train_files, args.batch_size)
+val_loader = partial(distributed_data, args.val_files)
 
 model = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768).cuda()
 for m in model.modules():
