@@ -364,7 +364,7 @@ class GPT(nn.Module):
             causal_mask = q_idx >= kv_idx
             document_mask = docs[q_idx] == docs[kv_idx]
             return causal_mask & document_mask
-        
+
         def dense_to_ordered(dense_mask: Tensor):
             num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
             indices = dense_mask.argsort(dim=-1, descending=True, stable=True).to(torch.int32)
