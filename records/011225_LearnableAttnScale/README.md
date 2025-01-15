@@ -15,3 +15,6 @@ import scipy.stats
 print('p=%.4f' % scipy.stats.ttest_1samp(accs, 3.28, alternative='less').pvalue)
 # p=0.0061
 ```
+
+NOTE: current record on PyTorch 2.7.0 nightly v.250110:
+step:1390/1390 val_loss:3.2782 train_time:202898ms step_avg:147.03ms
