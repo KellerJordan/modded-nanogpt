@@ -413,7 +413,8 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_mask)
         x = norm(x)
         logits = lm_head(x, self.lm_head.weight) if self.training else self.lm_head(x)
-        logits = 30 * torch.sigmoid(logits.float() / 7.5) # @Grad62304977
+        # @Grad62304977 added tanh softcapping, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
+        logits = 30 * torch.sigmoid(logits.float() / 7.5)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq.view(-1))
         return loss
 
