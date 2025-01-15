@@ -277,10 +277,10 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).view(B, T, self.num_heads, -1)
         k = self.c_k(x).view(B, T, self.num_heads, -1)
         v = self.c_v(x).view(B, T, self.num_heads, -1)
-        if ve is None: # skip mid-layers token value embeddings by @YouJiacheng 
-            v = self.lambdas[0] * v
-        else:
+        if ve is not None:
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+        else: # skip mid-layers token value embeddings by @YouJiacheng
+            v = self.lambdas[0] * v
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
@@ -291,7 +291,7 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.c_fc   = CastedLinear(dim, 4 * dim)
+        self.c_fc = CastedLinear(dim, 4 * dim)
         self.c_proj = CastedLinear(4 * dim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
@@ -309,10 +309,10 @@ class Block(nn.Module):
         self.mlp = MLP(model_dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x, vi, x0, block_mask):
+    def forward(self, x, ve, x0, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
-            x = x + self.attn(norm(x), vi, block_mask)
+            x = x + self.attn(norm(x), ve, block_mask)
         x = x + self.mlp(norm(x))
         return x
 
