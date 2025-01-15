@@ -396,7 +396,7 @@ class GPT(nn.Module):
 
         block_mask = create_doc_swc_block_mask(sliding_window_num_blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]) # @Grad62304977
+        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
         ve = self.value_embeds(input_seq)
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
         assert len(ve_enc) == self.num_encoder_layers and len(ve_dec) == self.num_decoder_layers
