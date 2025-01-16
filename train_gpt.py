@@ -173,6 +173,10 @@ class Muon(torch.optim.Optimizer):
         param_groups = [
             dict(params=[p for p in params if p.numel() == size], **create_update_buffer(size)) for size in sizes]
         super().__init__(param_groups, defaults)
+        # pre-init momentum
+        for group in self.param_groups:
+            for p in group['params']:
+                self.state[p]['momentum_buffer'] = torch.zeros(p.shape, device=p.device, dtype=torch.float)
 
     @torch.no_grad()
     def step(self):
@@ -203,9 +207,7 @@ class Muon(torch.optim.Optimizer):
                     g = p.grad
                     assert g is not None
                     state = self.state[p]
-                    if 'momentum_buffer' not in state:
-                        state['momentum_buffer'] = torch.zeros_like(g)
-                    buf: Tensor = state['momentum_buffer']
+                    buf = state['momentum_buffer']
                     buf.lerp_(g, 1 - momentum)
                     g = g.lerp_(buf, momentum) if nesterov else buf
                     g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
@@ -219,8 +221,28 @@ class Muon(torch.optim.Optimizer):
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
+# semi-orthogonal initialization @fernbear.bsky.social
+def semi_orthogonal_init(dim_in, dim_out, steps=5):
+    # default pytorch linear layer init
+    weight= (1/dim_in)**.5*(2*(torch.rand(dim_out, dim_in, device='cuda')) - 1.)
+
+    w_std = weight.std(dim=0).mean()
+    weight = zeropower_via_newtonschulz5(weight, steps=steps)
+    weight *= w_std/weight.std(dim=0).mean().add_(1e-8)
+    return weight.float()
+
+# fused scalar <-> RMSNorm @fernbear.bsky.social
+class RMSNormScalar(nn.Module):
+    def __init__(self, init_val=.5413):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(init_val)) # Softplus of default value is ~1
+
+    def forward(self, x):
+        norm = x.float().norm(dim=-1, keepdim=True).type_as(x)
+        norm = norm.add(torch.finfo(norm.dtype).eps)
+        rms_inv = (F.softplus(self.scale.type_as(x)) * x.shape[-1] ** .5) / norm
+        result = x * rms_inv
+        return result
 
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int):
@@ -255,61 +277,70 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int):
+
+    def __init__(self, dim: int, num_heads: int, use_value_embed=True):
         super().__init__()
         assert dim % num_heads == 0
+        num_heads = num_heads
         self.num_heads = num_heads
-        self.c_q = CastedLinear(dim, dim)
-        self.c_k = CastedLinear(dim, dim)
-        self.c_v = CastedLinear(dim, dim)
-        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
-        self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
-        self.c_proj = CastedLinear(dim, dim)
-        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        self.c_q = nn.Parameter(semi_orthogonal_init(dim, dim))
+        self.c_k = nn.Parameter(semi_orthogonal_init(dim, dim))
+        self.c_v = nn.Parameter(semi_orthogonal_init(dim, dim))
+        self.qkv_scale = nn.Parameter(torch.ones(3*dim))
+        self.q_norm = RMSNormScalar()
+        self.k_norm = RMSNormScalar()
+        if use_value_embed:
+            self.value_embed_lambda = nn.Parameter(torch.tensor([-.4328])) #~zero init after softplus
+        self.rotary = Rotary(dim // num_heads)
+        self.c_proj = nn.Parameter(torch.zeros(dim, dim)) # zero init suggested by @Grad62304977
+        self.c_proj_scale = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, 'Must use batch size = 1 for FlexAttention'
-        q = self.c_q(x).view(B, T, self.num_heads, -1)
-        k = self.c_k(x).view(B, T, self.num_heads, -1)
-        v = self.c_v(x).view(B, T, self.num_heads, -1)
-        if ve is not None:
-            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
-        else: # skip mid-layers token value embeddings by @YouJiacheng
-            v = self.lambdas[0] * v
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        qkv_weight = (self.qkv_scale.unsqueeze(1) * torch.cat([self.c_q, self.c_k, self.c_v], dim=0)).type_as(x) # fuse weights @fernbear.bsky.social
+        q, k, v = F.linear(x, qkv_weight).view(B, T, 3*self.num_heads, -1).chunk(3, dim=-2)
+        if ve is not None: # skip mid-layers token value embeddings by @YouJiacheng
+            v = v + F.softplus(self.value_embed_lambda.type_as(v)) * ve.view_as(v) # @KoszarskyB & @Grad62304977 & @fernbear.bsky.social
+        q, k = self.q_norm(q), self.k_norm(k) # QK norm @Grad62304977, learnable scalar @brendanh0gan
         q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
-        y = self.c_proj(y)
+        y = F.linear(y, (self.c_proj_scale*self.c_proj).type_as(x))
         return y
 
 class MLP(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, expand=4):
         super().__init__()
-        self.c_fc = CastedLinear(dim, 4 * dim)
-        self.c_proj = CastedLinear(4 * dim, dim)
-        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        self.c_fc_scale   = nn.Parameter(torch.ones(dim))
+        self.c_fc         = nn.Parameter(semi_orthogonal_init(dim, 4 * dim))
+        self.c_proj       = nn.Parameter(torch.zeros(dim, 4 * dim)) # zero-init suggested by @Grad62304977
+        self.c_proj_scale = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        x = self.c_fc(x)
+        x = F.linear(x, (self.c_fc*self.c_fc_scale.unsqueeze(0)).type_as(x)) # fuse weight & weight_scale mults
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
+        x = F.linear(x, (self.c_proj_scale.unsqueeze(1) * self.c_proj).type_as(x))
         return x
 
 class Block(nn.Module):
-    def __init__(self, model_dim: int, num_heads: int, layer_idx: int):
+
+    def __init__(self, model_dim, num_heads, block_num):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(model_dim, num_heads) if layer_idx != 7 else None
+        use_attn = (block_num != 7)
+        use_value_embed = (block_num in [0, 1, 2, 9, 10, 11])
+        self.attn = CausalSelfAttention(model_dim, num_heads, use_value_embed) if use_attn else None
+        self.attn_norm = RMSNormScalar(-.4328) if use_attn else None
         self.mlp = MLP(model_dim)
+        self.mlp_norm  = RMSNormScalar()
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x, ve, x0, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
-            x = x + self.attn(norm(x), ve, block_mask)
-        x = x + self.mlp(norm(x))
+            x = x + self.attn(self.attn_norm(x), ve, block_mask)
+        x = x + self.mlp(self.mlp_norm(x))
         return x
 
 class ValueEmbedding(nn.Module):
@@ -333,18 +364,22 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
+        self.embed_norm = RMSNormScalar()
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx) for layer_idx in range(num_layers)])
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
         self.value_embeds = ValueEmbedding(vocab_size, model_dim)
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx) for layer_idx in range(num_layers)])
+        # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
+        # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
+        self.lm_head = nn.Parameter(torch.zeros(next_multiple_of_n(vocab_size, n=128), model_dim)) # zero-init by @Grad6230497
+        self.lm_head_scale = nn.Parameter(torch.ones(model_dim))
+        self.out_norm = RMSNormScalar()
+        self.out_bias = nn.Embedding(vocab_size, model_dim)
         # U-net design by @brendanh0gan
         self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
         self.num_decoder_layers = num_layers - self.num_encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
-        # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
-        # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128))
-        self.lm_head.weight.detach().zero_() # @Grad62304977
+        self.register_buffer('noise_scale', torch.tensor(0.1))
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
@@ -391,7 +426,9 @@ class GPT(nn.Module):
 
         block_mask = create_doc_swc_block_mask(sliding_window_num_blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        embeds = self.embed(input_seq[None])
+        noise = self.noise_scale * torch.fmod(torch.randn_like(embeds), 2.) # input noising by schedule by @brendanh0gan
+        x = x0 = self.embed_norm(embeds + noise) # use of norm here by @Grad62304977, scalar norm by @fernbear.bsky.social
         ve = self.value_embeds(input_seq)
         assert len(ve) == len(self.blocks)
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
@@ -407,11 +444,14 @@ class GPT(nn.Module):
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
             x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_mask)
-        x = norm(x)
-        logits = lm_head_fp8(x, self.lm_head.weight) if self.training else self.lm_head(x)
+
+        x = self.out_norm(x - x0 + self.out_bias(input_seq).bfloat16()) # input subtract, per-token output bias by @fernbear.bsky.social
         # @Grad62304977 added tanh softcapping, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
-        logits = 30 * torch.sigmoid(logits.float() / 7.5)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
+        lm_head_w = (self.lm_head_scale / 7.5) * self.lm_head
+        # fuse sigmoid scale & weight scale @fernbear.bsky.social
+        logits = lm_head_fp8(x, lm_head_w) if self.training else F.linear(x, lm_head_w.type_as(x))
+        logits = 30 * torch.sigmoid(logits)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)).float(), target_seq)
         return loss
 
 # -----------------------------------------------------------------------------
@@ -455,7 +495,7 @@ class Hyperparameters:
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
-    num_iterations = 1395 # number of iterations to run
+    num_iterations = 1330 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -512,9 +552,9 @@ for param in model.parameters():
 
 # collect the parameters to optimize
 hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim == 2]
-embed_params = [model.embed.weight, *model.value_embeds.parameters()]
+embed_params = [model.out_bias.weight, model.embed.weight, *model.value_embeds.parameters()]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
-head_params = [model.lm_head.weight]
+head_params = [model.lm_head]
 
 # init the optimizer(s)
 adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
@@ -553,12 +593,22 @@ for step in range(train_steps + 1):
     # Linearly increase the block-wise sliding window size over training 128 -> 1792:
     # increase by @fernbear.bsky.social; block-wise by @YouJiacheng
     window_size = next_multiple_of_n(1728 * step / train_steps, n=128)
+
+    # Update noise scale to follow triangular schedule
+    # Cosine decay from 0.01 to 0 over entire training
+    progress = step / args.num_iterations
+    noise_scale = torch.cos(torch.tensor(progress * torch.pi)).mul_(.01)
+    model.noise_scale.copy_(noise_scale, non_blocking=True) # update model with new noise scale
+
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
+        # copy the noise scale out temporarily
+        noise_scale_cache = model.noise_scale.clone()
+        model.noise_scale.zero_()
         val_bs = world_size * args.seq_len
         assert args.val_tokens % val_bs == 0
         val_steps = args.val_tokens // val_bs
@@ -573,6 +623,8 @@ for step in range(train_steps + 1):
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f'step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms', console=True)
         model.train()
+        # reset noise value
+        model.noise_scale.copy_(noise_scale_cache, non_blocking=True)
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
