@@ -219,7 +219,7 @@ class Muon(torch.optim.Optimizer):
             update_prev()
 
 # -----------------------------------------------------------------------------
-# PyTorch nn.Module definitions for the GPT-2 model
+# PyTorch nn.Module definitions for the model
 
 # semi-orthogonal initialization @fernbear.bsky.social
 def semi_orthogonal_init(dim_in, dim_out, steps=5):
@@ -342,7 +342,7 @@ class ValueEmbedding(nn.Module):
         return ve
 
 # -----------------------------------------------------------------------------
-# The main GPT-2 model
+# The main model
 
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
