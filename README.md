@@ -5,7 +5,7 @@ We begin with Andrej Karpathy's [PyTorch GPT-2 trainer](https://github.com/karpa
 from [llm.c](https://github.com/karpathy/llm.c), which attains 3.28 validation cross-entropy loss on the FineWeb dataset after training for 45 minutes on 8 NVIDIA H100 GPUs.
 We then iteratively improve the trainer in order to attain the same level of performance in less wallclock time.
 The current iteration reaches the same performance as Karpathy's original GPT-2 trainer in:
-* 3.4 minutes on 8xH100 (original trainer needed 45)
+* 3.142 minutes on 8xH100 (original trainer needed 45)
 * 0.73B tokens (original trainer needed 10B)
 
 This improvement in training performance was brought about by the following techniques:
@@ -17,6 +17,7 @@ This improvement in training performance was brought about by the following tech
 * Skip connections from the embedding to residual stream junctions
 * Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
 * FlexAttention with window size warmup
+* FP8 for the head matmul
 
 Contributors list (growing with each new record): [@Grad62304977](https://x.com/Grad62304977),
 [@jxbz](https://x.com/jxbz), [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan),
@@ -35,7 +36,7 @@ python data/cached_fineweb10B.py 8 # downloads only the first 0.8B training toke
 ./run.sh
 ```
 
-The result will be a transformer with 124M active parameters trained for 1390 steps on 0.73B tokens of Fineweb [1], achieving ~3.279 mean validation loss (with 0.002 inter-run stddev).
+The result will be a transformer with 124M active parameters trained for 1395 steps on 0.73B tokens of Fineweb [1], achieving ~3.279 mean validation loss (with 0.002 inter-run stddev).
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
 **Note: torch.compile will take a long time on the first run.**
