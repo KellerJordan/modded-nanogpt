@@ -225,7 +225,6 @@ class Muon(torch.optim.Optimizer):
 def semi_orthogonal_init(dim_in, dim_out, steps=5):
     # default pytorch linear layer init
     weight= (1/dim_in)**.5*(2*(torch.rand(dim_out, dim_in, device='cuda')) - 1.)
-
     w_std = weight.std(dim=0).mean()
     weight = zeropower_via_newtonschulz5(weight, steps=steps)
     weight *= w_std/weight.std(dim=0).mean().add_(1e-8)
