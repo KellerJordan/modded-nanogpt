@@ -244,19 +244,6 @@ class RMSNormScalar(nn.Module):
         result = x * rms_inv
         return result
 
-class CastedLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int):
-        super().__init__(in_features, out_features, bias=False)
-
-    def reset_parameters(self) -> None:
-        std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
-        bound = (3 ** 0.5) * std
-        with torch.no_grad():
-            self.weight.uniform_(-bound, bound)
-
-    def forward(self, x):
-        return F.linear(x, self.weight.type_as(x))
-
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len=65536):
         super().__init__()
@@ -449,7 +436,8 @@ class GPT(nn.Module):
         # @Grad62304977 added tanh softcapping, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         lm_head_w = (self.lm_head_scale / 7.5) * self.lm_head
         # fuse sigmoid scale & weight scale @fernbear.bsky.social
-        logits = lm_head_fp8(x, lm_head_w) if self.training else F.linear(x, lm_head_w.type_as(x))
+        #logits = lm_head_fp8(x, lm_head_w) if self.training else F.linear(x, lm_head_w.type_as(x))
+        logits = F.linear(x, lm_head_w.type_as(x))
         logits = 30 * torch.sigmoid(logits)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)).float(), target_seq)
         return loss
