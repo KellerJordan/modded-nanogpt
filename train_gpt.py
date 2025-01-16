@@ -1,26 +1,22 @@
 import os
 import sys
-
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-import time
 import uuid
+import time
 from dataclasses import dataclass
-from functools import lru_cache, partial
-from itertools import cycle, islice
+from functools import lru_cache
 from pathlib import Path
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
-import torch._inductor.config as config
-import torch.distributed as dist
-import torch.nn.functional as F
+torch.empty(1, device='cuda', requires_grad=True).backward() # prevents a bug on some systems
 from torch import Tensor, nn
-
-# Use of FlexAttention contributed by @KoszarskyB
+import torch.nn.functional as F
+import torch.distributed as dist
+# use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-
-config.coordinate_descent_tuning = True
+torch._inductor.config.coordinate_descent_tuning = True
 
 # -----------------------------------------------------------------------------
 # Custom operators
@@ -103,7 +99,7 @@ def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
 
 mm_op.register_autograd(backward, setup_context=setup_context)
 
-def lm_head(x: Tensor, w: Tensor) -> Tensor:
+def lm_head_fp8(x: Tensor, w: Tensor) -> Tensor:
     _x = x.flatten(0, -2)
     out: Tensor = torch.ops.nanogpt.mm(_x, w, x_s=2.0, w_s=32.0, grad_s=2.0**29)[0]
     return out.reshape(*x.shape[:-1], -1)
@@ -164,14 +160,16 @@ class Muon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
+        self.rank = rank
+        self.world_size = world_size
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
-        params: "list[Tensor]" = [*params]
+        params: list[Tensor] = [*params]
         assert all(isinstance(p, Tensor) for p in params)
         sizes = {p.numel() for p in params}
         def create_update_buffer(size: int):
-            b = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda")
-            return dict(update_buffer=b, update_buffer_views=[b[i] for i in range(world_size)])
+            b = torch.empty(self.world_size, size, dtype=torch.bfloat16, device="cuda")
+            return dict(update_buffer=b, update_buffer_views=[b[i] for i in range(self.world_size)])
         param_groups = [
             dict(params=[p for p in params if p.numel() == size], **create_update_buffer(size)) for size in sizes]
         super().__init__(param_groups, defaults)
@@ -184,9 +182,9 @@ class Muon(torch.optim.Optimizer):
             nesterov = group['nesterov']
             ns_steps = group['ns_steps']
             update_buffer = group['update_buffer']
-            update_buffer_views: "list[Tensor]" = group['update_buffer_views']
+            update_buffer_views: list[Tensor] = group['update_buffer_views']
             # generate weight updates in distributed fashion
-            params: "list[Tensor]" = group['params']
+            params: list[Tensor] = group['params']
             handle = None
             params_world = None
             def update_prev():
@@ -199,9 +197,9 @@ class Muon(torch.optim.Optimizer):
                         g_world.view_as(p_world),
                         alpha=-lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
                     )
-            for base_i in range(len(params))[::world_size]:
-                if base_i + rank < len(params):
-                    p = params[base_i + rank]
+            for base_i in range(len(params))[::self.world_size]:
+                if base_i + self.rank < len(params):
+                    p = params[base_i + self.rank]
                     g = p.grad
                     assert g is not None
                     state = self.state[p]
@@ -212,19 +210,17 @@ class Muon(torch.optim.Optimizer):
                     g = g.lerp_(buf, momentum) if nesterov else buf
                     g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
                 else:
-                    g = update_buffer_views[rank]
+                    g = update_buffer_views[self.rank]
                 update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
                 handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
-                params_world = params[base_i : base_i + world_size]
+                params_world = params[base_i : base_i + self.world_size]
             update_prev()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
-def norm(x: Tensor, size: int = None):
-    if size is None:
-        size = x.size(-1)
-    return F.rms_norm(x.unflatten(-1, (-1, size)), (size,)).flatten(-2)
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),))
 
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int):
@@ -319,10 +315,9 @@ class Block(nn.Module):
 class ValueEmbedding(nn.Module):
     def __init__(self, num_embeddings: int, embedding_dim: int):
         super().__init__()
-        self.__setattr__
         self.embed = nn.ModuleList([nn.Embedding(num_embeddings, embedding_dim) for _ in range(3)])
 
-    def forward(self, input_seq) -> "list[Tensor | None]":
+    def forward(self, input_seq) -> list[Tensor | None]:
         ve = [emb(input_seq) for emb in self.embed]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
         ve = [ve[0], ve[1], ve[2], None, None, None, None, None, None, ve[0], ve[1], ve[2]]
@@ -412,7 +407,7 @@ class GPT(nn.Module):
             x = x + self.skip_weights[i] * skip_connections.pop()
             x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_mask)
         x = norm(x)
-        logits = lm_head(x, self.lm_head.weight) if self.training else self.lm_head(x)
+        logits = lm_head_fp8(x, self.lm_head.weight) if self.training else self.lm_head(x)
         # @Grad62304977 added tanh softcapping, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits.float() / 7.5)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
@@ -433,11 +428,11 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, 'number of tokens read does not match header'
     return tokens
 
-def distributed_data(filename_pattern: str, batch_size: int):
+def distributed_data_generator(filename_pattern: str, batch_size: int, rank : int, world_size : int):
     files = sorted(Path.cwd().glob(filename_pattern))
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
-    file_iter = cycle(files)
+    file_iter = iter(files) # use cycle(files) if you want to do multi-epoch training
     tokens, pos = _load_data_shard(next(file_iter)), 0
     while True:
         if pos + batch_size + 1 >= len(tokens):
@@ -479,17 +474,18 @@ dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 # begin logging
-def print0(s, console=False): ...
+logfile = None
 if master_process:
     run_id = uuid.uuid4()
-    (logs_dir := Path("logs")).mkdir(exist_ok=True)
-    logfile = logs_dir / f"{run_id}.txt"
-    print(logfile.stem)
-    def print0(s, console=False):
-        with logfile.open("a") as f:
-            # if console:
-            #     print(s)
-            print(s, file=f)
+    os.makedirs('logs', exist_ok=True)
+    logfile = f'logs/{run_id}.txt'
+    print(logfile)
+def print0(s, console=False):
+    if master_process:
+        with open(logfile, 'a') as f:
+             if console:
+                 print(s)
+             print(s, file=f)
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -504,8 +500,7 @@ print0(nvidia_smi())
 print0('='*100)
 
 # load data
-train_loader = distributed_data(args.train_files, args.batch_size)
-val_loader = partial(distributed_data, args.val_files)
+train_loader = distributed_data_generator(args.train_files, args.batch_size, rank, world_size)
 
 model = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768).cuda()
 for m in model.modules():
@@ -523,7 +518,7 @@ head_params = [model.lm_head.weight]
 # init the optimizer(s)
 adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
 optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95)
+optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 
 # learning rate schedule: stable then decay
@@ -558,7 +553,7 @@ for step in range(train_steps + 1):
     # increase by @fernbear.bsky.social; block-wise by @YouJiacheng
     window_size = next_multiple_of_n(1728 * step / train_steps, n=128)
     # --------------- VALIDATION SECTION -----------------
-    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
@@ -566,8 +561,14 @@ for step in range(train_steps + 1):
         val_bs = world_size * args.seq_len
         assert args.val_tokens % val_bs == 0
         val_steps = args.val_tokens // val_bs
+        val_loader = distributed_data_generator(args.val_files, val_bs, rank, world_size)
+        val_loss = 0
         with torch.no_grad():
-            val_loss = sum(model(x, y, sw_num_blks(window_size)) for x, y in islice(val_loader(val_bs), val_steps)) / val_steps
+            for _ in range(val_steps):
+                x, y = next(val_loader)
+                val_loss += model(x, y, sw_num_blks(window_size))
+        val_loss /= val_steps
+        del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f'step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms', console=True)
         model.train()
