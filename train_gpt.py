@@ -10,7 +10,7 @@ from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
-torch.empty(1, device='cuda', requires_grad=True).backward() # prevents a bug on some systems
+torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -151,7 +151,7 @@ class Muon(torch.optim.Optimizer):
     parameters; those should all be optimized by a standard method (e.g., AdamW).
     - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
     - We believe it is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
+    - We believe it may not work well for finetuning pretrained models, but we haven"t tested this.
     - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
 
     Arguments:
@@ -177,14 +177,14 @@ class Muon(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
-            lr = group['lr']
-            momentum = group['momentum']
-            nesterov = group['nesterov']
-            ns_steps = group['ns_steps']
-            update_buffer = group['update_buffer']
-            update_buffer_views: list[Tensor] = group['update_buffer_views']
+            lr = group["lr"]
+            momentum = group["momentum"]
+            nesterov = group["nesterov"]
+            ns_steps = group["ns_steps"]
+            update_buffer = group["update_buffer"]
+            update_buffer_views: list[Tensor] = group["update_buffer_views"]
             # generate weight updates in distributed fashion
-            params: list[Tensor] = group['params']
+            params: list[Tensor] = group["params"]
             handle = None
             params_world = None
             def update_prev():
@@ -203,9 +203,9 @@ class Muon(torch.optim.Optimizer):
                     g = p.grad
                     assert g is not None
                     state = self.state[p]
-                    if 'momentum_buffer' not in state:
-                        state['momentum_buffer'] = torch.zeros_like(g)
-                    buf: Tensor = state['momentum_buffer']
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf: Tensor = state["momentum_buffer"]
                     buf.lerp_(g, 1 - momentum)
                     g = g.lerp_(buf, momentum) if nesterov else buf
                     g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
@@ -242,7 +242,7 @@ class Rotary(nn.Module):
         angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
         angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
         t = torch.arange(max_seq_len, dtype=torch.float32)
-        theta = torch.einsum('i,j -> ij', t, angular_freq)
+        theta = torch.einsum("i,j -> ij", t, angular_freq)
         self.cos = nn.Buffer(theta.cos(), persistent=False)
         self.sin = nn.Buffer(theta.sin(), persistent=False)
 
@@ -269,7 +269,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
-        assert B == 1, 'Must use batch size = 1 for FlexAttention'
+        assert B == 1, "Must use batch size = 1 for FlexAttention"
         q = self.c_q(x).view(B, T, self.num_heads, -1)
         k = self.c_k(x).view(B, T, self.num_heads, -1)
         v = self.c_v(x).view(B, T, self.num_heads, -1)
@@ -419,14 +419,14 @@ class GPT(nn.Module):
 
 def _load_data_shard(file: Path):
     header = torch.from_file(f"{file}", False, 256, dtype=torch.int32) # header is 256 int32
-    assert header[0] == 20240520, 'magic number mismatch in the data .bin file'
-    assert header[1] == 1, 'unsupported version'
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
     num_tokens = int(header[2]) # number of tokens (claimed)
-    with file.open('rb', buffering=0) as f:
+    with file.open("rb", buffering=0) as f:
         tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
-        assert nbytes == 2 * num_tokens, 'number of tokens read does not match header'
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
 def distributed_data_generator(filename_pattern: str, batch_size: int, rank : int, world_size : int):
@@ -440,7 +440,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
             tokens, pos = _load_data_shard(next(file_iter)), 0
         buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn"t helpful.
         pos += batch_size
         yield inputs, targets
 
@@ -450,8 +450,8 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
 @dataclass
 class Hyperparameters:
     # data
-    train_files = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-    val_files = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
+    val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
@@ -465,12 +465,12 @@ class Hyperparameters:
 args = Hyperparameters()
 
 # torchrun sets these env variables
-rank = int(os.environ['RANK'])
-world_size = int(os.environ['WORLD_SIZE'])
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
 assert torch.cuda.is_available()
-device = torch.device('cuda', int(os.environ['LOCAL_RANK']))
+device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
-dist.init_process_group(backend='nccl', device_id=device)
+dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
@@ -478,27 +478,27 @@ master_process = (rank == 0) # this process will do logging, checkpointing etc.
 logfile = None
 if master_process:
     run_id = uuid.uuid4()
-    os.makedirs('logs', exist_ok=True)
-    logfile = f'logs/{run_id}.txt'
+    os.makedirs("logs", exist_ok=True)
+    logfile = f"logs/{run_id}.txt"
     print(logfile)
 def print0(s, console=False):
     if master_process:
-        with open(logfile, 'a') as f:
+        with open(logfile, "a") as f:
              if console:
                  print(s)
              print(s, file=f)
 
 # begin by printing this file (the Python code)
 print0(code)
-print0('='*100)
+print0("="*100)
 # log information about the hardware/software environment this is running on
-print0(f'Running Python {sys.version}')
-print0(f'Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}')
+print0(f"Running Python {sys.version}")
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 def nvidia_smi():
     import subprocess  # avoid top level import
-    return subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
+    return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
-print0('='*100)
+print0("="*100)
 
 # load data
 train_loader = distributed_data_generator(args.train_files, args.batch_size, rank, world_size)
@@ -548,7 +548,7 @@ for step in range(train_steps + 1):
     if step == 10:
         training_time_ms = 0
         t0 = time.perf_counter()
-    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+    timed_steps = float("nan") if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
     # Linearly increase the block-wise sliding window size over training 128 -> 1792:
     # increase by @fernbear.bsky.social; block-wise by @YouJiacheng
@@ -571,7 +571,7 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f'step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms', console=True)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -580,8 +580,8 @@ for step in range(train_steps + 1):
     if last_step:
         if master_process and args.save_checkpoint:
             log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-            os.makedirs(f'logs/{run_id}', exist_ok=True)
-            torch.save(log, f'logs/{run_id}/state_step{step:06d}.pt')
+            os.makedirs(f"logs/{run_id}", exist_ok=True)
+            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
 
@@ -594,7 +594,7 @@ for step in range(train_steps + 1):
     # momentum warmup for Muon
     frac = min(step / 300, 1)
     for group in optimizer2.param_groups:
-        group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+        group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
@@ -603,7 +603,7 @@ for step in range(train_steps + 1):
     model.zero_grad(set_to_none=True)
     # logging
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f'step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms', console=True)
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms", console=True)
 
 print0(
     f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
