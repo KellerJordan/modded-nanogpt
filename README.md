@@ -53,6 +53,11 @@ sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt pyt
 sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt sh run.sh
 ```
 
+To get an interactive docker, you can use
+```bash
+sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt bash
+```
+
 ---
 
 ## World record history
