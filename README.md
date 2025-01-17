@@ -63,7 +63,7 @@ sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt bas
 
 The following is the historical progression of world records for the following competitive task:
 
-> *Train a neural network to 3.28 validation loss on FineWeb in the minimal amount of time on an 8xH100 machine.*
+> *Train a neural network to 3.28 validation loss on FineWeb in the minimum time using 8 H100s.*
 
 | # | Record time | Description | Date | Log | Contributors |
 | - | - | - | - | - | - |
