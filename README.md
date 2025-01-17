@@ -86,9 +86,9 @@ The following is the progression of world records for the task of *training a ne
 19 | 3.142 minutes | [FP8 head & other improvements](https://x.com/YouJiacheng/status/1878827972519772241) | 01/13/25 | [log](records/011325_Fp8LmHead/c51969c2-d04c-40a7-bcea-c092c3c2d11a.txt) | @YouJiacheng
 20 | 2.997 minutes | [Merged QKV weights & Local-global attention & attention scale & lowered Adam epsilon & batched Muon]() | 01/16/25 | [log](records/011625_Sub3Min/1d3bd93b-a69e-4118-aeb8-8184239d7566.txt) | @leloykun, @fernbear.bsky.social, @YouJiacheng, @brendanh0gan, @scottjmaddox, @Grad62304977
 
-## Submission rules
+## Rules
 
-The only rules are that new record submissions must:
+The only rules are that new records must:
 
 1. Not modify the train or validation data pipelines. (You can change the batch size, sequence length, attention structure etc.; just don't change the underlying streams of tokens.)
 2. Attain ≤ 3.28 mean val loss. (Due to inter-run variance, submissions must provide enough run logs to attain a statistical significance level of p<0.01 that their mean val loss is ≤ 3.28. Example code to compute p-value can be found [here](records/010425_SoftCap#softer-softcap).)
