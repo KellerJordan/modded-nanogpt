@@ -5,7 +5,7 @@ We begin with Andrej Karpathy's [PyTorch GPT-2 trainer](https://github.com/karpa
 from [llm.c](https://github.com/karpathy/llm.c), which attains 3.28 validation cross-entropy loss on the FineWeb dataset after training for 45 minutes on 8 NVIDIA H100 GPUs.
 We then iteratively improve the trainer in order to attain the same level of performance in less wallclock time.
 The current iteration reaches the same performance as Karpathy's original GPT-2 trainer in:
-* 3.142 minutes on 8xH100 (original trainer needed 45)
+* 2.99 minutes on 8xH100 (original trainer needed 45)
 * 0.73B tokens (original trainer needed 10B)
 
 This improvement in training performance was brought about by the following techniques:
@@ -16,7 +16,7 @@ This improvement in training performance was brought about by the following tech
 * Logit softcapping (following Gemma 2)
 * Skip connections from the embedding to residual stream junctions
 * Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
-* FlexAttention with window size warmup
+* FlexAttention with long-short sliding window attention pattern (inspired by Gemma 2) and window size warmup
 * FP8 for the head matmul
 
 Contributors list (growing with each new record): [@Grad62304977](https://x.com/Grad62304977),
@@ -36,7 +36,7 @@ python data/cached_fineweb10B.py 8 # downloads only the first 0.8B training toke
 ./run.sh
 ```
 
-The result will be a transformer with 124M active parameters trained for 1395 steps on 0.73B tokens of Fineweb [1], achieving ~3.279 mean validation loss (with 0.002 inter-run stddev).
+The result will be a transformer with 124M active parameters trained for 1393 steps on 0.73B tokens of Fineweb [1], achieving ~3.2785 mean validation loss (with 0.002 inter-run stddev).
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
 **Note: torch.compile will take a long time on the first run.**
@@ -87,7 +87,7 @@ The following is the progression of world records for the task of *training a ne
 17 | 3.57 minutes | [Sparsify value embeddings, improve rotary, drop an attn layer](https://x.com/YouJiacheng/status/1868938024731787640) | 12/17/24 | [log](records/121724_SparsifyEmbeds) | @YouJiacheng
 18 | 3.4 minutes | [Lower logit softcap from 30 to 15](https://x.com/kellerjordan0/status/1876048851158880624) | 01/04/25 | [log](records/010425_SoftCap/31d6c427-f1f7-4d8a-91be-a67b5dcd13fd.txt) | @KoszarskyB
 19 | 3.142 minutes | [FP8 head & other improvements](https://x.com/YouJiacheng/status/1878827972519772241) | 01/13/25 | [log](records/011325_Fp8LmHead/c51969c2-d04c-40a7-bcea-c092c3c2d11a.txt) | @YouJiacheng
-20 | 2.997 minutes | [Local-global attention & attention scale & merged QKV weights & lowered Adam epsilon & batched Muon]() | 01/16/25 | [log](records/011625_Sub3Min/1d3bd93b-a69e-4118-aeb8-8184239d7566.txt) | @leloykun, @fernbear.bsky.social, @YouJiacheng, @brendanh0gan, @scottjmaddox, @Grad62304977
+20 | 2.997 minutes | [Merged QKV weights & Local-global attention & attention scale & lowered Adam epsilon & batched Muon]() | 01/16/25 | [log](records/011625_Sub3Min/1d3bd93b-a69e-4118-aeb8-8184239d7566.txt) | @leloykun, @fernbear.bsky.social, @YouJiacheng, @brendanh0gan, @scottjmaddox, @Grad62304977
 
 ## Submission rules
 
