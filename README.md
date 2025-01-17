@@ -63,7 +63,7 @@ sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt bas
 
 The following is the historical progression of world records for the following competitive task:
 
-> *Train a neural network to 3.28 validation loss on FineWeb in the minimum time using 8x NVIDIA H100s.*
+> *Train a neural network to ≤3.28 validation loss on FineWeb in the minimum time using 8x NVIDIA H100s.*
 
 | # | Record time | Description | Date | Log | Contributors |
 | - | - | - | - | - | - |
@@ -93,7 +93,7 @@ The following is the historical progression of world records for the following c
 The only rules are that new records must:
 
 1. Not modify the train or validation data pipelines. (You can change the batch size, sequence length, attention structure etc.; just don't change the underlying streams of tokens.)
-2. Attain â¤ 3.28 mean val loss. (Due to inter-run variance, submissions must provide enough run logs to attain a statistical significance level of p<0.01 that their mean val loss is â¤ 3.28. Example code to compute p-value can be found [here](records/010425_SoftCap#softer-softcap).)
+2. Attain ≤3.28 mean val loss. (Due to inter-run variance, submissions must provide enough run logs to attain a statistical significance level of p<0.01 that their mean val loss is â¤ 3.28. Example code to compute p-value can be found [here](records/010425_SoftCap#softer-softcap).)
 
 Other than that, anything and everything is fair game!
 
