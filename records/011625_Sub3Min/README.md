@@ -4,10 +4,10 @@
 
 ```bash
 $ grep "1393/1393 val" * | python -c "import sys; ss = list(sys.stdin); accs = [float(s.split()[1].split(':')[1]) for s in ss]; print(accs); import scipy.stats; mvs = scipy.stats.bayes_mvs(accs); print(mvs[0]); print(mvs[2]); print(f'p={scipy.stats.ttest_1samp(accs, 3.28, alternative='less').pvalue:.4f}')"
-[3.276, 3.2789, 3.2775, 3.2784, 3.2807, 3.2805, 3.2777, 3.2786, 3.2791, 3.2786, 3.2789, 3.2784, 3.2755, 3.2784]
-Mean(statistic=np.float64(3.278371428571428), minmax=(np.float64(3.2776991429043822), np.float64(3.279043714238474)))
-Std_dev(statistic=np.float64(0.0015095034522994838), minmax=(np.float64(0.0010830080414360307), np.float64(0.0021098955160711572)))
-p=0.0004
+[3.276, 3.2785, 3.2796, 3.2789, 3.2775, 3.2784, 3.2767, 3.2792, 3.2807, 3.2801, 3.2805, 3.2777, 3.2799, 3.2786, 3.2776, 3.2791, 3.2808, 3.2776, 3.2786, 3.2789, 3.2784, 3.2755, 3.2784, 3.2798, 3.2825]
+Mean(statistic=np.float64(3.27878), minmax=(np.float64(3.2782455033515947), np.float64(3.279314496648405)))
+Std_dev(statistic=np.float64(0.001613079322994619), minmax=(np.float64(0.001268119576300257), np.float64(0.0020563656558746845)))
+p=0.0003
 ```
 
 ```
