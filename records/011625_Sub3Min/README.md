@@ -4,14 +4,14 @@
 
 ```bash
 $ grep "1393/1393 val" * | python -c "import sys; ss = list(sys.stdin); accs = [float(s.split()[1].split(':')[1]) for s in ss]; print(accs); import scipy.stats; mvs = scipy.stats.bayes_mvs(accs); print(mvs[0]); print(mvs[2]); print(f'p={scipy.stats.ttest_1samp(accs, 3.28, alternative='less').pvalue:.4f}')"
-[3.276, 3.2789, 3.2784, 3.2807, 3.2805, 3.2777, 3.2786, 3.2791, 3.2786, 3.2789, 3.2784, 3.2755, 3.2784]
-Mean(statistic=np.float64(3.2784384615384616), minmax=(np.float64(3.2777191378183352), np.float64(3.279157785258588)))
-Std_dev(statistic=np.float64(0.0015547817302379028), minmax=(np.float64(0.001099334493687865), np.float64(0.0022050730331464735)))
-p=0.0011
+[3.276, 3.2789, 3.2775, 3.2784, 3.2807, 3.2805, 3.2777, 3.2786, 3.2791, 3.2786, 3.2789, 3.2784, 3.2755, 3.2784]
+Mean(statistic=np.float64(3.278371428571428), minmax=(np.float64(3.2776991429043822), np.float64(3.279043714238474)))
+Std_dev(statistic=np.float64(0.0015095034522994838), minmax=(np.float64(0.0010830080414360307), np.float64(0.0021098955160711572)))
+p=0.0004
 ```
 
 ```
-Mean runtime: 178.7 seconds
+Mean runtime: 179.8 seconds
 Stddev: 101ms
 ```
 
