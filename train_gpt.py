@@ -19,7 +19,7 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 torch._inductor.config.coordinate_descent_tuning = True
 
 # -----------------------------------------------------------------------------
-# Custom operators
+# Custom operators : FP8 matmul for lm_head by @YouJiacheng
 
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
@@ -118,7 +118,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
-    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox
+    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
@@ -129,7 +129,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     # Perform the NS iterations
     for _ in range(steps):
         A = X @ X.mT
-        B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
     
     if G.size(-2) > G.size(-1):
@@ -187,7 +187,7 @@ class Muon(torch.optim.Optimizer):
             params: list[Tensor] = group["params"]
             handle = None
             params_world = None
-            def update_prev():
+            def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
                 if params_world is None:
                     return
                 assert handle is not None
@@ -260,14 +260,16 @@ class CausalSelfAttention(nn.Module):
         assert dim % num_heads == 0
         self.num_heads = num_heads
         std = 0.5 * (dim ** -0.5)
-        bound = (3 ** 0.5) * std # init scale by @YouJiacheng
-        self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound)) # merged QKV weights by @fernbear.bsky.social & @brendanh0gan
+        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
+        # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, then further improved by @YouJiacheng
+        # https://x.com/hi_tysam/status/1879699187107033311
+        self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound))
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
-        # Set attention scale such that the minimum attainable attention entropy
-        # (but not necessary the attention entropy itself) is close to 0. By @leloykun
+        # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
+        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = 0.12
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
@@ -334,7 +336,7 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
-        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
+        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         self.value_embeds = ValueEmbedding(vocab_size, model_dim)
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx) for layer_idx in range(num_layers)])
         # U-net design by @brendanh0gan
@@ -436,7 +438,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
     files = sorted(Path.cwd().glob(filename_pattern))
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
-    file_iter = iter(files) # use cycle(files) if you want to do multi-epoch training
+    file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
     tokens, pos = _load_data_shard(next(file_iter)), 0
     while True:
         if pos + batch_size + 1 >= len(tokens):
@@ -521,7 +523,9 @@ head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
 adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
-optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), fused=True, eps=1e-10) # small adam epsilon by @fernbear.bsky.social & @YouJiacheng
+# small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
+# discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
+optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), fused=True, eps=1e-10)
 optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 
