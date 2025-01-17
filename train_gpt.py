@@ -118,7 +118,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
-    assert G.ndim >= 2
+    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
@@ -260,8 +260,8 @@ class CausalSelfAttention(nn.Module):
         assert dim % num_heads == 0
         self.num_heads = num_heads
         std = 0.5 * (dim ** -0.5)
-        bound = (3 ** 0.5) * std
-        self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound))
+        bound = (3 ** 0.5) * std # init scale by @YouJiacheng
+        self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound)) # merged QKV weights by @fernbear.bsky.social & @brendanh0gan
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
         self.c_proj = CastedLinear(dim, dim)
@@ -389,7 +389,7 @@ class GPT(nn.Module):
                 )
             return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
-        # Long-short SWA block masks by @leloykun & @YouJiacheng
+        # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         long_bm, short_bm = create_doc_swc_block_masks(sliding_window_num_blocks)
 
         x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
@@ -412,7 +412,7 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_masks[i])
         x = norm(x)
         logits = lm_head_fp8(x, self.lm_head.weight) if self.training else self.lm_head(x)
-        # @Grad62304977 added tanh softcapping, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
+        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits.float() / 7.5)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
         return loss
@@ -521,7 +521,7 @@ head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
 adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
-optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), fused=True, eps=1e-10)
+optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), fused=True, eps=1e-10) # small adam epsilon by @fernbear.bsky.social & @YouJiacheng
 optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 
