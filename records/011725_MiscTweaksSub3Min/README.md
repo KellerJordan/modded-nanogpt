@@ -3,12 +3,25 @@
 Changelogs:
 
 - @leloykun's & @YouJiacheng's Long-Short Sliding Window Attention
-  - (c) @Grad62304977 for suggesting Local-Global Attention which eventually morphed into this implementation
 - @leloykun's & @YouJiacheng's & @brendanh0gan's attention scale modifications
 - @tysam-code's & @brendanh0gan's merged QKV weights
   - @scottjmaddox's Batched Muon implementation (to avoid concat on the QKV weights)
   - (c) @YouJiacheng for pointing out this optimization
 - @tysam-code's & @YouJiacheng's Adam eps fix
+
+Additional credits:
+- @Grad62304977 for suggesting Local-Global Attention which eventually morphed into this implementation
+- @koszarskyb for implementing Sliding Window Attention using FlexAttention
+
+---
+
+```python
+val_losses = [3.2793, 3.2778, 3.2814, 3.2786, 3.2792, 3.278, 3.2764, 3.2777, 3.2783, 3.2782, 3.2801, 3.2774, 3.2767, 3.2776]
+
+import scipy.stats
+print('p=%.4f' % scipy.stats.ttest_1samp(val_losses, 3.28, alternative='less').pvalue)
+# p=0.0002
+```
 
 ![](val_losses.png)
 ![](wallclock.png)
