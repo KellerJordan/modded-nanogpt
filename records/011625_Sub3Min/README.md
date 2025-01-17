@@ -3,11 +3,11 @@
 ### Evidence for <=3.28 mean loss
 
 ```bash
-$ grep "1385/1385 val" * | python -c "import sys; ss = list(sys.stdin); accs = [float(s.split()[1].split(':')[1]) for s in ss]; print(accs); import scipy.stats; mvs = scipy.stats.bayes_mvs(accs); print(mvs[0]); print(mvs[2]); print(f'p={scipy.stats.ttest_1samp(accs, 3.28, alternative='less').pvalue:.4f}')"
-[3.2811, 3.2775, 3.2797, 3.2794, 3.2797, 3.279, 3.2794, 3.2785, 3.2798, 3.2787, 3.279, 3.2782, 3.2776, 3.2799, 3.2788, 3.2795, 3.2794, 3.2792, 3.2787, 3.2819]
-Mean(statistic=np.float64(3.27925), minmax=(np.float64(3.2788524181758407), np.float64(3.2796475818241597)))
-Std_dev(statistic=np.float64(0.0010712294216474881), minmax=(np.float64(0.0008163810847106718), np.float64(0.001409171376166544)))
-p=0.0021
+$ grep "1393/1393 val" * | python -c "import sys; ss = list(sys.stdin); accs = [float(s.split()[1].split(':')[1]) for s in ss]; print(accs); import scipy.stats; mvs = scipy.stats.bayes_mvs(accs); print(mvs[0]); print(mvs[2]); print(f'p={scipy.stats.ttest_1samp(accs, 3.28, alternative='less').pvalue:.4f}')"
+[3.276, 3.2789, 3.2784, 3.2807, 3.2805, 3.2777, 3.2786, 3.2791, 3.2786, 3.2789, 3.2784, 3.2755, 3.2784]
+Mean(statistic=np.float64(3.2784384615384616), minmax=(np.float64(3.2777191378183352), np.float64(3.279157785258588)))
+Std_dev(statistic=np.float64(0.0015547817302379028), minmax=(np.float64(0.001099334493687865), np.float64(0.0022050730331464735)))
+p=0.0011
 ```
 
 ```
