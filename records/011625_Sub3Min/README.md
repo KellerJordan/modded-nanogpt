@@ -50,8 +50,8 @@ def dense_to_ordered(dense_mask: torch.Tensor):
     document_full_bm = (docs_low[:, None] == docs_high) & (docs_low == docs_high[:, None])
 -     nonzero_bm = causal_bm & window_bm & document_bm
 -     full_bm  = causal_full_bm & window_full_bm & document_full_bm
-    nonzero_bm = causal_bm & document_bm
-    full_bm  = causal_full_bm & document_full_bm
++     nonzero_bm = causal_bm & document_bm
++     full_bm  = causal_full_bm & document_full_bm
     kv_num_blocks, kv_indices = dense_to_ordered(nonzero_bm & ~full_bm)
     full_kv_num_blocks, full_kv_indices = dense_to_ordered(full_bm)
 -     return BlockMask.from_kv_blocks(
@@ -99,13 +99,13 @@ But while the parameter-free RMSNorm is faster and leads to more stable training
 
 ![](attn-entropy.png)
 
-To fix this issue, we first tried out (1) RMSNorm with learned channel-wise parameters and (2) introducing a learned "attention scale" parameter, one for each Attenion layer. Both approaches led to better validation loss, albiet with an extra wallclock overhead. But overall, the speed gain was around 2-3 seconds.
+To fix this issue, we first tried out (1) RMSNorm with learned channel-wise parameters and (2) a learned scalar "attention scale" parameter, one for each Attenion layer. Both approaches allowed us to reduce training steps by 20, with a ~0.5-0.7 ms/step overhead. Overall, the wallclock time reduction was ~2-3 secs.
 
-Strangely, the models seem to consistently learn a UNet-like attention scales pattern. And hardcoding this pattern lead to roughly the same results (e.g. `attn_scale(layer_idx) := 0.12 + 0.01 * min(layer_idx, 11 - layer_idx)`). We find this interesting and could be a potential area for future research. But fow now, we offer now explanation why this pattern emerges and why it works well aside from divine intervention.
+Strangely, the models seemed to consistently learn a UNet-like attention scales pattern. And hardcoding this pattern lead to roughly the same results (e.g. `attn_scale(layer_idx) := 0.12 + 0.01 * min(layer_idx, 11 - layer_idx)`). We find this interesting and could be a potential area for future research. But fow now, we offer now explanation why this pattern emerges and why it works well aside from divine intervention.
 
-![](learned-attn-scales.png)
+![](attn-scales-pattern.gif)
 
-We eventually settled with simply setting the attention scale to `0.12` (vs. the default `1.0 / sqrt(d_model)`) for all layers. This leads to the same 2-3 sec speed gain as the other three approaches, but with zero overhead.
+We eventually settled with simply setting the attention scale to `0.12` (vs. the default `1.0 / sqrt(d_model)`) for all layers. This leads to the same 20 step reduction, but with no per-step overhead; an overall speed gain for ~3 secs.
 
 ```diff
 # In CausalSelfAttention.__init__
@@ -116,19 +116,21 @@ We eventually settled with simply setting the attention scale to `0.12` (vs. the
 + y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale)
 ```
 
+For logs on learnable attention scales, see: [README for 01/12/25 record attempt](https://github.com/leloykun/modded-nanogpt/blob/fc--learnable-attn-scale/records/011225_LearnableAttnScale/README.md)
+
 ### Stacked QKV Weights & Batched Muon Implementation
 
 This is an implementation/compiler-level optimization that leads to a 1-2 secs speed improvement. The crux is that, with a big enough GPU, doing one massive matmul for the QKV weights is faster than doing three smaller matmuls, one for each of the weights.
 
-The problem, however, is that Muon performs better on the unmerged QKV weights primarily due to the massive matmuls in its Newton-Schulz implementation. Our previous implementation involved storing these weights separately as before but concatenating them in the forward pass. But this concatenation operation introduced a slight regression. Finally, we got rid of the overhead by stacking the QKV weights instead and using a batched Muon implementation.
+The problem, however, is that Muon performs better on the unmerged QKV weights primarily due to the massive matmuls in its Newton-Schulz iterations. Our previous implementation involved storing these weights separately as before but concatenating them in the forward pass. But this concatenation operation introduced a ~1 sec regression. Finally, we got rid of this overhead by stacking the QKV weights instead and using a batched implementation of Muon.
 
 ### Adam `eps=1e-10` fix
 
 The speedrun is so tight now that even Adam's default epsilon parameter is already causing problems.
 
-For context, we initialize our LM head as a zero matrix. This leads to small gradients early on in training. And to compound to this, PyTorch's DDP apparently divides the gradients by the number of GPUs first before sending them to the other GPUs. This leads to even smaller gradients which are sometimes even smaller than Adam's default epsilon.
+For context, we initialize our LM head as a zero matrix. This leads to small gradients early on in training which could sometimes be even smaller than Adam's default epsilon--causing training instability and increased validation loss.
 
-To address this issue, we simply reduced Adam's `eps` from `1e-8` down to `1e-10`.
+To address this issue, we simply reduced Adam's `eps` from `1e-8` down to `1e-10`. This lead to a 0.0014 validation loss improvement with no per-step overhead; thereby allowing us to reduce training steps by 10.
 
 ```diff
 - optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), fused=True)
