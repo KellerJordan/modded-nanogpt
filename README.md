@@ -5,7 +5,7 @@ We begin with Andrej Karpathy's [PyTorch GPT-2 trainer](https://github.com/karpa
 from [llm.c](https://github.com/karpathy/llm.c), which attains 3.28 validation cross-entropy loss on the FineWeb dataset after training for 45 minutes on 8 NVIDIA H100 GPUs.
 We then iteratively improve the trainer in order to attain the same level of performance in less wallclock time.
 The current iteration reaches the same performance as Karpathy's original GPT-2 trainer in:
-* 2.99 minutes on 8xH100 (original trainer needed 45)
+* 3 minutes on 8xH100 (original trainer needed 45)
 * 0.73B tokens (original trainer needed 10B)
 
 This improvement in training performance was brought about by the following techniques:
