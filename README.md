@@ -11,13 +11,11 @@ The current iteration reaches the same performance as Karpathy's original GPT-2 
 This improvement in training performance was brought about by the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2
 * Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[code](https://github.com/KellerJordan/Muon)]
-* Untied head from embedding
+* Untie head from embedding, use FP8 matmul for head, and softcap logits (latter following Gemma 2)
 * Projection and classification layers initialized to zero (muP-like)
-* Logit softcapping (following Gemma 2)
-* Skip connections from the embedding to residual stream junctions
+* Skip connections from the embedding to residual stream junctions, and U-net-style skip connections between blocks
 * Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
 * FlexAttention with long-short sliding window attention pattern (inspired by Gemma 2) and window size warmup
-* FP8 for the head matmul
 
 Contributors list (growing with each new record): [@Grad62304977](https://x.com/Grad62304977),
 [@jxbz](https://x.com/jxbz), [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan),
