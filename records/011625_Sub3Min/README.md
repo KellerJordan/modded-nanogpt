@@ -25,8 +25,6 @@ We made a speedrun-specific decision to only use "long SWA" in the first, fifth,
 
 This would have been very difficult to implement without PyTorch's [FlexAttention](https://pytorch.org/blog/flexattention/).
 
----
-
 ```diff
 def dense_to_ordered(dense_mask: torch.Tensor):
     num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
