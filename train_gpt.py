@@ -118,22 +118,21 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
-    assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
-    if G.size(0) > G.size(1):
-        X = X.T
+    if G.size(-2) > G.size(-1):
+        X = X.mT
 
     # Ensure spectral norm is at most 1
-    X = X / (X.norm() + 1e-7)
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     # Perform the NS iterations
     for _ in range(steps):
-        A = X @ X.T
+        A = X @ X.mT
         B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
     
-    if G.size(0) > G.size(1):
-        X = X.T
+    if G.size(-2) > G.size(-1):
+        X = X.mT
     return X
 
 class Muon(torch.optim.Optimizer):
@@ -195,7 +194,7 @@ class Muon(torch.optim.Optimizer):
                 for p_world, g_world in zip(params_world, update_buffer_views):
                     p_world.add_(
                         g_world.view_as(p_world),
-                        alpha=-lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
+                        alpha=-lr * max(1, p_world.size(-2) / p_world.size(-1)) ** 0.5,
                     )
             for base_i in range(len(params))[::self.world_size]:
                 if base_i + self.rank < len(params):
@@ -255,31 +254,39 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int, layer_idx: int):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
-        self.c_q = CastedLinear(dim, dim)
-        self.c_k = CastedLinear(dim, dim)
-        self.c_v = CastedLinear(dim, dim)
+        # self.c_q = CastedLinear(dim, dim)
+        # self.c_k = CastedLinear(dim, dim)
+        # self.c_v = CastedLinear(dim, dim)
+        std = 0.5 * (dim ** -0.5)
+        bound = (3 ** 0.5) * std
+        self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound))
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        # Set attention scale such that the minimum attainable attention entropy
+        # (but not necessary the attention entropy itself) is close to 0. By @leloykun
+        self.attn_scale = 0.12
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q = self.c_q(x).view(B, T, self.num_heads, -1)
-        k = self.c_k(x).view(B, T, self.num_heads, -1)
-        v = self.c_v(x).view(B, T, self.num_heads, -1)
+        # q = self.c_q(x).view(B, T, self.num_heads, -1)
+        # k = self.c_k(x).view(B, T, self.num_heads, -1)
+        # v = self.c_v(x).view(B, T, self.num_heads, -1)
+        # qkv_weight = torch.cat([self.c_q.weight, self.c_k.weight, self.c_v.weight], dim=0).type_as(x)
+        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3*self.num_heads, -1).chunk(3, dim=-2)
         if ve is not None:
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = self.lambdas[0] * v
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -301,7 +308,7 @@ class Block(nn.Module):
     def __init__(self, model_dim: int, num_heads: int, layer_idx: int):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(model_dim, num_heads) if layer_idx != 7 else None
+        self.attn = CausalSelfAttention(model_dim, num_heads, layer_idx) if layer_idx != 7 else None
         self.mlp = MLP(model_dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
@@ -362,34 +369,34 @@ class GPT(nn.Module):
 
         def dense_to_ordered(dense_mask: Tensor):
             num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
-            indices = dense_mask.argsort(dim=-1, descending=True, stable=True).to(torch.int32)
+            indices = dense_mask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
             return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
         # manual block mask creation by @YouJiacheng
-        def create_doc_swc_block_mask(sliding_window_num_blocks: Tensor):
+        def create_doc_swc_block_masks(sliding_window_num_blocks: Tensor):
             kv_idx = block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
             q_idx = block_idx[:, None]
             causal_bm = q_idx >= kv_idx
             causal_full_bm = q_idx > kv_idx
-            window_bm = q_idx - kv_idx < sliding_window_num_blocks
-            window_full_bm = window_bm # block-wise sliding window by @YouJiacheng
-            # document_bm = (docs_low[q_idx] <= docs_high[kv_idx]) & (docs_low[kv_idx] <= docs_high[q_idx])
             document_bm = (docs_low[:, None] <= docs_high) & (docs_low <= docs_high[:, None])
             document_full_bm = (docs_low[:, None] == docs_high) & (docs_low == docs_high[:, None])
-            nonzero_bm = causal_bm & window_bm & document_bm
-            full_bm  = causal_full_bm & window_full_bm & document_full_bm
+            nonzero_bm = causal_bm & document_bm
+            full_bm  = causal_full_bm & document_full_bm
             kv_num_blocks, kv_indices = dense_to_ordered(nonzero_bm & ~full_bm)
             full_kv_num_blocks, full_kv_indices = dense_to_ordered(full_bm)
-            return BlockMask.from_kv_blocks(
-                kv_num_blocks,
-                kv_indices,
-                full_kv_num_blocks,
-                full_kv_indices,
-                BLOCK_SIZE=BLOCK_SIZE,
-                mask_mod=document_causal,
-            )
+            def build_bm(sw_num_blocks: Tensor) -> BlockMask:
+                return BlockMask.from_kv_blocks(
+                    torch.clamp_max(kv_num_blocks, torch.clamp_min(sw_num_blocks - full_kv_num_blocks, 1)),
+                    kv_indices,
+                    torch.clamp_max(full_kv_num_blocks, sw_num_blocks - 1),
+                    full_kv_indices,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    mask_mod=document_causal,
+                )
+            return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
-        block_mask = create_doc_swc_block_mask(sliding_window_num_blocks)
+        # Long-short SWA block masks by @leloykun & @YouJiacheng
+        long_bm, short_bm = create_doc_swc_block_masks(sliding_window_num_blocks)
 
         x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
         ve = self.value_embeds(input_seq)
@@ -400,13 +407,15 @@ class GPT(nn.Module):
         # Store outputs for U-Net skip connections
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
+        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, ve_enc[i], x0, block_mask)
+            x = self.blocks[i](x, ve_enc[i], x0, block_masks[i])
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
+        block_masks.reverse()
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_mask)
+            x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_masks[i])
         x = norm(x)
         logits = lm_head_fp8(x, self.lm_head.weight) if self.training else self.lm_head(x)
         # @Grad62304977 added tanh softcapping, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
@@ -511,14 +520,14 @@ for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
 # collect the parameters to optimize
-hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim == 2]
+hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
 embed_params = [model.embed.weight, *model.value_embeds.parameters()]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
 adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
-optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), fused=True)
+optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), fused=True, eps=1e-10)
 optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 
