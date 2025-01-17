@@ -118,6 +118,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
+    assert G.ndim >= 2
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
@@ -258,9 +259,6 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
-        # self.c_q = CastedLinear(dim, dim)
-        # self.c_k = CastedLinear(dim, dim)
-        # self.c_v = CastedLinear(dim, dim)
         std = 0.5 * (dim ** -0.5)
         bound = (3 ** 0.5) * std
         self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound))
@@ -275,10 +273,6 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        # q = self.c_q(x).view(B, T, self.num_heads, -1)
-        # k = self.c_k(x).view(B, T, self.num_heads, -1)
-        # v = self.c_v(x).view(B, T, self.num_heads, -1)
-        # qkv_weight = torch.cat([self.c_q.weight, self.c_k.weight, self.c_v.weight], dim=0).type_as(x)
         q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3*self.num_heads, -1).chunk(3, dim=-2)
         if ve is not None:
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
