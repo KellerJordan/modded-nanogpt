@@ -29,7 +29,7 @@ To run the current record, run the following commands.
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install -r requirements.txt
-pip install --pre torch==2.6.0.dev20241231+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade # install torch 2.6.0
+pip install --pre torch==2.7.0.dev20250110+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade
 python data/cached_fineweb10B.py 8 # downloads only the first 0.8B training tokens to save time
 ./run.sh
 ```
@@ -39,7 +39,7 @@ For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss 
 
 **Note: torch.compile will take a long time (up to 30 minutes) on the first run. You can disable `coordinate_descent_tuning` in the code to make this a bit faster.**
 
-## Alternative: Running with Docker
+## Alternative: Running with Docker (recommended for timing)
 
 For cases where CUDA or NCCL versions aren't compatible with your current system setup, Docker can be a helpful alternative.
 This approach standardizes versions for CUDA, NCCL, CUDNN, and Python, reducing dependency issues and simplifying setup. 
