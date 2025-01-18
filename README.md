@@ -65,6 +65,8 @@ The following is the historical progression of world records for the following c
 
 > *Train a neural network to ≤3.28 validation loss on FineWeb in the minimum time using 8x NVIDIA H100s.*
 
+Note: The 3.28 target was selected in order to match [Andrej Karpathy's GPT-2 (small) replication](https://github.com/karpathy/llm.c/discussions/481).
+
 | # | Record time | Description | Date | Log | Contributors |
 | - | - | - | - | - | - |
 1 | 45 minutes | [llm.c baseline](https://github.com/karpathy/llm.c/discussions/481) | 05/28/24 | [log](records/101324_llmc/main.log) | @karpathy, llm.c contributors
