@@ -61,11 +61,11 @@ sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt bas
 
 ## World record history
 
-The following is the historical progression of world records for the following competitive task:
+The following is the historical progression of world speed records for the following competitive task:
 
-> *Train a neural network to ≤3.28 validation loss on FineWeb in the minimum time using 8x NVIDIA H100s.*
+> *Train a neural network to ≤3.28 validation loss on FineWeb using 8x NVIDIA H100s.*
 
-Note: The 3.28 target was selected to [match Andrej Karpathy's GPT-2 (small) reproduction](https://github.com/karpathy/llm.c/discussions/481).
+Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) reproduction](https://github.com/karpathy/llm.c/discussions/481).
 
 | # | Record time | Description | Date | Log | Contributors |
 | - | - | - | - | - | - |
