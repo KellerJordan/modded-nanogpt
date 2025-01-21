@@ -32,8 +32,8 @@ def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[
             x_f8,
             w_f8.t(),
             out_dtype=torch.bfloat16,
-            scale_a=x.new_tensor(1 / x_s, dtype=torch.bfloat16),
-            scale_b=x.new_tensor(1 / w_s, dtype=torch.bfloat16),
+            scale_a=x.new_tensor(1 / x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(1 / w_s, dtype=torch.float32),
             use_fast_accum=True,
         )
         return out, x_f8, w_f8
@@ -53,9 +53,9 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
     @torch.compile
     def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
         assert grad.is_contiguous()
-        x_inv_s = grad.new_tensor(1 / x_s, dtype=torch.bfloat16)
-        w_inv_s = grad.new_tensor(1 / w_s, dtype=torch.bfloat16)
-        grad_inv_s = grad.new_tensor(1 / grad_s, dtype=torch.bfloat16)
+        x_inv_s = grad.new_tensor(1 / x_s, dtype=torch.float32)
+        w_inv_s = grad.new_tensor(1 / w_s, dtype=torch.float32)
+        grad_inv_s = grad.new_tensor(1 / grad_s, dtype=torch.float32)
         grad_f8 = grad.mul(grad_s).to(torch.float8_e5m2)
         grad_x = torch._scaled_mm(
             grad_f8,
