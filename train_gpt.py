@@ -32,8 +32,8 @@ def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[
             x_f8,
             w_f8.t(),
             out_dtype=torch.bfloat16,
-            scale_a=x.new_tensor(1 / x_s, dtype=torch.float32),
-            scale_b=x.new_tensor(1 / w_s, dtype=torch.float32),
+            scale_a=x.new_tensor(1 / x_s, dtype=torch.bfloat16),
+            scale_b=x.new_tensor(1 / w_s, dtype=torch.bfloat16),
             use_fast_accum=True,
         )
         return out, x_f8, w_f8
@@ -53,9 +53,9 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
     @torch.compile
     def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
         assert grad.is_contiguous()
-        x_inv_s = grad.new_tensor(1 / x_s, dtype=torch.float32)
-        w_inv_s = grad.new_tensor(1 / w_s, dtype=torch.float32)
-        grad_inv_s = grad.new_tensor(1 / grad_s, dtype=torch.float32)
+        x_inv_s = grad.new_tensor(1 / x_s, dtype=torch.bfloat16)
+        w_inv_s = grad.new_tensor(1 / w_s, dtype=torch.bfloat16)
+        grad_inv_s = grad.new_tensor(1 / grad_s, dtype=torch.bfloat16)
         grad_f8 = grad.mul(grad_s).to(torch.float8_e5m2)
         grad_x = torch._scaled_mm(
             grad_f8,
@@ -69,7 +69,7 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
         grad_w = torch._scaled_mm(
             x_f8.t().contiguous(),
             grad_f8.t().contiguous().t(),
-            out_dtype=torch.float32,
+            out_dtype=torch.bfloat16,
             scale_a=x_inv_s,
             scale_b=grad_inv_s,
             use_fast_accum=False,
@@ -80,7 +80,7 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
 
 @mm_backward_op.register_fake
 def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
-    return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
+    return x_f8.to(torch.bfloat16), w_f8.to(torch.bfloat16)
 
 def backward(ctx, grad_out: Tensor, *_):
     x_f8, w_f8 = ctx.saved_tensors
@@ -249,7 +249,7 @@ class Rotary(nn.Module):
     def forward(self, x_BTHD: Tensor):
         assert self.cos.size(0) >= x_BTHD.size(-3)
         cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
-        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        x1, x2 = x_BTHD.to(dtype=torch.bfloat16).chunk(2, dim=-1)
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
