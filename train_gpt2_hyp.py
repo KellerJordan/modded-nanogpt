@@ -442,17 +442,16 @@ class Hyperparameters:
     input_val_bin: str = ''  
     num_vocab : int = 50304
     # optimization hyperparams
-    batch_size : int = 64 # batch size, in sequences, across all devices
-    # device_batch_size : int = 64 # batch size, in sequences, per device
+    batch_size : int = 8*64 # batch size, in sequences, across all devices
+    device_batch_size : int = 32 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 10_000 # number of iterations to run (for FW 2.7B was 4578)
-    warmup_iters : int = 0
-    warmdown_iters : int = 0 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    num_iterations : int = 1_000 # number of iterations to run (for FW 2.7B was 4578)
+    cooldown_frac = 0.4
     weight_decay : float = 0
     # evaluation and logging hyperparams
-    generate_every : int = 5_000
-    train_loss_every : int = 100 
-    val_loss_every : int = 100 # every how many steps to evaluate val loss? 0 for only at the end
+    generate_every : int = 500
+    train_loss_every : int = 10 
+    val_loss_every : int = 10 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
     # model
@@ -478,10 +477,10 @@ class Hyperparameters:
             raise ValueError("Specify proper data path")
 
         # Calculate device_batch_size based on number of devices
-        n_devices = len(os.getenv("CUDA_VISIBLE_DEVICES", "").split(","))
-        if n_devices == 0:  # Default to 1 if CUDA_VISIBLE_DEVICES is not set
-            n_devices = 1
-        self.device_batch_size = self.batch_size // n_devices
+        # n_devices = len(os.getenv("CUDA_VISIBLE_DEVICES", "").split(","))
+        # if n_devices == 0:  # Default to 1 if CUDA_VISIBLE_DEVICES is not set
+        #     n_devices = 1
+        # self.device_batch_size = self.batch_size // n_devices
 
 parser = argparse.ArgumentParser(description="Train GPT model with customizable parameters.")
 
@@ -611,7 +610,7 @@ optimizer_wte = torch.optim.Adam(wte_params, lr=0.6, betas=(0.8, 0.95), fused=Tr
 
 if k_params:
     optimizer_k = torch.optim.Adam(k_params, lr=args.k_lr, betas=(0.8, 0.95), fused=True)
-    optimizers = [optimizer_lm_head, optimizer_muon, optimizer_wte,optimizer_k]
+    optimizers = [optimizer_lm_head, optimizer_muon, optimizer_wte, optimizer_k]
     if master_process:
         print(f"k is learned, {args.learnable}")
 else:
@@ -622,20 +621,24 @@ else:
 
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
-    assert it <= args.num_iterations
-    # 1) linear warmup for warmup_iters steps
-    if it < args.warmup_iters:
-        return (it+1) / args.warmup_iters
-    # 2) constant lr for a while
-    elif args.warmdown_iters and (it >= args.num_iterations - args.warmdown_iters):
-        return (args.num_iterations - it) / args.warmdown_iters
-    # 3) 
+    t = 1 - it / args.num_iterations # time remaining in training
+    assert 1 >= t > 0
+    # 1) constant lr for first part of training
+    if t >= args.cooldown_frac:
+        return 1.0
+    # 2) then linear cooldown
     else:
-        decay_ratio = (it - args.warmup_iters) / (args.num_iterations - args.warmup_iters)
-        assert 0 <= decay_ratio <= 1
-        return 0.1**decay_ratio
-
+        return t / args.cooldown_frac
+    
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+
+schedulers[-1] = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizers[-1],
+    mode='max',           # Monitor for the minimum metric (e.g., validation loss).
+    factor=0.1,           # Reduce LR by a factor of 0.1.
+    patience=5,           # Wait for 5 epochs without improvement.
+    verbose=True          # Print LR reduction messages.
+)
 
 # begin logging
 if master_process:
@@ -791,9 +794,14 @@ for step in range(args.num_iterations + 1):
             continue
         p.grad /= train_accumulation_steps
     # step the optimizers and schedulers
-    for opt, sched in zip(optimizers, schedulers):
+    for opt in optimizers:
         opt.step()
-        sched.step()
+    for i, sched in enumerate(schedulers):
+        if i == 3:
+            curvature_value = k_params[0].item()
+            sched.step(curvature_value)
+        else:
+            sched.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
     train_loss_accum += train_loss.item()
