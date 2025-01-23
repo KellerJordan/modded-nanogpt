@@ -99,11 +99,6 @@ def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
 
 mm_op.register_autograd(backward, setup_context=setup_context)
 
-def lm_head_fp8(x: Tensor, w: Tensor) -> Tensor:
-    _x = x.flatten(0, -2)
-    out: Tensor = torch.ops.nanogpt.mm(_x, w, x_s=2.0, w_s=32.0, grad_s=2.0**29)[0]
-    return out.reshape(*x.shape[:-1], -1)
-
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
@@ -219,12 +214,16 @@ class Muon(torch.optim.Optimizer):
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
 
-def norm(x):
+def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 class CastedLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int):
+    def __init__(self, in_features: int, out_features: int, use_fp8: bool = False, x_scale: float = 1.0, w_scale: float = 1.0, grad_scale: float = 1.0):
         super().__init__(in_features, out_features, bias=False)
+        self.use_fp8 = use_fp8
+        self.x_scale = x_scale
+        self.w_scale = w_scale
+        self.grad_scale = grad_scale
 
     def reset_parameters(self) -> None:
         std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
@@ -232,11 +231,16 @@ class CastedLinear(nn.Linear):
         with torch.no_grad():
             self.weight.uniform_(-bound, bound)
 
-    def forward(self, x):
-        return F.linear(x, self.weight.type_as(x))
+    def forward(self, x: Tensor):
+        if self.use_fp8 and self.training:
+            _x = x.flatten(0, -2)
+            out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_scale, w_s=self.w_scale, grad_s=self.grad_scale)[0]
+            return out.reshape(*x.shape[:-1], -1)
+        else:
+            return F.linear(x, self.weight.type_as(x))
 
 class Rotary(nn.Module):
-    def __init__(self, dim: int, max_seq_len=65536):
+    def __init__(self, dim: int, max_seq_len: int):
         super().__init__()
         # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
         angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
@@ -255,7 +259,7 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, layer_idx: int):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
@@ -265,7 +269,7 @@ class CausalSelfAttention(nn.Module):
         # https://x.com/hi_tysam/status/1879699187107033311
         self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound))
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
-        self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
+        self.rotary = Rotary(dim // num_heads, max_seq_len)
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
@@ -288,27 +292,27 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MLP(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim: int):
         super().__init__()
         self.c_fc = CastedLinear(dim, 4 * dim)
         self.c_proj = CastedLinear(4 * dim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
-    def forward(self, x):
+    def forward(self, x: Tensor):
         x = self.c_fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
         return x
 
 class Block(nn.Module):
-    def __init__(self, model_dim: int, num_heads: int, layer_idx: int):
+    def __init__(self, model_dim: int, num_heads: int, layer_idx: int, max_seq_len: int):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(model_dim, num_heads, layer_idx) if layer_idx != 7 else None
+        self.attn = CausalSelfAttention(model_dim, num_heads, max_seq_len) if layer_idx != 7 else None
         self.mlp = MLP(model_dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x, ve, x0, block_mask):
+    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
             x = x + self.attn(norm(x), ve, block_mask)
@@ -316,14 +320,16 @@ class Block(nn.Module):
         return x
 
 class ValueEmbedding(nn.Module):
-    def __init__(self, num_embeddings: int, embedding_dim: int):
+    def __init__(self, vocab_size: int, embedding_dim: int, num_layers: int, num_embeddings: int = 3):
         super().__init__()
-        self.embed = nn.ModuleList([nn.Embedding(num_embeddings, embedding_dim) for _ in range(3)])
+        self.num_layers = num_layers
+        self.num_embeddings = num_embeddings
+        self.embed = nn.ModuleList([nn.Embedding(vocab_size, embedding_dim) for _ in range(num_embeddings)])
 
-    def forward(self, input_seq) -> list[Tensor | None]:
-        ve = [emb(input_seq) for emb in self.embed]
+    def forward(self, x: Tensor) -> list[Tensor | None]:
+        ve = [emb(x) for emb in self.embed]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        ve = [ve[0], ve[1], ve[2], None, None, None, None, None, None, ve[0], ve[1], ve[2]]
+        ve = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 2 * self.num_embeddings) + [ve[0], ve[1], ve[2]]
         return ve
 
 # -----------------------------------------------------------------------------
@@ -333,12 +339,13 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, enable_lm_head_fp8: bool = True):
         super().__init__()
+        self.enable_lm_head_fp8 = enable_lm_head_fp8
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
-        self.value_embeds = ValueEmbedding(vocab_size, model_dim)
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx) for layer_idx in range(num_layers)])
+        self.value_embeds = ValueEmbedding(vocab_size, model_dim, num_layers)
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx, max_seq_len) for layer_idx in range(num_layers)])
         # U-net design by @brendanh0gan
         self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
         self.num_decoder_layers = num_layers - self.num_encoder_layers # Remaining for decoder
@@ -346,7 +353,7 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128))
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_scale=2.0, w_scale=2.0**5, grad_scale=2.0**29)
         self.lm_head.weight.detach().zero_() # @Grad62304977
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
@@ -404,16 +411,18 @@ class GPT(nn.Module):
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
+        assert len(block_masks) == self.num_encoder_layers
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, ve_enc[i], x0, block_masks[i])
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         block_masks.reverse()
+        assert len(block_masks) == self.num_decoder_layers
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
             x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_masks[i])
         x = norm(x)
-        logits = lm_head_fp8(x, self.lm_head.weight) if self.training else self.lm_head(x)
+        logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits.float() / 7.5)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
@@ -460,13 +469,15 @@ class Hyperparameters:
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
-    num_iterations = 1395 # number of iterations to run
+    num_iterations = 1400 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
     seq_len = 64*1024 # FlexAttention sequence length
+    val_seq_len = 64*1024 # FlexAttention sequence length for validation
     save_checkpoint = False
+    enable_lm_head_fp8 = True
 
 def train(args: Hyperparameters):
     # torchrun sets these env variables
@@ -508,7 +519,7 @@ def train(args: Hyperparameters):
     # load data
     train_loader = distributed_data_generator(args.train_files, args.batch_size, rank, world_size)
 
-    model = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768).cuda().bfloat16()
+    model = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=args.seq_len, enable_lm_head_fp8=args.enable_lm_head_fp8).cuda().bfloat16()
     for param in model.parameters():
         dist.broadcast(param.detach(), 0)
 
@@ -563,7 +574,7 @@ def train(args: Hyperparameters):
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
             model.eval()
-            val_bs = world_size * args.seq_len
+            val_bs = world_size * args.val_seq_len
             assert args.val_tokens % val_bs == 0
             val_steps = args.val_tokens // val_bs
             val_loader = distributed_data_generator(args.val_files, val_bs, rank, world_size)
