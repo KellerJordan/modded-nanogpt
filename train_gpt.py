@@ -339,9 +339,8 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, enable_lm_head_fp8: bool = True):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
         super().__init__()
-        self.enable_lm_head_fp8 = enable_lm_head_fp8
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         self.value_embeds = ValueEmbedding(vocab_size, model_dim, num_layers)
@@ -469,15 +468,14 @@ class Hyperparameters:
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
-    num_iterations = 1400 # number of iterations to run
-    cooldown_frac = 0.35 # fraction of training spent cooling down the learning rate
+    num_iterations = 1405 # number of iterations to run
+    cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
     seq_len = 64*1024 # FlexAttention sequence length
     val_seq_len = 64*1024 # FlexAttention sequence length for validation
     save_checkpoint = False
-    enable_lm_head_fp8 = True
 
 def train(args: Hyperparameters):
     # torchrun sets these env variables
@@ -519,7 +517,7 @@ def train(args: Hyperparameters):
     # load data
     train_loader = distributed_data_generator(args.train_files, args.batch_size, rank, world_size)
 
-    model = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=args.seq_len, enable_lm_head_fp8=args.enable_lm_head_fp8).cuda().bfloat16()
+    model = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=args.seq_len).cuda().bfloat16()
     for param in model.parameters():
         dist.broadcast(param.detach(), 0)
 
