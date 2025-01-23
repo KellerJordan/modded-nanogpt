@@ -470,7 +470,7 @@ class Hyperparameters:
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
     num_iterations = 1400 # number of iterations to run
-    cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
+    cooldown_frac = 0.35 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
