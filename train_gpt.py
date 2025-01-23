@@ -253,7 +253,7 @@ class Rotary(nn.Module):
     def forward(self, x_BTHD: Tensor):
         assert self.cos.size(0) >= x_BTHD.size(-3)
         cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
-        x1, x2 = x_BTHD.to(dtype=torch.bfloat16).chunk(2, dim=-1)
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
