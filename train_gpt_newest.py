@@ -289,7 +289,7 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MLP(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim: int):
         super().__init__()
         hdim = 4 * dim
         self.c_fc = CastedLinear(dim, hdim)
