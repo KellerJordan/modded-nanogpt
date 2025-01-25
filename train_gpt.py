@@ -530,8 +530,8 @@ optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world
 optimizers = [optimizer1, optimizer2]
 
 # learning rate schedule: stable then decay
-def get_lr(it: int):
-    t = 1 - it / args.num_iterations # time remaining in training
+def get_lr(step: int):
+    t = 1 - step / args.num_iterations # time remaining in training
     assert 1 >= t >= 0
     w = min(t / args.cooldown_frac, 1.0) # 1 -> 0
     return w * 1.0 + (1 - w) * 0.1
