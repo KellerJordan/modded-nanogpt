@@ -595,7 +595,7 @@ for step in range(train_steps + 1):
         # the last step only has the validation loop, so break to avoid training
         break
 
-    # --------------- TRAINING SECTION BEGIN -----------------
+    # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
     for input_seq, target_seq in zip(inputs.split(args.seq_len), targets.split(args.seq_len)):
         model(input_seq, target_seq, sw_num_blks(window_size)).backward()
