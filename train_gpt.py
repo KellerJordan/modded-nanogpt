@@ -491,9 +491,9 @@ if master_process:
 def print0(s, console=False):
     if master_process:
         with open(logfile, "a") as f:
-             if console:
-                 print(s)
-             print(s, file=f)
+            if console:
+                print(s)
+            print(s, file=f)
 
 # begin by printing this file (the Python code)
 print0(code)
