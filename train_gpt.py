@@ -259,7 +259,7 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
-        hdim = self.num_heads * self.head_dim
+        hdim = num_heads * head_dim
         std = 0.5 * (dim ** -0.5)
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
