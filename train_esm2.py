@@ -22,7 +22,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
 
 from optimizer import Muon
-from model import ModelConfig, ESM, CastedLinear, CastedEmbedding
+from model import ModelConfig, ESMForMaskedLM, Linear
 from dataloading import DistributedPaddedDataLoader
 
 
@@ -144,11 +144,8 @@ def main(args, model_config):
     print0(f'Testing DataLoader: {len(test_loader.files)} files')
     print0('='*100, logonly=True)
 
-    model = ESM(model_config)
+    model = ESMForMaskedLM(model_config)
     model = model.cuda().bfloat16()
-    # for m in model.modules():
-    #     if isinstance(m, CastedLinear) or isinstance(m, CastedEmbedding):
-    #         m.float()
     config.coordinate_descent_tuning = True # suggested by @Chillee
     model = torch.compile(model)
 
@@ -245,7 +242,8 @@ def main(args, model_config):
                 while input_ids.numel():
                     batch_valid_tokens = (input_ids != pad_id).sum()
                     valid_tokens += batch_valid_tokens
-                    val_loss += model(input_ids, sliding_window_size, final_mask_prob, final_keep_replace_prob) * batch_valid_tokens
+                    current_loss = model(input_ids, sliding_window_size, final_mask_prob, final_keep_replace_prob).loss
+                    val_loss += current_loss * batch_valid_tokens
                     input_ids = valid_loader.next_batch()
             if ddp_world_size > 1:
                 dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
@@ -290,7 +288,8 @@ def main(args, model_config):
                 if ddp_world_size > 1 and i < args.grad_accum - 1:
                     stack.enter_context(model.no_sync())
                 input_ids = train_loader.next_batch()
-                (model(input_ids, sliding_window_size, mask_prob, keep_replace_prob) / args.grad_accum).backward()
+                loss = model(input_ids, sliding_window_size, mask_prob, keep_replace_prob).loss / args.grad_accum
+                loss.backward()
                 # TODO
                 # Not sure if there is an advantage to scale the loss instead of the gradients, but this should improve total step speed.
                 # TODO
@@ -336,7 +335,8 @@ def main(args, model_config):
         while input_ids.numel():
             batch_test_tokens = (input_ids != pad_id).sum()
             test_tokens += batch_test_tokens
-            test_loss += model(input_ids, sliding_window_size, final_mask_prob, final_keep_replace_prob) * batch_test_tokens
+            current_loss = model(input_ids, sliding_window_size, final_mask_prob, final_keep_replace_prob).loss
+            test_loss += current_loss * batch_test_tokens
             input_ids = test_loader.next_batch()
     if ddp_world_size > 1:
         dist.all_reduce(test_loss, op=dist.ReduceOp.SUM)
