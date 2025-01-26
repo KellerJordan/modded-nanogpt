@@ -30,71 +30,62 @@ import argparse
 torch.set_float32_matmul_precision('high')
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# -----------------------------------------------------------------------------
-# Muon optimizer
-
-# -----------------------------------------------------------------------------
-# PyTorch nn.Module definitions for the GPT-2 model
-
-
 @dataclass
-class Hyperparameters:
-    # data hyperparams
-    data_path : str = 'data/fineweb10B'
-    input_bin: str = ''  
-    input_val_bin: str = ''  
-    num_vocab : int = 50304
-    # optimization hyperparams
-    batch_size : int = 64 # batch size, in sequences, across all devices
-    device_batch_size : int = 32 # batch size, in sequences, per device
-    sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 1_000 # number of iterations to run (for FW 2.7B was 4578)
-    cooldown_frac : float = 0.4
-    weight_decay : float = 0
-    # evaluation and logging hyperparams
-    generate_every : int = 1_000
-    train_loss_every : int = 10 
-    val_loss_every : int = 10 # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    # model
-    vocab_size : int = 50304
-    n_layer : int = 12
-    n_head : int = 6
-    n_embd : int = 768
-    head_mode : str = 'euc'
-    attn_mode : str = 'euc'
-    curvature : float = 1.0
-    learnable: bool = True
-    k_lr: float = 0.
-    seed : int = 0
-
+class FullConfig:
+    # Data hyperparams
+    data_path: str = "data/fineweb10B"
+    input_bin: str = ""
+    input_val_bin: str = ""
+    num_vocab: int = 50304
+    sequence_length: int = 1024
+    # Optimization hyperparams
+    batch_size: int = 64     # global batch size (across devices)
+    device_batch_size: int = 32  # per-device batch size
+    num_iterations: int = 1000
+    cooldown_frac: float = 0.4
+    weight_decay: float = 0
+    # Evaluation/logging
+    generate_every: int = 0
+    train_loss_every: int = 10
+    val_loss_every: int = 10
+    val_tokens: int = 10_485_760
+    save_every: int = 0
+    # Model architecture
+    vocab_size: int = 50304
+    n_layer: int = 12
+    n_head: int = 6
+    # Rather than specify n_embd directly,
+    # you could also define a `head_dim`, if you like:
+    head_dim: int = 128
+    n_embd: int = 768
+    head_mode: str = "euc"
+    attn_mode: str = "euc"
+    curvature: float = 1.0
+    k_lr: float = 0.0
+    # Reproducibility
+    seed: int = 42
+    
     def __post_init__(self):
-        # Dynamically set .bin paths based on data_path
-        if 'tinystories' in self.data_path:
+        """
+        Dynamically set up paths and possibly recalculate n_embd from n_head, head_dim.
+        You can also unify any validation logic here.
+        """
+        # If you want n_embd to be set from n_head * head_dim:
+        self.n_embd = self.n_head * self.head_dim
+
+        # Decide how to set the input bins.
+        if "tinystories" in self.data_path:
             self.input_bin = f"{self.data_path}/train.bin"
             self.input_val_bin = f"{self.data_path}/val.bin"
-        elif 'fineweb' in self.data_path:
+        elif "fineweb" in self.data_path:
             self.input_bin = f"{self.data_path}/fineweb_train_*.bin"
             self.input_val_bin = f"{self.data_path}/fineweb_val_*.bin"
         else:
-            raise ValueError("Specify proper data path")
-
+            raise ValueError("Specify a proper data path (contains 'tinystories' or 'fineweb')")
 
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
-@dataclass
-class GPTConfig:
-    vocab_size : int = 50304
-    n_layer : int = 12
-    n_head : int = 6 # head dim 128 suggested by @Grad62304977
-    n_embd : int = 768
-    head_mode : str = 'euc'
-    attn_mode : str = 'euc'
-    curvature : float = 1.0
-    learnable : bool = True
-    block_size : int = 1024
 
 class GPT(nn.Module):
 
@@ -172,111 +163,131 @@ class GPT(nn.Module):
                 generated = torch.cat((generated, next_token), dim=1)
         return generated
 
+    def model_size(self):
+        """Calculate the model size in millions or thousands, based on parameter count."""
+        total_params = sum(p.numel() for p in self.parameters())
+        if total_params >= 1e6:
+            return f"{total_params / 1e6:.2f}M parameters"
+        else:
+            return f"{total_params / 1e3:.2f}K parameters"
 
-# -----------------------------------------------------------------------------
-# parser
+
+def compute_grad_norm(params):
+    """Compute the total L2 norm of gradients in the given list of parameters."""
+    total_norm_sq = 0.0
+    for p in params:
+        if p.grad is not None:
+            param_norm = p.grad.detach().data.norm(2)  # L2 norm
+            total_norm_sq += param_norm.item() ** 2
+    return total_norm_sq ** 0.5
+
+
 
 parser = argparse.ArgumentParser(description="Train GPT model with customizable parameters.")
 
-parser.add_argument(
-    "--curvature",
-    type=float,
-    default=1.0,
-    help="Set the curvature for the Lorentz manifold (float, default: 1.0); if learnable, then is initial value."
-)
-parser.add_argument("--learnable", type=bool, default=True, help="Is the curvature learnable? (default: False)")
-parser.add_argument("--head_mode", type=str, default='euc', help="Set the mode for LM Head (default: 'euc')")
-parser.add_argument("--attn_mode", type=str, default='euc', help="Set the mode for attention layers (default: 'euc')")
-parser.add_argument("--data_path", type=str, default='data/fineweb10B', help="Path to dataset directory (default: 'data/tinystories')")
-parser.add_argument("--num_iterations", type=int, default=4578, help="Number of iterations (default=4578)")
-parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42)")
-parser.add_argument("--k_lr", type=float, default=1., help="Set the learning rate for curvature parameter.")
-parser.add_argument("--head_dim", type=int, default=128, help="Set the attention head dimension of the GPT model.")
-parser.add_argument("--n_head", type=int, default=6, help="Set the number of attention heads in the GPT model.")
+# Configurable arguments
+parser.add_argument("--data_path", type=str, default="data/fineweb10B")
+parser.add_argument("--num_iterations", type=int, default=4578)
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--head_mode", type=str, default="euc", help="Set the mode for LM Head")
+parser.add_argument("--attn_mode", type=str, default="euc", help="Set the mode for attention layers")
+parser.add_argument("--curvature", type=float, default=1.0)
+parser.add_argument("--k_lr", type=float, default=0.0)
+parser.add_argument("--head_dim", type=int, default=128)
+parser.add_argument("--n_head", type=int, default=6)
 
-args_from_cli = parser.parse_args()
+args = parser.parse_args()
 
-args = Hyperparameters(
-    seed=args_from_cli.seed,
-    data_path=args_from_cli.data_path,
-    num_iterations=args_from_cli.num_iterations,
-    head_mode=args_from_cli.head_mode,
-    attn_mode=args_from_cli.attn_mode,
-    curvature=args_from_cli.curvature,
-    learnable=args_from_cli.learnable,
-    n_embd=args_from_cli.n_head*args_from_cli.head_dim,
-    n_head=args_from_cli.n_head
+# Create the config
+config = FullConfig(
+    data_path=args.data_path,
+    num_iterations=args.num_iterations,
+    seed=args.seed,
+    head_mode=args.head_mode,
+    attn_mode=args.attn_mode,
+    curvature=args.curvature,
+    k_lr=args.k_lr,
+    head_dim=args.head_dim,
+    n_head=args.n_head
 )
 
+# Seeds
+random.seed(config.seed)
+np.random.seed(config.seed)
+torch.manual_seed(config.seed)
+torch.cuda.manual_seed_all(config.seed)
 
-# -----------------------------------------------------------------------------
-# int main
-SEED = args.seed  
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)  
-
-if "tinystories" in args.data_path:
+# Tokenizer setup
+if "tinystories" in config.data_path:
+    dataset_name = "TinyStories"
     tokenizer = PreTrainedTokenizerFast(
-        tokenizer_file=os.path.join(args.data_path, "tinystories_tokenizer.json"),
+        tokenizer_file=os.path.join(config.data_path, "tinystories_tokenizer.json"),
         eos_token="<|endoftext|>",
         unk_token="[UNK]",
-        pad_token="[PAD]"
+        pad_token="[PAD]",
     )
 else:
-    # GPT-2 tokenizer for FineWeb
+    dataset_name = "FineWeb"
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     tokenizer.eos_token = "<|endoftext|>"
-    tokenizer.pad_token = tokenizer.eos_token  
+    tokenizer.pad_token = tokenizer.eos_token
 
-# set up DDP (distributed data parallel). torchrun sets this env variable
-assert torch.cuda.is_available()
+# DDP setup
+assert torch.cuda.is_available(), "CUDA is required for DDP but not available."
+
+try:
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+except KeyError as e:
+    raise RuntimeError(f"Missing environment variable for DDP: {e}")
+
+# Initialize the process group
 dist.init_process_group(backend='nccl')
-ddp_rank = int(os.environ['RANK'])
-ddp_local_rank = int(os.environ['LOCAL_RANK'])
-ddp_world_size = int(os.environ['WORLD_SIZE'])
-device = f'cuda:{ddp_local_rank}'
+
+# Map local rank to CUDA device
+device = torch.device(f'cuda:{ddp_local_rank}')
 torch.cuda.set_device(device)
-print(f"using device: {device}")
-master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
-# convenience variables
-B, T = args.device_batch_size, args.sequence_length
-# calculate the number of steps to take in the val loop.
-assert args.val_tokens % (B * T * ddp_world_size) == 0
-val_steps = args.val_tokens // (B * T * ddp_world_size)
-# calculate the steps of gradient accumulation required to attain the desired global batch size.
-assert args.batch_size % (B * ddp_world_size) == 0
-train_accumulation_steps = args.batch_size // (B * ddp_world_size)
+print(f"[Rank {ddp_rank}] Using device: {device}")
 
-# load tokens
-train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+# Identify master process
+master_process = (ddp_rank == 0)
 if master_process:
-    print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
-    print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+    print(f"[Rank {ddp_rank}] This is the master process.")
+
+# Convenience variables
+B, T = config.device_batch_size, config.sequence_length
+assert config.val_tokens % (B * T * ddp_world_size) == 0, "val_tokens must be divisible by total global batch size."
+val_steps = config.val_tokens // (B * T * ddp_world_size)
+
+assert config.batch_size % (B * ddp_world_size) == 0, "batch_size must be divisible by global batch size."
+train_accumulation_steps = config.batch_size // (B * ddp_world_size)
+
+# Data loading (assuming DistributedDataLoader is implemented correctly)
+train_loader = DistributedDataLoader(config.input_bin, B, T, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(config.input_val_bin, B, T, ddp_rank, ddp_world_size)
+
+if master_process:
+    print(f"[Rank {ddp_rank}] Training DataLoader: {train_loader.ntok_total} tokens across {len(train_loader.files)} files.")
+    print(f"[Rank {ddp_rank}] Validation DataLoader: {val_loader.ntok_total} tokens across {len(val_loader.files)} files.")
 x, y = train_loader.next_batch()
 
-# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
-# this originates from Karpathy's experiments.
-# num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=args.vocab_size, 
-                      n_layer=args.n_layer, 
-                      n_head=args.n_head,
-                      n_embd=args.n_embd,
-                      head_mode=args.head_mode,
-                      attn_mode=args.attn_mode,
-                      curvature=args.curvature,
-                      learnable=args.learnable,
-                      block_size=args.sequence_length))
-model = model.cuda()
-# if hasattr(config, "coordinate_descent_tuning"):
-#     config.coordinate_descent_tuning = True # suggested by @Chillee
-# model = torch.compile(model)
-# here we wrap model into DDP container
+# Model setup
+model = GPT(config, tokenizer)  # Step 1: Create the model on CPU
+model = model.to(device)        # Step 2: Move the model to the correct device
+
+# If using PyTorch 2.0+ and want compiled model:
+model = torch.compile(model)
+
+# Step 3: Wrap the model in DDP
 model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module # always contains the "raw" unwrapped model
+raw_model = model.module  # Always access raw model via .module
+
+# Optional: Verify that DDP is correctly set up
+if master_process:
+    print(f"[Rank {ddp_rank}] Model wrapped in DDP.")
+
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 head_k_params, attn_k_params = [], []
@@ -287,8 +298,14 @@ for name, param in raw_model.named_parameters():
         attn_k_params.append(param)
 
 k_params = head_k_params + attn_k_params
-for p in k_params:
-    p.requires_grad = args.learnable  
+
+if config.k_lr:
+    for p in k_params:
+        p.requires_grad = True
+else:
+    for p in k_params:
+        p.requires_grad = False
+
 
 if master_process:
     print(f"k params lengths: head = {len(head_k_params)}, attn = {len(attn_k_params)}")
@@ -307,25 +324,32 @@ optimizer_muon = Muon(matrix_params, lr=0.05, momentum=0.95)
 
 optimizer_wte = torch.optim.Adam(wte_params, lr=0.6, betas=(0.8, 0.95), fused=True)
 
-if k_params:
+if attn_k_params:
     optimizer_k = torch.optim.SGD([
-        {"params": head_k_params, "lr": 10.},  
-        {"params": attn_k_params, "lr": 1.}  
+        {"params": head_k_params, "lr": config.k_lr},  
+        {"params": attn_k_params, "lr": config.k_lr}  
     ], momentum=0.9, nesterov=True)
     optimizers = [optimizer_lm_head, optimizer_muon, optimizer_wte, optimizer_k]
     if master_process:
-        print(f"k is learned, {args.learnable}")
+        print(f"attn.k is learned")
+elif head_k_params:
+    optimizer_k = torch.optim.SGD([
+        {"params": head_k_params, "lr": config.k_lr}
+    ], momentum=0.9, nesterov=True)
+    optimizers = [optimizer_lm_head, optimizer_muon, optimizer_wte, optimizer_k]
+    if master_process:
+        print(f"head.k is learned with {config.k_lr} lr")
 else:
     optimizers = [optimizer_lm_head, optimizer_muon, optimizer_wte]
     if master_process:
-        print(f"k is not learned, {args.learnable}")
+        print(f"k is not learned")
 
-
+init_lr = 1.0
+end_lr  = 0.1
 def get_lr(it):
-    t = 1 - it / args.num_iterations # time remaining in training
-    assert 1 >= t >= 0
-    w = min(t / args.cooldown_frac, 1.0) # 1 -> 0
-    return w * 1.0 + (1 - w) * 0.1
+    t = max(0, min(1, 1 - it/config.num_iterations))
+    w = min(t / config.cooldown_frac, 1.0)
+    return w * init_lr + (1 - w) * end_lr
     
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
@@ -337,6 +361,25 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 #     verbose=True          # Print LR reduction messages.
 # )
 
+if master_process:
+
+    print("\n=== Minimal Report ===")
+    print(f"Model Size:    {raw_model.model_size()}")
+
+    # 3) Minimal set of relevant hyperparams
+    print("\n=== Relevant Hyperparameters ===")
+    print(f"Data Path:            {config.data_path}")
+    print(f"Sequence Length:      {config.sequence_length}")
+    print(f"Batch Size (global):  {config.batch_size}")
+    print(f"Batch Size (device):  {config.device_batch_size}")
+    print(f"n_layer:              {config.n_layer}")
+    print(f"n_head:               {config.n_head}")
+    print(f"head_dim:             {config.head_dim}")
+    print(f"n_embd:               {config.n_embd}")
+    print(f"Seed:                 {config.seed}")
+    print("==============================\n")
+
+
 # begin logging
 if master_process:
 
@@ -345,9 +388,15 @@ if master_process:
     seconds_since_midnight = (now - now.replace(hour=0, minute=0, second=0, microsecond=0)).seconds #int(time.time() % 86400)
     run_id = f"{date_part}_{seconds_since_midnight}"
 
-    suffix = f"{args.head_mode}_head_{args.attn_mode}_attn"
+    if config.head_mode == 'hyp' and config.k_lr:
+        suffix = f"k_{config.curvature}_lr_{config.k_lr:.1f}"
+    elif config.head_mode == 'hyp':
+        suffix = f"k_{config.curvature}"
+    else:
+        suffix = f"{config.head_mode}_head"
+
     # Construct the new folder name
-    run_id = f"{run_id}_{suffix}_{args.seed}"
+    run_id = f"{run_id}_{suffix}_{config.seed}"
     
     # Create log directory and file
     logdir = f'runs/{run_id}/'
@@ -392,8 +441,8 @@ train_loss_accum = 0.0
 train_loss_count = 0
 # begin training
 train_loader.reset()
-for step in range(args.num_iterations + 1):
-    last_step = (step == args.num_iterations)
+for step in range(config.num_iterations + 1):
+    last_step = (step == config.num_iterations)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
     # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
     # steps with dummy data first, and then re-initialize the model and reset the loader.
@@ -403,7 +452,7 @@ for step in range(args.num_iterations + 1):
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
     # once in a while evaluate the validation dataset
-    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+    if (last_step or (config.val_loss_every > 0 and step % config.val_loss_every == 0)):
         # stop the clock
         torch.cuda.synchronize()
         training_time_s += time.time() - t0
@@ -421,15 +470,16 @@ for step in range(args.num_iterations + 1):
         val_loss /= val_steps
         # log val loss to console and to logfile
         if master_process:
-            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_s:.2f}s step_avg:{1000*training_time_s/(timed_steps-1):.0f}ms')
+            tokens_seen = step * config.device_batch_size * config.sequence_length * ddp_world_size
+            print(f'step:{step}/{config.num_iterations}, tokens seen: {tokens_seen/1e6:.2f}M, val_loss:{val_loss:.4f} train_time:{training_time_s:.2f}s step_avg:{1000*training_time_s/(timed_steps-1):.0f}ms')
             with open(logfile, "a") as f:
-                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_s:.2f}s step_avg:{1000*training_time_s/(timed_steps-1):.0f}ms\n')
-            writer.add_scalar('Loss/Validation', val_loss.item(), step)
+                f.write(f'step:{step}/{config.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_s:.2f}s step_avg:{1000*training_time_s/(timed_steps-1):.0f}ms\n')
+            writer.add_scalar('Loss/Validation', val_loss.item(), tokens_seen)
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
 
-    if master_process and step and (step % args.generate_every == 0):
+    if config.generate_every and master_process and step and (step % config.generate_every == 0):
         # Use a fixed prompt or context for generation
         prompt = "Once upon a time"  # Customize as per your dataset
         context = raw_model.encode_text(prompt)
@@ -445,7 +495,7 @@ for step in range(args.num_iterations + 1):
         print(f"[Step {step}] Generated Text: {generated_text}")
 
 
-    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+    if master_process and (last_step or (config.save_every > 0 and step % config.save_every == 0)):
         # stop the clock
         torch.cuda.synchronize()
         training_time_s += time.time() - t0
@@ -479,16 +529,24 @@ for step in range(args.num_iterations + 1):
         else:
             loss.backward() # just sync on the last step
 
-
-    for name, param in raw_model.named_parameters():
-        if "manifold.k" in name:
-            print(f"Parameter: {name} = {param.item():.2f}, Requires Grad: {param.requires_grad}")
-            print(f"Gradient: {param.grad}")
     for name, p in model.named_parameters():
         if p.grad is None:
             # print(f"WARNING: Parameter {name} has no gradient. Skipping.")
             continue
         p.grad /= train_accumulation_steps
+
+    if master_process and (step+1) % config.train_loss_every == 0:  # if you only want the rank-0 to log
+
+        grad_norm_lm_head = compute_grad_norm(lm_head_params)
+        grad_norm_matrix = compute_grad_norm(matrix_params)
+        grad_norm_wte = compute_grad_norm(wte_params)
+        grad_norm_k = compute_grad_norm(k_params)
+
+        writer.add_scalar("grad_norm/lm_head", grad_norm_lm_head, step)
+        writer.add_scalar("grad_norm/matrix", grad_norm_matrix, step)
+        writer.add_scalar("grad_norm/wte", grad_norm_wte, step)
+        writer.add_scalar("grad_norm/k", grad_norm_k, step)
+
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
@@ -501,7 +559,7 @@ for step in range(args.num_iterations + 1):
     # everything that follows now is just diagnostics, prints, logging, etc.
 
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
-    if master_process and (step+1) % args.train_loss_every == 0:# within the main training loop, after logging validation loss or training loss
+    if master_process and (step+1) % config.train_loss_every == 0:# within the main training loop, after logging validation loss or training loss
         
         if k_params:  # Only log if curvature is learnable
             for i, param in enumerate(head_k_params):
@@ -510,7 +568,6 @@ for step in range(args.num_iterations + 1):
                 if i == 0:
                     print(f"Head curvature value: {curvature_value:.2f}")
                     writer.add_scalar(f"Curvature/Head", curvature_value, step)
-                    # writer.add_scalar(f"Curvature Gradient", curvature_grad.item(), step)
             for i, param in enumerate(attn_k_params):
                 curvature_value = param.item()  
                 print(f"Attn curvature {i}: {curvature_value}")
@@ -520,11 +577,12 @@ for step in range(args.num_iterations + 1):
         elapsed_time = time.time() - total_t0
         approx_time = training_time_s + (time.time() - t0)
         avg_time_per_step = approx_time/timed_steps
-        estimated_total_time = avg_time_per_step * args.num_iterations
-        print(f"step:{step+1}/{args.num_iterations} avg_train_loss:{avg_train_loss:.4f} time:{elapsed_time:.0f}/{estimated_total_time:.0f}s step_avg:{1000*avg_time_per_step:.0f}ms")
+        estimated_total_time = avg_time_per_step * config.num_iterations
+        tokens_seen = step * config.device_batch_size * config.sequence_length * ddp_world_size
+        print(f"step:{step+1}/{config.num_iterations}, tokens seen:{tokens_seen/1e6:.2f}M, avg_train_loss:{avg_train_loss:.4f} time:{elapsed_time:.0f}/{estimated_total_time:.0f}s step_avg:{1000*avg_time_per_step:.0f}ms")
         with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} avg_train_loss:{avg_train_loss:.4f} time:{elapsed_time:.0f}s step_avg:{1000*avg_time_per_step:.0f}ms\n")
-        writer.add_scalar('Loss/Train', avg_train_loss, step)
+            f.write(f"step:{step+1}/{config.num_iterations} avg_train_loss:{avg_train_loss:.4f} time:{elapsed_time:.0f}s step_avg:{1000*avg_time_per_step:.0f}ms\n")
+        writer.add_scalar('Loss/Train', avg_train_loss, tokens_seen)
         train_loss_accum = 0.0
         train_loss_count = 0
 
