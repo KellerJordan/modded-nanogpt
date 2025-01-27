@@ -470,7 +470,7 @@ for step in range(config.num_iterations + 1):
         val_loss /= val_steps
         # log val loss to console and to logfile
         if master_process:
-            tokens_seen = step * config.device_batch_size * config.sequence_length * ddp_world_size
+            tokens_seen = step * config.batch_size * config.sequence_length
             print(f'step:{step}/{config.num_iterations}, tokens seen: {tokens_seen/1e6:.2f}M, val_loss:{val_loss:.4f} train_time:{training_time_s:.2f}s step_avg:{1000*training_time_s/(timed_steps-1):.0f}ms')
             with open(logfile, "a") as f:
                 f.write(f'step:{step}/{config.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_s:.2f}s step_avg:{1000*training_time_s/(timed_steps-1):.0f}ms\n')
@@ -578,7 +578,7 @@ for step in range(config.num_iterations + 1):
         approx_time = training_time_s + (time.time() - t0)
         avg_time_per_step = approx_time/timed_steps
         estimated_total_time = avg_time_per_step * config.num_iterations
-        tokens_seen = step * config.device_batch_size * config.sequence_length * ddp_world_size
+        tokens_seen = step * config.batch_size * config.sequence_length 
         print(f"step:{step+1}/{config.num_iterations}, tokens seen:{tokens_seen/1e6:.2f}M, avg_train_loss:{avg_train_loss:.4f} time:{elapsed_time:.0f}/{estimated_total_time:.0f}s step_avg:{1000*avg_time_per_step:.0f}ms")
         with open(logfile, "a") as f:
             f.write(f"step:{step+1}/{config.num_iterations} avg_train_loss:{avg_train_loss:.4f} time:{elapsed_time:.0f}s step_avg:{1000*avg_time_per_step:.0f}ms\n")
