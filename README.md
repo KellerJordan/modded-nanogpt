@@ -118,7 +118,7 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 
 ### Notable forks/attempts
 
-[@alexjc's 2.77-minute TokenMonster-based record](https://x.com/alexjc/status/1881410039639863622).
+[@alexjc's 01/20/2025 2.77-minute TokenMonster-based record](https://x.com/alexjc/status/1881410039639863622).
 This record by [@alexjc](https://x.com/alexjc) is technically outside the rules of the speedrun, since we specified that the train/val tokens must be kept fixed.
 However, it's very interesting, and worth including. The run is not more data-efficient; rather, the speedup seems to come from reducing the vocab size while preserving the same
 bytes-per-token, allowing the vocabulary size to shrink, and thereby saving lots of parameters and FLOPs in the head and embeddings.
