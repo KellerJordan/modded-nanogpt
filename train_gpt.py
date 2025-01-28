@@ -82,7 +82,7 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
 def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
     return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
 
-def mm_backward(ctx, grad_out: Tensor, *_):
+def backward(ctx, grad_out: Tensor, *_):
     x_f8, w_f8 = ctx.saved_tensors
     x_s, w_s, grad_s = ctx.scales
     grad_x, grad_w = torch.ops.nanogpt.mm_backward(
@@ -90,14 +90,14 @@ def mm_backward(ctx, grad_out: Tensor, *_):
     )
     return grad_x, grad_w, None, None, None
 
-def mm_setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
+def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
     *_, x_s, w_s, grad_s = inputs
     _, x_f8, w_f8 = output
     ctx.save_for_backward(x_f8, w_f8)
     ctx.scales = x_s, w_s, grad_s
     ctx.set_materialize_grads(False)
 
-mm_op.register_autograd(mm_backward, setup_context=mm_setup_context)
+mm_op.register_autograd(backward, setup_context=setup_context)
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -281,12 +281,12 @@ class CausalSelfAttention(nn.Module):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = self.rotary(q), self.rotary(k)
         if ve is not None:
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = self.lambdas[0] * v
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
-        q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.c_proj(y)
@@ -536,7 +536,7 @@ head_params = [model.lm_head.weight]
 adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), fused=True, eps=1e-10)
+optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
 optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 
@@ -582,7 +582,7 @@ for step in range(train_steps + 1):
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size , rank, world_size)
+        val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
