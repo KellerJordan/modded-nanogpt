@@ -323,6 +323,17 @@ class Block(nn.Module):
         x = x + self.mlp(norm(x))
         return x
 
+class ValueEmbedding(nn.Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__()
+        self.embed = nn.ModuleList([nn.Embedding(num_embeddings, embedding_dim) for _ in range(3)])
+
+    def forward(self, input_seq) -> list[Tensor | None]:
+        ve = [emb(input_seq) for emb in self.embed]
+        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
+        ve = [ve[0], ve[1], ve[2], None, None, None, None, None, None, ve[0], ve[1], ve[2]]
+        return ve
+
 # -----------------------------------------------------------------------------
 # The main model
 
@@ -332,7 +343,9 @@ def next_multiple_of_n(v: float | int, *, n: int):
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int):
         super().__init__()
-        self.embed = nn.Embedding(vocab_size, model_dim*4) # 1 input, 3x value embeddings
+        self.embed = nn.Embedding(vocab_size, model_dim)
+        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
+        self.value_embeds = ValueEmbedding(vocab_size, model_dim)
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx) for layer_idx in range(num_layers)])
         # U-net design by @brendanh0gan
         self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
@@ -389,14 +402,10 @@ class GPT(nn.Module):
 
         long_bm, short_bm = self.create_block_masks(input_seq, sliding_window_num_blocks)
 
-        embeds = self.embed(input_seq).chunk(4, dim=-1)
-        x = x0 = norm(embeds[0][None]) # use of norm here by @Grad62304977
-
-        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
-        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        _ve = [embeds[1], embeds[2], embeds[3], None, None, None, None, None, None, embeds[1], embeds[2], embeds[3]]
-        assert len(_ve) == len(self.blocks)
-        ve_enc, ve_dec = _ve[:self.num_encoder_layers], _ve[self.num_encoder_layers:]
+        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        ve = self.value_embeds(input_seq)
+        assert len(ve) == len(self.blocks)
+        ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
         assert len(ve_enc) == self.num_encoder_layers and len(ve_dec) == self.num_decoder_layers
 
         # Store outputs for U-Net skip connections
