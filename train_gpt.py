@@ -21,12 +21,6 @@ torch._inductor.config.coordinate_descent_tuning = True # turn this off for a fa
 # -----------------------------------------------------------------------------
 # Custom operators : FP8 matmul for lm_head by @YouJiacheng
 
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-torch.cuda.manual_seed_all(42)  # for multi-GPU
-# torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
     @torch.compile
