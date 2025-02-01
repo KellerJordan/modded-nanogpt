@@ -4,6 +4,7 @@ with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
 import time
+import copy
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -524,9 +525,8 @@ model: nn.Module = torch.compile(model, dynamic=False)
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 warmup_steps = 10
-def copy_state(obj):
-    return {k: v.clone() for k, v in obj.state_dict().items()}
-initial_state = dict(model=copy_state(model), optimizers=[copy_state(opt) for opt in optimizers]) # save the initial state
+initial_state = dict(model=copy.deepcopy(model.state_dict()),
+                     optimizers=[copy.deepcopy(opt.stat_dict()) for opt in optimizers]) # save the initial state
 train_loader = distributed_data_generator(args.train_files, world_size * args.seq_len, rank, world_size)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
