@@ -572,8 +572,8 @@ for step in range(train_steps + 1):
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
-                x, y = next(val_loader)
-                val_loss += model(x, y, sw_num_blks(window_size))
+                inputs, targets = next(val_loader)
+                val_loss += model(inputs, targets, sw_num_blks(window_size))
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -593,8 +593,7 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    for input_seq, target_seq in zip(inputs.split(args.seq_len), targets.split(args.seq_len)):
-        model(input_seq, target_seq, sw_num_blks(window_size)).backward()
+    model(inputs, targets, sw_num_blks(window_size)).backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     # momentum warmup for Muon
