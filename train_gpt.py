@@ -340,7 +340,7 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
         self.lm_head.weight.detach().zero_() # @Grad62304977
 
-    def create_block_masks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
+    def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
         docs = (input_seq == 50256).cumsum(0)
 
@@ -349,30 +349,30 @@ class GPT(nn.Module):
             document_mask = docs[q_idx] == docs[kv_idx]
             return causal_mask & document_mask
 
-        def dense_to_ordered(dense_mask: Tensor):
-            num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
-            indices = dense_mask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
+        def dense_to_ordered(dense_blockmask: Tensor):
+            num_blocks = dense_blockmask.sum(dim=-1, dtype=torch.int32)
+            indices = dense_blockmask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
             return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
         # manual block mask creation by @YouJiacheng
         assert len(input_seq) % BLOCK_SIZE == 0
         NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
         block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
-        any_causal_bm = block_idx[:, None] >= block_idx
-        all_causal_bm = block_idx[:, None] > block_idx
+        causal_blockmask_any = block_idx[:, None] >= block_idx
+        causal_blockmask_all = block_idx[:, None] > block_idx
         docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
         docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
-        any_document_bm = (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low)
-        all_document_bm = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
-        any_bm = any_causal_bm & any_document_bm
-        all_bm = all_causal_bm & all_document_bm
-        partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(any_bm & ~all_bm)
+        document_blockmask_any = (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low)
+        document_blockmask_all = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
+        blockmask_any = causal_blockmask_any & document_blockmask_any
+        blockmask_all = causal_blockmask_all & document_blockmask_all
+        partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(blockmask_any & ~blockmask_all)
         full_kv_num_blocks, full_kv_indices = dense_to_ordered(all_bm)
-        def build_bm(sw_num_blocks: Tensor) -> BlockMask:
+        def build_bm(window_size_blocks: Tensor) -> BlockMask:
             return BlockMask.from_kv_blocks(
-                torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(sw_num_blocks - full_kv_num_blocks, 1)),
+                torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(window_size_blocks - full_kv_num_blocks, 1)),
                 partial_kv_indices,
-                torch.clamp_max(full_kv_num_blocks, sw_num_blocks - 1),
+                torch.clamp_max(full_kv_num_blocks, window_size_blocks - 1),
                 full_kv_indices,
                 BLOCK_SIZE=BLOCK_SIZE,
                 mask_mod=document_causal,
@@ -388,7 +388,7 @@ class GPT(nn.Module):
         ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == len(self.blocks)
 
-        long_bm, short_bm = self.create_block_masks(input_seq, sliding_window_num_blocks)
+        long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
         block_masks = [long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
         assert len(block_masks) == len(self.blocks)
 
@@ -530,7 +530,7 @@ initial_state = dict(model=copy.deepcopy(model.state_dict()),
 train_loader = distributed_data_generator(args.train_files, world_size * args.seq_len, rank, world_size)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
-    model(inputs, targets, sw_num_blks(window_size)).backward()
+    model(inputs, targets, window_size_blocks(128)).backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     for opt in optimizers:
