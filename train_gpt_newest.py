@@ -518,7 +518,7 @@ def get_lr(step: int):
     return w * 1.0 + (1 - w) * 0.1
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 @lru_cache(1)
-def sw_num_blks(window_size: int):
+def window_size_blocks(window_size: int):
     return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
 model: nn.Module = torch.compile(model, dynamic=False)
@@ -569,7 +569,7 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets = next(val_loader)
-                val_loss += model(inputs, targets, sw_num_blks(window_size))
+                val_loss += model(inputs, targets, window_size_blocks(window_size))
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -589,7 +589,7 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    model(inputs, targets, sw_num_blks(window_size)).backward()
+    model(inputs, targets, window_size_blocks(window_size)).backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     # momentum warmup for Muon
