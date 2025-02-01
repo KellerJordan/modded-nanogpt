@@ -16,7 +16,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-# torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
+#torch._inductor.config.coordinate_descent_tuning = True # turn this on for a slightly faster run (but much slower compile time)
 
 # -----------------------------------------------------------------------------
 # Custom operators : FP8 matmul by @YouJiacheng
@@ -347,11 +347,6 @@ class GPT(nn.Module):
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         self.value_embeds = ValueEmbedding(vocab_size, model_dim, num_layers)
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx, max_seq_len) for layer_idx in range(num_layers)])
-        # U-net design by @brendanh0gan
-        self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
-        self.num_decoder_layers = num_layers - self.num_encoder_layers # Remaining for decoder
-        # Add learnable skip connection weights for decoder layers
-        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
@@ -400,28 +395,16 @@ class GPT(nn.Module):
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
 
-        long_bm, short_bm = self.create_block_masks(input_seq, sliding_window_num_blocks)
-
-        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
         ve = self.value_embeds(input_seq)
         assert len(ve) == len(self.blocks)
-        ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
-        assert len(ve_enc) == self.num_encoder_layers and len(ve_dec) == self.num_decoder_layers
 
-        # Store outputs for U-Net skip connections
-        skip_connections = []
-        # Encoder pass - process only the first half of the blocks
-        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
-        assert len(block_masks) == self.num_encoder_layers
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, ve_enc[i], x0, block_masks[i])
-            skip_connections.append(x)
-        # Decoder pass - process the remaining blocks with weighted skip connections
-        block_masks.reverse()
-        assert len(block_masks) == self.num_decoder_layers
-        for i in range(self.num_decoder_layers):
-            x = x + self.skip_weights[i] * skip_connections.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_masks[i])
+        long_bm, short_bm = self.create_block_masks(input_seq, sliding_window_num_blocks)
+        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+        assert len(block_masks) == len(self.blocks)
+
+        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        for i in range(len(self.blocks)):
+            x = self.blocks[i](x, ve[i], x0, block_masks[i])
         x = norm(x)
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
@@ -533,18 +516,18 @@ scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
+adam_params = [dict(params=head_params, lr=0.007), dict(params=embed_params, lr=0.55), dict(params=scalar_params, lr=0.035)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+optimizer2 = Muon(hidden_matrix_params, lr=0.045, momentum=0.95, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 
 # learning rate schedule: stable then decay
 def get_lr(step: int):
-    t = 1 - step / args.num_iterations # time remaining in training
-    assert 1 >= t >= 0
-    w = min(t / args.cooldown_frac, 1.0) # 1 -> 0
+    x = step / args.num_iterations # progress in training
+    assert 0 <= x <= 1
+    w = min((1 - x) / args.cooldown_frac, 1.0) # 1 -> 0
     return w * 1.0 + (1 - w) * 0.1
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 @lru_cache(1)
