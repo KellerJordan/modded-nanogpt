@@ -317,8 +317,8 @@ class Block(nn.Module):
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
         if self.attn is not None:
             x = x + self.attn(norm(x), ve, block_mask)
-        x = x + self.mlp(norm(x))
         x = self.lambdas[0] * x + self.lambdas[1] * x0
+        x = x + self.mlp(norm(x))
         return x
 
 class ValueEmbedding(nn.Module):
@@ -505,9 +505,6 @@ train_loader = distributed_data_generator(args.train_files, train_batch_size, ra
 model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
-        m.bfloat16()
-for m in model.blocks.modules():
-    if isinstance(m, CastedLinear):
         m.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
