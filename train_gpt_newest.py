@@ -320,17 +320,6 @@ class Block(nn.Module):
         x = x + self.mlp(norm(x))
         return x
 
-class ValueEmbedding(nn.Module):
-    def __init__(self, vocab_size: int, embedding_dim: int, num_layers: int, num_embeddings: int = 3):
-        super().__init__()
-        self.num_layers = num_layers
-        self.num_embeddings = num_embeddings
-        self.embed = nn.ModuleList([nn.Embedding(vocab_size, embedding_dim) for _ in range(num_embeddings)])
-
-    def forward(self, input_seq: Tensor) -> list[Tensor | None]:
-        ve = [emb(input_seq) for emb in self.embed]
-        return ve
-
 # -----------------------------------------------------------------------------
 # The main model
 
@@ -342,6 +331,7 @@ class GPT(nn.Module):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
+        # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len) for _ in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
