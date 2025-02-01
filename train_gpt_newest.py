@@ -398,7 +398,7 @@ class GPT(nn.Module):
         assert len(ve) == len(self.blocks)
 
         long_bm, short_bm = self.create_block_masks(input_seq, sliding_window_num_blocks)
-        block_masks = [long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm]
+        block_masks = [long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
         assert len(block_masks) == len(self.blocks)
 
         x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
@@ -451,7 +451,7 @@ class Hyperparameters:
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
-    num_iterations = 1940 # number of iterations to run
+    num_iterations = 1770 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -501,7 +501,7 @@ print0("="*100)
 train_batch_size = world_size * args.seq_len
 train_loader = distributed_data_generator(args.train_files, train_batch_size, rank, world_size)
 
-model: nn.Module = GPT(vocab_size=50257, num_layers=10, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
