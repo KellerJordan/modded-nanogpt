@@ -367,7 +367,7 @@ class GPT(nn.Module):
         blockmask_any = causal_blockmask_any & document_blockmask_any
         blockmask_all = causal_blockmask_all & document_blockmask_all
         partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(blockmask_any & ~blockmask_all)
-        full_kv_num_blocks, full_kv_indices = dense_to_ordered(all_bm)
+        full_kv_num_blocks, full_kv_indices = dense_to_ordered(blockmask_all)
         def build_bm(window_size_blocks: Tensor) -> BlockMask:
             return BlockMask.from_kv_blocks(
                 torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(window_size_blocks - full_kv_num_blocks, 1)),
