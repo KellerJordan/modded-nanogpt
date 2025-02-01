@@ -315,9 +315,9 @@ class Block(nn.Module):
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
-        x = self.lambdas[0] * x + self.lambdas[1] * x0
         x = x + self.attn(norm(x), ve, block_mask)
         x = x + self.mlp(norm(x))
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
         return x
 
 class ValueEmbedding(nn.Module):
