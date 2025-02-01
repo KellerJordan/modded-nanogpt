@@ -526,7 +526,7 @@ model: nn.Module = torch.compile(model, dynamic=False)
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizers=[copy.deepcopy(opt.stat_dict()) for opt in optimizers]) # save the initial state
+                     optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 train_loader = distributed_data_generator(args.train_files, world_size * args.seq_len, rank, world_size)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
