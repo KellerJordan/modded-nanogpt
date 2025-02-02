@@ -16,8 +16,8 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
-from torch.nn.attention.flex_attention import BlockMask, flex_attention
-#torch._inductor.config.coordinate_descent_tuning = True # this flag is banned for records because it causes compilation to take 30min
+fromccorch.nn.attention.flex_attention import BlockMask, flex_attention
+##torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 
 # -----------------------------------------------------------------------------
 # Custom operators : FP8 matmul by @YouJiacheng
@@ -147,7 +147,7 @@ class Muon(torch.optim.Optimizer):
     parameters; those should all be optimized by a standard method (e.g., AdamW).
     - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
     - We believe it is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven"t tested this.
+    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
     - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
 
     Arguments:
