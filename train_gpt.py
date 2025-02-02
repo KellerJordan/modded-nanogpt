@@ -360,8 +360,7 @@ class GPT(nn.Module):
 
         # manual block mask creation by @YouJiacheng
         assert len(input_seq) % BLOCK_SIZE == 0
-        NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
-        block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
+        block_idx = torch.arange(len(input_seq) // BLOCK_SIZE, dtype=torch.int32, device="cuda")
         causal_blockmask_any = block_idx[:, None] >= block_idx
         causal_blockmask_all = block_idx[:, None] > block_idx
         docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
