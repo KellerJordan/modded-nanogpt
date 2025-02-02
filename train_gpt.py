@@ -20,7 +20,7 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 
 # -----------------------------------------------------------------------------
-# Custom operators : FP8 matmul by @YouJiacheng
+# Custom operators: FP8 matmul by @YouJiacheng
 
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
