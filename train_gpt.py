@@ -147,7 +147,7 @@ class Muon(torch.optim.Optimizer):
     parameters; those should all be optimized by a standard method (e.g., AdamW).
     - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
     - We believe it is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven"t tested this.
+    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
     - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
 
     Arguments:
@@ -440,7 +440,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank=0, w
             tokens, pos = _load_data_shard(next(file_iter)), 0
         buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn"t helpful.
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
         pos += batch_size
         yield inputs, targets
 
