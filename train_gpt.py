@@ -20,7 +20,7 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # this flag is banned for records because it causes compilation to take 30min
 
 # -----------------------------------------------------------------------------
-# Custom operators : FP8 matmul by @YouJiacheng
+# Custom operators: FP8 matmul by @YouJiacheng
 
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
@@ -166,8 +166,8 @@ class Muon(torch.optim.Optimizer):
         def create_update_buffer(size: int):
             b = torch.empty(self.world_size, size, dtype=torch.bfloat16, device="cuda")
             return dict(update_buffer=b, update_buffer_views=[b[i] for i in range(self.world_size)])
-        param_groups = [
-            dict(params=[p for p in params if p.numel() == size], **create_update_buffer(size)) for size in sizes]
+        param_groups = [dict(params=[p for p in params if p.numel() == size], **create_update_buffer(size))
+                        for size in sizes]
         super().__init__(param_groups, defaults)
 
     @torch.no_grad()
@@ -429,7 +429,7 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, rank : int, world_size : int):
+def distributed_data_generator(filename_pattern: str, batch_size: int, rank=0, world_size=1):
     files = sorted(Path.cwd().glob(filename_pattern))
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
@@ -646,9 +646,7 @@ for step in range(train_steps + 1):
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
-print0(
-    f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-    f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB",
-    console=True,
-)
+print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+       f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB",
+       console=True)
 dist.destroy_process_group()
