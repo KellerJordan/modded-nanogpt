@@ -502,6 +502,10 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
+########################################
+#    Construct model and optimizer     #
+########################################
+
 model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
@@ -539,6 +543,10 @@ def window_size_blocks(window_size: int):
 
 model: nn.Module = torch.compile(model, dynamic=False)
 
+########################################
+#            Warmup kernels            #
+########################################
+
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
@@ -556,6 +564,10 @@ model.load_state_dict(initial_state['model'])
 for opt, opt_state in zip(optimizers, initial_state['optimizers']):
     opt.load_state_dict(opt_state)
 del train_loader, initial_state
+
+########################################
+#        Training and validation       #
+########################################
 
 train_loader = distributed_data_generator(args.train_files, world_size * args.seq_len, rank, world_size)
 training_time_ms = 0
