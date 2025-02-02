@@ -531,7 +531,7 @@ optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
-        group["initial_lr"] = pg["lr"]
+        group["initial_lr"] = group["lr"]
 
 # learning rate schedule: stable then decay
 def get_lr(step: int):
@@ -629,13 +629,13 @@ for step in range(train_steps + 1):
     model(inputs, targets, get_window_size_blocks(step)).backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-    # momentum warmup for Muon
-    frac = min(step / 300, 1)
-    for group in optimizer2.param_groups:
-        group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+    # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * get_lr(step)
+    for group in optimizer2.param_groups:
+        frac = min(step / 300, 1) # momentum warmup for muon
+        group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers
     for opt in optimizers:
         opt.step()
