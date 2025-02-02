@@ -322,19 +322,6 @@ class Block(nn.Module):
         x = x + self.mlp(norm(x))
         return x
 
-class ValueEmbedding(nn.Module):
-    def __init__(self, vocab_size: int, embedding_dim: int, num_layers: int, num_embeddings: int = 3):
-        super().__init__()
-        self.num_layers = num_layers
-        self.num_embeddings = num_embeddings
-        self.embed = nn.ModuleList([nn.Embedding(vocab_size, embedding_dim) for _ in range(num_embeddings)])
-
-    def forward(self, input_seq: Tensor) -> list[Tensor | None]:
-        ve = [emb(input_seq) for emb in self.embed]
-        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        ve = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 2 * self.num_embeddings) + [ve[0], ve[1], ve[2]]
-        return ve
-
 # -----------------------------------------------------------------------------
 # The main model
 
@@ -346,7 +333,8 @@ class GPT(nn.Module):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
-        self.value_embeds = ValueEmbedding(vocab_size, model_dim, num_layers)
+        # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
+        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
@@ -399,10 +387,10 @@ class GPT(nn.Module):
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
 
-        ve = self.value_embeds(input_seq)
+        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
+        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
+        ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == len(self.blocks)
-        n = len(self.skip_weights)
-        ve_enc, ve_dec = ve[:n], ve[n:]
 
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
@@ -412,14 +400,14 @@ class GPT(nn.Module):
 
         # U-net design by @brendanh0gan
         skip_connections = []
-        # Encoder pass - process only the first half of the blocks
-        for i in range(n):
-            x = self.blocks[i](x, ve_enc[i], x0, block_masks[i])
-            skip_connections.append(x)
-        # Decoder pass - process the remaining blocks with weighted skip connections
-        for i in range(n):
-            x = x + self.skip_weights[i] * skip_connections.pop()
-            x = self.blocks[n + i](x, ve_dec[i], x0, block_masks[n + i])
+        n = len(self.skip_weights)
+        for i in range(len(self.blocks)):
+            if i >= n:
+                x = x + self.skip_weights[i - n] * skip_connections.pop()
+            x = self.blocks[i](x, ve[i], x0, block_masks[i])
+            if i < n:
+                skip_connections.append(x)
+
         x = norm(x)
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
