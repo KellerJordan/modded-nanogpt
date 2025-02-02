@@ -536,24 +536,23 @@ def window_size_blocks(window_size: int):
 
 model: nn.Module = torch.compile(model, dynamic=False)
 
-if True:
-    # Warmup the training kernels, then re-initialize the state so we aren't cheating
-    warmup_steps = 10
-    initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                         optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-    train_loader = distributed_data_generator(args.train_files, world_size * args.seq_len, rank, world_size)
-    for _ in range(warmup_steps):
-        inputs, targets = next(train_loader)
-        model(inputs, targets, window_size_blocks(128)).backward()
-        for param in model.parameters():
-            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-        for opt in optimizers:
-            opt.step()
-        model.zero_grad(set_to_none=True)
-    model.load_state_dict(initial_state['model'])
-    for opt, opt_state in zip(optimizers, initial_state['optimizers']):
-        opt.load_state_dict(opt_state)
-    del train_loader, initial_state
+# Warmup the training kernels, then re-initialize the state so we aren't cheating
+warmup_steps = 10
+initial_state = dict(model=copy.deepcopy(model.state_dict()),
+                     optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
+train_loader = distributed_data_generator(args.train_files, world_size * args.seq_len, rank, world_size)
+for _ in range(warmup_steps):
+    inputs, targets = next(train_loader)
+    model(inputs, targets, window_size_blocks(128)).backward()
+    for param in model.parameters():
+        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+    for opt in optimizers:
+        opt.step()
+    model.zero_grad(set_to_none=True)
+model.load_state_dict(initial_state['model'])
+for opt, opt_state in zip(optimizers, initial_state['optimizers']):
+    opt.load_state_dict(opt_state)
+del train_loader, initial_state
 
 train_loader = distributed_data_generator(args.train_files, world_size * args.seq_len, rank, world_size)
 training_time_ms = 0
