@@ -198,7 +198,7 @@ class Muon(torch.optim.Optimizer):
                 else:
                     g = update_buffer_views[self.rank]
                 if base_i > 0:
-                    update_prev() # overlap computation and communication by @YouJiacheng
+                    update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
                 handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
                 params_world = params[base_i : base_i + self.world_size]
             update_prev()
