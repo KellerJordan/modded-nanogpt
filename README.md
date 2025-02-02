@@ -102,7 +102,9 @@ The only rules are that new records must:
 
 Other than that, anything and everything is fair game!
 
-Details on 22nd "record": After the 21st record, we improved the timing method of the run and banned an argument to the torch compiler. First, we replaced the initial "grace period" of 10 steps with an explicit kernel-warmup section. This adds 850ms to the runtime. We additionally banned the use of `torch._inductor.config.coordinate_descent_tuning`, which saves ~25min of first-run compilation, at the cost of 3s of runtime.
+### Details on 22nd 'record'
+
+After the 21st record, we made two changes to the timing. First, we replaced the initial "grace period" of 10 untimed steps with an explicit kernel-warmup section, adding 850ms to the runtime. Second, we banned the use of `torch._inductor.config.coordinate_descent_tuning`, resulting in 3s of extra runtime (but ~25min less compilation).
 
 <!--Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
 So it's no surprise that there is room to improve; as @karpathy has said, 'llm.c still has a lot of pending optimizations.'
