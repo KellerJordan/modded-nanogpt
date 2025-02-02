@@ -530,8 +530,8 @@ optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=T
 optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
-    for pg in opt.param_groups:
-        pg['initial_lr'] = pg['lr']
+    for group in opt.param_groups:
+        group["initial_lr"] = pg["lr"]
 
 # learning rate schedule: stable then decay
 def get_lr(step: int):
@@ -564,7 +564,7 @@ warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 for _ in range(warmup_steps):
-    inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device='cuda')
+    inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
     model(inputs, targets, get_window_size_blocks(0)).backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
@@ -631,10 +631,12 @@ for step in range(train_steps + 1):
     frac = min(step / 300, 1)
     for group in optimizer2.param_groups:
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-    # step the optimizers and schedulers
-    for opt, sched in zip(optimizers, schedulers):
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * get_lr(step)
+    # step the optimizers
+    for opt in optimizers:
         opt.step()
-        sched.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
     # logging
