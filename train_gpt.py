@@ -536,7 +536,7 @@ def window_size_blocks(window_size: int):
 
 model: nn.Module = torch.compile(model, dynamic=False)
 
-if False:
+if True:
     # Warmup the training kernels, then re-initialize the state so we aren't cheating
     warmup_steps = 10
     initial_state = dict(model=copy.deepcopy(model.state_dict()),
