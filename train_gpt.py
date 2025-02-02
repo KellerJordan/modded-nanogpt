@@ -549,6 +549,7 @@ if False:
             dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
         for opt in optimizers:
             opt.step()
+        model.zero_grad(set_to_none=True)
     model.load_state_dict(initial_state['model'])
     for opt, opt_state in zip(optimizers, initial_state['optimizers']):
         opt.load_state_dict(opt_state)
