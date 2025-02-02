@@ -630,9 +630,10 @@ for step in range(args.train_steps + 1):
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     # set optimization hyperparameters
+    lr_scale = get_lr(step)
     for opt in optimizers:
         for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
+            group["lr"] = group["initial_lr"] * lr_scale
     for group in optimizer2.param_groups:
         frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
