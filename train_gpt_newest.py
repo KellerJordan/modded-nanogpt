@@ -161,13 +161,12 @@ class Muon(torch.optim.Optimizer):
         self.world_size = world_size
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         params: list[Tensor] = [*params]
-        assert all(isinstance(p, Tensor) for p in params)
-        sizes = {p.numel() for p in params}
-        def create_update_buffer(size: int):
-            b = torch.empty(self.world_size, size, dtype=torch.bfloat16, device="cuda")
-            return dict(update_buffer=b, update_buffer_views=[b[i] for i in range(self.world_size)])
-        param_groups = [
-            dict(params=[p for p in params if p.numel() == size], **create_update_buffer(size)) for size in sizes]
+        param_groups = []
+        for size in {p.numel() for p in params}:
+            b = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda")
+            group = dict(params=[p for p in params if p.numel() == size],
+                         update_buffer=b, update_buffer_views=[b[i] for i in range(world_size)])
+            param_groups.append(group)
         super().__init__(param_groups, defaults)
 
     @torch.no_grad()
