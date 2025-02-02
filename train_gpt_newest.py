@@ -17,7 +17,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-#torch._inductor.config.coordinate_descent_tuning = True # turn this on for a slightly faster run (but much slower compile time)
+#torch._inductor.config.coordinate_descent_tuning = True # this flag is banned for records because it causes compilation to take 30min
 
 # -----------------------------------------------------------------------------
 # Custom operators : FP8 matmul by @YouJiacheng
