@@ -179,9 +179,6 @@ class Muon(torch.optim.Optimizer):
             handle = None
             params_world = None
             def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
-                if params_world is None:
-                    return
-                assert handle is not None
                 handle.wait()
                 for p_world, g_world in zip(params_world, update_buffer_views):
                     p_world.add_(g_world.view_as(p_world),
@@ -200,7 +197,8 @@ class Muon(torch.optim.Optimizer):
                     g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
                 else:
                     g = update_buffer_views[self.rank]
-                update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
+                if base_i > 0:
+                    update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
                 handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
                 params_world = params[base_i : base_i + self.world_size]
             update_prev()
