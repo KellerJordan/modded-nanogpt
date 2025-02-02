@@ -527,8 +527,11 @@ optimizers = [optimizer1, optimizer2]
 def get_lr(step: int):
     x = step / args.num_iterations # progress in training
     assert 0 <= x <= 1
-    w = min((1 - x) / args.cooldown_frac, 1.0) # 1 -> 0
-    return w * 1.0 + (1 - w) * 0.1
+    if x < 1 - args.cooldown_frac:
+        return 1.0
+    else:
+        w = (1 - x) / args.cooldown_frac
+        return w * 1.0 + (1 - w) * 0.1
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 @lru_cache(1)
 def window_size_blocks(window_size: int):
