@@ -172,26 +172,17 @@ class Muon(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
-            lr = group["lr"]
-            momentum = group["momentum"]
-            nesterov = group["nesterov"]
-            ns_steps = group["ns_steps"]
-            update_buffer = group["update_buffer"]
+            update_buffer: Tensor = group["update_buffer"]
             update_buffer_views: list[Tensor] = group["update_buffer_views"]
             # generate weight updates in distributed fashion
             params: list[Tensor] = group["params"]
             handle = None
             params_world = None
             def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
-                if params_world is None:
-                    return
-                assert handle is not None
                 handle.wait()
                 for p_world, g_world in zip(params_world, update_buffer_views):
-                    p_world.add_(
-                        g_world.view_as(p_world),
-                        alpha=-lr * max(1, p_world.size(-2) / p_world.size(-1)) ** 0.5,
-                    )
+                    p_world.add_(g_world.view_as(p_world),
+                                 alpha=-group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
             for base_i in range(len(params))[::self.world_size]:
                 if base_i + self.rank < len(params):
                     p = params[base_i + self.rank]
@@ -201,12 +192,13 @@ class Muon(torch.optim.Optimizer):
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(g)
                     buf: Tensor = state["momentum_buffer"]
-                    buf.lerp_(g, 1 - momentum)
-                    g = g.lerp_(buf, momentum) if nesterov else buf
-                    g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
+                    buf.lerp_(g, 1 - group["momentum"])
+                    g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
                 else:
                     g = update_buffer_views[self.rank]
-                update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
+                if base_i > 0:
+                    update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
                 handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
                 params_world = params[base_i : base_i + self.world_size]
             update_prev()
