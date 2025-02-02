@@ -98,9 +98,11 @@ The only rules are that new records must:
 
 1. Not modify the train or validation data pipelines. (You can change the batch size, sequence length, attention structure etc.; just don't change the underlying streams of tokens.)
 3. Attain ≤3.28 mean val loss. (Due to inter-run variance, submissions must provide enough run logs to attain a statistical significance level of p<0.01 that their mean val loss is ≤3.28. Example code to compute p-value can be found [here](records/010425_SoftCap#softer-softcap).)
-2. Not use any extra `torch._inductor.config` settings. (These can save a few seconds, but they make compilation take >30min the first time) Note: This rule was introduced after the 21st record.
+2. Not use any extra `torch._inductor.config` flags. (These can save a few seconds, but they can also make compilation take >30min. This rule was introduced after the 21st record.)
 
 Other than that, anything and everything is fair game!
+
+---
 
 ### Details on 22nd 'record'
 
@@ -120,8 +122,6 @@ were in the ImageNet days.
 The only possible 'benefit' I can think of for any empirical field to abandon benchmarks is that it would make it easier to publish false results. Oh, I guess that's why it happened.
 Hilarious to think about how, in the often-commented-upon and ongoing collapse of the peer review system, people blame the *reviewers* --
 yeah, those guys doing free labor who everyone constantly musters all of their intelligence to lie to, it's *their* fault! My bad, you caught me monologuing.-->
-
----
 
 ### Notable attempts & forks
 
