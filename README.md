@@ -88,20 +88,21 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 17 | 3.57 minutes | [Sparsify value embeddings, improve rotary embeddings, drop an attn layer](https://x.com/YouJiacheng/status/1868938024731787640) | 12/17/24 | [log](records/121724_SparsifyEmbeds) | @YouJiacheng
 18 | 3.4 minutes | [Lower logit softcap from 30 to 15](https://x.com/kellerjordan0/status/1876048851158880624) | 01/04/25 | [log](records/010425_SoftCap/31d6c427-f1f7-4d8a-91be-a67b5dcd13fd.txt) | @KoszarskyB
 19 | 3.142 minutes | [FP8 head, offset logits, lr decay to 0.1 instead of 0.0](https://x.com/YouJiacheng/status/1878827972519772241) | 01/13/25 | [log](records/011325_Fp8LmHead/c51969c2-d04c-40a7-bcea-c092c3c2d11a.txt) | @YouJiacheng
-20 | 2.997 minutes | [Merged QKV weights, long-short attention, attention scale, lower Adam epsilon, batched Muon](https://x.com/leloykun/status/1880301753213809016) | 01/16/25 | [log](records/011625_Sub3Min/1d3bd93b-a69e-4118-aeb8-8184239d7566.txt) | @leloykun, @fernbear.bsky.social, @YouJiacheng, @brendanh0gan, @scottjmaddox, @Grad62304977
+20 | 2.992 minutes | [Merged QKV weights, long-short attention, attention scale, lower Adam epsilon, batched Muon](https://x.com/leloykun/status/1880301753213809016) | 01/16/25 | [log](records/011625_Sub3Min/1d3bd93b-a69e-4118-aeb8-8184239d7566.txt) | @leloykun, @fernbear.bsky.social, @YouJiacheng, @brendanh0gan, @scottjmaddox, @Grad62304977
 21 | 2.933 minutes | [Reduced batch size](https://x.com/leloykun/status/1885640350368420160) | 01/26/25 | [log](records/012625_BatchSize/c44090cc-1b99-4c95-8624-38fb4b5834f9.txt) | @leloykun
+22 | 2.997 minutes | 21st record with new rules | 02/01/25 | [log](records/020125_RuleTweak/eff63a8c-2f7e-4fc5-97ce-7f600dae0bc7.txt) | (not a record)
 
 ## Rules
 
 The only rules are that new records must:
 
 1. Not modify the train or validation data pipelines. (You can change the batch size, sequence length, attention structure etc.; just don't change the underlying streams of tokens.)
-2. Not use any extra `torch._inductor.config` settings. (These can save a few seconds, but they make compilation take >30min the first time)
 3. Attain ≤3.28 mean val loss. (Due to inter-run variance, submissions must provide enough run logs to attain a statistical significance level of p<0.01 that their mean val loss is ≤3.28. Example code to compute p-value can be found [here](records/010425_SoftCap#softer-softcap).)
+2. Not use any extra `torch._inductor.config` settings. (These can save a few seconds, but they make compilation take >30min the first time) Note: This rule was introduced after the 21st record.
 
 Other than that, anything and everything is fair game!
 
-Note: After the 21st record, we improved the timing method by replacing the initial "grace period" of 10 steps with an explicit kernel-warmup section. This adds 850ms to all subsequent runs. We additionally banned the use of `torch._inductor.config.coordinate_descent_tuning`, which saves ~25min of first-run compilation, at the cost of 2800ms of runtime.
+Details on 22nd "record": After the 21st record, we improved the timing method of the run and banned an argument to the torch compiler. First, we replaced the initial "grace period" of 10 steps with an explicit kernel-warmup section. This adds 850ms to the runtime. We additionally banned the use of `torch._inductor.config.coordinate_descent_tuning`, which saves ~25min of first-run compilation, at the cost of 3s of runtime.
 
 <!--Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
 So it's no surprise that there is room to improve; as @karpathy has said, 'llm.c still has a lot of pending optimizations.'
