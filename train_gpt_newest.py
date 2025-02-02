@@ -625,8 +625,10 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    # perform the local forward-backward step
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(step)).backward()
+    # sync gradients across devices
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     # set optimization hyperparameters
