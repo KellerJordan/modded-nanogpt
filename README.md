@@ -104,7 +104,7 @@ Other than that, anything and everything is fair game!
 
 ---
 
-### Details on 22nd 'record'
+### Timing change for record 22
 
 After the 21st record, we made two changes to the timing. First, we replaced the initial "grace period" of 10 untimed steps with an explicit kernel-warmup section, adding 850ms to the runtime. Second, we banned the use of `torch._inductor.config.coordinate_descent_tuning`, resulting in 3s of extra runtime (but ~25min less compilation).
 
