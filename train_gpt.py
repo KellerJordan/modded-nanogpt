@@ -340,7 +340,7 @@ class GPT(nn.Module):
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
         self.lm_head.weight.detach().zero_() # @Grad62304977
-        # Add learnable skip connection weights for decoder layers
+        # skip weights for U-net skip connections
         assert num_layers % 2 == 0
         self.skip_weights = nn.Parameter(torch.ones(num_layers//2))
 
