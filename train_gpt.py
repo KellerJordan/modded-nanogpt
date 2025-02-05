@@ -31,7 +31,7 @@ def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[
         w_f8 = w.mul(w_s).to(torch.float8_e4m3fn)
         out = torch._scaled_mm(
             x_f8,
-            w_f8.t(),
+            w_f8.T,
             out_dtype=torch.bfloat16,
             scale_a=x.new_tensor(1 / x_s, dtype=torch.float32),
             scale_b=x.new_tensor(1 / w_s, dtype=torch.float32),
@@ -47,7 +47,7 @@ def _(x: Tensor, w: Tensor, *_):
     assert x.shape[1] == w.shape[1]
     assert x.device == w.device
     assert x.is_contiguous() and w.is_contiguous()
-    return x @ w.t(), x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+    return x @ w.T, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
 
 @torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
 def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
@@ -60,7 +60,7 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
         grad_f8 = grad.mul(grad_s).to(torch.float8_e5m2)
         grad_x = torch._scaled_mm(
             grad_f8,
-            w_f8.t().contiguous().t(),
+            w_f8.T.contiguous().T,
             out_dtype=torch.bfloat16,
             scale_a=grad_inv_s,
             scale_b=w_inv_s,
@@ -68,13 +68,13 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
         )
         # faster than grad_f8_t @ x_f8, for (d_out, d_in) == (50304, 768)
         grad_w = torch._scaled_mm(
-            x_f8.t().contiguous(),
-            grad_f8.t().contiguous().t(),
+            x_f8.T.contiguous(),
+            grad_f8.T.contiguous().T,
             out_dtype=torch.float32,
             scale_a=x_inv_s,
             scale_b=grad_inv_s,
             use_fast_accum=False,
-        ).t()
+        ).T
         return grad_x, grad_w
 
     return impl(g, x_f8, w_f8)
