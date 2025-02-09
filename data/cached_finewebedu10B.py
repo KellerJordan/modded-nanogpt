@@ -1,6 +1,6 @@
 import os
 import sys
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download # type: ignore
 # Download the GPT-2 tokens of FinewebEDU10B from huggingface. This
 # saves about an hour of startup time compared to regenerating them.
 def get(fname):

@@ -22,21 +22,12 @@ from config import FullConfig
 torch.set_float32_matmul_precision('high')
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-def compute_grad_norm(params):
-    """Compute the total L2 norm of gradients in the given list of parameters."""
-    total_norm_sq = 0.0
-    for p in params:
-        if p.grad is not None:
-            param_norm = p.grad.detach().data.norm(2)  # L2 norm
-            total_norm_sq += param_norm.item() ** 2
-    return total_norm_sq ** 0.5
-
 parser = argparse.ArgumentParser(description="Train GPT model with customizable parameters.")
 
 # Configurable arguments
 parser.add_argument("--data_path", type=str, default="data/fineweb10B")
 parser.add_argument("--num_iterations", type=int, default=4578)
-parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--head_mode", type=str, default="euc", help="Set the mode for LM Head")
 parser.add_argument("--attn_mode", type=str, default="euc", help="Set the mode for attention layers")
 parser.add_argument("--curvature", type=float, default=1.0)
@@ -66,7 +57,16 @@ torch.manual_seed(config.seed)
 torch.cuda.manual_seed_all(config.seed)
 
 # Tokenizer setup
-if "tinystories" in config.data_path:
+if "tinystories_char" in config.data_path:
+    dataset_name = "TinyStoriesChar"
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_file=os.path.join(config.data_path, "tokenizer_ts_char.json"),
+        eos_token="<|endoftext|>",
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+    )
+    config.vocab_size = tokenizer.vocab_size
+elif "tinystories" in config.data_path:
     dataset_name = "TinyStories"
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_file=os.path.join(config.data_path, "tinystories_tokenizer.json"),
@@ -74,6 +74,7 @@ if "tinystories" in config.data_path:
         unk_token="[UNK]",
         pad_token="[PAD]",
     )
+    config.vocab_size = tokenizer.vocab_size
 else:
     dataset_name = "FineWeb"
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
@@ -278,6 +279,16 @@ if master_process:
         result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         f.write(f'{result.stdout}\n')
         f.write('='*100 + '\n')
+
+
+def compute_grad_norm(params):
+    """Compute the total L2 norm of gradients in the given list of parameters."""
+    total_norm_sq = 0.0
+    for p in params:
+        if p.grad is not None:
+            param_norm = p.grad.detach().data.norm(2)  # L2 norm
+            total_norm_sq += param_norm.item() ** 2
+    return total_norm_sq ** 0.5
 
 training_time_s = 0.0
 # start the clock
