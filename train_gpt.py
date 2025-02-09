@@ -209,7 +209,7 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 class CastedLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, use_fp8: bool = False, x_s: float = 1.0, w_s: float = 1.0, grad_s: float = 1.0):
+    def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
         super().__init__(in_features, out_features, bias=False)
         self.use_fp8 = use_fp8
         self.x_s = x_s
