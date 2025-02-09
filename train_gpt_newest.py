@@ -5,6 +5,7 @@ with open(sys.argv[0]) as f:
 import uuid
 import time
 import copy
+import glob
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -420,7 +421,7 @@ def _load_data_shard(file: Path):
     return tokens
 
 def distributed_data_generator(filename_pattern: str, batch_size: int, rank : int, world_size : int):
-    files = sorted(Path.cwd().glob(filename_pattern))
+    files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
     file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
