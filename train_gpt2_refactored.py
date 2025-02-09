@@ -5,77 +5,22 @@ with open(sys.argv[0]) as f:
 import random
 import datetime
 import time
+import argparse
 from torch.utils.tensorboard import SummaryWriter
 import json
-from dataclasses import dataclass
 from transformers import GPT2TokenizerFast, PreTrainedTokenizerFast # type: ignore #
 import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from lib.geoopt.optim import RiemannianSGD
+
 from modules.model import GPT
 from modules.muon import Muon
 from modules.loader import DistributedDataLoader
-
-import argparse
-
+from config import FullConfig
 torch.set_float32_matmul_precision('high')
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-@dataclass
-class FullConfig:
-    # Data hyperparams
-    data_path: str = "data/fineweb10B"
-    input_bin: str = ""
-    input_val_bin: str = ""
-    num_vocab: int = 50304
-    sequence_length: int = 1024
-    # Optimization hyperparams
-    batch_size: int = 64     # global batch size (across devices)
-    device_batch_size: int = 32  # per-device batch size
-    num_iterations: int = 1000
-    cooldown_frac: float = 0.4
-    weight_decay: float = 0
-    # Evaluation/logging
-    generate_every: int = 0
-    train_loss_every: int = 10
-    val_loss_every: int = 10
-    val_tokens: int = 10_485_760
-    save_every: int = 0
-    # Model architecture
-    vocab_size: int = 50304
-    n_layer: int = 12
-    n_head: int = 6
-    # Rather than specify n_embd directly,
-    # you could also define a `head_dim`, if you like:
-    head_dim: int = 128
-    n_embd: int = 768
-    head_mode: str = "euc"
-    attn_mode: str = "euc"
-    curvature: float = 1.0
-    k_lr: float = 0.0
-    # Reproducibility
-    seed: int = 42
-    
-    def __post_init__(self):
-        """
-        Dynamically set up paths and possibly recalculate n_embd from n_head, head_dim.
-        You can also unify any validation logic here.
-        """
-        # If you want n_embd to be set from n_head * head_dim:
-        self.n_embd = self.n_head * self.head_dim
-
-        # Decide how to set the input bins.
-        if "tinystories" in self.data_path:
-            self.input_bin = f"{self.data_path}/train.bin"
-            self.input_val_bin = f"{self.data_path}/val.bin"
-        elif "fineweb" in self.data_path:
-            self.input_bin = f"{self.data_path}/fineweb_train_*.bin"
-            self.input_val_bin = f"{self.data_path}/fineweb_val_*.bin"
-        else:
-            raise ValueError("Specify a proper data path (contains 'tinystories' or 'fineweb')")
-
 
 def compute_grad_norm(params):
     """Compute the total L2 norm of gradients in the given list of parameters."""
@@ -384,7 +329,7 @@ for step in range(config.num_iterations + 1):
     if config.generate_every and master_process and step and (step % config.generate_every == 0):
         # Use a fixed prompt or context for generation
         prompt = "Once upon a time"  # Customize as per your dataset
-        context = raw_model.encode_text(prompt)
+        context = raw_model.encode_text(prompt, device)
         
         # Generate text
         generated_tokens = raw_model.generate_text(context, max_length=200, temperature=1.0, top_k=50)
