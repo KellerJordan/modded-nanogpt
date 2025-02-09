@@ -2,28 +2,21 @@ import os
 import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
-
 import random
 import datetime
 import time
 from torch.utils.tensorboard import SummaryWriter
 import json
-
 from dataclasses import dataclass
 from transformers import GPT2TokenizerFast, PreTrainedTokenizerFast # type: ignore #
-
 import numpy as np
-import math
 import torch
-from torch import nn
-import torch.nn.functional as F
 import torch.distributed as dist
-# import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from lib.geoopt.optim import RiemannianSGD
-from modules.layers import *
-from modules.muon import *
-from modules.loader import *
+from modules.model import GPT
+from modules.muon import Muon
+from modules.loader import DistributedDataLoader
 
 import argparse
 
@@ -84,94 +77,6 @@ class FullConfig:
             raise ValueError("Specify a proper data path (contains 'tinystories' or 'fineweb')")
 
 
-# -----------------------------------------------------------------------------
-# The main GPT-2 model
-
-class GPT(nn.Module):
-
-    def __init__(self, config, tokenizer):
-        super().__init__()
-        self.config = config
-        self.tokenizer = tokenizer
-
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-        ))
-
-        if config.head_mode == 'euc':
-            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-            stdv = 1. / math.sqrt(config.n_embd)
-            nn.init.uniform_(self.lm_head.weight.data, -stdv, stdv)
-
-        elif config.head_mode == 'hyp':
-            self.manifold = CustomLorentz(k=torch.tensor([config.curvature]))
-            self.lm_head = LorentzMLR(
-                manifold=self.manifold,
-                num_features=config.n_embd,
-                num_classes=config.vocab_size
-            )
-        else:
-            raise ValueError("Invalid head_mode, choose 'euc'/'hyp'.")
-
-    def forward(self, idx, targets=None, return_logits=True):
-
-        # forward the GPT model itself
-        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        x = F.rms_norm(x, (x.size(-1),))
-        for block in self.transformer.h:
-            x = block(x)
-        x = F.rms_norm(x, (x.size(-1),))
-
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            logits = logits.float() # use tf32/fp32 for logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            logits = logits.float() # use tf32/fp32 for logits
-            loss = None
-
-        # there are performance reasons why not returning logits is prudent, if not needed
-        if not return_logits:
-            logits = None
-
-        return logits, loss
-
-    def encode_text(self, text):
-        """Encodes a string into token IDs."""
-        return self.tokenizer.encode(text, return_tensors="pt").to(device)
-
-    def decode_tokens(self, tokens):
-        """Decodes token IDs into a readable string."""
-        return self.tokenizer.decode(tokens.cpu().tolist(), skip_special_tokens=True)
-
-    def generate_text(self, context, max_length=200, temperature=1.0, top_k=50):
-        self.eval()
-        generated = context.clone()
-        for _ in range(max_length):
-            with torch.no_grad():
-                logits, _ = self(generated, return_logits=True)
-                logits = logits[:, -1, :] / temperature
-                if top_k > 0:
-                    values, indices = torch.topk(logits, top_k)
-                    logits[logits < values[:, [-1]]] = -float('Inf')
-                probs = F.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-                generated = torch.cat((generated, next_token), dim=1)
-        return generated
-
-    def model_size(self):
-        """Calculate the model size in millions or thousands, based on parameter count."""
-        total_params = sum(p.numel() for p in self.parameters())
-        if total_params >= 1e6:
-            return f"{total_params / 1e6:.2f}M parameters"
-        else:
-            return f"{total_params / 1e3:.2f}K parameters"
-
-
 def compute_grad_norm(params):
     """Compute the total L2 norm of gradients in the given list of parameters."""
     total_norm_sq = 0.0
@@ -180,8 +85,6 @@ def compute_grad_norm(params):
             param_norm = p.grad.detach().data.norm(2)  # L2 norm
             total_norm_sq += param_norm.item() ** 2
     return total_norm_sq ** 0.5
-
-
 
 parser = argparse.ArgumentParser(description="Train GPT model with customizable parameters.")
 
@@ -264,7 +167,6 @@ val_steps = config.val_tokens // (B * T * ddp_world_size)
 assert config.batch_size % (B * ddp_world_size) == 0, "batch_size must be divisible by global batch size."
 train_accumulation_steps = config.batch_size // (B * ddp_world_size)
 
-# Data loading (assuming DistributedDataLoader is implemented correctly)
 train_loader = DistributedDataLoader(config.input_bin, B, T, ddp_rank, ddp_world_size)
 val_loader = DistributedDataLoader(config.input_val_bin, B, T, ddp_rank, ddp_world_size)
 
