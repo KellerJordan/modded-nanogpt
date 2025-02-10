@@ -105,6 +105,12 @@ Other than that, anything and everything is fair game!
 
 ---
 
+### Comment on the target metric
+
+The target metric is *cross-entropy loss on the FineWeb val set*. To speak mathematically, the goal of the speedrun is *to obtain a probability model of language which assigns a probability of at least `math.exp(-3.28 * 10485760)` to the first 10,485,760 tokens of the FineWeb valset. Hence, e.g., we allow evaluation at any sequence length, so long as we still have a valid probability model of language.
+
+---
+
 ### Timing change after record 21
 
 After the 21st record, we made two changes to the timing. First, there used to be an initial "grace period" of 10 untimed steps to allow kernel warmup. We replaced this with an explicit kernel-warmup preamble, which uses dummy data is untimed. This results in an extra runtime of 850ms from the 10 extra timed steps.
