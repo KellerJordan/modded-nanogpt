@@ -1,6 +1,6 @@
 # Modded-NanoGPT
 
-This repository is the home of the glorious *NanoGPT speedrun*, in which we collaboratively/competitively determine the fastest algorithm in the universe to use 8 NVIDIA H100 GPUs to train a language model that attains 3.28 cross-entropy loss on the [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) validation set.
+This repository is the home of the glorious *NanoGPT speedrun*, in which we (collaboratively|competitively) determine the fastest algorithm in the universe to use 8 NVIDIA H100 GPUs to train a language model that attains 3.28 cross-entropy loss on the [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) validation set.
 
 The target (3.28 validation loss on FineWeb) follows Andrej Karpathy's [GPT-2 replication in llm.c, which attains that target after running for 45 minutes](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 Furthermore, the speedrun trainer in this repo descends from llm.c's [PyTorch trainer](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py).
