@@ -101,6 +101,8 @@ The only rules are that new records must:
 
 Other than that, anything and everything is fair game!
 
+[further clarifications](https://github.com/KellerJordan/modded-nanogpt/discussions/23?sort=new#discussioncomment-12109560)
+
 ---
 
 ### Timing change after record 21
