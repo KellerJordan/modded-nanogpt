@@ -10,7 +10,7 @@ Thanks to many people's contributions, this repo now contains a training algorit
 
 This improvement in training performance was brought about by the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU²
-* Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[repo](https://github.com/KellerJordan/Muon)]
+* The Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[repo](https://github.com/KellerJordan/Muon)]
 * Untie head from embedding, use FP8 matmul for head, and softcap logits (latter following Gemma 2)
 * Projection and classification layers initialized to zero (muP-like)
 * Skip connections from embedding to every block as well as between blocks in U-net pattern
