@@ -1,10 +1,10 @@
 # Modded-NanoGPT
 
-The purpose of this repository is to collaboratively determine the fastest way to train small-scale language models.
-We begin with Andrej Karpathy's [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py)
-from [llm.c](https://github.com/karpathy/llm.c), which attains 3.28 validation loss on the FineWeb dataset after training for 45 minutes on 8 NVIDIA H100 GPUs.
-We then iteratively modify the trainer to attain the same level of performance in less wallclock time.
-The current trainer reaches the same performance as Karpathy's original GPT-2 trainer in:
+This repository is the home of the glorious *NanoGPT speedrun*, in which we collaboratively determine the fastest algorithm in the universe to use 8 NVIDIA H100 GPUs to train a language model that attains 3.28 cross-entropy loss on the [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) validation set.
+
+The target of 3.28 validation loss on FineWeb comes from Andrej Karpathy's [PyTorch GPT-2 replication](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py)
+in [llm.c](https://github.com/karpathy/llm.c), which [attains that target after running for 45 minutes](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
+Thanks to many people's contributions, this repository now hosts a training algorithm which attains the same performance in:
 * 3 minutes on 8xH100 (original trainer needed 45)
 * 0.73B tokens (original trainer needed 10B)
 
@@ -35,7 +35,6 @@ python data/cached_fineweb10B.py 8 # downloads only the first 0.8B training toke
 ```
 
 The result will be a transformer with 124M active parameters trained for 1393 steps on 0.73B tokens of Fineweb [1], achieving ~3.2785 mean validation loss (with 0.002 inter-run stddev).
-For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
 **Note: torch.compile will take around 5 minutes the first time you run the code.**
 
