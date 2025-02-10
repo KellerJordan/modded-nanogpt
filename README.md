@@ -17,9 +17,7 @@ This improvement in training performance was brought about by the following tech
 * Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
 * FlexAttention with long-short sliding window attention pattern (inspired by Gemma 2) and window size warmup
 
-Contributors list (growing with each new record): [@Grad62304977](https://x.com/Grad62304977),
-[@jxbz](https://x.com/jxbz), [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan),
-[@KoszarskyB](https://x.com/KoszarskyB), [@fernbear.bsky.social](https://bsky.app/profile/fernbear.bsky.social), [@leloykun](https://x.com/@leloykun), [@YouJiacheng](https://x.com/YouJiacheng), [@kellerjordan0](https://x.com/kellerjordan0)
+Contributors list (growing with each new record): [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan), [@fernbear.bsky.social](https://bsky.app/profile/fernbear.bsky.social), [@Grad62304977](https://x.com/Grad62304977), [@jxbz](https://x.com/jxbz), [@kellerjordan0](https://x.com/kellerjordan0), [@KoszarskyB](https://x.com/KoszarskyB), [@leloykun](https://x.com/@leloykun), [@YouJiacheng](https://x.com/YouJiacheng)
 
 ---
 
