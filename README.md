@@ -32,8 +32,6 @@ python data/cached_fineweb10B.py 8 # downloads only the first 0.8B training toke
 ./run.sh
 ```
 
-The result will be a transformer with 124M active parameters trained for 1393 steps on 0.73B tokens of Fineweb [1], achieving ~3.2785 mean validation loss (with 0.002 inter-run stddev).
-
 **Note: torch.compile will take around 5 minutes the first time you run the code.**
 
 ## Alternative: Running with Docker (recommended for timing)
