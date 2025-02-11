@@ -11,8 +11,8 @@ Thanks to the efforts of many contributors, this repo now contains a training al
 This improvement in training speed has been brought about by the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU²
 * The Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[repo](https://github.com/KellerJordan/Muon)]
-* Untie head from embedding, use FP8 matmul for head, and softcap logits (latter following Gemma 2)
-* Projection and classification layers initialized to zero (muP-like)
+* Untie head from embedding, use FP8 matmul for head, and softcap logits (the latter following Gemma 2)
+* Initialization of projection and classification layers to zero (muP-like)
 * Skip connections from embedding to every block as well as between blocks in U-net pattern
 * Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
 * FlexAttention with long-short sliding window attention pattern (inspired by Gemma 2) and window size warmup
