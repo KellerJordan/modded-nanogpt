@@ -8,7 +8,7 @@ Thanks to the efforts of many contributors, this repo now contains a training al
 * 3 minutes on 8xH100 (the llm.c GPT-2 replication needed 45)
 * 0.73B tokens (the llm.c GPT-2 replication needed 10B)
 
-This improvement in training performance has been brought about by the following techniques:
+This improvement in training speed has been brought about by the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU²
 * The Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[repo](https://github.com/KellerJordan/Muon)]
 * Untie head from embedding, use FP8 matmul for head, and softcap logits (latter following Gemma 2)
