@@ -544,7 +544,7 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
-model: nn.Module = torch.compile(model, dynamic=False)
+model: nn.Module = torch.compile(model, dynamic=False, mode="max-autotune-no-cudagraphs")
 
 ########################################
 #            Warmup kernels            #
