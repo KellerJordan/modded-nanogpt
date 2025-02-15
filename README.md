@@ -1,6 +1,8 @@
 # Hyperbolic nanoGPT
 
-This project explores the benefits of hyperbolic geometry in language models by modifying various components of nanoGPT. The hypothesis is that certain NLP tasks and relationships might be better represented in hyperbolic rather than Euclidean space.
+Forked from [kellerjordan/nanoGPT](https://github.com/kellerjordan/nanoGPT)
+
+This project explores the benefits of hyperbolic geometry in language models by modifying various components of nanoGPT. The hypothesis is that relationships in languagemight be better represented in hyperbolic rather than Euclidean space.
 
 ### Current Modifications
 
@@ -11,11 +13,12 @@ The following components can be switched between Euclidean and hyperbolic versio
 TODO: 3. Embeddings 
 
 ### Installation
+```bash
 git clone https://github.com/Alex2034/hyp-nanogpt
 cd hyp-nanogpt
 conda env create -f env.yaml
 conda activate hyp-nanogpt
-
+```
 
 ### Experiment Scripts
 
@@ -32,4 +35,9 @@ For convenience, we provide shell scripts to run multiple experiments:
 - `curvature`: Initial curvature value for hyperbolic space (if using hyperbolic components)
 - `k_lr`: Learning rate for the curvature parameter (set to 0 to keep curvature fixed)
 
+### Acknowledgements
 
+- [kellerjordan/nanoGPT](https://github.com/kellerjordan/nanoGPT) for the baseline implementation
+- [karpathy/nanoGPT](https://github.com/karpathy/nanoGPT) for the original nanoGPT 
+- [kschwethelm/HyperbolicCV](https://github.com/kschwethelm/HyperbolicCV/tree/main/code) for the LorentzMLR code
+- [geoopt](https://github.com/geoopt/geoopt) for the Riemannian optimization code
