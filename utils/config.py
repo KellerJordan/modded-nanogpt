@@ -1,53 +1,54 @@
-import argparse
 from dataclasses import dataclass
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Train GPT model with customizable parameters.")
-    
-    # Configurable arguments
-    parser.add_argument("--data_path", type=str, default="data/fineweb10B")
-    parser.add_argument("--num_iterations", type=int, default=4578)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--head_mode", type=str, default="euc", help="Set the mode for LM Head")
-    parser.add_argument("--attn_mode", type=str, default="euc", help="Set the mode for attention layers")
-    parser.add_argument("--curvature", type=float, default=1.0)
-    parser.add_argument("--k_lr", type=float, default=0.0)
-    parser.add_argument("--head_dim", type=int, default=128)
-    parser.add_argument("--n_heads", type=int, default=6,
-                       help="Number of attention heads")
-    parser.add_argument("--n_layers", type=int, default=12,
-                       help="Number of transformer layers")
-    
-    return parser.parse_args()
 
 @dataclass
 class FullConfig:
-    data_path: str
-    num_iterations: int
-    seed: int
-    head_mode: str
-    attn_mode: str
-    curvature: float
-    k_lr: float
-    head_dim: int
-    n_heads: int
-    n_layers: int
+    # Data hyperparams
+    data_path: str = "data/fineweb10B"
+    input_bin: str = ""
+    input_val_bin: str = ""
+    num_vocab: int = 50304
+    sequence_length: int = 1024
+    # Optimization hyperparams
+    batch_size: int = 512     # global batch size (across devices)
+    device_batch_size: int = 32  # per-device batch size
+    num_iterations: int = 1000
+    cooldown_frac: float = 0.4
+    weight_decay: float = 0
+    # Evaluation/logging
+    generate_every: int = 0
+    train_loss_every: int = 10
+    val_loss_every: int = 10
+    val_tokens: int = 10_485_760
+    save_every: int = 0
+    # Model architecture
+    vocab_size: int = 50304
+    n_layers: int = 12
+    n_heads: int = 6
+    # Rather than specify n_embd directly,
+    # you could also define a `head_dim`, if you like:
+    head_dim: int = 128
+    n_embd: int = 768
+    head_mode: str = "euc"
+    attn_mode: str = "euc"
+    curvature: float = 1.0
+    k_lr: float = 0.0
+    # Reproducibility
+    seed: int = 42
     
     def __post_init__(self):
-        # Add derived configuration parameters
-        self.device_batch_size = 4
-        self.sequence_length = 1024
-        self.batch_size = 32
-        self.val_tokens = 378880
-        self.n_layer = 12
-        self.n_embd = self.head_dim * self.n_heads
-        self.vocab_size = None  # Set later based on tokenizer
-        self.cooldown_frac = 0.1
-        self.val_loss_every = 200
-        self.train_loss_every = 1
-        self.generate_every = 1000
-        self.save_every = 1000
-        
-        # Derived paths
-        self.input_bin = f"{self.data_path}/train.bin"
-        self.input_val_bin = f"{self.data_path}/val.bin" 
+        """
+        Dynamically set up paths and possibly recalculate n_embd from n_heads, head_dim.
+        You can also unify any validation logic here.
+        """
+        # If you want n_embd to be set from n_heads * head_dim:
+        self.n_embd = self.n_heads * self.head_dim
+
+        # Decide how to set the input bins.
+        if "tinystories" in self.data_path:
+            self.input_bin = f"{self.data_path}/train.bin"
+            self.input_val_bin = f"{self.data_path}/val.bin"
+        elif "fineweb" in self.data_path:
+            self.input_bin = f"{self.data_path}/fineweb_train_*.bin"
+            self.input_val_bin = f"{self.data_path}/fineweb_val_*.bin"
+        else:
+            raise ValueError("Specify a proper data path (contains 'tinystories' or 'fineweb')")

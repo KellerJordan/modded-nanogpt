@@ -17,8 +17,8 @@ from lib.geoopt.optim import RiemannianSGD
 
 from model.model import GPT
 from utils.muon import Muon
-from modules.loader import DistributedDataLoader
-from config import FullConfig
+from utils.loader import DistributedDataLoader
+from utils.config import FullConfig
 torch.set_float32_matmul_precision('high')
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
