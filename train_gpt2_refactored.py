@@ -15,8 +15,8 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from lib.geoopt.optim import RiemannianSGD
 
-from modules.model import GPT
-from modules.muon import Muon
+from model.model import GPT
+from utils.muon import Muon
 from modules.loader import DistributedDataLoader
 from config import FullConfig
 torch.set_float32_matmul_precision('high')
@@ -26,28 +26,36 @@ parser = argparse.ArgumentParser(description="Train GPT model with customizable 
 
 # Configurable arguments
 parser.add_argument("--data_path", type=str, default="data/fineweb10B")
+parser.add_argument("--batch_size", type=int, default=512)
+parser.add_argument("--device_batch_size", type=int, default=32)
 parser.add_argument("--num_iterations", type=int, default=4578)
+parser.add_argument("--generate_every", type=int, default=0)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--head_mode", type=str, default="euc", help="Set the mode for LM Head")
 parser.add_argument("--attn_mode", type=str, default="euc", help="Set the mode for attention layers")
 parser.add_argument("--curvature", type=float, default=1.0)
 parser.add_argument("--k_lr", type=float, default=0.0)
 parser.add_argument("--head_dim", type=int, default=128)
-parser.add_argument("--n_head", type=int, default=6)
+parser.add_argument("--n_heads", type=int, default=6)
+parser.add_argument("--n_layers", type=int, default=12, help="Number of transformer layers")
 
 args = parser.parse_args()
 
 # Create the config
 config = FullConfig(
     data_path=args.data_path,
+    batch_size=args.batch_size,
+    device_batch_size=args.device_batch_size,
     num_iterations=args.num_iterations,
+    generate_every=args.generate_every,
     seed=args.seed,
     head_mode=args.head_mode,
     attn_mode=args.attn_mode,
     curvature=args.curvature,
     k_lr=args.k_lr,
     head_dim=args.head_dim,
-    n_head=args.n_head
+    n_heads=args.n_heads,
+    n_layers=args.n_layers
 )
 
 # Seeds
@@ -59,13 +67,9 @@ torch.cuda.manual_seed_all(config.seed)
 # Tokenizer setup
 if "tinystories_char" in config.data_path:
     dataset_name = "TinyStoriesChar"
-    tokenizer = PreTrainedTokenizerFast(
-        tokenizer_file=os.path.join(config.data_path, "tokenizer_ts_char.json"),
-        eos_token="<|endoftext|>",
-        unk_token="[UNK]",
-        pad_token="[PAD]",
-    )
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file="data/tinystories_char/char_tokenizer.json")
     config.vocab_size = tokenizer.vocab_size
+    print(f"Tokenizer vocab size: {config.vocab_size}")
 elif "tinystories" in config.data_path:
     dataset_name = "TinyStories"
     tokenizer = PreTrainedTokenizerFast(
@@ -83,6 +87,18 @@ else:
 
 # DDP setup
 assert torch.cuda.is_available(), "CUDA is required for DDP but not available."
+
+def encode_text(tokenizer, text, device):
+    """Encodes a string into token IDs."""
+    return tokenizer.encode(text, return_tensors="pt").to(device)
+
+def decode_tokens(tokenizer, tokens):
+    """Decodes token IDs into a readable string."""
+    # For character-level tokenizer, join characters without spaces
+    if "tinystories_char" in config.data_path:
+        return ''.join(tokenizer.convert_ids_to_tokens(tokens.cpu().tolist()))
+    # For word-level tokenizers, use normal decoding
+    return tokenizer.decode(tokens.cpu().tolist(), skip_special_tokens=True)
 
 try:
     ddp_rank = int(os.environ['RANK'])
@@ -122,7 +138,7 @@ if master_process:
 x, y = train_loader.next_batch()
 
 # Model setup
-model = GPT(config, tokenizer)  # Step 1: Create the model on CPU
+model = GPT(config)  # Step 1: Create the model on CPU
 model = model.to(device)        # Step 2: Move the model to the correct device
 
 # If using PyTorch 2.0+ and want compiled model:
@@ -210,18 +226,14 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 # )
 
 if master_process:
-
-    print("\n=== Minimal Report ===")
-    print(f"Model Size:    {raw_model.model_size()}")
-
-    # 3) Minimal set of relevant hyperparams
-    print("\n=== Relevant Hyperparameters ===")
+    print("\n=== Report ===")
+    print(f"Model Size:    {raw_model.model_size()}\n")
     print(f"Data Path:            {config.data_path}")
     print(f"Sequence Length:      {config.sequence_length}")
     print(f"Batch Size (global):  {config.batch_size}")
     print(f"Batch Size (device):  {config.device_batch_size}")
-    print(f"n_layer:              {config.n_layer}")
-    print(f"n_head:               {config.n_head}")
+    print(f"n_layers:              {config.n_layers}")
+    print(f"n_heads:               {config.n_heads}")
     print(f"head_dim:             {config.head_dim}")
     print(f"n_embd:               {config.n_embd}")
     print(f"Seed:                 {config.seed}")
@@ -337,20 +349,20 @@ for step in range(config.num_iterations + 1):
         torch.cuda.synchronize()
         t0 = time.time()
 
-    if config.generate_every and master_process and step and (step % config.generate_every == 0):
+    if config.generate_every and master_process and ((step+1) % config.generate_every == 0):
         # Use a fixed prompt or context for generation
-        prompt = "Once upon a time"  # Customize as per your dataset
-        context = raw_model.encode_text(prompt, device)
+        prompt = "Once upon a time in a"  # Customize as per your dataset
+        context = encode_text(tokenizer,prompt, device)
         
         # Generate text
-        generated_tokens = raw_model.generate_text(context, max_length=200, temperature=1.0, top_k=50)
-        generated_text = raw_model.decode_tokens(generated_tokens[0])
+        generated_tokens = raw_model.generate_text(context, max_length=50, temperature=1.0, top_k=50)
+        generated_text = decode_tokens(tokenizer, generated_tokens[0])
         
         # Log the generated text to TensorBoard
-        writer.add_text(f"Generated_Text/Step_{step}", generated_text, step)
+        writer.add_text(f"Generated_Text/Step_{step+1}", generated_text, step)
         
         # Optionally log to console for immediate feedback
-        print(f"[Step {step}] Generated Text: {generated_text}")
+        print(f"[Step {step+1}] Generated Text: {generated_text}")
 
 
     if master_process and (last_step or (config.save_every > 0 and step % config.save_every == 0)):

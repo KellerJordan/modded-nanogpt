@@ -195,7 +195,7 @@ def _project(x, k: torch.Tensor, dim: int = -1):
     """
     # Compute the Euclidean norm of the input vector along the specified dimension
     norm_x = torch.norm(x, p=2, dim=dim, keepdim=True) 
-    p0 = torch.sqrt(k + norm_x ** 2)  
+    p0 = torch.sqrt(k + norm_x**2)  
     proj = torch.cat((p0, x), dim=dim)  
     return proj
 

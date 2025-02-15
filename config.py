@@ -9,7 +9,7 @@ class FullConfig:
     num_vocab: int = 50304
     sequence_length: int = 1024
     # Optimization hyperparams
-    batch_size: int = 64     # global batch size (across devices)
+    batch_size: int = 512     # global batch size (across devices)
     device_batch_size: int = 32  # per-device batch size
     num_iterations: int = 1000
     cooldown_frac: float = 0.4
@@ -22,8 +22,8 @@ class FullConfig:
     save_every: int = 0
     # Model architecture
     vocab_size: int = 50304
-    n_layer: int = 12
-    n_head: int = 6
+    n_layers: int = 12
+    n_heads: int = 6
     # Rather than specify n_embd directly,
     # you could also define a `head_dim`, if you like:
     head_dim: int = 128
@@ -37,11 +37,11 @@ class FullConfig:
     
     def __post_init__(self):
         """
-        Dynamically set up paths and possibly recalculate n_embd from n_head, head_dim.
+        Dynamically set up paths and possibly recalculate n_embd from n_heads, head_dim.
         You can also unify any validation logic here.
         """
-        # If you want n_embd to be set from n_head * head_dim:
-        self.n_embd = self.n_head * self.head_dim
+        # If you want n_embd to be set from n_heads * head_dim:
+        self.n_embd = self.n_heads * self.head_dim
 
         # Decide how to set the input bins.
         if "tinystories" in self.data_path:

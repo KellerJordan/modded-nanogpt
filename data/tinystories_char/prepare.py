@@ -1,87 +1,64 @@
 import os
-import argparse
-import json
 import numpy as np
 from datasets import load_dataset
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.trainers import WordLevelTrainer
+from tokenizers.pre_tokenizers import Split
 
-def main(args):
-    # Load the TinyStories dataset splits using HuggingFace datasets.
-    print("Loading TinyStories dataset splits...")
-    train_dataset = load_dataset('roneneldan/TinyStories', split='train')
-    val_dataset = load_dataset('roneneldan/TinyStories', split='validation')
+def main():
+    # 1) Load and split TinyStories
+    dataset = load_dataset("roneneldan/TinyStories", split="train")
+    split = dataset.train_test_split(test_size=0.1, seed=42)
+    split = split["test"].train_test_split(test_size=0.01, seed=42)
+    train_texts = split["train"]["text"]
+    val_texts   = split["test"]["text"]
 
-    # Extract text from the dataset.
-    # (Adjust the key if needed; here we assume the text is in the "text" column.
-    #  Some versions might have "story", so you may change accordingly.)
-    key = "text" if "text" in train_dataset.column_names else "story"
-    train_texts = train_dataset[key]
-    val_texts   = val_dataset[key]
+    # 2) Build a *character-level* tokenizer using a WordLevel backbone
+    #    (In principle, "WordLevel" can be used purely for collecting 'tokens',
+    #     even if they're single characters, as long as we define the right pre_tokenizer/trainer.)
+    tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
+    # Split with each character as a separate token
+    tokenizer.pre_tokenizer = Split(pattern="", behavior="isolated")
 
-    # Join all individual samples with a newline separator.
-    train_text = "\n".join(train_texts)
-    val_text   = "\n".join(val_texts)
-    print(f"Train text length: {len(train_text)} characters")
-    print(f"Validation text length: {len(val_text)} characters")
-
-    # Build a character-level vocabulary from the training text.
-    vocab = sorted(set(train_text))
-    print(f"Initial vocabulary size: {len(vocab)}")
-
-    # Special tokens
-    # Even if you're just training a GPT, you might include:
-    # - <|endoftext|>: Marks the end of a sequence. This helps the model know where a context ends.
-    # - [PAD]: Useful for batching variable-length sequences, even if in our case you may use fixed-length chunks.
-    # - [UNK]: Although a character-level vocabulary for a curated corpus should cover all characters,
-    #          including an [UNK] token is common practice to safely handle any unexpected input.
-    eos_token = "<|endoftext|>"
-    pad_token = "[PAD]"
-    unk_token = "[UNK]"
-
-    for token in [eos_token, pad_token, unk_token]:
-        if token not in vocab:
-            vocab.append(token)
-    vocab = sorted(vocab)
-    print(f"Vocabulary size after adding special tokens: {len(vocab)}")
-
-    # Create mappings: character -> token id (stoi) and token id -> character (itos)
-    stoi = {ch: i for i, ch in enumerate(vocab)}
-    itos = {i: ch for i, ch in enumerate(vocab)}
-
-    # Save the tokenizer configuration as JSON.
-    tokenizer_data = {
-        "vocab": stoi,
-        "itos": itos,
-        "eos_token": eos_token,
-        "pad_token": pad_token,
-        "unk_token": unk_token
-    }
-    tokenizer_path = os.path.join(args.out_dir, "tokenizer_ts_char.json")
-    with open(tokenizer_path, "w", encoding="utf-8") as f:
-        json.dump(tokenizer_data, f, indent=2)
-    print(f"Saved tokenizer to {tokenizer_path}")
-
-    # Tokenize the texts on a character level.
-    # Every character is converted to its corresponding token id.
-    train_token_ids = np.array([stoi.get(ch, stoi[unk_token]) for ch in train_text], dtype=np.int16)
-    val_token_ids   = np.array([stoi.get(ch, stoi[unk_token]) for ch in val_text], dtype=np.int16)
-    print(f"Tokenized train text into {len(train_token_ids)} tokens.")
-    print(f"Tokenized validation text into {len(val_token_ids)} tokens.")
-
-    # Save token sequences to binary files.
-    train_bin_path = os.path.join(args.out_dir, "train.bin")
-    val_bin_path   = os.path.join(args.out_dir, "val.bin")
-    train_token_ids.tofile(train_bin_path)
-    val_token_ids.tofile(val_bin_path)
-    print(f"Saved training tokens to {train_bin_path}")
-    print(f"Saved validation tokens to {val_bin_path}")
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description="Prepare TinyStories character-level dataset for GPT training."
+    trainer = WordLevelTrainer(
+        special_tokens=["[UNK]", "[PAD]", "[BOS]", "[EOS]"],
+        min_frequency=1,  # If you want absolutely every character to appear
     )
-    # Output directory where tokenizer JSON and .bin files will be saved.
-    parser.add_argument("--out_dir", type=str, default=".", help="Output directory to save tokenizer and binary files.")
-    args = parser.parse_args()
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    main(args)
+    # 3) Train the tokenizer on the training set (concatenated text)
+    train_texts_list = list(train_texts)  # HF dataset to normal Python list
+    tokenizer.train_from_iterator(train_texts_list, trainer=trainer)
+
+    # 4) Define a helper function to encode text as IDs:
+    def tokenize_texts(tokenizer, texts):
+        ids = []
+        for text in texts:
+            output = tokenizer.encode(text)
+            ids.extend(output.ids)
+        return np.array(ids, dtype=np.uint8)
+
+    train_ids = tokenize_texts(tokenizer, train_texts)
+    val_ids   = tokenize_texts(tokenizer, val_texts)
+    
+    def save_with_header(filename, ids):
+        header = np.zeros(256, dtype=np.int32)
+        header[0] = 20240520  # Magic number
+        header[1] = 1         # Version
+        header[2] = len(ids)  # Number of tokens
+        with open(filename, "wb") as f:
+            f.write(header.tobytes())  # Write the header (256 * 4 bytes)
+            f.write(ids.tobytes())     # Write the token IDs as uint16
+
+    # 5) Save the tokenized data as .bin for efficient reading
+    os.makedirs("data/tinystories_char", exist_ok=True)
+    save_with_header("data/tinystories_char/train.bin", train_ids)
+    save_with_header("data/tinystories_char/val.bin", val_ids)
+
+    # 6) Save the tokenizer itself (JSON file) so you can load it later
+    tokenizer.save("data/tinystories_char/char_tokenizer.json")
+
+    print("Done! Created train.bin, val.bin, and char_tokenizer.json in data/tinystories_char/")
+
+if __name__ == "__main__":
+    main()
