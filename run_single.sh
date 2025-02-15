@@ -3,8 +3,8 @@
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
     train_gpt2_refactored.py \
     --data_path "data/tinystories_char" \
-    --device_batch_size 2 \
-    --batch_size 4 \
+    --device_batch_size 32 \
+    --batch_size 64 \
     --num_iterations 300 \
     --generate_every 100 \
     --n_heads 4 \
