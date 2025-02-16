@@ -69,7 +69,6 @@ if "tinystories_char" in config.data_path:
     dataset_name = "TinyStoriesChar"
     tokenizer = PreTrainedTokenizerFast(tokenizer_file="data/tinystories_char/char_tokenizer.json")
     config.vocab_size = tokenizer.vocab_size
-    print(f"Tokenizer vocab size: {config.vocab_size}")
 elif "tinystories" in config.data_path:
     dataset_name = "TinyStories"
     tokenizer = PreTrainedTokenizerFast(
@@ -173,6 +172,7 @@ else:
 
 if master_process:
     print(f"k params lengths: head = {len(head_k_params)}, attn = {len(attn_k_params)}")
+    print(f"Tokenizer vocab size: {config.vocab_size}")
         
 lm_head_params = [p for name, p in raw_model.lm_head.named_parameters() if (p.requires_grad and ("manifold.k" not in name))]
 
@@ -226,8 +226,9 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 # )
 
 if master_process:
+    model_size = raw_model.model_size()
     print("\n=== Report ===")
-    print(f"Model Size:    {raw_model.model_size()}\n")
+    print(f"Model Size:    {model_size}\n")
     print(f"Data Path:            {config.data_path}")
     print(f"Sequence Length:      {config.sequence_length}")
     print(f"Batch Size (global):  {config.batch_size}")
@@ -242,24 +243,43 @@ if master_process:
 
 # begin logging
 if master_process:
+    def create_run_id(config, dataset_name, timestamp):
+        """Create a run identifier."""
+        # Aliases for common configurations
+        dataset_aliases = {
+            'TinyStories': 'ts',
+            'TinyStoriesChar': 'tsc',
+            'FineWeb': 'fw'
+        }
+        mode_aliases = {
+            'euc': 'e',
+            'hyp': 'h'
+        }
+        
+        # Get date and time components
+        date = timestamp.strftime('%m.%d') 
+        seconds_since_midnight = (timestamp - timestamp.replace(hour=0, minute=0, second=0, microsecond=0)).seconds
+        
+        # Get architecture configuration
+        head, attn = mode_aliases[config.head_mode], mode_aliases[config.attn_mode]
+        arch = f"{head}{attn}"
+        
+        # Build the hyperbolic parameters string if needed
+        hyp_params = ""
+        if 'h' in arch:
+            hyp_params = f"_k{config.curvature}"
+            if config.k_lr:
+                hyp_params += f"_lr{config.k_lr:.0e}"  # Using shorter scientific notation
+        
+        # Combine all components
+        run_id = f"{seconds_since_midnight}_{dataset_aliases[dataset_name]}_{arch}{hyp_params}_s{config.seed}"
+        return date, run_id
 
+    # Create the run ID
     now = datetime.datetime.now()
-    date_part = now.strftime('%d.%m')  
-    seconds_since_midnight = (now - now.replace(hour=0, minute=0, second=0, microsecond=0)).seconds #int(time.time() % 86400)
-    run_id = f"{date_part}_{seconds_since_midnight}"
-
-    if config.head_mode == 'hyp' and config.k_lr:
-        suffix = f"k_{config.curvature}_lr_{config.k_lr:.1f}"
-    elif config.head_mode == 'hyp':
-        suffix = f"k_{config.curvature}"
-    else:
-        suffix = f"{config.head_mode}_head"
-
-    # Construct the new folder name
-    run_id = f"{run_id}_{suffix}_{config.seed}"
-    
+    date, run_id = create_run_id(config, dataset_name, now)
     # Create log directory and file
-    logdir = f'runs/{run_id}/'
+    logdir = f'runs/{date}/{run_id}/'
     os.makedirs(logdir, exist_ok=True)
     os.makedirs(os.path.join(logdir, "tensorboard_logs"), exist_ok=True)
 
@@ -364,6 +384,25 @@ for step in range(config.num_iterations + 1):
         # Optionally log to console for immediate feedback
         print(f"[Step {step+1}] Generated Text: {generated_text}")
 
+        # Add curvature logging here
+        if k_params:  # Only log if curvature is learnable
+            # Log head curvature
+            for i, param in enumerate(head_k_params):
+                curvature_value = param.item()  
+                if i == 0:
+                    print(f"Head curvature value: {curvature_value:.2f}")
+                    writer.add_scalar(f"Curvature/Head", curvature_value, step)
+            
+            # Log attention layer curvatures
+            for i, param in enumerate(attn_k_params):
+                # Get curvature values and reshape to remove extra dimensions
+                curvature_values = param.squeeze().detach().cpu()  # Shape: (n_heads,)
+                values_str = ' '.join([f"{v:.2f}" for v in curvature_values])
+                print(f"Attn layer {i} curvatures: [{values_str}]")
+                
+                # Log each head's curvature to tensorboard
+                for head_idx, value in enumerate(curvature_values):
+                    writer.add_scalar(f"Curvature/Attn/{i}/Head_{head_idx}", value, step)
 
     if master_process and (last_step or (config.save_every > 0 and step % config.save_every == 0)):
         # stop the clock
@@ -405,17 +444,19 @@ for step in range(config.num_iterations + 1):
             continue
         p.grad /= train_accumulation_steps
 
-    if master_process and (step+1) % config.train_loss_every == 0:  # if you only want the rank-0 to log
+    if master_process and (step+1) % config.train_loss_every == 0:
 
         grad_norm_lm_head = compute_grad_norm(lm_head_params)
         grad_norm_matrix = compute_grad_norm(matrix_params)
         grad_norm_wte = compute_grad_norm(wte_params)
-        grad_norm_k = compute_grad_norm(k_params)
+        grad_norm_head_k = compute_grad_norm(head_k_params)
+        grad_norm_attn_k = compute_grad_norm(attn_k_params)
 
         writer.add_scalar("grad_norm/lm_head", grad_norm_lm_head, step)
         writer.add_scalar("grad_norm/matrix", grad_norm_matrix, step)
         writer.add_scalar("grad_norm/wte", grad_norm_wte, step)
-        writer.add_scalar("grad_norm/k", grad_norm_k, step)
+        writer.add_scalar("grad_norm/head_k", grad_norm_head_k, step)
+        writer.add_scalar("grad_norm/attn_k", grad_norm_attn_k, step)
 
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
@@ -431,18 +472,6 @@ for step in range(config.num_iterations + 1):
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     if master_process and (step+1) % config.train_loss_every == 0:# within the main training loop, after logging validation loss or training loss
         
-        if k_params:  # Only log if curvature is learnable
-            for i, param in enumerate(head_k_params):
-                curvature_value = param.item()  
-                # curvature_grad = param.grad
-                if i == 0:
-                    print(f"Head curvature value: {curvature_value:.2f}")
-                    writer.add_scalar(f"Curvature/Head", curvature_value, step)
-            for i, param in enumerate(attn_k_params):
-                curvature_value = param.item()  
-                print(f"Attn curvature {i}: {curvature_value}")
-                writer.add_scalar(f"Curvature/Attn/{i}", curvature_value, step)
-
         avg_train_loss = train_loss_accum / train_loss_count
         elapsed_time = time.time() - total_t0
         approx_time = training_time_s + (time.time() - t0)
