@@ -9,8 +9,12 @@ This project explores the benefits of hyperbolic geometry in language models by 
 The following components can be switched between Euclidean and hyperbolic versions:
 
 1. Language Model Head (`model/model.py` -> `LorentzMLR` class)
+   (currently outperforms the original slightly but has to be studied more)
 2. Attention Layer (file: `model/model.py` -> `HyperbolicSelfAttention` class)
-TODO: 3. Embeddings 
+   (currently unstable)
+
+TBD: 
+3. Embeddings 
 
 ### Installation
 ```bash
