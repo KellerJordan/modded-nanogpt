@@ -155,7 +155,7 @@ ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 head_k_params, attn_k_params = [], []
 for name, param in raw_model.named_parameters():
-    if "manifold.k" in name:
+    if "lm_head.k" in name:
         head_k_params.append(param)
     elif "attn.k" in name:
         attn_k_params.append(param)
@@ -173,38 +173,36 @@ else:
 if master_process:
     print(f"k params lengths: head = {len(head_k_params)}, attn = {len(attn_k_params)}")
     print(f"Tokenizer vocab size: {config.vocab_size}")
+
         
-lm_head_params = [p for name, p in raw_model.lm_head.named_parameters() if (p.requires_grad and ("manifold.k" not in name))]
+lm_head_params = [p for name, p in raw_model.lm_head.named_parameters() if (p.requires_grad and ("lm_head.k" not in name))]
 
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 wte_params = [raw_model.transformer.wte.weight]
 
-optimizer_lm_head = RiemannianSGD(
-    [{'params': lm_head_params}], lr=0.1, weight_decay=5e-4, momentum=0.9, nesterov=True, stabilize=1
-)
-
+optimizer_head = torch.optim.Adam(lm_head_params, lr=0.22, betas=(0.8, 0.95), eps=1e-10, fused=True)
+optimizer_wte = torch.optim.Adam(wte_params, lr=0.6, betas=(0.8, 0.95), eps=1e-10, fused=True)
 optimizer_muon = Muon(matrix_params, lr=0.05, momentum=0.95)
 
-optimizer_wte = torch.optim.Adam(wte_params, lr=0.6, betas=(0.8, 0.95), fused=True)
 
 if attn_k_params:
     optimizer_k = torch.optim.SGD([
         {"params": head_k_params, "lr": config.k_lr},  
         {"params": attn_k_params, "lr": config.k_lr}  
     ], momentum=0.9, nesterov=True)
-    optimizers = [optimizer_lm_head, optimizer_muon, optimizer_wte, optimizer_k]
+    optimizers = [optimizer_head, optimizer_muon, optimizer_wte, optimizer_k]
     if master_process:
         print(f"attn.k is learned")
 elif head_k_params:
     optimizer_k = torch.optim.SGD([
         {"params": head_k_params, "lr": config.k_lr}
     ], momentum=0.9, nesterov=True)
-    optimizers = [optimizer_lm_head, optimizer_muon, optimizer_wte, optimizer_k]
+    optimizers = [optimizer_head, optimizer_muon, optimizer_wte, optimizer_k]
     if master_process:
         print(f"head.k is learned with {config.k_lr} lr")
 else:
-    optimizers = [optimizer_lm_head, optimizer_muon, optimizer_wte]
+    optimizers = [optimizer_head, optimizer_muon, optimizer_wte]
     if master_process:
         print(f"k is not learned")
 
@@ -395,7 +393,6 @@ for step in range(config.num_iterations + 1):
             
             # Log attention layer curvatures
             for i, param in enumerate(attn_k_params):
-                # Get curvature values and reshape to remove extra dimensions
                 curvature_values = param.squeeze().detach().cpu()  # Shape: (n_heads,)
                 values_str = ' '.join([f"{v:.2f}" for v in curvature_values])
                 print(f"Attn layer {i} curvatures: [{values_str}]")

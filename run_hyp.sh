@@ -2,15 +2,15 @@
 
 # Dataset configurations
 declare -A MODEL_CONFIGS=(
-    ["data/tinystories_char"]="--n_heads 4 --head_dim 16 --n_layers 6 --device_batch_size 64 --batch_size 128"
+    ["data/tinystories_char"]="--n_heads 4 --head_dim 16 --n_layers 6 --device_batch_size 256 --batch_size 512"
     ["data/tinystories"]="--n_heads 6 --head_dim 32 --n_layers 6 --device_batch_size 32 --batch_size 64"
     ["data/fineweb10B"]="--n_heads 6 --head_dim 128 --n_layers 12 --device_batch_size 16 --batch_size 64"
 )
 
 # Experiment configurations
 SEEDS=(0)
-NUM_ITERATIONS=1000  # Reduced for testing
-DATASETS=("data/fineweb10B" "data/tinystories" "data/tinystories_char")
+NUM_ITERATIONS=100  # Reduced for testing
+DATASETS=("data/tinystories_char")
 CURVATURES=(1.)
 K_LRS=(10.)
 
