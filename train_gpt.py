@@ -82,7 +82,7 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
 
 @mm_backward_op.register_fake
 def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
-    return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
+    return x_f8.to(torch.bfloat16), w_f8.T.contiguous().T.to(torch.float32)
 
 def backward(ctx, grad_out: Tensor, *_):
     x_f8, w_f8 = ctx.saved_tensors
