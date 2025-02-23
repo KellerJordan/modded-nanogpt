@@ -79,7 +79,7 @@ def loss(
     )
 
     # This auxiliary loss term encourages the flatness of the composite curve
-    # Taken from @YouJiacheng's code
+    # Taken from @YouJiacheng's code here: https://gist.github.com/YouJiacheng/393c90cbdc23b09d5688815ba382288b
     y_max = jnp.amax(y)
     y_min = jnp.amin(jnp.where(x > 0.05, y, jnp.inf))
     diff_ratio = (y_max - y_min) / jnp.clip(y_max, min=1e-3)
