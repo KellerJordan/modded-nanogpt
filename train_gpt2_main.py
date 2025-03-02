@@ -132,16 +132,15 @@ train_loader = DistributedDataLoader(config.input_bin, B, T, ddp_rank, ddp_world
 val_loader = DistributedDataLoader(config.input_val_bin, B, T, ddp_rank, ddp_world_size)
 
 if master_process:
-    print(f"[Rank {ddp_rank}] Training DataLoader: {train_loader.ntok_total} tokens across {len(train_loader.files)} files.")
-    print(f"[Rank {ddp_rank}] Validation DataLoader: {val_loader.ntok_total} tokens across {len(val_loader.files)} files.")
+    print(f"Training DataLoader: {train_loader.ntok_total / 1e6:.2f}M tokens across {len(train_loader.files)} files.")
+    print(f"Validation DataLoader: {val_loader.ntok_total / 1e6:.2f}M tokens across {len(val_loader.files)} files.")
+    print(f"config.val_tokens / val_loader.ntok_total = {config.val_tokens / val_loader.ntok_total:.2f}")
 x, y = train_loader.next_batch()
 
 # Model setup
-model = GPT(config)  # Step 1: Create the model on CPU
-model = model.to(device)        # Step 2: Move the model to the correct device
-
-# If using PyTorch 2.0+ and want compiled model:
-model = torch.compile(model)
+model = GPT(config)  
+model = model.to(device)    
+# model = torch.compile(model)
 
 # Step 3: Wrap the model in DDP
 model = DDP(model, device_ids=[ddp_local_rank])
@@ -372,7 +371,7 @@ for step in range(config.num_iterations + 1):
         torch.cuda.synchronize()
         t0 = time.time()
 
-    if config.generate_every and master_process and ((step+1) % config.generate_every == 0):
+    if config.generate_every and master_process and ((step) % config.generate_every == 0):
         # Use a fixed prompt or context for generation
         prompt = "Once upon a time in a"  # Customize as per your dataset
         context = encode_text(tokenizer,prompt, device)
@@ -382,10 +381,10 @@ for step in range(config.num_iterations + 1):
         generated_text = decode_tokens(tokenizer, generated_tokens[0])
         
         # Log the generated text to TensorBoard
-        writer.add_text(f"Generated_Text/Step_{step+1}", generated_text, step)
+        writer.add_text(f"Generated_Text/Step_{step}", generated_text, step)
         
         # Optionally log to console for immediate feedback
-        print(f"[Step {step+1}] Generated Text: {generated_text}")
+        print(f"[Step {step}] Generated Text: {generated_text}")
 
         # Add curvature logging here
         if k_params:  # Only log if curvature is learnable
@@ -446,7 +445,7 @@ for step in range(config.num_iterations + 1):
             continue
         p.grad /= train_accumulation_steps
 
-    if master_process and (step+1) % config.train_loss_every == 0:
+    if master_process and step % config.train_loss_every == 0:
 
         grad_norm_lm_head = compute_grad_norm(lm_head_params)
         grad_norm_matrix = compute_grad_norm(matrix_params)
@@ -480,9 +479,9 @@ for step in range(config.num_iterations + 1):
         avg_time_per_step = approx_time/timed_steps
         estimated_total_time = avg_time_per_step * config.num_iterations
         tokens_seen = step * config.batch_size * config.sequence_length 
-        print(f"step:{step+1}/{config.num_iterations}, tokens seen:{tokens_seen/1e6:.2f}M, avg_train_loss:{avg_train_loss:.4f} time:{elapsed_time:.0f}/{estimated_total_time:.0f}s step_avg:{1000*avg_time_per_step:.0f}ms")
+        print(f"step:{step}/{config.num_iterations}, tokens seen:{tokens_seen/1e6:.2f}M, avg_train_loss:{avg_train_loss:.4f} time:{elapsed_time:.0f}/{estimated_total_time:.0f}s step_avg:{1000*avg_time_per_step:.0f}ms")
         with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{config.num_iterations} avg_train_loss:{avg_train_loss:.4f} time:{elapsed_time:.0f}s step_avg:{1000*avg_time_per_step:.0f}ms\n")
+            f.write(f"step:{step}/{config.num_iterations} avg_train_loss:{avg_train_loss:.4f} time:{elapsed_time:.0f}s step_avg:{1000*avg_time_per_step:.0f}ms\n")
         writer.add_scalar('Loss/Train', avg_train_loss, tokens_seen)
         train_loss_accum = 0.0
         train_loss_count = 0

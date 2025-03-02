@@ -1,7 +1,8 @@
 #!/bin/bash
 
-SEEDS=(0)
+SEEDS=(1 2 3 4)
 NUM_ITERATIONS=100  
+GENERATE_EVERY=0
 CURVATURES=(1.)
 K_LRS=(10.)
 
@@ -27,6 +28,7 @@ run_experiment() {
                     train_gpt2_main.py \
                     --data_path "$dataset" \
                     --num_iterations "$NUM_ITERATIONS" \
+                    --generate_every "$GENERATE_EVERY" \
                     --head_mode "$head_mode" \
                     --attn_mode "$attn_mode" \
                     --curvature "$curvature" \
@@ -36,7 +38,7 @@ run_experiment() {
                     --n_layers "$n_layers" \
                     --head_dim "$head_dim" \
                     --device_batch_size "$device_batch" \
-                    --batch_size 128 \
+                    --batch_size "$device_batch" \
                     > last_logs.txt 2>&1 # "logs/${dataset_name}_${exp_name}_k${curvature}_lr${k_lr}_seed${seed}.txt" 2>&1
             done
         done
@@ -46,7 +48,10 @@ run_experiment() {
 
 
 # Run all experiments
-run_experiment "test" "euc" "euc" "data/tinystories_char" 5 4 6 16 64
+run_experiment "test" "euc" "euc" "data/tinystories_char" 5 6 6 16 512
+run_experiment "test" "hyp" "euc" "data/tinystories_char" 5 6 6 16 512
+run_experiment "test" "euc" "hyp" "data/tinystories_char" 5 6 6 16 512
+run_experiment "test" "hyp" "hyp" "data/tinystories_char" 5 6 6 16 512
 
 
 echo "All experiments completed!"
