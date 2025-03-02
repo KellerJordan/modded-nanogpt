@@ -182,18 +182,6 @@ def project(x, *, k, dim=-1):
 
 @torch.jit.script
 def _project(x, k: torch.Tensor, dim: int = -1):
-    """
-    Projects a d-dimensional Euclidean vector onto the (d+1)-dimensional hyperboloid.
-
-    Args:
-        x (torch.Tensor): Input tensor of shape (..., d), where d is the last dimension.
-        k (torch.Tensor): Curvature parameter, a positive scalar tensor.
-        dim (int): The dimension along which to perform the projection. Defaults to -1.
-
-    Returns:
-        torch.Tensor: Projected tensor of shape (..., d+1) representing points on the hyperboloid.
-    """
-    # Compute the Euclidean norm of the input vector along the specified dimension
     norm_x = torch.norm(x, p=2, dim=dim, keepdim=True) 
     p0 = torch.sqrt(k + norm_x**2)  
     proj = torch.cat((p0, x), dim=dim)  

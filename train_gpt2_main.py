@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from lib.geoopt.optim import RiemannianSGD
+# from lib.geoopt.optim import RiemannianSGD
 
 from model.model import GPT
 from utils.muon import Muon
@@ -225,7 +225,7 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 
 if master_process:
     model_size = raw_model.model_size()
-    print("\n=== Report ===")
+    print("\n=== Model ===")
     print(f"Model Size:    {model_size}\n")
     print(f"Data Path:            {config.data_path}")
     print(f"Sequence Length:      {config.sequence_length}")
@@ -235,6 +235,11 @@ if master_process:
     print(f"n_heads:               {config.n_heads}")
     print(f"head_dim:             {config.head_dim}")
     print(f"n_embd:               {config.n_embd}")
+    print("\n=== Experiment ===")
+    print(f"Head mode:             {config.head_mode}")
+    print(f"Attention mode:        {config.attn_mode}")
+    print(f"Init curvature:        {config.curvature}")
+    print(f"Curvature learning rate: {config.k_lr}")
     print(f"Seed:                 {config.seed}")
     print("==============================\n")
 
@@ -467,7 +472,7 @@ for step in range(config.num_iterations + 1):
     # everything that follows now is just diagnostics, prints, logging, etc.
 
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
-    if master_process and (step+1) % config.train_loss_every == 0:# within the main training loop, after logging validation loss or training loss
+    if master_process and step % config.train_loss_every == 0:# within the main training loop, after logging validation loss or training loss
         
         avg_train_loss = train_loss_accum / train_loss_count
         elapsed_time = time.time() - total_t0

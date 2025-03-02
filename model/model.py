@@ -3,148 +3,37 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-# from utils.lmath import project, distance
+from model.lmath import project, distance
 
 # --------------------------------
 # Hyperbolic Attention
 # --------------------------------  
 
-class HyperbolicEmbedding(nn.Module):
-    def __init__(self, vocab_size, dim, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.spatial_embed = nn.Embedding(vocab_size, dim-1)
-        self._init_weights()
+# class HyperbolicEmbedding(nn.Module):
+#     def __init__(self, vocab_size, dim, eps=1e-6):
+#         super().__init__()
+#         self.eps = eps
+#         self.spatial_embed = nn.Embedding(vocab_size, dim)
+#         self._init_weights()
 
-    def _init_weights(self):
-        nn.init.normal_(self.spatial_embed.weight, mean=0.0, std=0.02)
+#     def _init_weights(self):
+#         nn.init.normal_(self.spatial_embed.weight, mean=0.0, std=0.02)
         
-    def forward(self, idx):
-        x_spatial = self.spatial_embed(idx)
+#     def forward(self, idx):
+#         x_spatial = self.spatial_embed(idx)
         
-        # x0 computation
-        spatial_sq = torch.sum(x_spatial**2, dim=-1, keepdim=True)
-        spatial_sq = torch.clamp(spatial_sq, min=0)  # Prevent negative due to numerical errors
-        x0 = torch.sqrt(1 + spatial_sq + self.eps)
+#         # x0 computation
+#         spatial_sq = torch.sum(x_spatial**2, dim=-1, keepdim=True)
+#         spatial_sq = torch.clamp(spatial_sq, min=0)  # Prevent negative due to numerical errors
+#         x0 = torch.sqrt(1 + spatial_sq + self.eps)
         
-        return torch.cat([x0, x_spatial], dim=-1)
-
-
-class HyperbolicRotary(nn.Module):
-    def __init__(self, dim, base=10000, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.register_buffer('inv_freq', 1.0 / (base ** (torch.arange(0, dim, 2).float() / (dim-2*eps))))
-        self.register_buffer('seq_len_cached', None)
-        self.register_buffer('cos_cached', None)
-        self.register_buffer('sin_cached', None)
-
-    def forward(self, x):
-        seq_len = x.shape[1]
-        if seq_len != self.seq_len_cached:
-            t = torch.arange(seq_len, device=x.device, dtype=torch.float32)  # High precision
-            freqs = torch.outer(t, self.inv_freq)
-            self.cos_cached = freqs.cos().to(x.dtype)
-            self.sin_cached = freqs.sin().to(x.dtype)
-            self.seq_len_cached = seq_len
-        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
-
-
-def apply_hyperbolic_rotary_emb(x, cos, sin, eps=1e-6, debug=True):
-    # Split temporal components
-    x0 = x[..., 0:1]
-    x_spatial = x[..., 1:]
-    d = x_spatial.shape[-1] // 2
-    
-    # Split spatial into pairs
-    x1, x2 = x_spatial[..., :d], x_spatial[..., d:]
-    
-    y1 = x1 * cos + x2 * sin
-    y2 = -x1 * sin + x2 * cos
-    
-    rotated_spatial = torch.cat([y1, y2], dim=-1)
-    rotated_spatial = torch.clamp(rotated_spatial, min=-1e3, max=1e3)  # Prevent overflow
-    
-    # may not be needed, see debug
-    spatial_sq = torch.sum(rotated_spatial**2, dim=-1, keepdim=True)
-    spatial_sq = torch.clamp(spatial_sq, min=0, max=1e6)  # Prevent extreme values
-    new_x0 = torch.sqrt(1 + spatial_sq + eps)
-
-    if debug:
-        with torch.no_grad():
-            # Compute relative difference
-            diff = torch.abs(new_x0 - x0) / (torch.abs(x0) + 1e-8)
-            max_diff = diff.max().item()
-            
-            if max_diff > 1e-5:
-                print(f"Max x0 deviation: {max_diff:.2e}")
-    
-    return torch.cat([new_x0, rotated_spatial], dim=-1)
-
-
-def hyperbolic_attention(q, k, v, head_dim, eps=1e-6):
-    q0, k0 = q[..., 0:1], k[..., 0:1]
-    q_spatial, k_spatial = q[..., 1:], k[..., 1:]
-    
-    lorentz_term = -q0 * k0
-    spatial_term = torch.sum(q_spatial * k_spatial, dim=-1, keepdim=True)
-    
-    attn_logits = lorentz_term + spatial_term
-    attn_logits = attn_logits / (head_dim**0.5)  # Scale like standard attention
-    attn_logits = torch.clamp(attn_logits, min=-100.0, max=100.0)  # Prevent softmax overflow
-    
-    attn = F.softmax(attn_logits, dim=-1)
-    return torch.einsum('bthn,bthd->btnd', attn, v)
-
-
-class HyperbolicCausalSelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.n_heads = config.n_heads
-        self.dim = config.dim
-        self.head_dim = (config.dim - 1) // self.n_heads
-        self.eps = config.eps if hasattr(config, 'eps') else 1e-6
-        
-        self.c_q = nn.Linear(self.dim, self.dim, bias=False)
-        self.c_k = nn.Linear(self.dim, self.dim, bias=False)
-        self.c_v = nn.Linear(self.dim, self.dim, bias=False)
-        self._init_projections()
-        
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
-        
-        self.rotary = HyperbolicRotary(self.head_dim, eps=self.eps)
-        
-    def _init_projections(self):
-        for lin in [self.c_q, self.c_k, self.c_v]:
-            nn.init.xavier_normal_(lin.weight, gain=0.02)  # Smaller gain for stability
-    
-    def forward(self, x):
-        B, T, _ = x.shape
-        
-        # Projections
-        q = self.c_q(x).view(B, T, self.n_heads, self.dim)
-        k = self.c_k(x).view(B, T, self.n_heads, self.dim)
-        v = self.c_v(x).view(B, T, self.n_heads, self.dim)
-        
-        cos, sin = self.rotary(q[..., 1:])  # Rotate spatial only
-        q = apply_hyperbolic_rotary_emb(q, cos, sin, self.eps)
-        k = apply_hyperbolic_rotary_emb(k, cos, sin, self.eps)
-        
-        y = hyperbolic_attention(q, k, v, self.head_dim, self.eps)
-        y = y.contiguous().view_as(x)
-        y = self.c_proj(y)
-        return y
-
-# --------------------------------
-# Euclidean Attention
-# --------------------------------
+#         return torch.cat([x0, x_spatial], dim=-1)
 
 class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
         super().__init__()
-        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim)))
         self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
@@ -162,16 +51,42 @@ class Rotary(torch.nn.Module):
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4 # multihead attention
-    d = x.shape[3]//2
-    x1 = x[..., :d]
-    x2 = x[..., d:]
+    half_d = x.shape[3]//2
+    x1 = x[..., :half_d]
+    x2 = x[..., half_d:]
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).type_as(x)
 
 
-class CausalSelfAttention(nn.Module):
+def custom_attention(query, key, value, curvature=None, 
+                                 mode='euc', dropout_p=0.0,
+                                 is_causal=False, scale=None,
+                                 eps=1e-6, p=2) -> torch.Tensor:
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
 
+    if is_causal:
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0).to(attn_bias.device)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+
+    if mode == 'euc':
+        attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    elif mode == 'hyp':
+        assert curvature is not None
+        lq = project(query, k=curvature, dim=-1).unsqueeze(-2)
+        lk = project(key, k=curvature, dim=-1).unsqueeze(-3)
+        dis = distance(lq, lk, k=curvature, dim=-1)
+        attn_weight = 1 / (eps + dis**p)
+
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    return attn_weight @ value
+
+
+class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.n_heads = config.n_heads
@@ -194,11 +109,115 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(q)
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        y = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
     
+class HyperbolicSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        
+        self.n_heads = config.n_heads
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_heads
+        assert self.n_embd % self.n_heads == 0
+        
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.rotary = Rotary(self.head_dim)
+        
+        if not config.k_lr:
+            self.register_buffer('k', torch.tensor(float(config.curvature)))
+        else:
+            x = torch.randn(1, 1, config.n_heads, 1, device=self.c_attn.weight.device)
+            init_k = torch.exp(x) * config.curvature
+            self.k = nn.Parameter(init_k)
+
+    def forward(self, x):
+        B, T, C = x.size()
+
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
+        q = q.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
+
+        cos, sin = self.rotary(q) 
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+
+        y = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), 
+                             is_causal=True, mode='hyp', curvature=self.k)
+            
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.c_proj(y)
+        return y
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Assume these are defined elsewhere:
+# - Rotary: returns cosine and sine tensors for rotary embeddings.
+# - apply_rotary_emb: applies rotary embeddings to tensors.
+# - custom_attention: computes causal attention (optionally in 'hyp' mode).
+
+class JointSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.mode = config.attn_mode
+        self.n_heads = config.n_heads
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_heads
+        assert self.n_embd % self.n_heads == 0, "Embedding dimension must be divisible by number of heads"
+        
+        # Combined QKV projection (more efficient than separate projections)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        
+        # Output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.c_proj.weight.data.zero_()
+        self.rotary = Rotary(self.head_dim)
+        
+        if self.mode == 'hyp':
+            if not getattr(config, 'k_lr', False):
+                self.register_buffer('k', torch.tensor(float(config.curvature)))
+            else:
+                init_k = torch.exp(torch.randn(1, 1, self.n_heads, 1)) * config.curvature
+                self.k = nn.Parameter(init_k)
+
+    def forward(self, x):
+        B, T, C = x.size()
+        
+        qkv = self.c_attn(x)  
+        q, k, v = qkv.split(self.n_embd, dim=2)
+        
+        # Reshape and transpose: (B, T, n_embd) -> (B, n_heads, T, head_dim)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        
+        # Get rotary parameters and apply RMS normalization
+        cos, sin = self.rotary(q)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        
+        if self.mode == 'hyp':
+            y = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                                 is_causal=True, mode='hyp', curvature=self.k)
+        else:
+            y = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                                 is_causal=True)
+            
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.c_proj(y)
+        return y
+
 
 class MLP(nn.Module):
 
@@ -219,12 +238,7 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        if config.attn_mode == 'euc':
-            self.attn = CausalSelfAttention(config)
-        elif config.attn_mode == 'hyp':
-            self.attn = HyperbolicCausalSelfAttention(config)
-        else:
-            raise ValueError("Invalid attn_mode, use 'euc'/'hyp'.")
+        self.attn = JointSelfAttention(config)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -246,7 +260,7 @@ class LorentzMLR(nn.Module):
         super(LorentzMLR, self).__init__()
 
         self.k = nn.Parameter(torch.tensor(curvature))
-        self.a = torch.nn.Parameter(torch.zeros(num_classes,))
+        self.a = torch.nn.Parameter(torch.zeros(num_classes,)) # optimize properly
         self.z = torch.nn.Parameter(F.pad(torch.zeros(num_classes, num_features-2), pad=(1,0), value=1))
 
         self.init_weights()
@@ -297,7 +311,7 @@ class GPT(nn.Module):
 
         elif config.head_mode == 'hyp':
             self.lm_head = LorentzMLR(
-                num_features=config.n_embd - 1,
+                num_features=config.n_embd,
                 num_classes=config.vocab_size,
                 curvature=config.curvature
             )
@@ -375,8 +389,8 @@ class GPT(nn.Module):
 #             self.register_buffer('c', torch.tensor(float(config.curvature)))
 #         else:
 #             x = torch.randn(1, config.n_heads, 1, 1, device=self.c_attn.weight.device)
-#             init_c = torch.exp(x) * config.curvature
-#             self.k = nn.Parameter(init_c)
+#             init_k = torch.exp(x) * config.curvature
+#             self.k = nn.Parameter(init_k)
         
 #         self.register_buffer('p', torch.tensor(2.0))
 #         self.register_buffer('eps', torch.tensor(1e-3))
