@@ -261,7 +261,7 @@ class CausalSelfAttention(nn.Module):
         # https://x.com/hi_tysam/status/1879699187107033311
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
-        self.rotary = Rotary(head_dim, max_seq_len)
+        self.rotary = Rotary(head_dim//2, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
@@ -270,7 +270,9 @@ class CausalSelfAttention(nn.Module):
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
-        q, k = self.rotary(q), self.rotary(k)
+        q1, k1 = self.rotary(q[:, :, :, :self.head_dim//2]), self.rotary(k[:, :, :, :self.head_dim//2])
+        q2, k2 = q[:, :, :, self.head_dim//2:], k[:, :, :, self.head_dim//2:]
+        q, k = torch.cat([q1, q2], dim=-1), torch.cat([k1, k2], dim=-1)
         if ve is not None:
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
