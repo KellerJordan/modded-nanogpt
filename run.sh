@@ -1,7 +1,7 @@
 #!/bin/bash
 
 SEEDS=(1 2 3 4)
-NUM_ITERATIONS=100  
+NUM_ITERATIONS=5000  
 GENERATE_EVERY=0
 CURVATURES=(1.)
 K_LRS=(10.)
@@ -38,8 +38,8 @@ run_experiment() {
                     --n_layers "$n_layers" \
                     --head_dim "$head_dim" \
                     --device_batch_size "$device_batch" \
-                    --batch_size "$device_batch" \
-                    > last_logs.txt 2>&1 # "logs/${dataset_name}_${exp_name}_k${curvature}_lr${k_lr}_seed${seed}.txt" 2>&1
+                    --batch_size 512 \
+                    > logs/${dataset_name}_seed${seed}.txt 2>&1 # "logs/${dataset_name}_${exp_name}_k${curvature}_lr${k_lr}_seed${seed}.txt" 2>&1
             done
         done
     done
@@ -48,10 +48,8 @@ run_experiment() {
 
 
 # Run all experiments
-run_experiment "test" "euc" "euc" "data/tinystories_char" 5 6 6 16 512
-run_experiment "test" "hyp" "euc" "data/tinystories_char" 5 6 6 16 512
-run_experiment "test" "euc" "hyp" "data/tinystories_char" 5 6 6 16 512
-run_experiment "test" "hyp" "hyp" "data/tinystories_char" 5 6 6 16 512
+run_experiment "fully_euc" "euc" "euc" "data/fineweb10B" 6 6 12 128 32 
+run_experiment "hyp_head" "hyp" "euc" "data/fineweb10B" 6 6 12 128 32 
 
 
 echo "All experiments completed!"

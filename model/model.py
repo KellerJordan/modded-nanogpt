@@ -155,14 +155,6 @@ class HyperbolicSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-# Assume these are defined elsewhere:
-# - Rotary: returns cosine and sine tensors for rotary embeddings.
-# - apply_rotary_emb: applies rotary embeddings to tensors.
 # - custom_attention: computes causal attention (optionally in 'hyp' mode).
 
 class JointSelfAttention(nn.Module):
