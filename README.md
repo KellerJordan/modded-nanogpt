@@ -144,9 +144,10 @@ the vocabulary size to be reduced (nearly halved!) while preserving the same byt
 
 ---
 
-## Track 2: Speedrunning GPT-2-Medium
+## Speedrun track 2: GPT-2-Medium
 
 The target loss for this track is lowered from 3.28 to 2.92, as per Andrej Karpathy's 350M-parameter llm.c baseline.
+This baseline generates a model with performance similar to the original GPT-2 Medium, whereas the first track's baseline generates a model on par with GPT-2 Small.
 All other rules remain the same.
 
 | # | Record time | Description | Date | Log | Contributors |
