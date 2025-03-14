@@ -1,4 +1,6 @@
-# Modded-NanoGPT
+in this repo I'm tryna see if Modded-NanoGPT can work as a fast/cheap base model to build experiments off of. we'll see if we can get it up and running, how much it costs to do so, and how easy it is to edit
+
+# Modded-NanoGPT (ORIGINAL README)
 
 This repository hosts the *NanoGPT speedrun*, in which we (collaboratively|competitively) search for the fastest algorithm to use 8 NVIDIA H100 GPUs to train a language model that attains 3.28 cross-entropy loss on the [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) validation set.
 
