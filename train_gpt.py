@@ -640,14 +640,15 @@ def pack_hellaswag_tasks_into_sequences(hellaswag_tasks: list[tuple[list[list[in
 
         # add task
         boundaries = []
-        for option_tokens, start_id in zip(options, start_ids):            # iterate over 4 endings
+        for option_tokens, start_id in zip(options, start_ids):            # iterate over 4 options
+            if len(tokens) > 0:                                            # add EOT token between tasks and options
+                tokens.append(ENDOFTEXT_ID)
+                targets.append(ENDOFTEXT_ID)
             start_id_in_sequence = len(tokens) + start_id - 1              # -1 because we shift targets one position to the left
             end_id_in_sequence = len(tokens) + len(option_tokens) - 1 - 1  # -1 because we add one less token, and then len(option_tokens) - 1 because this is the id of the last token
             boundaries.append((start_id_in_sequence, end_id_in_sequence))
-
-            prefix = [ENDOFTEXT_ID] if len(tokens) > 0 else []                   # add EOT token between options
-            tokens.extend(prefix + option_tokens[:-1])
-            targets.extend(prefix + option_tokens[1:])
+            tokens.extend(option_tokens[:-1])
+            targets.extend(option_tokens[1:])
         tasks.append((label, boundaries))
 
     if len(tokens) > 0:
