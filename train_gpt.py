@@ -19,6 +19,8 @@ import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+BLOCK_SIZE = 128
+ENDOFTEXT_ID = 50256  # id for end of text token at GPT2-tokenizer
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -335,8 +337,7 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(num_layers//2))
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
-        BLOCK_SIZE = 128
-        docs = (input_seq == 50256).cumsum(0)
+        docs = (input_seq == ENDOFTEXT_ID).cumsum(0)
 
         def document_causal(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
@@ -402,7 +403,8 @@ class GPT(nn.Module):
         logits = self.lm_head(x).float()
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction='sum' if self.training else 'mean')
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction='sum' if self.training else 'none')
+
         return loss
 
 # -----------------------------------------------------------------------------
@@ -454,6 +456,7 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
+    hellaswag = True # run validation on HellaSwag (https://huggingface.co/datasets/Rowan/hellaswag)
 args = Hyperparameters()
 
 # torchrun sets these env variables
@@ -568,6 +571,144 @@ for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
 del initial_state
 
 ########################################
+#     Prepare HellaSwag validation     #
+########################################
+@dataclass
+class HellaswagSequence:
+    """
+    Packs multiple HellaSwag tasks into a single token sequence for efficient evaluation. For val_seq_len = 260k,
+    we pack ~800 tasks (with 4 endings per task) into 1 sequence which lets us evaluate them in 1 forward pass.
+
+    Each task contains:
+      - A context (prompt) and four candidate endings
+      - A label indicating the index of the correct ending
+
+    The sequence holds:
+      - tokens: a concatenated list of token IDs with EOT tokens separating endings and tasks (note: we don't add the last token of each ending)
+      - targets: a shifted version of tokens for loss computation
+      - tasks: metadata for each task as (label, [(start_id, end_id), ...]), where each pair marks the token range of an ending
+
+    Example with 2 tasks (task 0 has context [10,11] and 4 possible answers [20,21], [30,31], [40,41], [50,51]):       
+                                task 0                                                  task 1                                                          
+                                ----------------------------------------------------    ---------------------------------------------------------------
+    index of token                0  1  2   3  4  5  6   7  8  9 10  11 12 13 14  15     16  17  18  19  20  21  22  23  24  25  26  27  28  29  30  31
+    self.tokens              = [ 10 11 20 EOT 10 11 30 EOT 10 11 40 EOT 10 11 50 EOT    110 111 120 EOT 110 111 130 EOT 110 111 140 EOT 110 111 150 EOT ]
+    self.targets             = [ 11 20 21 EOT 11 30 31 EOT 11 40 41 EOT 11 50 51 EOT    111 120 121 EOT 111 130 131 EOT 111 140 141 EOT 111 150 151 EOT ]
+    self.tasks               = [(0,[(1, 2),      (5, 6),      (9,10),     (13,14)])     (1,[(17, 18),       (21, 22),       (25, 26),       (29, 30)] ) ]
+    """
+
+    tokens: Tensor                                  # shape (val_seq_len,)
+    targets: Tensor                                 # shape (val_seq_len,)
+    tasks: list[tuple[int, list[tuple[int, int]]]]  # one tuple for each task: (label, list of (start_id, end_id) for each ending)
+
+def get_hellaswag_task(raw_task: dict, tokenizer) -> tuple[list[list[int]], list[int], int]:
+    ctx, label, endings = raw_task["ctx"], raw_task["label"], raw_task["endings"]
+    assert len(endings) == 4
+
+    ctx_tokens = tokenizer.encode_ordinary(ctx)
+    options = [ctx_tokens + tokenizer.encode_ordinary(f" {ending}") for ending in endings]
+    start_ids = [len(ctx_tokens) for _ in endings]  # holds index of first token of each ending
+    return options, start_ids, int(label)
+
+def pack_hellaswag_tasks_into_sequences(hellaswag_tasks: list[tuple[list[list[int]], list[int], int]], max_seq_len: int) -> list[HellaswagSequence]:
+    sequences = []
+    tokens, targets, tasks = [], [], []
+
+    def flush_sequence() -> None:
+        nonlocal tokens, targets, tasks
+
+        # Pad to multiple of BLOCK_SIZE
+        desired_length = next_multiple_of_n(len(tokens), n=BLOCK_SIZE)
+        padding_length = desired_length - len(tokens)
+        tokens.extend([ENDOFTEXT_ID] * padding_length)
+        targets.extend([ENDOFTEXT_ID] * padding_length)
+
+        # Create a HellaswagSequence and add it to the list
+        sequence = HellaswagSequence(
+            tokens=torch.tensor(tokens).to(dtype=torch.int32, device="cuda", non_blocking=True),
+            targets=torch.tensor(targets).to(dtype=torch.int64, device="cuda", non_blocking=True),
+            tasks=tasks,
+        )
+        sequences.append(sequence)
+        tokens, targets, tasks = [], [], [] # reset
+
+    for options, start_ids, label in hellaswag_tasks:
+        # flush if adding this task would exceed maximum sequence length
+        num_tokens = sum(len(option_tokens) for option_tokens in options)
+        if len(tokens) + num_tokens >= max_seq_len:
+            flush_sequence()
+
+        # add task
+        boundaries = []
+        for option_tokens, start_id in zip(options, start_ids):            # iterate over 4 options
+            if len(tokens) > 0:                                            # add EOT token between tasks and options
+                tokens.append(ENDOFTEXT_ID)
+                targets.append(ENDOFTEXT_ID)
+            start_id_in_sequence = len(tokens) + start_id - 1              # -1 because we shift targets one position to the left
+            end_id_in_sequence = len(tokens) + len(option_tokens) - 1 - 1  # -1 because we add one less token, and then len(option_tokens) - 1 because this is the id of the last token
+            boundaries.append((start_id_in_sequence, end_id_in_sequence))
+            tokens.extend(option_tokens[:-1])
+            targets.extend(option_tokens[1:])
+        tasks.append((label, boundaries))
+
+    if len(tokens) > 0:
+        flush_sequence()
+
+    return sequences
+
+def evaluate_hellaswag_sequence(step: int, sequence: HellaswagSequence) -> tuple[int, int]:
+    correct, count = 0, 0
+    loss_per_token = model(sequence.tokens, sequence.targets, get_window_size_blocks(step))
+
+    for label, boundaries in sequence.tasks:
+        avg_loss_per_ending = [loss_per_token[start_id : end_id + 1].mean() for start_id, end_id in boundaries]
+        predicted = torch.tensor(avg_loss_per_ending).argmin().item()
+        is_correct = (predicted == label)  # check if lowest loss corresponds to correct ending (given by label)
+        correct += is_correct
+        count += 1
+
+    return correct, count
+
+def get_hellaswag_accuracy(step: int) -> float:
+    sequences = get_hellaswag_sequences()
+
+    correct, count = 0, 0
+    with torch.no_grad():
+        for sequence in sequences:
+            correct_, count_ = evaluate_hellaswag_sequence(step, sequence)
+            correct += correct_
+            count += count_
+
+    correct_tensor = torch.tensor([correct], device="cuda")
+    count_tensor = torch.tensor([count], device="cuda")
+    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+    correct = correct_tensor.item()
+    count = count_tensor.item()
+    acc = correct / count if count > 0 else 0.0
+
+    return acc
+
+@lru_cache(1)
+def get_hellaswag_sequences():
+    # 10042 HellaSwag validation tasks are packed into ~16 sequences (2 forward passes per GPU if 8 GPUs)
+
+    import tiktoken
+    from datasets import load_dataset
+    tokenizer = tiktoken.get_encoding("gpt2")
+    dataset = load_dataset(path="Rowan/hellaswag", split="validation", keep_in_memory=True)
+    dataset = dataset.shuffle(seed=42)  # shuffle to have similar distribution of tasks across sequences and gpus
+
+    tasks = []
+    for i in range(0, len(dataset), world_size):
+        if i + rank <= len(dataset) - 1:
+            task = get_hellaswag_task(dataset[i + rank], tokenizer)
+            tasks.append(task)
+    sequences = pack_hellaswag_tasks_into_sequences(tasks, max_seq_len=args.val_seq_len)
+    return sequences
+
+
+########################################
 #        Training and validation       #
 ########################################
 
@@ -595,11 +736,17 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets = next(val_loader)
-                val_loss += model(inputs, targets, get_window_size_blocks(step))
+                val_loss += model(inputs, targets, get_window_size_blocks(step)).mean()
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+
+        if args.hellaswag:
+            val_hellaswag_acc = str(round(get_hellaswag_accuracy(step), 6))
+        else:
+            val_hellaswag_acc = "n/a"
+
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} val_hellaswag_acc:{val_hellaswag_acc} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
