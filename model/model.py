@@ -85,76 +85,6 @@ def custom_attention(query, key, value, curvature=None,
     attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
     return attn_weight @ value
 
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.n_heads = config.n_heads
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_heads
-        assert self.n_embd % self.n_heads == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        # output projection
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
-        self.rotary = Rotary(self.head_dim)
-
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        q = self.c_q(x).view(B, T, self.n_heads, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_heads, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_heads, self.head_dim)
-        cos, sin = self.rotary(q)
-        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        y = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
-        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
-        y = self.c_proj(y)
-        return y
-    
-class HyperbolicSelfAttention(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        
-        self.n_heads = config.n_heads
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_heads
-        assert self.n_embd % self.n_heads == 0
-        
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.rotary = Rotary(self.head_dim)
-        
-        if not config.k_lr:
-            self.register_buffer('k', torch.tensor(float(config.curvature)))
-        else:
-            x = torch.randn(1, 1, config.n_heads, 1, device=self.c_attn.weight.device)
-            init_k = torch.exp(x) * config.curvature
-            self.k = nn.Parameter(init_k)
-
-    def forward(self, x):
-        B, T, C = x.size()
-
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
-        q = q.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
-        v = v.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
-
-        cos, sin = self.rotary(q) 
-        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-
-        y = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), 
-                             is_causal=True, mode='hyp', curvature=self.k)
-            
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
-        return y
-
 # - custom_attention: computes causal attention (optionally in 'hyp' mode).
 
 class JointSelfAttention(nn.Module):
@@ -211,6 +141,38 @@ class JointSelfAttention(nn.Module):
         return y
 
 
+# original attention implementation
+class CausalSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.n_heads = config.n_heads
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_heads
+        assert self.n_embd % self.n_heads == 0
+        self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        # output projection
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.rotary = Rotary(self.head_dim)
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        q = self.c_q(x).view(B, T, self.n_heads, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_heads, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_heads, self.head_dim)
+        cos, sin = self.rotary(q)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return y
+
+
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -230,7 +192,7 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.attn = JointSelfAttention(config)
+        self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -247,7 +209,8 @@ class LorentzMLR(nn.Module):
             self, 
             num_features: int, 
             num_classes: int,
-            curvature: float = 1.0
+            curvature: float = 1.0,
+            init: str = 'zero'
         ):
         super(LorentzMLR, self).__init__()
 
@@ -255,7 +218,7 @@ class LorentzMLR(nn.Module):
         self.a = torch.nn.Parameter(torch.zeros(num_classes,)) # optimize properly
         self.z = torch.nn.Parameter(F.pad(torch.zeros(num_classes, num_features-2), pad=(1,0), value=1))
 
-        self.init_weights()
+        # self.init_weights()
 
     def forward(self, x):
         # x: (B, T, num_features)
@@ -298,9 +261,10 @@ class GPT(nn.Module):
 
         if config.head_mode == 'euc':
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-            stdv = 1. / math.sqrt(config.n_embd)
-            nn.init.uniform_(self.lm_head.weight.data, -stdv, stdv)
-
+            # stdv = 1. / math.sqrt(config.n_embd)
+            # nn.init.uniform_(self.lm_head.weight.data, -stdv, stdv)
+            self.lm_head.weight.data.zero_()
+        
         elif config.head_mode == 'hyp':
             self.lm_head = LorentzMLR(
                 num_features=config.n_embd,
@@ -359,9 +323,78 @@ class GPT(nn.Module):
         else:
             return f"{total_params / 1e3:.2f}K"
         
-
+## OLD
         
+# class CausalSelfAttention(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+#         self.n_heads = config.n_heads
+#         self.n_embd = config.n_embd
+#         self.head_dim = self.n_embd // self.n_heads
+#         assert self.n_embd % self.n_heads == 0
+#         self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
+#         self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
+#         self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
+#         # output projection
+#         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+#         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+#         self.rotary = Rotary(self.head_dim)
 
+#     def forward(self, x):
+#         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+#         q = self.c_q(x).view(B, T, self.n_heads, self.head_dim)
+#         k = self.c_k(x).view(B, T, self.n_heads, self.head_dim)
+#         v = self.c_v(x).view(B, T, self.n_heads, self.head_dim)
+#         cos, sin = self.rotary(q)
+#         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
+#         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+#         y = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+#         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
+#         y = self.c_proj(y)
+#         return y
+    
+# class HyperbolicSelfAttention(nn.Module):
+
+#     def __init__(self, config):
+#         super().__init__()
+        
+#         self.n_heads = config.n_heads
+#         self.n_embd = config.n_embd
+#         self.head_dim = self.n_embd // self.n_heads
+#         assert self.n_embd % self.n_heads == 0
+        
+#         # key, query, value projections for all heads, but in a batch
+#         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+#         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+#         self.rotary = Rotary(self.head_dim)
+        
+#         if not config.k_lr:
+#             self.register_buffer('k', torch.tensor(float(config.curvature)))
+#         else:
+#             x = torch.randn(1, 1, config.n_heads, 1, device=self.c_attn.weight.device)
+#             init_k = torch.exp(x) * config.curvature
+#             self.k = nn.Parameter(init_k)
+
+#     def forward(self, x):
+#         B, T, C = x.size()
+
+#         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+#         k = k.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
+#         q = q.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
+#         v = v.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
+
+#         cos, sin = self.rotary(q) 
+#         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
+#         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+
+#         y = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), 
+#                              is_causal=True, mode='hyp', curvature=self.k)
+            
+#         y = y.transpose(1, 2).contiguous().view(B, T, C)
+#         y = self.c_proj(y)
+#         return y
+    
+## ELDERLY
 
 # class HyperbolicSelfAttention(nn.Module):
 

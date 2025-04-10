@@ -25,8 +25,9 @@ class FullConfig:
     n_layers: int = 12
     n_heads: int = 6
     # Rather than specify n_embd directly,
-    # you could also define a `head_dim`, if you like:
-    head_dim: int = 128
+    # you could also define a `head_dim`, if you like;
+    # default is zero, bc unless it is set, it is n_embd // n_heads)
+    head_dim: int = 0
     n_embd: int = 768
     head_mode: str = "euc"
     attn_mode: str = "euc"
@@ -41,12 +42,19 @@ class FullConfig:
         You can also unify any validation logic here.
         """
         # If you want n_embd to be set from n_heads * head_dim:
-        self.n_embd = self.n_heads * self.head_dim
+        if self.head_dim:
+            self.n_embd = self.n_heads * self.head_dim
 
         # Decide how to set the input bins.
         if "tinystories" in self.data_path:
             self.input_bin = f"{self.data_path}/train.bin"
             self.input_val_bin = f"{self.data_path}/val.bin"
+        if "shakespeare" in self.data_path:
+            self.input_bin = f"{self.data_path}/train.bin"
+            self.input_val_bin = f"{self.data_path}/val.bin"
+        elif "finewebedu" in self.data_path:
+            self.input_bin = f"{self.data_path}/finewebedu_train_*.bin"
+            self.input_val_bin = f"{self.data_path}/finewebedu_val_*.bin"
         elif "fineweb" in self.data_path:
             self.input_bin = f"{self.data_path}/fineweb_train_*.bin"
             self.input_val_bin = f"{self.data_path}/fineweb_val_*.bin"

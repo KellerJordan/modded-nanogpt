@@ -38,6 +38,7 @@ parser.add_argument("--k_lr", type=float, default=0.0)
 parser.add_argument("--head_dim", type=int, default=128)
 parser.add_argument("--n_heads", type=int, default=6)
 parser.add_argument("--n_layers", type=int, default=12, help="Number of transformer layers")
+parser.add_argument("--sequence_length", type=int, default=1024)
 
 args = parser.parse_args()
 
@@ -55,7 +56,8 @@ config = FullConfig(
     k_lr=args.k_lr,
     head_dim=args.head_dim,
     n_heads=args.n_heads,
-    n_layers=args.n_layers
+    n_layers=args.n_layers,
+    sequence_length=args.sequence_length
 )
 
 # Seeds
@@ -78,14 +80,16 @@ elif "tinystories" in config.data_path:
         pad_token="[PAD]",
     )
     config.vocab_size = tokenizer.vocab_size
-else:
-    dataset_name = "FineWeb"
+elif "fineweb" in config.data_path:
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     tokenizer.eos_token = "<|endoftext|>"
     tokenizer.pad_token = tokenizer.eos_token
-
-# DDP setup
-assert torch.cuda.is_available(), "CUDA is required for DDP but not available."
+    if "finewebedu" in config.data_path:
+        dataset_name = "FineWebEdu"
+    else:
+        dataset_name = "FineWeb"
+else:
+    raise ValueError("Incorrect data_path")
 
 def encode_text(tokenizer, text, device):
     """Encodes a string into token IDs."""
@@ -98,6 +102,9 @@ def decode_tokens(tokenizer, tokens):
         return ''.join(tokenizer.convert_ids_to_tokens(tokens.cpu().tolist()))
     # For word-level tokenizers, use normal decoding
     return tokenizer.decode(tokens.cpu().tolist(), skip_special_tokens=True)
+
+# DDP setup
+assert torch.cuda.is_available(), "CUDA is required for DDP but not available."
 
 try:
     ddp_rank = int(os.environ['RANK'])
@@ -143,7 +150,7 @@ model = model.to(device)
 # model = torch.compile(model)
 
 # Step 3: Wrap the model in DDP
-model = DDP(model, device_ids=[ddp_local_rank])
+model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
 raw_model = model.module  # Always access raw model via .module
 
 # Optional: Verify that DDP is correctly set up
@@ -213,14 +220,6 @@ def get_lr(it):
     return w * init_lr + (1 - w) * end_lr
     
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
-
-# schedulers[-1] = torch.optim.lr_scheduler.ReduceLROnPlateau(
-#     optimizers[-1],
-#     mode='max',           # Monitor for the minimum metric (e.g., validation loss).
-#     factor=0.1,           # Reduce LR by a factor of 0.1.
-#     patience=5,           # Wait for 5 epochs without improvement.
-#     verbose=True          # Print LR reduction messages.
-# )
 
 if master_process:
     model_size = raw_model.model_size()
