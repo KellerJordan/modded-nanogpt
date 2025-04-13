@@ -22,7 +22,7 @@ from utils.config import FullConfig
 torch.set_float32_matmul_precision('high')
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-parser = argparse.ArgumentParser(description="Train GPT model with customizable parameters.")
+parser = argparse.ArgumentParser()
 
 # Configurable arguments
 parser.add_argument("--data_path", type=str, default="data/fineweb10B")
@@ -67,7 +67,12 @@ torch.manual_seed(config.seed)
 torch.cuda.manual_seed_all(config.seed)
 
 # Tokenizer setup
-if "tinystories_char" in config.data_path:
+if "shakespeare" in config.data_path:
+    from data.shakespeare_char.CharTokenizer import CharacterTokenizer
+    dataset_name = "TinyShakespeare"
+    tokenizer = CharacterTokenizer.from_pretrained(save_directory="data/shakespeare_char/")
+    config.vocab_size = tokenizer.vocab_size
+elif "tinystories_char" in config.data_path:
     dataset_name = "TinyStoriesChar"
     tokenizer = PreTrainedTokenizerFast(tokenizer_file="data/tinystories_char/char_tokenizer.json")
     config.vocab_size = tokenizer.vocab_size
@@ -248,8 +253,9 @@ if master_process:
         """Create a run identifier."""
         # Aliases for common configurations
         dataset_aliases = {
-            'TinyStories': 'ts',
+            'TinyShakespeare': 'sh',
             'TinyStoriesChar': 'tsc',
+            'TinyStories': 'ts',
             'FineWeb': 'fw'
         }
         mode_aliases = {

@@ -25,7 +25,7 @@ def _load_data_shard(filename):
         assert header[1] == 1, "unsupported version"
         ntok = header[2] # number of tokens (claimed)
         # the rest of it are tokens, stored as 
-        np_dtype = np.uint8 if 'char' in filename else np.uint16
+        np_dtype = np.uint16 # np.uint8 if 'char' in filename else np.uint16
         tokens = np.frombuffer(f.read(), dtype=np_dtype)
     assert len(tokens) == ntok, "number of tokens read does not match header?"
     return tokens

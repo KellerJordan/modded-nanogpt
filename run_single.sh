@@ -12,11 +12,11 @@ OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=1,3 torchrun --standalone --nproc_per_nod
     --head_dim 16 \
     --sequence_length 256 \
     --attn_mode "euc" \
-    --head_mode "hyp" \
+    --head_mode "euc" \
     --curvature 1. \
     --k_lr 0. \
     --seed 0 \
-    > logs/last.txt 2>&1
+    > logs/last2.txt 2>&1
     
 # --curvature "${curvature}" \
 # --k_lr "${k_lr}" \
