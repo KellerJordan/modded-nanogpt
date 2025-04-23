@@ -27,14 +27,14 @@ To run the current record, run the following commands.
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install -r requirements.txt
-pip install --pre torch==2.7.0.dev20250110+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade
+pip install --pre torch==2.7.0.dev20250310+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade
 python data/cached_fineweb10B.py 8 # downloads only the first 800M training tokens to save time
 ./run.sh
 ```
 
-**Note: torch.compile will take around 5 minutes the first time you run the code.**
+**Note: torch.compile will add around 5 minutes of latency the first time you run the code.**
 
-## Alternative: Running with Docker (recommended for timing)
+## Alternative: Running with Docker (recommended for precise timing)
 
 For cases where CUDA or NCCL versions aren't compatible with your current system setup, Docker can be a helpful alternative.
 This approach standardizes versions for CUDA, NCCL, CUDNN, and Python, reducing dependency issues and simplifying setup. 
