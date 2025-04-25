@@ -23,6 +23,11 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
+def ca_ctx():
+    # Compiled Autograd's config API doesn't work for mm_backward_op's torch.compile call,
+    # directly use context manager instead. Tracked in https://github.com/pytorch/pytorch/issues/152219.
+    return torch._dynamo.compiled_autograd._enable(torch.compile)
+
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
     @torch.compile
@@ -544,6 +549,12 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
+def ar_hook(param):
+    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+
+for param in model.parameters():
+    param.register_post_accumulate_grad_hook(ar_hook)
+
 model: nn.Module = torch.compile(model, dynamic=False)
 
 ########################################
@@ -556,9 +567,8 @@ initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 for _ in range(warmup_steps):
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
-    model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
-    for param in model.parameters():
-        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+    with ca_ctx():
+        model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
@@ -615,9 +625,8 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
-    for param in model.parameters():
-        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+    with ca_ctx():
+        model(inputs, targets, get_window_size_blocks(step)).backward()
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
