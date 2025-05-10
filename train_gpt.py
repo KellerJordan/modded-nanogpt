@@ -1,7 +1,6 @@
-import os
-import sys
-with open(sys.argv[0]) as f:
+with open(__file__) as f:
     code = f.read() # read the code of this file ASAP, for logging
+import os
 import uuid
 import time
 import copy
@@ -456,6 +455,7 @@ class Hyperparameters:
     save_checkpoint = False
 args = Hyperparameters()
 
+run_id = int(os.environ.get("RUN_ID", 0))
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
@@ -468,30 +468,52 @@ dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 # begin logging
-logfile = None
-if master_process:
-    run_id = uuid.uuid4()
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{run_id}.txt"
-    print(logfile)
 def print0(s, console=False):
     if master_process:
         with open(logfile, "a") as f:
             if console:
                 print(s)
             print(s, file=f)
+def patch_trace():
+    import torch._inductor.codecache
+    import torch._inductor.graph
+    from torch._logging._internal import trace_structured
+    def _patched_trace_structured(name, *args, **kwargs):
+        if name == "inductor_output_code":
+            match args, kwargs:
+                case (metadata_fn, *_), _:
+                    filename = metadata_fn().get("filename", "Unknown")
+                case _, {"metadata_fn": metadata_fn}:
+                    filename = metadata_fn().get("filename", "Unknown")
+                case _:
+                    filename = "Unknown"
+            print0(f"inductor_output_code: {filename}")
+        trace_structured(name, *args, **kwargs)
+    torch._inductor.codecache.trace_structured = _patched_trace_structured
+    torch._inductor.graph.trace_structured = _patched_trace_structured
+if master_process:
+    run_id_full = f"{run_id:03d}_{uuid.uuid4()}"
+    os.makedirs("logs", exist_ok=True)
+    logfile = f"logs/{run_id_full}.txt"
+    patch_trace()
 
 # begin by printing this file (the Python code)
 print0(code)
 print0("="*100)
-# log information about the hardware/software environment this is running on
-print0(f"Running Python {sys.version}")
-print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
-def nvidia_smi():
-    import subprocess  # avoid top level import
-    return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
-print0(nvidia_smi())
-print0("="*100)
+def log_env(): # log information about the hardware/software environment this is running on
+    import contextlib
+    import importlib.metadata
+    import subprocess
+    import sys
+    print0(f"Running Python {sys.version}")
+    print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda} and NCCL {torch.cuda.nccl.version()}")
+    print0("Python Package Version:")
+    for pkg in ("torch", "nvidia-nccl-cu12", "nvidia-cudnn-cu12", "nvidia-cublas-cu12", "nvidia-cuda-runtime-cu12"):
+        with contextlib.suppress(importlib.metadata.PackageNotFoundError):
+            print0(f"    {pkg}: {importlib.metadata.version(pkg)}")
+    print0(subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout)
+    print0("="*100)
+log_env()
 
 ########################################
 #    Construct model and optimizer     #
