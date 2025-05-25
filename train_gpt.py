@@ -312,7 +312,7 @@ class Block(nn.Module):
         return x
 
 # -----------------------------------------------------------------------------
-# custom buckets for efficient allreduce
+# custom grad buckets for efficient all_reduce @KonstantinWilleke
 def initialize_buckets(parameters, bucket_size_bytes):
     buckets, current_bucket, current_size = [], [], 0
     for param in parameters:
@@ -353,7 +353,6 @@ def reduce_gradients(bucket_data):
         handle = dist.all_reduce(flat_buffer, op=dist.ReduceOp.AVG, async_op=True)
         handles.append((handle, i))
     return handles
-
 
 def unpack_gradients(bucket_data, handles):
     bucket_info, flat_buffers = bucket_data['bucket_info'], bucket_data['flat_buffers']
@@ -576,8 +575,8 @@ for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
-# init the gradient buckets
-gradient_buckets = initialize_buckets(model.parameters(), 64.0 * 1024**2) # 128MB buckets
+# initialize custom gradient buckets @KonstantinWilleke
+gradient_buckets = initialize_buckets(model.parameters(), 64.0 * 1024**2) # optimal bucket size for H100NVL @KonstantinWilleke
 
 # learning rate schedule: stable then decay
 def get_lr(step: int):
