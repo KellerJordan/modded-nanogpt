@@ -17,7 +17,15 @@ This improvement in training speed has been brought about by the following techn
 * Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
 * FlexAttention with long-short sliding window attention pattern (inspired by Gemma 2) and window size warmup
 
-Contributors list (growing with each new record): [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan), [@fernbear.bsky.social](https://bsky.app/profile/fernbear.bsky.social), [@Grad62304977](https://x.com/Grad62304977), [@jxbz](https://x.com/jxbz), [@kellerjordan0](https://x.com/kellerjordan0), [@KoszarskyB](https://x.com/KoszarskyB), [@leloykun](https://x.com/@leloykun), [@YouJiacheng](https://x.com/YouJiacheng), [@jadenj3o](https://x.com/jadenj3o)
+Contributors list (growing with each new record): [@bozavlado](https://x.com/bozavlado); [@brendanh0gan](https://x.com/brendanh0gan);
+[@fernbear.bsky.social](https://bsky.app/profile/fernbear.bsky.social); [@Grad62304977](https://x.com/Grad62304977); 
+[@jxbz](https://x.com/jxbz); [@kellerjordan0](https://x.com/kellerjordan0);
+[@KoszarskyB](https://x.com/KoszarskyB); [@leloykun](https://x.com/@leloykun);
+[@YouJiacheng](https://x.com/YouJiacheng); [@jadenj3o](https://x.com/jadenj3o);
+Enigma Project: [@KonstantinWilleke](https://github.com/KonstantinWilleke), [@alexrgilbert](https://github.com/alexrgilbert), [@adricarda](https://github.com/adricarda),
+[@tuttyfrutyee](https://github.com/tuttyfrutyee), [@vdlad](https://github.com/vdlad); 
+[@ryanyang0](https://x.com/ryanyang0)
+
 
 ---
 
