@@ -22,7 +22,7 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@jxbz](https://x.com/jxbz); [@kellerjordan0](https://x.com/kellerjordan0);
 [@KoszarskyB](https://x.com/KoszarskyB); [@leloykun](https://x.com/@leloykun);
 [@YouJiacheng](https://x.com/YouJiacheng); [@jadenj3o](https://x.com/jadenj3o);
-Enigma Project: [@KonstantinWilleke](https://github.com/KonstantinWilleke), [@alexrgilbert](https://github.com/alexrgilbert), [@adricarda](https://github.com/adricarda),
+[@KonstantinWilleke](https://github.com/KonstantinWilleke), [@alexrgilbert](https://github.com/alexrgilbert), [@adricarda](https://github.com/adricarda),
 [@tuttyfrutyee](https://github.com/tuttyfrutyee), [@vdlad](https://github.com/vdlad); 
 [@ryanyang0](https://x.com/ryanyang0)
 
