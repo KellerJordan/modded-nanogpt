@@ -105,7 +105,7 @@ mm_op.register_autograd(backward, setup_context=setup_context)
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
-@torch.compile(mode="reduce-overhead", fullgraph=True, dynamic=False)
+@torch.compile
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
@@ -118,7 +118,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
     assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     a, b, c = (3.4445, -4.7750,  2.0315)
-    X = G.bfloat16()
+    X = G
     if G.size(-2) > G.size(-1):
         X = X.mT
 
@@ -132,7 +132,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
 
     if G.size(-2) > G.size(-1):
         X = X.mT
-    return X.type_as(G)
+    return X
 
 class Muon(torch.optim.Optimizer):
     """
@@ -196,7 +196,7 @@ class Muon(torch.optim.Optimizer):
                     p.mul_(1 - eff_weight_decay)
                     momentum_buffer.lerp_(grad, 1 - momentum)
                     grad = grad.lerp_(momentum_buffer, momentum)
-                    v = zeropower_via_newtonschulz5(grad, 5)
+                    v = zeropower_via_newtonschulz5(grad.bfloat16(), 5)
                     p.add_(other=v, alpha=-eff_lr)
                 idx += 1
                 futures.append(dist.all_gather(params_pad[base_i:base_i + self.world_size], params_pad[base_i + self.rank], async_op=True).get_future())
@@ -220,6 +220,7 @@ class DistAdam(torch.optim.Optimizer):
             ))
         super().__init__(param_groups, defaults)
 
+    @torch.compile
     @torch.no_grad()
     def step(self):
         futures: list[torch.Future] = []
@@ -308,7 +309,7 @@ class CastedLinear(nn.Linear):
             out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
             return out.reshape(*x.shape[:-1], -1)
         else:
-            return F.linear(x, self.weight)
+            return F.linear(x, self.weight.type_as(x))
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -350,7 +351,7 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor, ve: Tensor | None, lambdas: Tensor, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         if ve is not None:
@@ -651,7 +652,7 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
-model: nn.Module = torch.compile(model, mode="reduce-overhead", fullgraph=True, dynamic=False)
+model: nn.Module = torch.compile(model, dynamic=False)
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 warmup_steps = 10
@@ -660,10 +661,7 @@ initial_state = dict(model=copy.deepcopy(model.state_dict()),
 train_loader = distributed_data_generator(args.train_files, world_size * args.seq_len, rank, world_size)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
-    torch.compiler.cudagraph_mark_step_begin()
-    with autocast(device_type="cuda", dtype=torch.bfloat16):
-        loss = model(inputs, targets, get_window_size_blocks(1))
-    loss.backward()
+    model(inputs, targets, get_window_size_blocks(1)).backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
@@ -672,11 +670,8 @@ torch.cuda.synchronize()
 dist.barrier()
 with torch.profiler.profile() as prof:
     for _ in range(warmup_steps):
-        torch.compiler.cudagraph_mark_step_begin()
         inputs, targets = next(train_loader)
-        with autocast(device_type="cuda", dtype=torch.bfloat16):
-            loss = model(inputs, targets, get_window_size_blocks(1))
-        loss.backward()
+        model(inputs, targets, get_window_size_blocks(1)).backward()
         for opt in optimizers:
             opt.step()
     model.zero_grad(set_to_none=True)
@@ -699,7 +694,6 @@ t0 = time.perf_counter()
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
-    torch.compiler.cudagraph_mark_step_begin()
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         # stop the clock
@@ -714,8 +708,7 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets = next(val_loader)
-                with autocast(device_type="cuda", dtype=torch.bfloat16):
-                    val_loss += model(inputs, targets, get_window_size_blocks(step))
+                val_loss += model(inputs, targets, get_window_size_blocks(step))
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -737,9 +730,7 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    with autocast(device_type="cuda", dtype=torch.bfloat16):
-        loss = model(inputs, targets, get_window_size_blocks(step))
-    loss.backward()
+    model(inputs, targets, get_window_size_blocks(step)).backward()
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
