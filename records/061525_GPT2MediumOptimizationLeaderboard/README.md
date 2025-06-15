@@ -1,10 +1,12 @@
 # NanoGPT-Medium optimizer leaderboard
 
-In which we collaboratively find the best hyperparameters for various optimizers.
+The goal of the NanoGPT-Medium speedrun is to minimize the amount of wallclock time required to train a model that attains 2.92 validation loss on FineWeb.
+The competitive process of improving this speedrun has generated a high-quality training algorithm.
 
-For each optimizer, the goal is to find hyperparameters which minimize the number of steps required to attain the target of 2.92 validation loss.
+In this sub-leaderboard we will use this high-quality, easily-accessible, and fast-to-run training algorithm as the foundation to compare various optimizers.
+We will freeze the NanoGPT-Medium speedrun at its current record (held by @jadenj3o as of 06/15/25), and then collaboratively/competitively search for the best hyperparameters for each optimizer of interest.
 
-The underlying training algorithm shall be fixed to the NanoGPT-Medium speedrun record from 04/22/25.
+The target remains the same as in the speedrun: 2.92 validation loss on the FineWeb validation set. However, here we will mainly focus on the steps required to reach that goal rather than the wallclock time, in order not to create a level playing field to study purely the training speed of different optimizers.
 
 Optimizer | Best hparams | log | Steps to 2.92
 --- | --- | --- | ---
