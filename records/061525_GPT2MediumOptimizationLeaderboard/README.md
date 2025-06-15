@@ -6,7 +6,7 @@ The competitive process of improving this speedrun has generated a high-quality 
 In this sub-leaderboard we will use this high-quality, easily-accessible, and fast-to-run training algorithm as the foundation to compare various optimizers.
 We will freeze the NanoGPT-Medium speedrun at its current record (held by @jadenj3o as of 06/15/25), and then collaboratively/competitively search for the best hyperparameters for each optimizer of interest.
 
-The target remains the same as in the speedrun: 2.92 validation loss on the FineWeb validation set. However, here we will mainly focus on the steps required to reach that goal rather than the wallclock time, in order not to create a level playing field to study purely the training speed of different optimizers.
+The target remains the same as in the speedrun: 2.92 validation loss on the FineWeb validation set. However, here we will mainly focus on the steps required to reach that goal rather than the wallclock time.
 
 # Table of best currently known hyperparameters
 
