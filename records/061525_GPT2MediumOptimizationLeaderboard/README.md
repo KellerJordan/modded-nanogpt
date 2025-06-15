@@ -17,12 +17,6 @@ The target remains the same as in the speedrun: 2.92 validation loss on the Fine
 | [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo) | ? | ? | ? | ? | ? |
 
 
-
-Open bounties:
-- Find hparams for AdamW that yield at least 85% of the speed of Muon ($XXXX)
-- Find any optimizer with any hparams that yields 10% fewer steps-to-2.92 than Muon ($XXXX)
-
-
 # Record histories for each optimizer
 
 ## [Muon](https://kellerjordan.github.io/posts/muon/)
@@ -34,5 +28,4 @@ Open bounties:
 ## [AdamW](https://arxiv.org/abs/1711.05101)
 
 ## [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo)
-
 
