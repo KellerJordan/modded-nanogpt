@@ -8,7 +8,7 @@ We will freeze the NanoGPT-Medium speedrun at its current record (held by @jaden
 
 The target remains the same as in the speedrun: 2.92 validation loss on the FineWeb validation set. However, here we will mainly focus on the steps required to reach that goal rather than the wallclock time.
 
-# Table of best currently known hyperparameters
+## Table of best currently known hyperparameters
 
 | Optimizer | Steps to 2.92 | Wallclock | Hparam summary | Log | Contributors |
 | - | - | - | - | - | - |
@@ -20,7 +20,7 @@ The target remains the same as in the speedrun: 2.92 validation loss on the Fine
 | Lion | ? | ? | ? | ? | ? |
 
 
-# Record histories for each optimizer
+## Record histories for each optimizer
 
 ## [Muon](https://kellerjordan.github.io/posts/muon/)
 
