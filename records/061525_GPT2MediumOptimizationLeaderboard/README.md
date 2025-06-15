@@ -2,7 +2,7 @@
 
 In which we collaboratively find the best hyperparameters for various optimizers.
 
-For each optimizer, the goal is to find the hyperparameters that minimize the number of steps required to attain the target of 2.92 validation loss.
+For each optimizer, the goal is to find hyperparameters which minimize the number of steps required to attain the target of 2.92 validation loss.
 
 The underlying training algorithm shall be fixed to the NanoGPT-Medium speedrun record from 04/22/25.
 
