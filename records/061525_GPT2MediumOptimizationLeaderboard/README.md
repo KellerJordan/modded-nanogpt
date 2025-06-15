@@ -14,6 +14,6 @@ Optimizer | Best hparams | log | Steps to 2.92
 
 
 
-Open bounties:
+Open money-bounties:
 - Find hparams for AdamW that yield at least 85% of the speed of Muon ($XXXX)
 - Find any optimizer with any hparams that yields 10% fewer steps-to-2.92 than Muon ($XXXX)
