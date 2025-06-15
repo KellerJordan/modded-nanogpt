@@ -6,7 +6,7 @@ For each optimizer, the goal is to find the hyperparameters that minimize the nu
 
 The underlying training algorithm shall be fixed to the NanoGPT-Medium speedrun record from 04/22/25.
 
-Optimizer | Hparam summary | log | Steps to 2.92
+Optimizer | Best hparams | log | Steps to 2.92
 --- | --- | --- | ---
 [Muon](https://kellerjordan.github.io/posts/muon/) | lr=0.025, wd=0.01 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | 5960
 [AdamW](https://arxiv.org/abs/1711.05101) | ? | ? | ?
