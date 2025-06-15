@@ -23,7 +23,7 @@ Open money-bounties:
 - Find any optimizer with any hparams that yields 10% fewer steps-to-2.92 than Muon ($XXXX)
 
 
-# Per-optimizer record history
+# Record histories for each optimizer
 
 ## [Muon](https://kellerjordan.github.io/posts/muon/)
 
