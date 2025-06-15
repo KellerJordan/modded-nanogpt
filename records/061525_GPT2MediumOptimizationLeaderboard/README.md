@@ -1,4 +1,4 @@
-# NanoGPT-Medium speedrun optimization leaderboard
+# NanoGPT-Medium optimizer leaderboard
 
 In which we collaboratively find the best hyperparameters for various optimizers.
 
