@@ -27,9 +27,9 @@ Open money-bounties:
 
 ## [Muon](https://kellerjordan.github.io/posts/muon/)
 
-| # | Steps to 2.92 | hparam summary | log | contributors |
-| - | - | - | - | - |
-| 1 | 5960 | lr=0.025, wd=0.01 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj3o |
+| # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
+| - | - | - | - | - | - |
+| 1 | 5960 | lr=0.025, wd=0.01 | 04/22/25 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj3o |
 
 ## [AdamW](https://arxiv.org/abs/1711.05101)
 
