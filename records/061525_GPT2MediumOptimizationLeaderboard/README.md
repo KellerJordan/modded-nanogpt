@@ -10,7 +10,7 @@ Our goal is then to collaboratively/competitively search for the hyperparameters
 
 The target remains the same as in the speedrun: 2.92 validation loss on the FineWeb validation set. However, here we will focus only on the steps required to reach that goal rather than the wallclock time.
 
-Hopefully, this leaderboard can reveal a portion of the truth of which optimizers are effective.
+Hopefully, this leaderboard can reveal a portion of the truth of which optimizers are effective for training neural networks.
 
 ## Rules
 
