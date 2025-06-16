@@ -11,7 +11,7 @@ The goal is to attain the fastest performance that can be realized with each opt
 
 The target remains the same as in the speedrun: 2.92 validation loss on the FineWeb validation set. However, here we will mainly focus on the steps required to reach that goal rather than the wallclock time.
 
-## Submission rules
+## Rules
 
 Records submissions are not allowed to modify the architecture or data pipeline.
 
