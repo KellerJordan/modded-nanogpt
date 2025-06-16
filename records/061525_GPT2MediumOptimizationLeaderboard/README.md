@@ -10,6 +10,8 @@ Our goal is then to collaboratively/competitively search for the hyperparameters
 
 The target remains the same as in the speedrun: 2.92 validation loss on the FineWeb validation set. However, here we will focus only on the steps required to reach that goal rather than the wallclock time.
 
+Hopefully, we will reveal a portion of the truth of which optimizers are effective.
+
 ## Rules
 
 - Each optimizer will have its own sequence of records.
