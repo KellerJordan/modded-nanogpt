@@ -42,7 +42,7 @@ and add a warmup using `if step < 500: return step / 500` in `get_lr()`.
 
 
 
-## Response to some possible critiques
+## Response to a possible critique
 
 Critique: "The idea of SOTA in “optimization” is b.s. When the architecture changes we may get need different optimization algorithms." (this is quoted from a researcher on Twitter)
 
