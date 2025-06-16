@@ -1,6 +1,6 @@
 # Optimization leaderboard for the NanoGPT-medium speedrun
 
-The goal of this leaderboard is to collaboratively/competitively search for best optimizer for the NanoGPT-medium speedrun record. Unlike the main speedrun which seeks to minimize wallclock by any means necessary, here we will try to minimize step count while fixing the architecture and data pipelines.
+The goal of this leaderboard is to collaboratively/competitively search for best optimizer for the NanoGPT-medium speedrun record. Unlike the main speedrun which seeks to minimize wallclock by any means necessary, here we will try to minimize step count by modifying only the optimizer.
 
 The foundation will be the current (as of 06/15/25) NanoGPT-medium speedrun record, which is held by @jadenj3o.
 Entries in this leaderboard cannot modify the architecture or data pipelines of this record; instead they must try to reduce the steps needed to reach the target loss
