@@ -6,7 +6,7 @@ The goal of this leaderboard is to collaboratively/competitively search for best
 
 - Each optimizer will have its own history of records. We are interested in finding the best setting for each optimizer, in order to help the community make a fair comparisons and find good new optimizers.
 - The foundation of all runs in this leaderboard will be the NanoGPT-medium record from 04/22/25 which is held by @jadenj3o. New runs must not modify the main speedrun's architecture or data pipeline; in particular the batch size should stay the same.
-- New runs can use any optimizer. They will be considered a new record for their respective optimizer if they attain a faster steps-to-target than the previous best.
+- New runs can use any optimizer. They will be considered a new record for their respective optimizer if they attain a faster steps-to-target than the previous record.
 
 ## Best currently known hyperparameters for each optimizer
 
