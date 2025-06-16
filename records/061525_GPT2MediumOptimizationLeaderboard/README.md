@@ -5,9 +5,8 @@ The goal of the NanoGPT-Medium speedrun is to minimize the wallclock time needed
 The competitive process of improving this speedrun over time has generated a high-quality baseline training algorithm.
 
 In this sub-leaderboard we will use this training algorithm as an open source foundation to compare optimizers.
-In particular, we freeze the NanoGPT-medium speedrun at its 04/22/25 record (held by @jadenj3o) and then our goal will be to collaboratively/competitively search for the best hyperparameters for each optimizer of interest.
-
-The goal is to attain the fastest performance that can be realized with each optimizer.
+In particular, we freeze the NanoGPT-medium speedrun at its 04/22/25 record (held by @jadenj3o).
+Our goal is then to collaboratively/competitively search for the hyperparameters that yield the fastest performance from each optimizer on top of this foundation.
 
 The target remains the same as in the speedrun: 2.92 validation loss on the FineWeb validation set. However, here we will mainly focus on the steps required to reach that goal rather than the wallclock time.
 
