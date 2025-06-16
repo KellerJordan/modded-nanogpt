@@ -15,7 +15,7 @@ Hopefully, this leaderboard can reveal a portion of the truth of which optimizer
 ## Rules
 
 - Each optimizer will have its own sequence of records.
-- Records are not allowed to modify the speedrun's architecture or data pipeline. In particular the batch size should stay the same as in the baseline.
+- Records are not allowed to modify the speedrun's architecture or data pipeline. In particular the batch size should stay the same as in the speedrun.
 - Submissions can use any optimizer. They will be considered a new record for that optimizer if they attain a faster steps-to-target than the previous best for that optimizer.
 
 ## Table of best currently known hyperparameters
