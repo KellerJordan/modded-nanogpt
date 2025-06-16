@@ -1,5 +1,13 @@
 # Optimization leaderboard for the NanoGPT-medium speedrun
 
+The goal of this leaderboard is to collaboratively/competitively search for the best hyperparameters for each optimizer, so that the community can get a fair comparison between them and find good new optimizers.
+
+The foundation of this leaderboard will be the current (as of 06/15/25) NanoGPT-medium speedrun record, which is held by @jadenj3o.
+Entries in this leaderboard cannot modify the architecture or data pipelines of this record; instead they must try to reduce the steps needed to reach the target loss
+by replacing the optimizer and tuning the hyperparameters.
+
+----
+
 The goal of the NanoGPT-Medium speedrun is to minimize the wallclock time needed to train a model that attains 2.92 validation loss on FineWeb
 (this target was chosen because it's the loss attained by Andrej Karpathy's medium-scale NanoGPT).
 The competitive process of improving this speedrun over time has generated a high-quality baseline training algorithm.
