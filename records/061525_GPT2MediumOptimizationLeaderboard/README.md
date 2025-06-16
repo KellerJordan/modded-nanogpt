@@ -4,7 +4,7 @@ The goal of this leaderboard is to collaboratively/competitively search for best
 
 ## Rules
 
-- Each optimizer will have its own history of records. We are interested in finding the best setting for each optimizer, in order to make a fair comparison between them.
+- Each optimizer will have its own history of records. We are interested in finding the best setting for each optimizer, in order to help the community make a fair comparison between them and find good new optimizers.
 - Records are not allowed to modify the speedrun's architecture or data pipeline. In particular the batch size should stay the same as in the speedrun.
 - Submissions can use any optimizer. They will be considered a new record for their respective optimizer if they attain a faster steps-to-target than the previous best.
 
