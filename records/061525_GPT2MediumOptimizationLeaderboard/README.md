@@ -8,7 +8,7 @@ In this sub-leaderboard we will use this training algorithm as an open source fo
 In particular, we freeze the NanoGPT-medium speedrun at its 04/22/25 record (held by @jadenj3o).
 Our goal is then to collaboratively/competitively search for the hyperparameters that yield the fastest performance from each optimizer on top of this foundation.
 
-The target remains the same as in the speedrun: 2.92 validation loss on the FineWeb validation set. However, here we will mainly focus on the steps required to reach that goal rather than the wallclock time.
+The target remains the same as in the speedrun: 2.92 validation loss on the FineWeb validation set. However, here we will focus only on the steps required to reach that goal rather than the wallclock time.
 
 ## Rules
 
