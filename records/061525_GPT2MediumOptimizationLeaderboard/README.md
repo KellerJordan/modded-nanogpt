@@ -16,7 +16,7 @@ Hopefully, this leaderboard can reveal a portion of the truth of which optimizer
 
 - Each optimizer will have its own history of records. We are interested in finding the best setting for each optimizer, in order to make a fair comparison between them.
 - Records are not allowed to modify the speedrun's architecture or data pipeline. In particular the batch size should stay the same as in the speedrun.
-- Submissions can use any optimizer. They will be considered a new record if they attain a faster steps-to-target than the previous best for their respective optimizer.
+- Submissions can use any optimizer. They will be considered a new record for their respective optimizer if they attain a faster steps-to-target than the previous best.
 
 ## Best currently known hyperparameters for each optimizer
 
