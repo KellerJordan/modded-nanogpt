@@ -13,7 +13,7 @@ The target remains the same as in the speedrun: 2.92 validation loss on the Fine
 
 ## Rules
 
-- Each optimizer will have its own record history table.
+- Each optimizer will have its own sequence of records.
 - Records are not allowed to modify the architecture or data pipeline. In particular the batch size should stay the same as in the baseline.
 - Submissions can use any optimizer. They will be considered a new record for that optimizer if they attain a faster steps-to-target than the previous best for that optimizer.
 
