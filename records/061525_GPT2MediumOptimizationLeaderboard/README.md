@@ -30,4 +30,8 @@ The target remains the same as in the speedrun: 2.92 validation loss on the Fine
 
 ### [AdamW](https://arxiv.org/abs/1711.05101)
 
+| # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
+| - | - | - | - | - | - |
+| 1 | 10500 | lr=0.0015, wd=0.125, warmup_steps=500 | 06/15/25 | ? | @kellerjordan0 |
+
 ### [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo)
