@@ -18,6 +18,7 @@ The target remains the same as in the speedrun: 2.92 validation loss on the Fine
 | PSGD Kron | ? | ? | ? | ? | ? |
 | Sophia | ? | ? | ? | ? | ? |
 | Lion | ? | ? | ? | ? | ? |
+| ? | ? | ? | ? | ? | ? |
 
 
 ## Record histories for each optimizer
