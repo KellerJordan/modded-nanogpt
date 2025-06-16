@@ -11,6 +11,12 @@ The goal is to attain the fastest performance that can be realized with each opt
 
 The target remains the same as in the speedrun: 2.92 validation loss on the FineWeb validation set. However, here we will mainly focus on the steps required to reach that goal rather than the wallclock time.
 
+## Rules
+
+Records submissions are not allowed to modify the architecture or data pipeline.
+
+Submissions can use any optimizer. They will be considered a new record if they attain a lower steps-to-target than the previous best submission for their respective optimizer.
+
 ## Table of best currently known hyperparameters
 
 | Optimizer | Steps to 2.92 | Wallclock | Hparam summary | Log | Contributors |
