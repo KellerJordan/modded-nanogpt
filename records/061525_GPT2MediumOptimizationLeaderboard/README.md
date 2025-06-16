@@ -18,7 +18,7 @@ Hopefully, this leaderboard can reveal a portion of the truth of which optimizer
 - Records are not allowed to modify the speedrun's architecture or data pipeline. In particular the batch size should stay the same as in the speedrun.
 - Submissions can use any optimizer. They will be considered a new record if they attain a faster steps-to-target than the previous best for their respective optimizer.
 
-## Table of current records for each optimizer
+## Best currently known hyperparameters for each optimizer
 
 | Optimizer | Steps to 2.92 | Hparam summary | Log | Contributors |
 | - | - | - | - | - |
