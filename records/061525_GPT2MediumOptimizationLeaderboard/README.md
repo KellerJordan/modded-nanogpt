@@ -13,7 +13,7 @@ The target remains the same as in the speedrun: 2.92 validation loss on the Fine
 
 ## Rules
 
-Records submissions are not allowed to modify the architecture or data pipeline.
+Records submissions are not allowed to modify the architecture or data pipeline (in particular the batch size should stay the same).
 
 Submissions can use any optimizer. They will be considered a new record if they attain a lower steps-to-target than the previous best submission for their respective optimizer.
 
