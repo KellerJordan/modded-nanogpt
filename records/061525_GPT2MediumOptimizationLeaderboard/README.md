@@ -1,6 +1,7 @@
 # NanoGPT-medium speedrun optimization leaderboard
 
-The goal of the NanoGPT-Medium speedrun is to minimize the amount of wallclock time required to train a model that attains 2.92 validation loss on FineWeb.
+The goal of the NanoGPT-Medium speedrun is to minimize the amount of wallclock time required to train a model that attains 2.92 validation loss on FineWeb
+(this target was chosen because it's the loss attained by Andrej Karpathy's medium-scale NanoGPT).
 The competitive process of improving this speedrun has generated a high-quality baseline training algorithm.
 
 In this sub-leaderboard we will use this trainer as a foundation to compare various optimizers.
