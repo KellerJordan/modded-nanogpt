@@ -17,8 +17,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-torch._inductor.config.coordinate_descent_tuning = True # we allow this flag for medium track
-torch._dynamo.config.compiled_autograd = True
+from kron_torch import Kron
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -435,7 +434,7 @@ adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_param
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
+optimizer2 = Kron(hidden_matrix_params, lr=0.0005, weight_decay=3*0.125)
 optimizers: list[torch.optim.Optimizer] = [optimizer1, optimizer2]
 def opt_params(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
     return [p for group in opt.param_groups for p in group["params"]]
