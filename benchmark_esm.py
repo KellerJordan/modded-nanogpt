@@ -20,6 +20,7 @@ def main():
         print(data)
         sequences = data['sequence']
         sequences = sorted(sequences, key=len, reverse=True)
+        sequences = sequences[:10]
         print(sequences[-1])
         total_tokens = sum(len(seq) for seq in sequences)
         print(f"Total tokens: {total_tokens}")
@@ -27,15 +28,15 @@ def main():
         # Load the ESM tokenizer and model
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model_names = {
-            'facebook/esm2_t6_8M_UR50D': 'ESM2-8M',
-            'facebook/esm2_t12_35M_UR50D': 'ESM2-35M',
+            #'facebook/esm2_t6_8M_UR50D': 'ESM2-8M',
+            #'facebook/esm2_t12_35M_UR50D': 'ESM2-35M',
             'Synthyra/ESMplusplus_small': 'ESMC-300M',
-            'facebook/esm2_t30_150M_UR50D': 'ESM2-150M',
-            'Synthyra/ESMplusplus_large': 'ESMC-600M',
-            'facebook/esm2_t33_650M_UR50D': 'ESM2-650M'
+            #'facebook/esm2_t30_150M_UR50D': 'ESM2-150M',
+            #'Synthyra/ESMplusplus_large': 'ESMC-600M',
+            #'facebook/esm2_t33_650M_UR50D': 'ESM2-650M'
         }
 
-        mask_rate, batch_size = 0.15, 4
+        mask_prob, keep_replace_prob, batch_size = 0.15, 0.1, 4
         results = []
         for model_name, nickname in model_names.items():
             torch.manual_seed(42)
@@ -45,7 +46,8 @@ def main():
             else:
                 model = EsmForMaskedLM.from_pretrained(model_name).to(device).eval()
                 tokenizer = EsmTokenizer.from_pretrained(model_name)
-            masker = ProteinMasker(tokenizer, mask_rate)
+            
+            masker = ProteinMasker(tokenizer)
             total_loss, count = 0.0, 0
             all_true, all_pred = [], []
             
@@ -54,7 +56,7 @@ def main():
                     batch = sequences[i:i+batch_size]
                     encoding = tokenizer(batch, return_tensors='pt', padding=True, add_special_tokens=True, truncation=True, max_length=1024)
                     input_ids, attention_mask = encoding['input_ids'].to(device), encoding['attention_mask'].to(device)
-                    masked_input_ids, labels = masker(input_ids)
+                    masked_input_ids, labels = masker(input_ids, mask_prob, keep_replace_prob)
 
                     out = model(input_ids=masked_input_ids, attention_mask=attention_mask, labels=labels)
                     logits, loss = out.logits, out.loss
