@@ -44,7 +44,7 @@ and add a warmup using `if step < 500: return step / 500` in `get_lr()`.
 
 | # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
 | - | - | - | - | - | - |
-| 1 | 9000 | lr=.0005, wd=.625 | 06/15/25 | ? | @kellerjordan0 |
+| 1 | 9000 | lr=.0005, wd=.625 | 06/19/25 | ? | @kellerjordan0 |
 
 Precise steps to reproduce #1: Install and import `Kron`, then replace `optimizer2` with `Kron(hidden_matrix_params, lr=.0005, weight_decay=.625)`. Adding lr warmup does not seem to be needed.
 
