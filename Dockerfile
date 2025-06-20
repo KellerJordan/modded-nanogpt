@@ -35,7 +35,7 @@ COPY requirements.txt .
 RUN pip install --upgrade pip setuptools
 
 # PyTorch is already installed in the base image, but upgrade if needed
-RUN pip install --upgrade torch torchvision
+RUN pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu126
 
 # Install requirements
 RUN pip install -r requirements.txt
