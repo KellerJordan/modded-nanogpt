@@ -22,8 +22,8 @@ RUN curl -O https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_
     cd .. && \
     rm -rf Python-${PYTHON_VERSION} Python-${PYTHON_VERSION}.tgz
 
-RUN ln -s /usr/local/bin/python3.12 /usr/local/bin/python && \
-    ln -s /usr/local/bin/pip3.12 /usr/local/bin/pip
+RUN ln -s /usr/local/bin/python3.10 /usr/local/bin/python && \
+    ln -s /usr/local/bin/pip3.10 /usr/local/bin/pip
 
 # Set working directory
 WORKDIR /app
