@@ -47,7 +47,8 @@ and add a warmup using `if step < 500: return step / 500` in `get_lr()`.
 | - | - | - | - | - | - |
 | 1 | 9000 | lr=.0005, wd=.625, bf16 weights | 06/19/25 | ? | @kellerjordan0 |
 
-Precise steps to reproduce #1: Install and import `Kron`, then replace `optimizer2` with `Kron(hidden_matrix_params, lr=.0005, weight_decay=.625)`. Adding lr warmup does not seem to be needed.
+Precise steps to reproduce:
+* #1: Install and import `Kron`, then replace `optimizer2` with `Kron(hidden_matrix_params, lr=.0005, weight_decay=.625)` in the `train_gpt_medium.py` of the main folder. Note: Adding lr warmup does not seem to be needed.
 
 ## Response to a possible critique
 
