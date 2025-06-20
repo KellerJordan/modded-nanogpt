@@ -8,7 +8,7 @@ from datasets import Dataset
 from functools import partial
 from transformers import EsmTokenizer
 from huggingface_hub import hf_hub_download
-from model import ESM
+from model.model import ESM
 
 
 def parse_args():
