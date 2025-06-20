@@ -38,8 +38,6 @@ The goal of this leaderboard is to collaboratively/competitively search for best
 Precise steps to reproduce #1: Replace `optimizer2` with `AdamW(hidden_matrix_params, lr=0.0015, weight_decay=0.125, betas=(0.9, 0.95), eps=1e-10)`
 and add a warmup using `if step < 500: return step / 500` in `get_lr()`.
 
-### [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo)
-
 ### [PSGD Kron](https://github.com/evanatyourservice/kron_torch)
 
 | # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
