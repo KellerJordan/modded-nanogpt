@@ -4,7 +4,7 @@
 # ./run.sh
 
 # Build the Docker image
-docker build -t speedrun_plm .
+sudo docker build -t speedrun_plm .
 
 # Run the Docker container with GPU support and volume mounts
-docker run --gpus all -v $(pwd)/data:/app/data -v $(pwd)/results:/app/results -v $(pwd)/logs:/app/logs speedrun_plm python train_plm.py
+sudo docker run --gpus all -v $(pwd)/data:/app/data -v $(pwd)/results:/app/results -v $(pwd)/logs:/app/logs speedrun_plm python train_plm.py
