@@ -33,8 +33,8 @@ The goal of this leaderboard is to collaboratively/competitively find good optim
 
 | # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
 | - | - | - | - | - | - |
-| 1 | 10500 | lr=0.0015, wd=0.125, warmup_steps=500 | 06/15/25 | ? | @kellerjordan0 |
-| 2 | 9500 | lr=0.0015, wd=0.125, warmup_steps=500, fp32 master weights | 06/19/25 | ? | @kellerjordan0 |
+| 1 | 10500 | lr=0.0015, wd=0.125, warmup_steps=500, bf16 weights | 06/15/25 | ? | @kellerjordan0 |
+| 2 | 9500 | lr=0.0015, wd=0.125, warmup_steps=500 | 06/19/25 | ? | @kellerjordan0 |
 
 Precise steps to reproduce:
 * #1: In the main `train_gpt_medium.py`, replace `optimizer2` with `AdamW(hidden_matrix_params, lr=0.0015, weight_decay=0.125, betas=(0.9, 0.95), eps=1e-10)`
@@ -45,7 +45,7 @@ and add a warmup using `if step < 500: return step / 500` in `get_lr()`.
 
 | # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
 | - | - | - | - | - | - |
-| 1 | 9000 | lr=.0005, wd=.625 | 06/19/25 | ? | @kellerjordan0 |
+| 1 | 9000 | lr=.0005, wd=.625, bf16 weights | 06/19/25 | ? | @kellerjordan0 |
 
 Precise steps to reproduce #1: Install and import `Kron`, then replace `optimizer2` with `Kron(hidden_matrix_params, lr=.0005, weight_decay=.625)`. Adding lr warmup does not seem to be needed.
 
