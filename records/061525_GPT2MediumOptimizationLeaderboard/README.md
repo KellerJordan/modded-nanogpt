@@ -15,7 +15,7 @@ The goal of this leaderboard is to collaboratively/competitively find good optim
 | Muon w/ 2x MLP wd | 5960 | lr=.025, wd=.01, double wd for MLP | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj30 et al. |
 | [Muon](https://kellerjordan.github.io/posts/muon/) | 6125 | lr=.025, wd=.01 | ? | @kellerjordan0 |
 | [AdamW](https://arxiv.org/abs/1711.05101) | 9500 | lr=.0015, wd=.125, warmup_steps=500 | ? | @kellerjordan0 |
-| [PSGD Kron](https://github.com/evanatyourservice/kron_torch) | 9000 | lr=.0005, wd=.625 | ? | @kellerjordan0 |
+| [PSGD Kron](https://github.com/evanatyourservice/kron_torch) | 7875 | lr=.0005, wd=.625 | ? | @kellerjordan0 |
 | [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo) | ? | ? | ? | ? | ? |
 | Sophia | ? | ? | ? | ? |
 | Lion | ? | ? | ? | ? |
@@ -57,9 +57,11 @@ and add a warmup using `if step < 500: return step / 500` in `get_lr()`.
 | # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
 | - | - | - | - | - | - |
 | 1 | 9000 | lr=.0005, wd=.625, bf16 weights | 06/19/25 | ? | @kellerjordan0 |
+| 2 | 9000 | lr=.0005, wd=.625 | 06/19/25 | ? | @kellerjordan0 |
 
 Precise steps to reproduce:
 * #1: Install and import `Kron`, then replace `optimizer2` with `Kron(hidden_matrix_params, lr=.0005, weight_decay=.625)` in the `train_gpt_medium.py` of the main folder. Note: Adding lr warmup does not seem to be needed.
+* #2: Same thing, but instead on top of the `train_gpt_medium.py` that's contained in this folder instead of the main folder. That way we get fp32 weights.
 
 ## Response to a possible critique
 
