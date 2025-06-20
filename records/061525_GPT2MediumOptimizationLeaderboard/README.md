@@ -40,7 +40,7 @@ and add a warmup using `if step < 500: return step / 500` in `get_lr()`.
 
 ### [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo)
 
-###[PSGD Kron](https://github.com/evanatyourservice/kron_torch)
+### [PSGD Kron](https://github.com/evanatyourservice/kron_torch)
 
 | # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
 | - | - | - | - | - | - |
