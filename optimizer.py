@@ -4,8 +4,7 @@ from torch import Tensor
 
 
 ### Muon optimizer
-@torch.compile
-def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
+def _zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -32,6 +31,16 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
+
+
+# Conditionally compile the function based on triton availability
+try:
+    # Test if triton is available by trying to compile a simple function
+    import triton
+    zeropower_via_newtonschulz5 = torch.compile(_zeropower_via_newtonschulz5)
+except (ImportError, RuntimeError):
+    # Fall back to the uncompiled version if triton is not available
+    zeropower_via_newtonschulz5 = _zeropower_via_newtonschulz5
 
 
 class Muon(torch.optim.Optimizer):
