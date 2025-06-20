@@ -21,6 +21,7 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
+@torch.compile
 def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
@@ -54,7 +55,6 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
         X = X.mT
     return X
 
-@torch.compile
 def muon_update(grad, momentum, beta=0.95, nesterov=True):
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
