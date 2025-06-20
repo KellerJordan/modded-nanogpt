@@ -148,7 +148,7 @@ def main(args):
     training_args = TrainingArguments(
         output_dir=args.save_path.split('/')[-1],
         overwrite_output_dir=True,
-        per_device_train_batch_size=args.batch_size,
+        per_device_train_batch_size=1,  # Each item from TokenBasedIterableDataset is already a complete batch
         per_device_eval_batch_size=args.batch_size,
         max_steps=args.max_steps,
         gradient_accumulation_steps=args.grad_accum,

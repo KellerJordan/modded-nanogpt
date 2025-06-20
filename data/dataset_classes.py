@@ -94,6 +94,8 @@ class TokenBasedSequenceCollator:
         self.eos_token = tokenizer.eos_token
 
     def __call__(self, batch: List[str]) -> Dict[str, torch.Tensor]:
+        if isinstance(batch[0], list):
+            batch = batch[0]
         seq = ''.join([self.cls_token + s + self.eos_token for s in batch])
         input_ids = self.tokenizer.encode(seq, add_special_tokens=False, return_tensors='pt')
         return {'input_ids':input_ids}
