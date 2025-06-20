@@ -5,7 +5,7 @@
 FROM nvidia/cuda:12.6.2-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHON_VERSION=3.12.7
+ENV PYTHON_VERSION=3.10.13
 ENV PATH=/usr/local/bin:$PATH
 
 RUN apt update && apt install -y --no-install-recommends build-essential libssl-dev zlib1g-dev \
