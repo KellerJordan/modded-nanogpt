@@ -104,7 +104,7 @@ class Muon(torch.optim.Optimizer):
                     if len(state) == 0:
                         state["momentum_buffer"] = torch.zeros_like(p)
                     update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"]) * getattr(p, "wd_mul", 1.0)  # <-- this is custom
+                    p.mul_(1 - group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0))  # <-- this is custom
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
 
