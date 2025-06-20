@@ -6,7 +6,7 @@ from datasets import Dataset
 from huggingface_hub import hf_hub_download
 from tqdm.auto import tqdm
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, matthews_corrcoef
-from utils import ProteinMasker
+from masker import ProteinMasker
 
 
 def main():
