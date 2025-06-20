@@ -30,11 +30,15 @@ The goal of this leaderboard is to collaboratively/competitively find good optim
 | - | - | - | - | - | - |
 | 1 | 5960 | lr=0.025, wd=0.01, double wd for MLP | 04/22/25 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj3o |
 
+Comment: This is just the NanoGPT-medium speedrun record as of 06/15/25.
+
 ### [Muon](https://kellerjordan.github.io/posts/muon/)
 
 | # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
 | - | - | - | - | - | - |
 | 1 | 6125 | lr=0.025, wd=0.01 | 06/19/25 | ? | @kellerjordan0 |
+
+Comment: We lose a ~165 steps by removing the custom weight decay settings from the speedrun.
 
 ### [AdamW](https://arxiv.org/abs/1711.05101)
 
