@@ -14,8 +14,8 @@ The goal of this leaderboard is to collaboratively/competitively search for best
 | - | - | - | - | - |
 | [Muon](https://kellerjordan.github.io/posts/muon/) | 5960 | lr=.025, wd=.01 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj30 |
 | [AdamW](https://arxiv.org/abs/1711.05101) | 10500 | lr=.0015, wd=.125, warmup_steps=500 | ? | @kellerjordan0 |
-| [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo) | ? | ? | ? | ? | ? |
 | [PSGD Kron](https://github.com/evanatyourservice/kron_torch) | 9000 | lr=.0005, wd=.625 | ? | @kellerjordan0 |
+| [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo) | ? | ? | ? | ? | ? |
 | Sophia | ? | ? | ? | ? |
 | Lion | ? | ? | ? | ? |
 | ? | ? | ? | ? | ? |
