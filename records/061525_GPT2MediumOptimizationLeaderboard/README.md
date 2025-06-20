@@ -39,7 +39,7 @@ The goal of this leaderboard is to collaboratively/competitively find good optim
 Precise steps to reproduce:
 * #1: In the main `train_gpt_medium.py`, replace `optimizer2` with `AdamW(hidden_matrix_params, lr=0.0015, weight_decay=0.125, betas=(0.9, 0.95), eps=1e-10)`
 and add a warmup using `if step < 500: return step / 500` in `get_lr()`.
-* #2: In the `train_gpt_medium.py` in this folder, which enables fp32 master weights for any optimizer, do the same thing.
+* #2: In the `train_gpt_medium.py` contained in this folder, which enables fp32 weights for any optimizer, do the same thing as above.
 
 ### [PSGD Kron](https://github.com/evanatyourservice/kron_torch)
 
