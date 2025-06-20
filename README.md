@@ -1,3 +1,15 @@
+# Speedrunning PLM Pretraining
+
+```console
+git clone https://github.com/Synthyra/SpeedrunningPLMs.git
+cd SpeedrunningPLMs
+chmod +x run.sh
+./run.sh
+```
+
+
+<details>
+<summary>Previous Speed runnning ESM2 repo readme with preliminary results</summary>
 # Replicating ESM2 at the speed of sound
 This repo is an open-source collaboration to reproduce ESM2 models with the same or less parameters in as little time as possible, inspired by the fantastic [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) repo. Mostly interested in 8xH100 or 1xH200 runs which are currently available through many vendors.
 
@@ -50,3 +62,9 @@ These match the [results](https://github.com/Synthyra/SpeedRunningESM2/pull/2#is
 |ESM2-150|132M      |9.00 hours |1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs/e631bf18-f202-492b-a3b8-fbae2cb7484a.txt)| 2.2137 | 2.2093 |
 |ESM2-650|132M      |45.16 hours|1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs/a0a3dc4e-6f27-43e0-96fb-b1c2372a164b.txt)| 2.1044 | 2.1058 |
 |ESMC-300|44M       |7.01 hours |4 x 4090 |[Link](https://gist.github.com/lapp0/8553e911c649eea11cc2d7426f26eab6)                                        | 2.1906 | NA     |
+
+
+</details>
+
+
+

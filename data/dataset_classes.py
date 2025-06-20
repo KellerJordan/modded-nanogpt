@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data import Dataset as TorchDataset
 from torch.utils.data import IterableDataset
-from typing import List, Tuple, Dict
+from typing import List, Dict
 
 
 class SequenceDatasetFromList(TorchDataset):
@@ -33,15 +33,12 @@ class IterableDatasetFromHF(IterableDataset):
 
 
 class SequenceCollator:
-    def __init__(self, tokenizer, max_length=512, **kwargs):
+    def __init__(self, tokenizer, **kwargs):
         self.tokenizer = tokenizer
-        self.max_length = max_length
+        self.cls_token = tokenizer.cls_token
+        self.eos_token = tokenizer.eos_token
 
-    def __call__(self, batch: Tuple[List[str], List[str]]) -> Dict[str, torch.Tensor]:
-        batch = self.tokenizer(batch,
-                          padding='longest',
-                          truncation=True,
-                          max_length=self.max_length,
-                          return_tensors='pt',
-                          add_special_tokens=True)
-        return batch
+    def __call__(self, batch: List[str]) -> Dict[str, torch.Tensor]:
+        seq = ''.join([self.cls_token + s + self.eos_token for s in batch])
+        input_ids = self.tokenizer.encode(seq, add_special_tokens=False, return_tensors='pt')
+        return {'input_ids':input_ids}

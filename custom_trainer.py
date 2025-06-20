@@ -29,18 +29,12 @@ class CustomTrainer(Trainer):
         # Separate parameters into groups like in the training script
         hidden_matrix_params = [p for n, p in opt_model.named_parameters() 
                                if p.ndim >= 2 and "embed" not in n and "lm_head" not in n and p.requires_grad]
-        embed_params = [p for n, p in opt_model.named_parameters()
-                       if "embed" in n and p.requires_grad]
-        scalar_params = [p for p in opt_model.parameters() 
-                        if p.ndim < 2 and p.requires_grad]
-        head_params = [p for n, p in opt_model.named_parameters() 
-                      if "lm_head" in n and p.requires_grad]
+        the_rest = [p for n, p in opt_model.named_parameters()
+                    if p.requires_grad and p.ndim < 2 and ("embed" in n or "lm_head" in n)]
 
         # Create Adam optimizer for head, embedding, and scalar parameters
         adam_params = [
-            {"params": head_params, "lr": 0.01},
-            {"params": embed_params, "lr": 0.01}, 
-            {"params": scalar_params, "lr": 0.01}
+            {"params": the_rest, "lr": 0.01}
         ]
         adam_optimizer = torch.optim.Adam(
             adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True
@@ -96,14 +90,12 @@ class CustomTrainer(Trainer):
                 
         return torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_lambda)
 
+    """
     def training_step(self, model, inputs, num_items_in_batch=None):
-        """
-        Perform a training step with custom optimizer handling.
-        """
         model.train()
         inputs = self._prepare_inputs(inputs)
 
-        if self.use_amp:
+        if self.use_apex:
             with torch.autocast(device_type=self.args.device):
                 loss = self.compute_loss(model, inputs)
         else:
@@ -112,7 +104,7 @@ class CustomTrainer(Trainer):
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multiple gpus.
 
-        if self.use_amp:
+        if self.use_apex:
             self.scaler.scale(loss).backward()
         elif self.use_apex:
             with amp.scale_loss(loss, self.optimizer) as scaled_loss:
@@ -121,7 +113,8 @@ class CustomTrainer(Trainer):
             loss.backward()
 
         return loss.detach() / self.args.gradient_accumulation_steps
-
+        """
+    
     def optimizer_step(self, model):
         """
         Custom optimizer step handling both Adam and Muon optimizers.

@@ -4,7 +4,7 @@ import argparse
 import torch
 import torch.nn.functional as F
 from torchinfo import summary
-from transformers import TrainingArguments, EvalPrediction
+from transformers import TrainingArguments, EvalPrediction, Trainer
 from sklearn.metrics import (
     f1_score,
     accuracy_score,
@@ -15,8 +15,8 @@ from sklearn.metrics import (
 from huggingface_hub import login, hf_hub_download
 from datasets import load_dataset, Dataset
 
-from model.model import PLM
-from data.dataset_classes import SequenceDatasetFromList, SequenceCollator
+from model.model import PLM, PLMConfig
+from data.dataset_classes import SequenceDatasetFromList, SequenceCollator, IterableDatasetFromHF
 from custom_trainer import CustomTrainer
 
 
@@ -35,19 +35,23 @@ except ImportError:
 def compute_dsm_metrics(eval_preds: EvalPrediction):
     ### NOTE the eval mask percentage is fixed at 15%
     metrics = {}
-    logits = eval_preds.predictions[0] if isinstance(eval_preds.predictions, tuple) else eval_preds.predictions
-    labels = eval_preds.label_ids[0] if isinstance(eval_preds.label_ids, tuple) else eval_preds.label_ids
+    lm_logits = eval_preds.predictions[0] if isinstance(eval_preds.predictions, tuple) else eval_preds.predictions
+    input_ids = eval_preds.label_ids[0] if isinstance(eval_preds.label_ids, tuple) else eval_preds.label_ids
+    lm_logits, labels = lm_logits
+
     # labels are already -100 for non-masked tokens
-    logits_torch = torch.tensor(logits)
+    lm_logits_torch = torch.tensor(lm_logits)
     labels_torch = torch.tensor(labels)
     # We need ot do this because the eval loss is scaled by the mask rate
     cross_entropy_loss = F.cross_entropy(
-        logits_torch.view(-1, logits_torch.shape[-1]), 
+        lm_logits_torch.view(-1, lm_logits_torch.shape[-1]), 
         labels_torch.view(-1),
         ignore_index=-100
     )
+
     metrics['cross_entropy_loss'] = cross_entropy_loss
-    y_pred = logits.argmax(axis=-1).flatten()
+
+    y_pred = lm_logits.argmax(axis=-1).flatten()
     y_true = labels.flatten()
     valid_indices = y_true != -100
     y_pred = y_pred[valid_indices]
@@ -88,24 +92,41 @@ def get_eval_data():
 def parse_args():
     parser = argparse.ArgumentParser(description="Synthyra Trainer")
     parser.add_argument("--token", type=str, default=None, help="Huggingface token")
-    parser.add_argument("--model_path", type=str, default="Synthyra/ESM2-650M", help="Path to the model to train")
-    parser.add_argument("--save_path", type=str, default="GleghornLab/DSM_650", help="Path to save the model and report to wandb")
+    parser.add_argument("--save_path", type=str, default="Synthyra/speedrun_test", help="Path to save the model and report to wandb")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
-    parser.add_argument("--grad_accum", type=int, default=16, help="Gradient accumulation steps")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    parser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--max_steps", type=int, default=100000, help="Maximum number of steps to train for")
-    parser.add_argument("--wandb_project", type=str, default="DSM", help="Wandb project name")
-    parser.add_argument("--max_length", type=int, default=2048, help="Maximum length of sequences fed to the model")
+    parser.add_argument("--wandb_project", type=str, default="SpeedrunPLM", help="Wandb project name")
     parser.add_argument("--save_every", type=int, default=1000, help="Save the model every n steps and evaluate every n/2 steps")
     parser.add_argument("--fp16", action="store_true", help="Use mixed precision for training")
     parser.add_argument("--bugfix", action="store_true", help="Use small batch size and max length for debugging")
+    parser.add_argument("--p_attention", action="store_true", help="Use PAttention")
+    parser.add_argument("--hidden_size", type=int, default=512, help="Hidden size")
+    parser.add_argument("--n_heads", type=int, default=8, help="Number of attention heads")
+    parser.add_argument("--num_att_tokens", type=int, default=512, help="Number of attention tokens")
+    parser.add_argument("--expansion_ratio", type=float, default=2.0, help="Expansion ratio for MLP")
+    parser.add_argument("--soft_logit_cap", type=float, default=16.0, help="Soft logit cap")
+    parser.add_argument("--num_hidden_layers", type=int, default=12, help="Number of hidden layers")
+    parser.add_argument("--sliding_window_size", type=int, default=2048, help="Sliding window size for PAttention")
+    parser.add_argument("--disable_muon", action="store_true", help="Disable Muon optimizer")
     args = parser.parse_args()
     return args
 
 
 def main(args):
     ### Load model
-    model = PLM.from_pretrained(args.model_path)
+    config = PLMConfig(
+        p_attention=args.p_attention,
+        hidden_size=args.hidden_size,
+        num_attention_heads=args.n_heads,
+        num_att_tokens=args.num_att_tokens,
+        expansion_ratio=args.expansion_ratio,
+        soft_logit_cap=args.soft_logit_cap,
+        num_hidden_layers=args.num_hidden_layers,
+        sliding_window_size=args.sliding_window_size,
+    )
+    model = PLM(config)
     tokenizer = model.tokenizer
     summary(model)
 
@@ -116,9 +137,10 @@ def main(args):
         valid_seqs = valid_seqs[:10]
         test_seqs = test_seqs[:10]
     
+    train_dataset = IterableDatasetFromHF(train_dataset, col_name='sequence')
     valid_dataset = SequenceDatasetFromList(valid_seqs)
     test_dataset = SequenceDatasetFromList(test_seqs)
-    data_collator = SequenceCollator(tokenizer, args.max_length)
+    data_collator = SequenceCollator(tokenizer)
 
     ### Define Training Arguments
     training_args = TrainingArguments(
@@ -138,7 +160,7 @@ def main(args):
         learning_rate=args.lr,
         fp16=args.fp16,
         dataloader_num_workers=4 if not args.bugfix else 0,
-        dataloader_prefetch_factor=10,
+        dataloader_prefetch_factor=10 if not args.bugfix else None,
         report_to="wandb" if WANDB_AVAILABLE else 'none',
         save_total_limit=3,
         max_grad_norm=10.0,
@@ -146,11 +168,16 @@ def main(args):
     )
 
     ### Create a trainer
-    trainer = CustomTrainer(
+    if args.disable_muon:
+        trainer_cls = Trainer
+    else:
+        trainer_cls = CustomTrainer
+
+    trainer = trainer_cls(
         model=model,
+        args=training_args,
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,
-        training_args=training_args,
         data_collator=data_collator,
         compute_metrics=compute_dsm_metrics,
     )
@@ -179,7 +206,14 @@ if __name__ == "__main__":
 
     if args.bugfix:
         args.batch_size = 2
-        args.max_length = 32
+        args.p_attention = False
+        args.hidden_size = 32
+        args.n_heads = 2
+        args.num_att_tokens = 32
+        args.expansion_ratio = 2.0
+        args.soft_logit_cap = 16.0
+        args.num_hidden_layers = 1
+        args.sliding_window_size = 32
         args.save_every = 1000
 
     main(args)
