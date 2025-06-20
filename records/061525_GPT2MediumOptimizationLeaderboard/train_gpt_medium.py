@@ -103,7 +103,7 @@ class Muon(torch.optim.Optimizer):
                     if len(state) == 0:
                         state["momentum_buffer"] = torch.zeros_like(p)
                     update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0))  # <-- this is custom
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
 
@@ -175,8 +175,6 @@ class MLP(nn.Module):
         hdim = 4 * dim
         self.fc_w = nn.Parameter(init_linear(torch.empty(hdim, dim)))
         self.proj_w = nn.Parameter(torch.zeros(dim, hdim))
-        self.fc_w.wd_mul = 2.0
-        self.proj_w.wd_mul = 2.0
 
     def forward(self, x: Tensor):
         x = F.linear(x, self.fc_w.bfloat16())
@@ -346,7 +344,7 @@ class Hyperparameters:
     train_seq_len = 64*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 5960 # number of iterations to run
+    num_iterations = 6125 # number of iterations to run
     cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
     # architecture
     vocab_size = 50257
