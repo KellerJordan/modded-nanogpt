@@ -24,11 +24,17 @@ The goal of this leaderboard is to collaboratively/competitively find good optim
 
 ## Record histories for each optimizer
 
+### Muon w/ 2x MLP wd
+
+| # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
+| - | - | - | - | - | - |
+| 1 | 5960 | lr=0.025, wd=0.01, double wd for MLP | 04/22/25 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj3o |
+
 ### [Muon](https://kellerjordan.github.io/posts/muon/)
 
 | # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
 | - | - | - | - | - | - |
-| 1 | 5960 | lr=0.025, wd=0.01 | 04/22/25 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj3o |
+| 1 | 6125 | lr=0.025, wd=0.01 | 06/19/25 | ? | @kellerjordan0 |
 
 ### [AdamW](https://arxiv.org/abs/1711.05101)
 
