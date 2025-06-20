@@ -1,6 +1,6 @@
 # Optimization leaderboard for the NanoGPT-medium speedrun
 
-The goal of this leaderboard is to collaboratively/competitively search for best optimizer on top of the NanoGPT-medium speedrun record. Unlike the main speedrun which seeks to minimize wallclock by any means necessary, here we will try to minimize the step count by modifying only the optimizer.
+The goal of this leaderboard is to collaboratively/competitively find good optimizers for use with the NanoGPT-medium speedrun record. Unlike the main speedrun which seeks to minimize wallclock, here we will only care about minimizing step count by modifying only the optimizer.
 
 ## Rules
 
@@ -12,10 +12,10 @@ The goal of this leaderboard is to collaboratively/competitively search for best
 
 | Optimizer | Steps to 2.92 | Hparam summary | Log | Contributors |
 | - | - | - | - | - |
-| [Muon](https://kellerjordan.github.io/posts/muon/) | 5960 | lr=0.025, wd=0.01 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj30 |
-| [AdamW](https://arxiv.org/abs/1711.05101) | 10500 | lr=0.0015, wd=0.125, warmup_steps=500 | ? | @kellerjordan0 |
+| [Muon](https://kellerjordan.github.io/posts/muon/) | 5960 | lr=.025, wd=.01 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj30 |
+| [AdamW](https://arxiv.org/abs/1711.05101) | 10500 | lr=.0015, wd=.125, warmup_steps=500 | ? | @kellerjordan0 |
+| [PSGD Kron](https://github.com/evanatyourservice/kron_torch) | 9000 | lr=.0005, wd=.625 | ? | @kellerjordan0 |
 | [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo) | ? | ? | ? | ? | ? |
-| PSGD Kron | ? | ? | ? | ? |
 | Sophia | ? | ? | ? | ? |
 | Lion | ? | ? | ? | ? |
 | ? | ? | ? | ? | ? |
@@ -38,9 +38,13 @@ The goal of this leaderboard is to collaboratively/competitively search for best
 Precise steps to reproduce #1: Replace `optimizer2` with `AdamW(hidden_matrix_params, lr=0.0015, weight_decay=0.125, betas=(0.9, 0.95), eps=1e-10)`
 and add a warmup using `if step < 500: return step / 500` in `get_lr()`.
 
-### [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo)
+### [PSGD Kron](https://github.com/evanatyourservice/kron_torch)
 
+| # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
+| - | - | - | - | - | - |
+| 1 | 9000 | lr=.0005, wd=.625 | 06/19/25 | ? | @kellerjordan0 |
 
+Precise steps to reproduce #1: Install and import `Kron`, then replace `optimizer2` with `Kron(hidden_matrix_params, lr=.0005, weight_decay=.625)`. Adding lr warmup does not seem to be needed.
 
 ## Response to a possible critique
 
