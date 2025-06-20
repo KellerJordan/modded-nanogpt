@@ -3,10 +3,23 @@
 ```console
 git clone https://github.com/Synthyra/SpeedrunningPLMs.git
 cd SpeedrunningPLMs
-chmod +x run.sh
-./run.sh
 ```
 
+On linux
+
+```console
+sudo docker build -t speedrun_plm .
+sudo docker run --gpus all -v $(pwd)/data:/app/data -v $(pwd)/results:/app/results -v $(pwd)/logs:/app/logs speedrun_plm python train_plm.py
+```
+
+On windows
+
+Open docker desktop
+
+```console
+sudo docker build -t speedrun_plm .
+docker run --gpus all -v ${PWD}/data:/app/data -v ${PWD}/results:/app/results -v ${PWD}/logs:/app/logs speedrun_plm python train_plm.py
+```
 
 <details>
 <summary>Previous Speed runnning ESM2 repo readme with preliminary results</summary>

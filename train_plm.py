@@ -92,6 +92,7 @@ def get_eval_data():
 def parse_args():
     parser = argparse.ArgumentParser(description="Synthyra Trainer")
     parser.add_argument("--token", type=str, default=None, help="Huggingface token")
+    parser.add_argument("--wandb_token", type=str, default=None, help="Wandb token")
     parser.add_argument("--save_path", type=str, default="Synthyra/speedrun_test", help="Path to save the model and report to wandb")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
@@ -198,8 +199,13 @@ if __name__ == "__main__":
     args = parse_args()
 
     if WANDB_AVAILABLE:
-        run_name = args.save_path.split('/')[-1]
-        wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
+        if args.wandb_token is not None:
+            wandb.login(key=args.wandb_token)
+            run_name = args.save_path.split('/')[-1]
+            wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
+        else:
+            print("Wandb token is not provided, skipping wandb")
+            WANDB_AVAILABLE = False
 
     if args.token is not None:
         login(args.token)    
