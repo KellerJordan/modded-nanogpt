@@ -16,7 +16,7 @@ from huggingface_hub import login, hf_hub_download
 from datasets import load_dataset, Dataset
 
 from model.model import PLM, PLMConfig
-from data.dataset_classes import SequenceDatasetFromList, SequenceCollator, IterableDatasetFromHF
+from data.dataset_classes import SequenceDatasetFromList, SequenceCollator, IterableDatasetFromHF, TokenBasedSequenceCollator, TokenBasedIterableDataset
 from custom_trainer import CustomTrainer
 
 
@@ -110,6 +110,7 @@ def parse_args():
     parser.add_argument("--soft_logit_cap", type=float, default=16.0, help="Soft logit cap")
     parser.add_argument("--num_hidden_layers", type=int, default=12, help="Number of hidden layers")
     parser.add_argument("--sliding_window_size", type=int, default=2048, help="Sliding window size for PAttention")
+    parser.add_argument("--target_token_count", type=int, default=8192, help="Target token count for training")
     parser.add_argument("--disable_muon", action="store_true", help="Disable Muon optimizer")
     args = parser.parse_args()
     return args
@@ -138,10 +139,10 @@ def main(args):
         valid_seqs = valid_seqs[:10]
         test_seqs = test_seqs[:10]
     
-    train_dataset = IterableDatasetFromHF(train_dataset, col_name='sequence')
+    train_dataset = TokenBasedIterableDataset(train_dataset, target_token_count=args.target_token_count, col_name='sequence')
     valid_dataset = SequenceDatasetFromList(valid_seqs)
     test_dataset = SequenceDatasetFromList(test_seqs)
-    data_collator = SequenceCollator(tokenizer)
+    data_collator = TokenBasedSequenceCollator(tokenizer)
 
     ### Define Training Arguments
     training_args = TrainingArguments(
