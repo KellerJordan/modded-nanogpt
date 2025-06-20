@@ -13,12 +13,13 @@ from pathlib import Path
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
-from torch import Tensor, nn
+from torch import Tensor, nn, autocast
 import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+#import wandb
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -117,7 +118,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
     assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     a, b, c = (3.4445, -4.7750,  2.0315)
-    X = G.bfloat16()
+    X = G
     if G.size(-2) > G.size(-1):
         X = X.mT
 
@@ -144,63 +145,143 @@ class Muon(torch.optim.Optimizer):
     matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
     the advantage that it can be stably run in bfloat16 on the GPU.
 
-    Some warnings:
-    - This optimizer should not be used for the embedding layer, the final fully connected layer,
+    Warning: This optimizer should not be used for the embedding layer, the final fully connected layer,
     or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
-
-    Arguments:
-        lr: The learning rate used by the internal SGD.
-        momentum: The momentum used by the internal SGD.
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        ns_steps: The number of Newton-Schulz iteration steps to use.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
+    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, rank=0, world_size=1):
         self.rank = rank
         self.world_size = world_size
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
-        params: list[Tensor] = [*params]
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
+
+        params = list(params)
+        sizes = {p.shape for p in params}
+
+        # create one buffer per unique parameter-size
         param_groups = []
-        for size in {p.numel() for p in params}:
-            b = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda")
-            group = dict(params=[p for p in params if p.numel() == size],
-                         update_buffer=b, update_buffer_views=[b[i] for i in range(world_size)])
-            param_groups.append(group)
+        for size in sizes:
+            group_params = [p for p in params if p.shape == size]
+            param_groups.append(dict(params=group_params,))
         super().__init__(param_groups, defaults)
 
     @torch.no_grad()
     def step(self):
+        futures: list[torch.Future] = []
+        reduce_scatter_futures: list[torch.Future] = []
         for group in self.param_groups:
-            update_buffer: Tensor = group["update_buffer"]
-            update_buffer_views: list[Tensor] = group["update_buffer_views"]
-            # generate weight updates in distributed fashion
             params: list[Tensor] = group["params"]
-            handle = None
-            params_world = None
-            def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
-                handle.wait()
-                for p_world, g_world in zip(params_world, update_buffer_views):
-                    p_world.add_(g_world.view_as(p_world),
-                                 alpha=-group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
-            for base_i in range(len(params))[::self.world_size]:
+            grad = torch.empty_like(params[-1])
+            grad_pad = [param.grad for param in params] + [torch.zeros_like(params[-1])] * self.world_size
+            for base_i in range(0, len(params), self.world_size):
+                if base_i + self.rank < len(params):
+                    grad = params[base_i + self.rank].grad
+                # This gives strange dynamo warnings
+                reduce_scatter_futures.append(dist.reduce_scatter(grad, grad_pad[base_i:base_i + self.world_size], op=dist.ReduceOp.AVG, async_op=True).get_future())
+
+        idx = 0
+        for group in self.param_groups:
+            params: list[Tensor] = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * self.world_size
+            momentum = group["momentum"]
+            for base_i in range(0, len(params), self.world_size):
+                reduce_scatter_futures[idx].wait()
                 if base_i + self.rank < len(params):
                     p = params[base_i + self.rank]
-                    g = p.grad
-                    assert g is not None
+                    grad = p.grad
+                    eff_lr = group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5 * getattr(p, "lr_mul", 1.0)
+                    eff_weight_decay = group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)
                     state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf: Tensor = state["momentum_buffer"]
-                    buf.lerp_(g, 1 - group["momentum"])
-                    g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
-                else:
-                    g = update_buffer_views[self.rank]
-                if base_i > 0:
-                    update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
-                handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
-                params_world = params[base_i : base_i + self.world_size]
-            update_prev()
+                    if len(state) == 0:
+                        state["momentum_buffer"] = torch.zeros_like(grad)
+                    momentum_buffer = state["momentum_buffer"]
+                    p.mul_(1 - eff_weight_decay)
+                    momentum_buffer.lerp_(grad, 1 - momentum)
+                    grad = grad.lerp_(momentum_buffer, momentum)
+                    v = zeropower_via_newtonschulz5(grad.bfloat16(), 5)
+                    p.add_(other=v, alpha=-eff_lr)
+                idx += 1
+                futures.append(dist.all_gather(params_pad[base_i:base_i + self.world_size], params_pad[base_i + self.rank], async_op=True).get_future())
+        # TODO: Check if commenting it is dangerous
+        torch.futures.collect_all(futures).wait()
+
+class DistAdam(torch.optim.Optimizer):
+    def __init__(self, params, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01, rank: int = 0, world_size: int = 1):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        params = list(params)
+        sizes = {p.shape for p in params}
+        self.rank = rank
+        self.world_size = world_size
+
+        # create one buffer per unique parameter-size
+        param_groups = []
+        for size in sizes:
+            group_params = [p for p in params if p.shape == size]
+            param_groups.append(dict(
+                params=group_params,
+            ))
+        super().__init__(param_groups, defaults)
+
+    @torch.compile
+    @torch.no_grad()
+    def step(self):
+        futures: list[torch.Future] = []
+        reduce_scatter_futures: list[torch.Future] = []
+        grad_slices = []
+        for group in self.param_groups:
+            params: list[Tensor] = group["params"]
+            grad = torch.empty_like(params[-1])
+            for base_i in range(len(params)):
+                grad = params[base_i].grad
+                rank_size = grad.shape[0] // self.world_size
+                grad_slice = torch.empty_like(grad[:rank_size])
+                reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
+                grad_slices.append(grad_slice)
+
+        idx = 0
+        for group in self.param_groups:
+            beta1, beta2 = group['betas']
+            eps = group['eps']
+            wd = group['weight_decay']
+            params = group['params']
+            for base in range(len(params)):
+                reduce_scatter_futures[idx].wait()
+                p = params[base]
+                rank_size = p.shape[0] // self.world_size
+                p_slice = p[rank * rank_size:(rank + 1) * rank_size]
+                lr = group['lr'] * getattr(p, "lr_mul", 1.0)
+                state = self.state[p]
+                g_slice = grad_slices[idx]
+                # State init
+                if not state:
+                    state['step'] = torch.tensor(0, dtype=torch.int64, device=p.device)
+                    state['exp_avg'] = torch.zeros_like(p_slice)
+                    state['exp_avg_sq'] = torch.zeros_like(p_slice)
+
+                exp_avg = state['exp_avg']
+                exp_avg_sq = state['exp_avg_sq']
+                state['step'] += 1
+                t = state['step']
+
+                # weight decay
+                if wd != 0:
+                    eff_weight_decay = lr * wd * getattr(p, "wd_mul", 1.0)
+                    p_slice.mul_(1 - eff_weight_decay)
+                # update running averages
+                exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
+
+                # bias corrections
+                bias1 = 1 - beta1 ** t
+                bias2 = 1 - beta2 ** t
+
+                # compute step
+                denom = exp_avg_sq.sqrt().add_(eps)
+                step_size = lr * (torch.sqrt(bias2) / bias1)
+                update = exp_avg.div(denom).mul_(step_size)
+                p_slice.add_(other=update, alpha=-1.0)
+                idx += 1
+                futures.append(dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future())
+        # TODO: Check if commenting it is dangerous
+        torch.futures.collect_all(futures).wait()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -260,24 +341,24 @@ class CausalSelfAttention(nn.Module):
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
-        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(head_dim, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
+        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
+        self.attn_scale = 0.12
 
-    def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
+    def forward(self, x: Tensor, ve: Tensor | None, lambdas: Tensor, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         if ve is not None:
-            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+            v = lambdas[0] * v + lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
-            v = self.lambdas[0] * v
-        # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
-        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=0.12).transpose(1, 2)
+            v = lambdas[0] * v
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -302,12 +383,11 @@ class Block(nn.Module):
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
         self.mlp = MLP(dim)
-        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
-        x = self.lambdas[0] * x + self.lambdas[1] * x0
+    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor, block_mask: BlockMask):
+        x = lambdas[0] * x + lambdas[1] * x0
         if self.attn is not None:
-            x = x + self.attn(norm(x), ve, block_mask)
+            x = x + self.attn(norm(x), ve, sa_lambdas, block_mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -321,18 +401,30 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
+        for param in self.embed.parameters():
+            param.lr_mul = 75.
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
+        for embeds in self.value_embeds:
+            for param in self.value_embeds.parameters():
+                param.lr_mul = 75.
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
-                                    use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
+        self.lm_head.weight.lr_mul = 27.5
         self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
-        self.skip_weights = nn.Parameter(torch.ones(num_layers//2))
+        pad = (-num_layers * 5) % world_size
+        self.scalars = nn.Parameter(torch.cat([
+            torch.ones(num_layers), # skip_weights
+            *[torch.tensor([1.0, 0.0]) for _ in range(num_layers)], # block lambdas
+            *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)], # SA lambdas
+            torch.ones(pad),
+        ]))
+        self.scalars.lr_mul = 5.0
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
@@ -340,6 +432,7 @@ class GPT(nn.Module):
 
         def document_causal(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
+            #return causal_mask
             document_mask = docs[q_idx] == docs[kv_idx]
             return causal_mask & document_mask
 
@@ -390,11 +483,16 @@ class GPT(nn.Module):
 
         # U-net design by @brendanh0gan
         skip_connections = []
-        n = len(self.skip_weights)
+        skip_weights = self.scalars[:(len(self.blocks) // 2)]
+        lambdas = self.scalars[1 * len(self.blocks): 3 * len(self.blocks)].view(-1, 2)
+        sa_lambdas = self.scalars[3 * len(self.blocks): 5 * len(self.blocks)].view(-1, 2)
+
+        n = len(self.blocks) // 2
+
         for i in range(len(self.blocks)):
             if i >= n:
-                x = x + self.skip_weights[i - n] * skip_connections.pop()
-            x = self.blocks[i](x, ve[i], x0, block_masks[i])
+                x = x + skip_weights[i - n] * skip_connections.pop()
+            x = self.blocks[i](x, ve[i], x0, lambdas[i], sa_lambdas[i], block_masks[i])
             if i < n:
                 skip_connections.append(x)
 
@@ -444,28 +542,29 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 48*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
     num_iterations = 1770 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
-    # architecture
-    vocab_size = 50257
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    # implementation
+    seq_len = 48*1024 # FlexAttention sequence length
+    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     save_checkpoint = False
 args = Hyperparameters()
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == 8 # this code is designed for 8xH100
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
+
+#if master_process:
+#    wandb.init(project="modded-nanogpt-tiny", name=f"run-{os.path.basename(__file__)}", save_code=True)
 
 # begin logging
 logfile = None
@@ -474,7 +573,7 @@ if master_process:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     print(logfile)
-def print0(s, console=False):
+def print0(s, console=True):
     if master_process:
         with open(logfile, "a") as f:
             if console:
@@ -490,15 +589,11 @@ print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.ve
 def nvidia_smi():
     import subprocess  # avoid top level import
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
-print0(nvidia_smi())
+if master_process:
+    print0(nvidia_smi())
 print0("="*100)
 
-########################################
-#    Construct model and optimizer     #
-########################################
-
-model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=12, num_heads=6, model_dim=768,
-                       max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+model: nn.Module = GPT(vocab_size=next_multiple_of_n(50257, n=128), num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -512,27 +607,40 @@ scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+
+optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, rank=rank, world_size=world_size)
+optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, weight_decay=0.0)
 optimizers = [optimizer1, optimizer2]
+
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
+for n, p in model.named_parameters():
+    wd_mul = getattr(p, "wd_mul", 1.0)
+    lr_mul = getattr(p, "lr_mul", 1.0)
+
+    print0(f"{n}: {p.shape} {p.dtype} {wd_mul} {lr_mul}")
+
+# Count parameters
+total_params = sum(p.numel() for p in model.parameters())
+embedding_params = sum(p.numel() for n, p in model.named_parameters() if "embed" in n)
+non_embedding_params = total_params - embedding_params
+
+print0(f"")
+print0(f"Model parameters:")
+print0(f"  Total parameters: {total_params:,}")
+print0(f"  Embedding parameters: {embedding_params:,}")
+print0(f"  Non-embedding parameters: {non_embedding_params:,}")
+
 # learning rate schedule: stable then decay
 def get_lr(step: int):
     x = step / args.num_iterations # progress in training
-    assert 0 <= x < 1
-    if x < 1 - args.cooldown_frac:
-        return 1.0
-    else:
-        w = (1 - x) / args.cooldown_frac
-        return w * 1.0 + (1 - w) * 0.1
-
-# attention window size schedule: linearly increase
+    assert 0 <= x <= 1
+    w = min((1 - x) / args.cooldown_frac, 1.0) # 1 -> 0
+    return w * 1.0 + (1 - w) * 0.1
 @lru_cache(1)
 def get_window_size_blocks_helper(window_size: int):
     return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -546,117 +654,38 @@ def get_window_size_blocks(step: int):
 
 model: nn.Module = torch.compile(model, dynamic=False)
 
-########################################
-#            Warmup kernels            #
-########################################
-
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
+train_loader = distributed_data_generator(args.train_files, world_size * args.seq_len, rank, world_size)
 for _ in range(warmup_steps):
-    inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
-    model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+    inputs, targets = next(train_loader)
+    model(inputs, targets, get_window_size_blocks(1)).backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
-model.load_state_dict(initial_state["model"])
-for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
+
+torch.cuda.synchronize()
+dist.barrier()
+with torch.profiler.profile() as prof:
+    for _ in range(warmup_steps):
+        inputs, targets = next(train_loader)
+        model(inputs, targets, get_window_size_blocks(1)).backward()
+        for opt in optimizers:
+            opt.step()
+    model.zero_grad(set_to_none=True)
+    torch.cuda.synchronize()
+    dist.barrier()
+os.makedirs("traces", exist_ok=True)
+prof.export_chrome_trace(f"traces/trace_{rank}.json")
+
+model.load_state_dict(initial_state['model'])
+for opt, opt_state in zip(optimizers, initial_state['optimizers']):
     opt.load_state_dict(opt_state)
-del initial_state
+del train_loader, initial_state
 
-########################################
-#      Overlap Communication Setup     #
-########################################
-
-# Create parameter buckets for better overlap
-def create_buckets(params, bucket_size_mb=25):
-    """Group parameters into buckets of approximately bucket_size_mb MB each"""
-    buckets = []
-    current_bucket = []
-    current_size = 0
-
-    # Sort parameters by size (largest first) for better bucketing
-    sorted_params = sorted(params, key=lambda p: p.numel(), reverse=True)
-
-    for param in sorted_params:
-        param_size_mb = param.numel() * param.element_size() / (1024 * 1024)
-
-        if current_size + param_size_mb > bucket_size_mb and current_bucket:
-            buckets.append(current_bucket)
-            current_bucket = [param]
-            current_size = param_size_mb
-        else:
-            current_bucket.append(param)
-            current_size += param_size_mb
-
-    if current_bucket:
-        buckets.append(current_bucket)
-
-    return buckets
-
-# Create buckets for all parameters
-all_params = [p for p in model.parameters() if p.requires_grad]
-param_buckets = create_buckets(all_params)
-
-print0(f"Created {len(param_buckets)} gradient buckets")
-for i, bucket in enumerate(param_buckets):
-    total_size = sum(p.numel() * p.element_size() for p in bucket) / (1024 * 1024)
-    print0(f"Bucket {i}: {len(bucket)} params, {total_size:.1f} MB")
-
-# Bucket state tracking
-bucket_ready_count = [0] * len(param_buckets)
-bucket_handles = [None] * len(param_buckets)
-param_to_bucket = {}
-
-# Map each parameter to its bucket index
-for bucket_idx, bucket in enumerate(param_buckets):
-    for param in bucket:
-        param_to_bucket[param] = bucket_idx
-
-def _gradient_hook(param: Tensor):
-    """Called when a parameter's gradient is ready"""
-    if param.grad is None:
-        return
-
-    bucket_idx = param_to_bucket[param]
-    bucket_ready_count[bucket_idx] += 1
-
-    # Check if all parameters in this bucket are ready
-    if bucket_ready_count[bucket_idx] == len(param_buckets[bucket_idx]):
-        # All-reduce this bucket
-        bucket_grads = [p.grad for p in param_buckets[bucket_idx]]
-
-        # For multi-tensor operations, we can reduce them together
-        if len(bucket_grads) == 1:
-            handle = dist.all_reduce(bucket_grads[0], op=dist.ReduceOp.AVG, async_op=True)
-        else:
-            # Use multi-tensor all-reduce for efficiency
-            handle = dist.all_reduce_coalesced(bucket_grads, op=dist.ReduceOp.AVG, async_op=True)
-
-        bucket_handles[bucket_idx] = handle
-
-# Register hooks for all parameters
-print0("Registering bucketed gradient hooks...")
-for param in all_params:
-    param.register_post_accumulate_grad_hook(_gradient_hook)
-
-def wait_for_gradients():
-    """Wait for all gradient reductions to complete and reset bucket state"""
-    for handle in bucket_handles:
-        if handle is not None:
-            handle.wait()
-
-    # Reset state for next iteration
-    for i in range(len(bucket_ready_count)):
-        bucket_ready_count[i] = 0
-        bucket_handles[i] = None
-
-########################################
-#        Training and validation       #
-########################################
-
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
+train_loader = distributed_data_generator(args.train_files, world_size * args.seq_len, rank, world_size)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -665,7 +694,6 @@ t0 = time.perf_counter()
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
-
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         # stop the clock
@@ -684,6 +712,8 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        #if master_process:
+        #    wandb.log({"val/loss": val_loss}, step=step)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
@@ -701,18 +731,14 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(step)).backward()
-    #for param in model.parameters():
-    #    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-    wait_for_gradients() # does the same thing as commented two lines above, but faster
-
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * get_lr(step)
+    frac = min(step / 300, 1)
     for group in optimizer2.param_groups:
-        frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-    # step the optimizers
+    # step the optimizers and schedulers
     for opt in optimizers:
         opt.step()
     # null the gradients
