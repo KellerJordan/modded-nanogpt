@@ -43,9 +43,5 @@ RUN pip install -r requirements.txt
 # Copy the rest of the application code
 COPY . .
 
-# Create a non-root user for security
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
-USER appuser
-
 # Set the default command
-CMD ["bash"] 
+CMD ["bash"]
