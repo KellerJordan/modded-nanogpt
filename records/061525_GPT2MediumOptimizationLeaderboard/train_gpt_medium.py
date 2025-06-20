@@ -19,7 +19,7 @@ import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 # replace this with whatever optimizer you wish to use
-from muon import DistributedMuon
+from muon import Muon
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -343,7 +343,7 @@ adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_param
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
-optimizer2 = DistributedMuon(hidden_matrix_params, lr=0.025, momentum=0.95)
+optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95)
 optimizers: list[torch.optim.Optimizer] = [optimizer1, optimizer2]
 def opt_params(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
     return [p for group in opt.param_groups for p in group["params"]]
