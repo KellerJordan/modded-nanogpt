@@ -13,7 +13,7 @@ The goal of this leaderboard is to collaboratively/competitively find good optim
 | Optimizer | Steps to 2.92 | Hparam summary | Log | Contributors |
 | - | - | - | - | - |
 | Muon w/ 2x MLP wd | 5960 | lr=.025, wd=.01, double wd for MLP | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj30, @YouJiacheng, @leloykun, ... |
-| [AdamW](https://arxiv.org/abs/1711.05101) | 10500 | lr=.0015, wd=.125, warmup_steps=500 | ? | @kellerjordan0 |
+| [AdamW](https://arxiv.org/abs/1711.05101) | 9500 | lr=.0015, wd=.125, warmup_steps=500 | ? | @kellerjordan0 |
 | [PSGD Kron](https://github.com/evanatyourservice/kron_torch) | 9000 | lr=.0005, wd=.625 | ? | @kellerjordan0 |
 | [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo) | ? | ? | ? | ? | ? |
 | Sophia | ? | ? | ? | ? |
@@ -34,9 +34,12 @@ The goal of this leaderboard is to collaboratively/competitively find good optim
 | # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
 | - | - | - | - | - | - |
 | 1 | 10500 | lr=0.0015, wd=0.125, warmup_steps=500 | 06/15/25 | ? | @kellerjordan0 |
+| 2 | 9500 | lr=0.0015, wd=0.125, warmup_steps=500, fp32 master weights | 06/19/25 | ? | @kellerjordan0 |
 
-Precise steps to reproduce #1: Replace `optimizer2` with `AdamW(hidden_matrix_params, lr=0.0015, weight_decay=0.125, betas=(0.9, 0.95), eps=1e-10)`
+Precise steps to reproduce:
+* #1: In the main `train_gpt_medium.py`, replace `optimizer2` with `AdamW(hidden_matrix_params, lr=0.0015, weight_decay=0.125, betas=(0.9, 0.95), eps=1e-10)`
 and add a warmup using `if step < 500: return step / 500` in `get_lr()`.
+* #2: In the `train_gpt_medium.py` in this folder, which enables fp32 master weights for any optimizer, do the same thing.
 
 ### [PSGD Kron](https://github.com/evanatyourservice/kron_torch)
 
