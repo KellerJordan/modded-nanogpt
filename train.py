@@ -1,6 +1,10 @@
 import os
 import sys
 
+# Configure torch inductor for flex_attention
+import torch._inductor.config
+torch._inductor.config.max_autotune_gemm_backends = "ATEN,TRITON"
+
 code = open(sys.argv[0]).read()
 code += open('optimizer.py', 'r', encoding='utf-8').read()
 code += open('dataloading.py', 'r', encoding='utf-8').read()
@@ -159,7 +163,7 @@ def main(args, model_config):
     for m in model.modules():
         if isinstance(m, Linear):
             m.float()
-    model = torch.compile(model)
+    # model = torch.compile(model)  # Temporarily disabled due to flex_attention backward issues
 
     # wrap model in DDP only if using distributed training
     if ddp_world_size > 1:
