@@ -15,6 +15,7 @@ from sklearn.metrics import (
 from huggingface_hub import login, hf_hub_download
 from datasets import load_dataset, Dataset
 
+from model.utils import Linear
 from model.model import PLM, PLMConfig
 from data.dataset_classes import SequenceDatasetFromList, TokenBasedSequenceCollator, TokenBasedIterableDataset
 from custom_trainer import CustomTrainer
@@ -131,6 +132,14 @@ def main(args):
         unet=args.unet,
     )
     model = PLM(config)
+
+    model = model.cuda().bfloat16()
+    for m in model.modules():
+        if isinstance(m, Linear):
+            m.float()
+
+    model = torch.compile(model)
+
     tokenizer = model.tokenizer
     summary(model)
 
