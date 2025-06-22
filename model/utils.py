@@ -20,11 +20,11 @@ def correction_fn(expansion_ratio: float, d_model: int) -> int:
 
 
 class MLP(nn.Module):
-    def __init__(self, hidden_size, expansion_ratio):
+    def __init__(self, config):
         super().__init__()
-        corrected_dim = correction_fn(expansion_ratio, hidden_size)
-        self.up = Linear(hidden_size, corrected_dim)
-        self.down = Linear(corrected_dim, hidden_size)
+        corrected_dim = correction_fn(config.expansion_ratio, config.hidden_size)
+        self.up = Linear(config.hidden_size, corrected_dim)
+        self.down = Linear(corrected_dim, config.hidden_size)
         self.down.weight.data.zero_()
         self.relu = nn.ReLU()
 

@@ -4,7 +4,8 @@ from torch import Tensor
 
 
 ### Muon optimizer
-def _zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
+@torch.compile
+def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -31,16 +32,6 @@ def _zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
-
-
-# Conditionally compile the function based on triton availability
-try:
-    # Test if triton is available by trying to compile a simple function
-    import triton
-    zeropower_via_newtonschulz5 = torch.compile(_zeropower_via_newtonschulz5)
-except (ImportError, RuntimeError):
-    # Fall back to the uncompiled version if triton is not available
-    zeropower_via_newtonschulz5 = _zeropower_via_newtonschulz5
 
 
 class Muon(torch.optim.Optimizer):
@@ -79,26 +70,7 @@ class Muon(torch.optim.Optimizer):
         super().__init__(param_groups, defaults)
 
     @torch.no_grad()
-    def step(self, *args, **kwargs):
-        # Handle single-process case
-        if self.world_size == 1:
-            for group in self.param_groups:
-                params: list[Tensor] = group["params"]
-                for p in params:
-                    g = p.grad
-                    if g is None:
-                        continue
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf: Tensor = state["momentum_buffer"]
-                    buf.lerp_(g, 1 - group["momentum"])
-                    g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
-                    p.add_(g, alpha=-group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5)
-            return
-        
-        # Original distributed code
+    def step(self):
         for group in self.param_groups:
             update_buffer: Tensor = group["update_buffer"]
             update_buffer_views: list[Tensor] = group["update_buffer_views"]

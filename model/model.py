@@ -21,7 +21,6 @@ class PLMConfig(PretrainedConfig):
         num_att_tokens: int = 512,
         vocab_size: int = 33,
         expansion_ratio: float = 2.0,
-        dropout: float = 0.1,
         soft_logit_cap: float = 16.0,
         sliding_window_size: int = 2048,
         p_attention: bool = False,
@@ -34,7 +33,6 @@ class PLMConfig(PretrainedConfig):
         self.num_att_tokens = num_att_tokens
         self.vocab_size = vocab_size
         self.expansion_ratio = expansion_ratio
-        self.dropout = dropout
         self.soft_logit_cap = soft_logit_cap
         self.sliding_window_size = sliding_window_size
         self.p_attention = p_attention
@@ -84,10 +82,10 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.config = config
         if config.p_attention:
-            self.attn = MultiHeadPAttention(config.hidden_size, config.num_attention_heads, config.num_att_tokens, config.sliding_window_size)
+            self.attn = MultiHeadPAttention(config)
         else:
-            self.attn = SelfAttention(config.hidden_size, config.num_attention_heads)
-        self.mlp = MLP(config.hidden_size, config.expansion_ratio)
+            self.attn = SelfAttention(config)
+        self.mlp = MLP(config)
         self.unet = config.unet
         if config.unet:
             self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
@@ -183,11 +181,11 @@ class PLM(PreTrainedModel):
         self.special_token_ids = torch.tensor(self.special_token_ids, device=device).flatten()
         return self.special_token_ids
 
-    def get_last_hidden_state(self, input_ids: torch.Tensor) -> torch.Tensor: # (l,)
+    def get_last_hidden_state(self, input_ids: torch.Tensor, sliding_window_size: int) -> torch.Tensor: # (l,)
         docs = (input_ids == self.cls_token_id).cumsum(0)
 
         def doc_mask_mod(b, h, q_idx, kv_idx):
-            bidirectional_sliding_window_mask = torch.abs(q_idx - kv_idx) < self.sliding_window_size
+            bidirectional_sliding_window_mask = torch.abs(q_idx - kv_idx) < sliding_window_size
             doc_mask = docs[q_idx] == docs[kv_idx]
             return bidirectional_sliding_window_mask & doc_mask
 
@@ -228,11 +226,14 @@ class PLM(PreTrainedModel):
         # Stack into [num_documents, hidden_size]
         return torch.stack(doc_embeds, dim=0)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, sliding_window_size: Optional[int] = None) -> torch.Tensor:
         eps = 1e-3
         input_ids = input_ids.flatten()
         seq_len = len(input_ids)
         device = input_ids.device
+
+        if sliding_window_size is not None:
+            sliding_window_size = self.sliding_window_size
 
         if self.training: # sample uniform between 0 and 1
             t = torch.rand(1, device=device)
@@ -251,7 +252,7 @@ class PLM(PreTrainedModel):
         non_mask_indices = ~mask_indices
         labels[non_mask_indices] = -100
 
-        last_hidden_state = self.get_last_hidden_state(noisy_batch)
+        last_hidden_state = self.get_last_hidden_state(noisy_batch, sliding_window_size)
 
         lm_logits = self.lm_head(norm(last_hidden_state)) # (l, v)
 
@@ -259,7 +260,7 @@ class PLM(PreTrainedModel):
             lm_logits[mask_indices].view(-1, self.vocab_size),
             input_ids[mask_indices].view(-1)) / p_mask[mask_indices]
         
-        loss = token_loss.sum() / seq_len
+        loss = token_loss.sum() / mask_indices.sum()
 
         return ESMOutput(
             loss=loss,

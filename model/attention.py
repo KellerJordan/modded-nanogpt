@@ -32,24 +32,37 @@ class Rotary(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, hidden_size: int, n_heads: int):
+    def __init__(self, config):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.n_heads = n_heads
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.n_heads = config.num_attention_heads
         self.d_head = self.hidden_size // self.n_heads
 
-        corrected_dim = n_heads * self.d_head
+        corrected_dim = self.n_heads * self.d_head
         std = 0.5 * (self.d_head ** -0.5)
         bound = (3 ** 0.5) * std
 
-        self.Wqkv = nn.Parameter(torch.empty(3, hidden_size, corrected_dim).uniform_(-bound, bound))
-        self.Wo = nn.Linear(hidden_size, hidden_size)
+        self.Wqkv = nn.Parameter(torch.empty(3, self.hidden_size, corrected_dim).uniform_(-bound, bound))
+        self.Wo = Linear(self.hidden_size, self.hidden_size)
         self.rotary = Rotary(self.d_head)
         
-    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if config.unet:
+            self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+        self.unet = config.unet
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            vi: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
         l, d = x.size() # batch size must be 1 for FlexAttention
         q, k, v = F.linear(x, self.Wqkv.flatten(end_dim=1).type_as(x)).view(1, l, 3 * self.n_heads, self.d_head).chunk(3, dim=-2)
         # (1, l, n_heads, d_head), (1, l, n_heads, d_head), (1, l, n_heads, d_head)
+        if self.unet and vi is not None:
+            v = self.lambdas[0] * v + self.lambdas[1] * vi
+        
         q, k = norm(q), norm(k)
         q, k = self.rotary(q), self.rotary(k)
         
@@ -65,19 +78,27 @@ class PAttention(nn.Module):
     """
     Cross-attention mechanism for token-parameter-attention (b, L, d) -> (b, L, n_tokens) ->  (b, L, d)
     """
-    def __init__(self, hidden_size: int, n_tokens: int, sliding_window_size: int):
+    def __init__(self, config):
         super(PAttention, self).__init__()
-        self.n_tokens = n_tokens
-        self.Wq = Linear(hidden_size, hidden_size)
-        self.Pk = nn.Parameter(torch.randn(1, n_tokens, hidden_size))
-        self.Pv = nn.Parameter(torch.randn(1, n_tokens, hidden_size))
-        self.sliding_window_size = sliding_window_size
+        self.config = config
+        self.n_tokens = config.num_att_tokens
+        self.Wq = Linear(config.hidden_size, config.hidden_size)
+        self.Pk = nn.Parameter(torch.randn(1, self.n_tokens, config.hidden_size))
+        self.Pv = nn.Parameter(torch.randn(1, self.n_tokens, config.hidden_size))
+        self.sliding_window_size = config.sliding_window_size
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+            self,
+            x: torch.Tensor,
+            sliding_window_size: Optional[int] = None,
+        ) -> torch.Tensor:
         Q_len, d = x.size() # batch size must be 1 for FlexAttention
 
+        if sliding_window_size is None:
+            sliding_window_size = self.sliding_window_size
+
         def doc_mask_mod(b, h, q_idx, kv_idx):
-            bidirectional_sliding_window_mask = torch.abs(q_idx - kv_idx) < self.sliding_window_size
+            bidirectional_sliding_window_mask = torch.abs(q_idx - kv_idx) < sliding_window_size
             return bidirectional_sliding_window_mask
 
         KV_len = self.n_tokens
@@ -88,31 +109,52 @@ class PAttention(nn.Module):
         v = self.Pv.unsqueeze(1) # (1, 1, n_tokens, d)
         y = flex_attention(q, k, v, block_mask=attention_mask) # (1, 1, Q_len, d)
         return y.squeeze(1) # (1, Q_len, d)
-    
+
 
 class MultiHeadPAttention(nn.Module):
-    def __init__(self, hidden_size: int, n_heads: int, n_tokens: int, sliding_window_size: int):
+    def __init__(self, config):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.n_heads = n_heads
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.n_heads = config.num_attention_heads
         self.d_head = self.hidden_size // self.n_heads
-        self.Wq = PAttention(hidden_size, n_tokens=n_tokens, sliding_window_size=sliding_window_size)
-        self.Wk = PAttention(hidden_size, n_tokens=n_tokens, sliding_window_size=sliding_window_size)
-        self.Wv = PAttention(hidden_size, n_tokens=n_tokens, sliding_window_size=sliding_window_size)
-        self.Wo = Linear((hidden_size // n_heads) * n_heads, hidden_size)
+        self.Wq = PAttention(config)
+        self.Wk = PAttention(config)
+        self.Wv = PAttention(config)
+        self.Wo = Linear((self.hidden_size // self.n_heads) * self.n_heads, self.hidden_size)
         self.rotary = Rotary(self.d_head)
 
-    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if config.unet:
+            self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+        self.unet = config.unet
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            vi: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
         # attention mask already prepped for sdpa shape (bs, 1, seq_len, seq_len)
         l, d = x.size()
         q = self.Wq(x) # (1, l, d)
         k = self.Wk(x) # (1, l, d)
         v = self.Wv(x) # (1, l, d)
+
+        if self.unet and vi is not None:
+            v = self.lambdas[0] * v + self.lambdas[1] * vi
+
         q = q.view(1, l, self.n_heads, self.d_head)
         k = k.view(1, l, self.n_heads, self.d_head)
         v = v.view(1, l, self.n_heads, self.d_head)
         q, k = norm(q), norm(k)
         q, k = self.rotary(q), self.rotary(k)
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=attention_mask).transpose(1, 2) # (1, n_heads, l, d_head)
+        
+        y = flex_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            block_mask=attention_mask,
+        ).transpose(1, 2) # (1, n_heads, l, d_head)
+        
         y = y.contiguous().view(1, l, self.n_heads * self.d_head) # (1, l, n_heads * d_head)
         return self.Wo(y).squeeze(0) # (l, hidden_size)
