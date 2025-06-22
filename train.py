@@ -51,7 +51,7 @@ class TrainingArguments:
     input_test_bin: str = 'data/omgprot50/omgprot50_test_*.bin'
 
     # Optimization hyperparams
-    batch_size: int = 32*1024
+    batch_size: int = 8192
     grad_accum: int = 1
     num_steps: int = 20000
     cooldown_steps: int = 5000
@@ -159,6 +159,7 @@ def main(args, model_config):
     print0('='*100, logonly=True)
 
     model = PLM(model_config)
+    print(model)
     model = model.cuda().bfloat16()
     for m in model.modules():
         if isinstance(m, Linear):
