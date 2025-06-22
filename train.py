@@ -51,7 +51,7 @@ class TrainingArguments:
     input_test_bin: str = 'data/omgprot50/omgprot50_test_*.bin'
 
     # Optimization hyperparams
-    batch_size: int = 4*64*1024
+    batch_size: int = 2*64*1024
     grad_accum: int = 8
     num_steps: int = 20000
     cooldown_steps: int = 5000
