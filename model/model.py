@@ -258,7 +258,7 @@ class PLM(PreTrainedModel):
 
         token_loss = self.ce(
             lm_logits[mask_indices].view(-1, self.vocab_size),
-            input_ids[mask_indices].view(-1)) / p_mask[mask_indices]
+            input_ids[mask_indices].view(-1).long()) / p_mask[mask_indices]
         
         loss = token_loss.sum() / mask_indices.sum()
 
