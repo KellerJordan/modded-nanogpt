@@ -232,7 +232,7 @@ class PLM(PreTrainedModel):
         seq_len = len(input_ids)
         device = input_ids.device
 
-        if sliding_window_size is not None:
+        if sliding_window_size is None:
             sliding_window_size = self.sliding_window_size
 
         if self.training: # sample uniform between 0 and 1

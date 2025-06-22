@@ -61,7 +61,9 @@ class SelfAttention(nn.Module):
         q, k, v = F.linear(x, self.Wqkv.flatten(end_dim=1).type_as(x)).view(1, l, 3 * self.n_heads, self.d_head).chunk(3, dim=-2)
         # (1, l, n_heads, d_head), (1, l, n_heads, d_head), (1, l, n_heads, d_head)
         if self.unet and vi is not None:
-            v = self.lambdas[0] * v + self.lambdas[1] * vi
+            # Reshape vi from (l, d) to (1, l, n_heads, d_head) to match v's shape
+            vi_reshaped = vi.view(1, l, self.n_heads, self.d_head)
+            v = self.lambdas[0] * v + self.lambdas[1] * vi_reshaped
         
         q, k = norm(q), norm(k)
         q, k = self.rotary(q), self.rotary(k)
@@ -141,7 +143,9 @@ class MultiHeadPAttention(nn.Module):
         v = self.Wv(x) # (1, l, d)
 
         if self.unet and vi is not None:
-            v = self.lambdas[0] * v + self.lambdas[1] * vi
+            # Reshape vi from (l, d) to (1, l, d) to match v's shape before applying it
+            vi_reshaped = vi.unsqueeze(0)  # (1, l, d)
+            v = self.lambdas[0] * v + self.lambdas[1] * vi_reshaped
 
         q = q.view(1, l, self.n_heads, self.d_head)
         k = k.view(1, l, self.n_heads, self.d_head)
