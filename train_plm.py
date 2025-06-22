@@ -16,7 +16,7 @@ from huggingface_hub import login, hf_hub_download
 from datasets import load_dataset, Dataset
 
 from model.model import PLM, PLMConfig
-from data.dataset_classes import SequenceDatasetFromList, SequenceCollator, IterableDatasetFromHF, TokenBasedSequenceCollator, TokenBasedIterableDataset
+from data.dataset_classes import SequenceDatasetFromList, TokenBasedSequenceCollator, TokenBasedIterableDataset
 from custom_trainer import CustomTrainer
 
 
@@ -103,15 +103,16 @@ def parse_args():
     parser.add_argument("--fp16", action="store_true", help="Use mixed precision for training")
     parser.add_argument("--bugfix", action="store_true", help="Use small batch size and max length for debugging")
     parser.add_argument("--p_attention", action="store_true", help="Use PAttention")
-    parser.add_argument("--hidden_size", type=int, default=512, help="Hidden size")
-    parser.add_argument("--n_heads", type=int, default=8, help="Number of attention heads")
+    parser.add_argument("--hidden_size", type=int, default=768, help="Hidden size")
+    parser.add_argument("--n_heads", type=int, default=6, help="Number of attention heads")
     parser.add_argument("--num_att_tokens", type=int, default=512, help="Number of attention tokens")
-    parser.add_argument("--expansion_ratio", type=float, default=2.0, help="Expansion ratio for MLP")
+    parser.add_argument("--expansion_ratio", type=float, default=8/3, help="Expansion ratio for MLP")
     parser.add_argument("--soft_logit_cap", type=float, default=16.0, help="Soft logit cap")
     parser.add_argument("--num_hidden_layers", type=int, default=12, help="Number of hidden layers")
-    parser.add_argument("--sliding_window_size", type=int, default=2048, help="Sliding window size for PAttention")
-    parser.add_argument("--target_token_count", type=int, default=8192, help="Target token count for training")
+    parser.add_argument("--sliding_window_size", type=int, default=512, help="Sliding window size for PAttention")
+    parser.add_argument("--target_token_count", type=int, default=64*1024, help="Target token count for training")
     parser.add_argument("--disable_muon", action="store_true", help="Disable Muon optimizer")
+    parser.add_argument("--unet", action="store_true", help="Use UNet")
     args = parser.parse_args()
     return args
 
@@ -127,6 +128,7 @@ def main(args):
         soft_logit_cap=args.soft_logit_cap,
         num_hidden_layers=args.num_hidden_layers,
         sliding_window_size=args.sliding_window_size,
+        unet=args.unet,
     )
     model = PLM(config)
     tokenizer = model.tokenizer

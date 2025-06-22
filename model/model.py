@@ -26,6 +26,7 @@ class PLMConfig(PretrainedConfig):
         sliding_window_size: int = 2048,
         p_attention: bool = False,
         tie_embeddings: bool = False,
+        unet: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
@@ -38,6 +39,7 @@ class PLMConfig(PretrainedConfig):
         self.sliding_window_size = sliding_window_size
         self.p_attention = p_attention
         self.tie_embeddings = tie_embeddings
+        self.unet = unet
 
 
 @dataclass
@@ -45,6 +47,20 @@ class ESMOutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
     last_hidden_state: Optional[torch.Tensor] = None
+
+
+class ValueEmbedding(nn.Module):
+    def __init__(self, config: PLMConfig):
+        super().__init__()
+        self.embed = nn.ModuleList([
+            nn.Embedding(config.vocab_size, config.hidden_size)
+            for _ in range(config.num_hidden_layers // 2)
+        ])
+
+    def forward(self, inputs: torch.Tensor) -> List[torch.Tensor]:
+        ve = [emb(inputs) for emb in self.embed]
+        ve += reversed(ve)
+        return ve
 
 
 class LMHead(nn.Module):
@@ -64,16 +80,30 @@ class LMHead(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: PLMConfig):
         super().__init__()
+        self.config = config
         if config.p_attention:
             self.attn = MultiHeadPAttention(config.hidden_size, config.num_attention_heads, config.num_att_tokens, config.sliding_window_size)
         else:
             self.attn = SelfAttention(config.hidden_size, config.num_attention_heads)
         self.mlp = MLP(config.hidden_size, config.expansion_ratio)
+        self.unet = config.unet
+        if config.unet:
+            self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
     
-    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = x + self.attn(norm(x), attention_mask)
+    def forward(
+            self,
+            x: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            vi: Optional[torch.Tensor] = None,
+            x0: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+        if self.unet:
+            x = self.lambdas[0] * x + self.lambdas[1] * x0
+            x = x + self.attn(norm(x), attention_mask, vi)
+        else:
+            x = x + self.attn(norm(x), attention_mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -87,7 +117,32 @@ class Transformer(nn.Module):
         for layer in self.layers:
             x = layer(x, attention_mask)
         return x
+    
 
+class UnetTransformer(nn.Module):
+    def __init__(self, config: PLMConfig):
+        super().__init__()
+        assert config.num_hidden_layers % 2 == 0
+        self.num_encoder_layers = config.num_hidden_layers // 2
+        self.num_decoder_layers = config.num_hidden_layers // 2
+
+        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
+
+        self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_hidden_layers)])
+
+    def forward(self, x: torch.Tensor, ve: List[torch.Tensor], attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x0 = x
+        ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
+        skip_connections = []
+        for i in range(self.num_encoder_layers):
+            x = self.layers[i](x, attention_mask, ve_enc[i], x0)
+            skip_connections.append(x)
+        
+        for i in range(self.num_decoder_layers):
+            x = x + self.skip_weights[i] * skip_connections.pop()
+            x = self.layers[self.num_encoder_layers + i](x, attention_mask, ve_dec[i], x0)
+        return x
+    
 
 class PLM(PreTrainedModel):
     config_class = PLMConfig
@@ -103,7 +158,12 @@ class PLM(PreTrainedModel):
         self.sliding_window_size = config.sliding_window_size
 
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.transformer = Transformer(config)
+        self.unet = config.unet
+        if config.unet:
+            self.transformer = UnetTransformer(config)
+            self.value_embeds = ValueEmbedding(config)
+        else:
+            self.transformer = Transformer(config)
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, config.soft_logit_cap)
         if config.tie_embeddings:
             self.lm_head.decoder.weight = self.embedding.weight
@@ -142,7 +202,12 @@ class PLM(PreTrainedModel):
         )
 
         x = self.embedding(input_ids)
-        x = self.transformer(x, attention_mask)
+        x = norm(x)
+        if self.unet:
+            ve = self.value_embeds(input_ids)
+            x = self.transformer(x, ve, attention_mask)
+        else:
+            x = self.transformer(x, attention_mask)
         return x
 
     def get_vector_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -188,7 +253,7 @@ class PLM(PreTrainedModel):
 
         last_hidden_state = self.get_last_hidden_state(noisy_batch)
 
-        lm_logits = self.lm_head(last_hidden_state) # (l, v)
+        lm_logits = self.lm_head(norm(last_hidden_state)) # (l, v)
 
         token_loss = self.ce(
             lm_logits[mask_indices].view(-1, self.vocab_size),
@@ -205,7 +270,7 @@ class PLM(PreTrainedModel):
 
 if __name__ == "__main__":
     # py -m model.model
-    config = PLMConfig(p_attention=False)
+    config = PLMConfig(p_attention=False, unet=True)
     model = PLM(config).cuda()
     print(model)
 
