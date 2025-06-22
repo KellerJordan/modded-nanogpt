@@ -201,7 +201,10 @@ def main(args):
     trainer.train()
     metrics = trainer.evaluate(test_dataset)
     print('Final Metrics: \n', metrics)
-    trainer.model.push_to_hub(args.save_path, private=True)
+    try:
+        trainer.model.push_to_hub(args.save_path, private=True)
+    except Exception as e:
+        print(f"Error pushing model to hub: {e}")
     if WANDB_AVAILABLE:
         wandb.finish()
 
