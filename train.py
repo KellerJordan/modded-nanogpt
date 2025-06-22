@@ -260,7 +260,7 @@ def main(args, model_config):
                 while input_ids.numel():
                     batch_valid_tokens = (input_ids != pad_id).sum()
                     valid_tokens += batch_valid_tokens
-                    val_loss += model(input_ids, sliding_window_size) * batch_valid_tokens
+                    val_loss += model(input_ids, sliding_window_size).loss * batch_valid_tokens
                     input_ids = valid_loader.next_batch()
             
             if ddp_world_size > 1:
@@ -313,7 +313,7 @@ def main(args, model_config):
                 if ddp_world_size > 1 and i < args.grad_accum - 1:
                     stack.enter_context(model.no_sync())
                 input_ids = train_loader.next_batch()
-                (model(input_ids, sliding_window_size) / args.grad_accum).backward()
+                (model(input_ids, sliding_window_size).loss / args.grad_accum).backward()
 
         # momentum warmup for Muon
         frac = min(step/args.muon_momentum_warmup_steps, 1)
@@ -358,7 +358,7 @@ def main(args, model_config):
         while input_ids.numel():
             batch_test_tokens = (input_ids != pad_id).sum()
             test_tokens += batch_test_tokens
-            test_loss += model(input_ids, sliding_window_size) * batch_test_tokens
+            test_loss += model(input_ids, sliding_window_size).loss * batch_test_tokens
             input_ids = test_loader.next_batch()
     
     if ddp_world_size > 1:
