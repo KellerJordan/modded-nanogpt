@@ -260,7 +260,7 @@ class PLM(PreTrainedModel):
             lm_logits[mask_indices].view(-1, self.vocab_size),
             input_ids[mask_indices].view(-1).long()) / p_mask[mask_indices]
         
-        loss = token_loss.sum() / mask_indices.sum()
+        loss = token_loss.sum() / seq_len
 
         return ESMOutput(
             loss=loss,

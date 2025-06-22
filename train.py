@@ -51,8 +51,8 @@ class TrainingArguments:
     input_test_bin: str = 'data/omgprot50/omgprot50_test_*.bin'
 
     # Optimization hyperparams
-    batch_size: int = 8192
-    grad_accum: int = 1
+    batch_size: int = 8*64*1024
+    grad_accum: int = 8
     num_steps: int = 20000
     cooldown_steps: int = 5000
     max_length: int = 2048
@@ -149,9 +149,9 @@ def main(args, model_config):
     cls_id, eos_id, pad_id = tokenizer.cls_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id
     train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size,
                                                cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=100)
-    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size,
+    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size // 8, ddp_rank, ddp_world_size,
                                                cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
-    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size,
+    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size // 8, ddp_rank, ddp_world_size,
                                               cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
     print0(f'Training DataLoader: {len(train_loader.files)} files')
     print0(f'Validation DataLoader: {len(valid_loader.files)} files')
