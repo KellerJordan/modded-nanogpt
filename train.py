@@ -24,7 +24,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from optimizer import Muon
-from dataloading import DistributedPaddedDataLoader
+from dataloading import DistributedPaddedDataLoader, DistributedDataLoader
 from model.model import PLM, PLMConfig
 from model.utils import Linear
 
@@ -145,12 +145,18 @@ def main(args, model_config):
     # load tokens
     tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
     cls_id, eos_id, pad_id = tokenizer.cls_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id
-    train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size,
-                                               cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=100)
-    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size // 8, ddp_rank, ddp_world_size,
-                                               cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
-    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size // 8, ddp_rank, ddp_world_size,
-                                              cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
+    
+    #train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size,
+    #                                           cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=100)
+    #valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size // 8, ddp_rank, ddp_world_size,
+    #                                           cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
+    #test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size // 8, ddp_rank, ddp_world_size,
+    #                                          cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
+    
+    train_loader = DistributedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size)
+    valid_loader = DistributedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size)
+    test_loader = DistributedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size)
+
     print0(f'Training DataLoader: {len(train_loader.files)} files')
     print0(f'Validation DataLoader: {len(valid_loader.files)} files')
     print0(f'Testing DataLoader: {len(test_loader.files)} files')
