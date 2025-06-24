@@ -16,7 +16,6 @@ import torch
 import torch.distributed as dist
 import argparse
 import torch._inductor.config as inductor_config
-from typing import Optional
 from transformers import EsmTokenizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
@@ -149,10 +148,9 @@ def main(args, model_config):
         if isinstance(m, Linear):
             m.float()
     
-    #print0("Coordinate descent tuning - can take up to 30 minutes")
-    #inductor_config.coordinate_descent_tuning = True
+    print0("Coordinate descent tuning - can take up to 30 minutes")
+    inductor_config.coordinate_descent_tuning = True
     print0("torch.compile()")
-    
     model = torch.compile(model)
 
     # wrap model in DDP only if using distributed training
