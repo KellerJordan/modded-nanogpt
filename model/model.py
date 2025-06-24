@@ -148,6 +148,7 @@ class PLM(PreTrainedModel):
         self.config = config
         self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
         self.cls_token_id = self.tokenizer.cls_token_id
+        self.pad_token_id = self.tokenizer.pad_token_id
         self.mask_token_id = self.tokenizer.mask_token_id
 
         self.vocab_size = config.vocab_size
@@ -165,20 +166,7 @@ class PLM(PreTrainedModel):
         if config.tie_embeddings:
             self.lm_head.decoder.weight = self.embedding.weight
 
-        self.ce = nn.CrossEntropyLoss()
-        self.special_token_ids = self.get_special_token_ids()
-
-    def get_special_token_ids(self, extra_tokens: Optional[List[str]] = None):
-        # Do not include the mask token
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        mask_token = self.tokenizer.mask_token
-        self.special_token_ids = [self.tokenizer.convert_tokens_to_ids(v) for k, v in self.tokenizer.special_tokens_map.items() if v != mask_token]
-        if extra_tokens is not None:
-            self.special_token_ids.extend([self.tokenizer.convert_tokens_to_ids(v) for v in extra_tokens])
-
-        self.special_token_ids = list(set(self.special_token_ids))
-        self.special_token_ids = torch.tensor(self.special_token_ids, device=device).flatten()
-        return self.special_token_ids
+        self.ce = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
 
     def get_last_hidden_state(self, input_ids: torch.Tensor, sliding_window_size: int) -> torch.Tensor: # (l,)
         docs = (input_ids == self.cls_token_id).cumsum(0)
@@ -225,47 +213,32 @@ class PLM(PreTrainedModel):
         # Stack into [num_documents, hidden_size]
         return torch.stack(doc_embeds, dim=0)
 
-    def forward(self, input_ids: torch.Tensor, sliding_window_size: Optional[int] = None) -> torch.Tensor:
-        eps = 1e-3
-        input_ids = input_ids.flatten()
-        seq_len = len(input_ids)
-        device = input_ids.device
-
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        mask_rate: torch.Tensor,
+        sliding_window_size: Optional[int] = None,
+        ) -> torch.Tensor:
         if sliding_window_size is None:
             sliding_window_size = self.sliding_window_size
 
-        if self.training: # sample uniform between 0 and 1
-            t = torch.rand(1, device=device)
-            t = (1 - eps) * t + eps
-        else: # evaluate at classic 15%
-            t = torch.full((1,), 0.15, device=device)
-
-        p_mask = t.repeat(seq_len)
-        mask_indices = torch.rand(seq_len, device=device) < p_mask
-        # prevent special tokens from being masked (cls, sep, eos, etc.)
-        special_mask = torch.isin(input_ids, self.special_token_ids)
-        mask_indices = mask_indices & ~special_mask
-
-        noisy_batch = torch.where(mask_indices, self.mask_token_id, input_ids)
-        labels = input_ids.clone()
-        non_mask_indices = ~mask_indices
-        labels[non_mask_indices] = -100
-
-        last_hidden_state = self.get_last_hidden_state(noisy_batch, sliding_window_size)
+        last_hidden_state = self.get_last_hidden_state(input_ids, sliding_window_size)
 
         lm_logits = self.lm_head(norm(last_hidden_state)) # (l, v)
 
-        token_loss = self.ce(
-            lm_logits[mask_indices].view(-1, self.vocab_size),
-            input_ids[mask_indices].view(-1).long()) / p_mask[mask_indices]
-        
-        loss = token_loss.sum() / seq_len
-
-        return ESMOutput(
-            loss=loss,
-            logits=(lm_logits, labels),
-            last_hidden_state=last_hidden_state,
-        )
+        if self.training:
+            token_loss = self.ce(
+                lm_logits.view(-1, self.vocab_size),
+                labels.view(-1).long()
+            ) / mask_rate
+            loss = token_loss.sum() / len(input_ids)
+        else:
+            loss = self.ce(
+                lm_logits.view(-1, self.vocab_size),
+                labels.view(-1).long()
+            ).mean()
+        return loss
 
 
 if __name__ == "__main__":

@@ -16,7 +16,6 @@ import torch
 import torch.distributed as dist
 import argparse
 import torch._inductor.config as inductor_config
-from dataclasses import dataclass
 from typing import Optional
 from transformers import EsmTokenizer
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -30,46 +29,6 @@ from model.utils import Linear
 
 
 inductor_config.max_autotune_gemm_backends = "aten,cutlass,fbgemm"
-
-
-@dataclass
-class TrainingArguments:
-    # Model hyperparams
-    hidden_size: int = 768
-    num_attention_heads: int = 6
-    num_hidden_layers: int = 24
-    num_att_tokens: int = 512
-    vocab_size: int = 33
-    expansion_ratio: float = 8/3
-    soft_logit_cap: float = 16.0
-    p_attention: bool = False
-    tie_embeddings: bool = False
-    unet: bool = True
-
-    # Data hyperparams
-    input_bin: str = 'data/omgprot50/omgprot50_train_*.bin'
-    input_valid_bin: str = 'data/omgprot50/omgprot50_valid_*.bin'
-    input_test_bin: str = 'data/omgprot50/omgprot50_test_*.bin'
-
-    # Optimization hyperparams
-    batch_size: int = 8*64*1024
-    grad_accum: int = 8
-    num_steps: int = 500
-    cooldown_steps: int = 5000
-    max_length: int = 1024
-
-    # adam
-    lr_embed: float = 0.06
-    lr_head: float = 0.008
-    lr_scalar: float = 0.04
-    # muon
-    lr_hidden: float = 0.05
-    muon_momentum_warmup_steps: int = 300  # steps for warmup momentum, 0.85 -> 0.95
-
-    # Evaluation and logging hyperparams
-    valid_loss_every: int = 250
-    hf_model_name: Optional[str] = None
-    save_every: Optional[int] = None
 
 
 def get_param_count(model):
@@ -271,13 +230,13 @@ def main(args, model_config):
             val_loss, valid_tokens = 0.0, 0
 
             with torch.no_grad():
-                input_ids = valid_loader.next_batch()
+                input_ids, labels, mask_rate = valid_loader.next_batch()
                 pbar = tqdm(desc='Validating', leave=False)
                 while input_ids.numel():
                     batch_valid_tokens = (input_ids != pad_id).sum()
                     valid_tokens += batch_valid_tokens
-                    val_loss += model(input_ids, sliding_window_size).loss * batch_valid_tokens
-                    input_ids = valid_loader.next_batch()
+                    val_loss += model(input_ids, labels, mask_rate, sliding_window_size) * batch_valid_tokens
+                    input_ids, labels, mask_rate = valid_loader.next_batch()
                     pbar.update(1)
                 pbar.close()
 
@@ -330,8 +289,9 @@ def main(args, model_config):
                 # Only sync gradients on last accumulation step
                 if ddp_world_size > 1 and i < args.grad_accum - 1:
                     stack.enter_context(model.no_sync())
-                input_ids = train_loader.next_batch()
-                (model(input_ids, sliding_window_size).loss / args.grad_accum).backward()
+                input_ids, labels, mask_rate = train_loader.next_batch()
+                loss = model(input_ids, labels, mask_rate, sliding_window_size) / args.grad_accum
+                loss.backward()
 
         # momentum warmup for Muon
         frac = min(step/args.muon_momentum_warmup_steps, 1)
@@ -372,13 +332,13 @@ def main(args, model_config):
 
     test_loss, test_tokens = 0.0, 0
     with torch.no_grad():
-        input_ids = test_loader.next_batch()
+        input_ids, labels, mask_rate = test_loader.next_batch()
         pbar = tqdm(desc='Testing', leave=False)
         while input_ids.numel():
             batch_test_tokens = (input_ids != pad_id).sum()
             test_tokens += batch_test_tokens
-            test_loss += model(input_ids, sliding_window_size).loss * batch_test_tokens
-            input_ids = test_loader.next_batch()
+            test_loss += model(input_ids, labels, mask_rate, sliding_window_size) * batch_test_tokens
+            input_ids, labels, mask_rate = test_loader.next_batch()
             pbar.update(1)
         pbar.close()
     
@@ -399,17 +359,57 @@ def main(args, model_config):
 
 def arg_parser():
     parser = argparse.ArgumentParser(description="Synthyra Trainer")
+    
+    # CLI-specific arguments
     parser.add_argument("--token", type=str, default=None, help="Huggingface token")
     parser.add_argument("--save_path", type=str, default="Synthyra/speedrun_test", help="Path to save the model and report to wandb")
     parser.add_argument("--bugfix", action="store_true", help="Use small batch size and max length for debugging")
+    
+    # Model hyperparams
+    parser.add_argument("--hidden_size", type=int, default=768, help="Hidden size of the model")
+    parser.add_argument("--num_attention_heads", type=int, default=6, help="Number of attention heads")
+    parser.add_argument("--num_hidden_layers", type=int, default=24, help="Number of hidden layers")
+    parser.add_argument("--num_att_tokens", type=int, default=512, help="Number of attention tokens")
+    parser.add_argument("--vocab_size", type=int, default=33, help="Vocabulary size")
+    parser.add_argument("--expansion_ratio", type=float, default=8/3, help="Expansion ratio for MLP")
+    parser.add_argument("--soft_logit_cap", type=float, default=16.0, help="Soft logit cap")
+    parser.add_argument("--p_attention", action="store_true", help="Use P attention")
+    parser.add_argument("--tie_embeddings", action="store_true", help="Tie embeddings")
+    parser.add_argument("--unet", action="store_true", default=True, help="Use UNet architecture")
+    
+    # Data hyperparams
+    parser.add_argument("--input_bin", type=str, default='data/omgprot50/omgprot50_train_*.bin', help="Input training bin files pattern")
+    parser.add_argument("--input_valid_bin", type=str, default='data/omgprot50/omgprot50_valid_*.bin', help="Input validation bin files pattern")
+    parser.add_argument("--input_test_bin", type=str, default='data/omgprot50/omgprot50_test_*.bin', help="Input test bin files pattern")
+    
+    # Optimization hyperparams
+    parser.add_argument("--batch_size", type=int, default=8*64*1024, help="Total batch size in tokens")
+    parser.add_argument("--grad_accum", type=int, default=8, help="Gradient accumulation steps")
+    parser.add_argument("--num_steps", type=int, default=500, help="Number of training steps")
+    parser.add_argument("--cooldown_steps", type=int, default=5000, help="Number of cooldown steps")
+    parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
+    
+    # Adam optimizer params
+    parser.add_argument("--lr_embed", type=float, default=0.06, help="Learning rate for embeddings")
+    parser.add_argument("--lr_head", type=float, default=0.008, help="Learning rate for head")
+    parser.add_argument("--lr_scalar", type=float, default=0.04, help="Learning rate for scalar params")
+    
+    # Muon optimizer params
+    parser.add_argument("--lr_hidden", type=float, default=0.05, help="Learning rate for hidden layers (Muon)")
+    parser.add_argument("--muon_momentum_warmup_steps", type=int, default=300, help="Steps for warmup momentum (0.85 -> 0.95)")
+    
+    # Evaluation and logging hyperparams
+    parser.add_argument("--valid_loss_every", type=int, default=250, help="Validate every N steps")
+    parser.add_argument("--hf_model_name", type=str, default=None, help="Huggingface model name for saving")
+    parser.add_argument("--save_every", type=int, default=None, help="Save checkpoint every N steps")
+    
     return parser.parse_args()
 
 
 if __name__ == '__main__':
-    cli_args = arg_parser()
-    args = TrainingArguments()
+    args = arg_parser()
 
-    if cli_args.bugfix:
+    if args.bugfix:
         args.hidden_size = 128
         args.num_attention_heads = 2
         args.num_hidden_layers = 2
@@ -440,9 +440,9 @@ if __name__ == '__main__':
         unet=args.unet,
     )
 
-    if cli_args.token:
+    if args.token:
         from huggingface_hub import login
-        login(cli_args.token)
-        cli_args.token = None
+        login(args.token)
+        args.token = None
     
     val_loss, test_loss = main(args, model_config)
