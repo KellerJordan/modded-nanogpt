@@ -59,7 +59,8 @@ class DistributedDataLoaderWithMasking:
             rank: int,
             world_size: int,
             training: bool,
-            tokenizer: EsmTokenizer):
+            tokenizer: EsmTokenizer
+        ):
         assert batch_size % world_size == 0
         self.world_size = world_size
         self.rank = rank
@@ -118,13 +119,19 @@ class DistributedDataLoaderWithMasking:
 
 
 class DistributedPaddedDataLoader(DistributedDataLoaderWithMasking):
-    def __init__(self, filename_pattern, seq_len, process_rank, num_processes, cls_id, eos_id, pad_id, max_epochs=1):
-        self.cls_id = cls_id
-        self.eos_id = eos_id
-        self.pad_id = pad_id
+    def __init__(
+            self,
+            filename_pattern,
+            seq_len,
+            process_rank,
+            num_processes,
+            max_epochs,
+            training,
+            tokenizer
+        ):
         self._leftover_tokens = torch.empty(0, dtype=torch.uint8)
         self.max_epochs = max_epochs
-        super().__init__(filename_pattern, seq_len, process_rank, num_processes)
+        super().__init__(filename_pattern, seq_len, process_rank, num_processes, training, tokenizer)
 
     def advance(self):
         self.pos = 0
@@ -148,14 +155,14 @@ class DistributedPaddedDataLoader(DistributedDataLoaderWithMasking):
 
         processed_chunks = []
         curr_batch_len = 0
-        eos_positions = (raw_tokens == self.eos_id).nonzero(as_tuple=True)[0]
+        eos_positions = (raw_tokens == self.eos_token_id).nonzero(as_tuple=True)[0]
 
         for i in range(len(eos_positions)):
             curr_eos = eos_positions[i]
             prev_eos_plus_one = 0 if i == 0 else eos_positions[i-1] + 1  # EOS_idx + 1 = CLS_idx
             sample = raw_tokens[prev_eos_plus_one:curr_eos+1]  # One sample: "CLS ... EOS"
 
-            if not sample[0] == self.cls_id and sample[-1] == self.eos_id:
+            if not sample[0] == self.cls_token_id and sample[-1] == self.eos_token_id:
                 print(f"Warning: sample[0]=={sample[0]}, sample[-1]=={sample[-1]}, sample.numel()=={sample.numel()}")
                 print(f"\ti={i}, eos_positions[:i]=={eos_positions[:i]}")
             assert curr_batch_len < self.local_batch_size, str((curr_batch_len, self.local_batch_size))
@@ -163,7 +170,7 @@ class DistributedPaddedDataLoader(DistributedDataLoaderWithMasking):
             # if adding sample exceeds the batch size resulting in truncation, pad to end of batch, starting a fresh batch
             if len(sample) + curr_batch_len >= self.local_batch_size:
                 num_pad = self.local_batch_size - curr_batch_len
-                processed_chunks.append(torch.full((num_pad,), self.pad_id, dtype=torch.uint8))
+                processed_chunks.append(torch.full((num_pad,), self.pad_token_id, dtype=torch.uint8))
                 curr_batch_len = 0
 
             # if len(sample) > local batch size, chunk evenly, making multiple padded batches, starting a fresh batch
@@ -171,7 +178,7 @@ class DistributedPaddedDataLoader(DistributedDataLoaderWithMasking):
                 for split_sample in torch.chunk(sample, len(sample) // self.local_batch_size + 1):
                     processed_chunks.append(split_sample)
                     num_pad = self.local_batch_size - len(split_sample)
-                    processed_chunks.append(torch.full((num_pad,), self.pad_id, dtype=torch.uint8))
+                    processed_chunks.append(torch.full((num_pad,), self.pad_token_id, dtype=torch.uint8))
                 curr_batch_len = 0
                 continue
 

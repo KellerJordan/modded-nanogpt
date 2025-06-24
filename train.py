@@ -106,14 +106,35 @@ def main(args, model_config):
 
     # load tokens
     tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
-    cls_id, eos_id, pad_id = tokenizer.cls_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id
+    pad_token_id = tokenizer.pad_token_id
     
-    train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size,
-                                               cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=100)
-    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size,
-                                               cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
-    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size,
-                                              cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
+    train_loader = DistributedPaddedDataLoader(
+        filename_pattern=args.input_bin,
+        seq_len=batch_size,
+        process_rank=ddp_rank,
+        num_processes=ddp_world_size,
+        max_epochs=100,
+        training=True,
+        tokenizer=tokenizer,
+    )
+    valid_loader = DistributedPaddedDataLoader(
+        filename_pattern=args.input_valid_bin,
+        seq_len=batch_size,
+        process_rank=ddp_rank,
+        num_processes=ddp_world_size,
+        max_epochs=1,
+        training=False,
+        tokenizer=tokenizer,
+    )
+    test_loader = DistributedPaddedDataLoader(
+        filename_pattern=args.input_test_bin,
+        seq_len=batch_size,
+        process_rank=ddp_rank,
+        num_processes=ddp_world_size,
+        max_epochs=1,
+        training=False,
+        tokenizer=tokenizer,
+    )
 
     print0(f'Training DataLoader: {len(train_loader.files)} files')
     print0(f'Validation DataLoader: {len(valid_loader.files)} files')
@@ -233,7 +254,7 @@ def main(args, model_config):
                 input_ids, labels, mask_rate = valid_loader.next_batch()
                 pbar = tqdm(desc='Validating', leave=False)
                 while input_ids.numel():
-                    batch_valid_tokens = (input_ids != pad_id).sum()
+                    batch_valid_tokens = (input_ids != pad_token_id).sum()
                     valid_tokens += batch_valid_tokens
                     val_loss += model(input_ids, labels, mask_rate, sliding_window_size) * batch_valid_tokens
                     input_ids, labels, mask_rate = valid_loader.next_batch()
@@ -335,7 +356,7 @@ def main(args, model_config):
         input_ids, labels, mask_rate = test_loader.next_batch()
         pbar = tqdm(desc='Testing', leave=False)
         while input_ids.numel():
-            batch_test_tokens = (input_ids != pad_id).sum()
+            batch_test_tokens = (input_ids != pad_token_id).sum()
             test_tokens += batch_test_tokens
             test_loss += model(input_ids, labels, mask_rate, sliding_window_size) * batch_test_tokens
             input_ids, labels, mask_rate = test_loader.next_batch()
