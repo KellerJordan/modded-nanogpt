@@ -3,8 +3,6 @@
 ```console
 git clone https://github.com/Synthyra/SpeedrunningPLMs.git
 cd SpeedrunningPLMs
-git clone https://github.com/Synthyra/SpeedRunningESM2
-cd SpeedRunningESM2
 pip install -r requirements.txt
 pip install --pre torch==2.6.0.dev20241231+cu124 torchvision --index-url https://download.pytorch.org/whl/nightly/cu124 --upgrade
 python data/download_omgprot50.py --num_chunks 10
