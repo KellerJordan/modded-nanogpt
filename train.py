@@ -407,7 +407,7 @@ def arg_parser():
     parser.add_argument("--add_att_soft_cap", type=bool, default=True, help="Add attention softmax cap")
     parser.add_argument("--p_attention", action="store_true", help="Use P attention")
     parser.add_argument("--tie_embeddings", action="store_true", help="Tie embeddings")
-    parser.add_argument("--unet", action="store_true", default=True, help="Use UNet architecture")
+    parser.add_argument("--unet", type=bool, default=True, help="Use UNet architecture")
     
     # Data hyperparams
     parser.add_argument("--input_bin", type=str, default='data/omgprot50/omgprot50_train_*.bin', help="Input training bin files pattern")
@@ -416,8 +416,8 @@ def arg_parser():
     
     # Optimization hyperparams
     parser.add_argument("--batch_size", type=int, default=8*64*1024, help="Total batch size in tokens")
-    parser.add_argument("--grad_accum", type=int, default=8, help="Gradient accumulation steps")
-    parser.add_argument("--num_steps", type=int, default=500, help="Number of training steps")
+    parser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--num_steps", type=int, default=50000, help="Number of training steps")
     parser.add_argument("--cooldown_steps", type=int, default=5000, help="Number of cooldown steps")
     parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
     
@@ -431,8 +431,8 @@ def arg_parser():
     parser.add_argument("--muon_momentum_warmup_steps", type=int, default=300, help="Steps for warmup momentum (0.85 -> 0.95)")
     
     # Evaluation and logging hyperparams
-    parser.add_argument("--valid_loss_every", type=int, default=250, help="Validate every N steps")
-    parser.add_argument("--hf_model_name", type=str, default=None, help="Huggingface model name for saving")
+    parser.add_argument("--valid_loss_every", type=int, default=1000, help="Validate every N steps")
+    parser.add_argument("--hf_model_name", type=str, default='lhallee/speedrun', help="Huggingface model name for saving")
     parser.add_argument("--save_every", type=int, default=None, help="Save checkpoint every N steps")
     
     # Optimized dataloader params
