@@ -21,6 +21,7 @@ from typing import Optional
 from transformers import EsmTokenizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
+from tqdm import tqdm
 
 from optimizer import Muon
 from dataloading import DistributedPaddedDataLoader
@@ -48,7 +49,7 @@ class TrainingArguments:
     input_test_bin: str = 'data/omgprot50/omgprot50_test_*.bin'
 
     # Optimization hyperparams
-    batch_size: int = 8*64*1024
+    batch_size: int = 4*64*1024
     grad_accum: int = 1
     num_steps: int = 20000
     cooldown_steps: int = 5000
@@ -155,14 +156,17 @@ def main(args, model_config):
     print0(f'Testing DataLoader: {len(test_loader.files)} files')
     print0('='*100, logonly=True)
 
+    print0("Initializing model...")
     model = PLM(model_config)
-    print(model)
+    print0(model)
     model = model.cuda().bfloat16()
     for m in model.modules():
         if isinstance(m, Linear):
             m.float()
     
-    inductor_config.coordinate_descent_tuning = True
+    #print0("Coordinate descent tuning - can take up to 30 minutes")
+    #inductor_config.coordinate_descent_tuning = True
+    print0("torch.compile()")
     model = torch.compile(model)
 
     # wrap model in DDP only if using distributed training
@@ -173,6 +177,7 @@ def main(args, model_config):
         raw_model = model
 
     # init the optimizers
+    print0("Initializing optimizers...")
     hidden_matrix_params = [
         p for n, p in model.named_parameters() 
         if p.ndim >= 2 and "embed" not in n.lower() and "lm_head" not in n.lower() and p.requires_grad
@@ -234,7 +239,8 @@ def main(args, model_config):
     t0 = time.perf_counter()
 
     ### BEGIN TRAINING LOOP ###
-    for step in range(args.num_steps + 1):
+    print0("Beginning training loop...")
+    for step in tqdm(range(args.num_steps + 1), desc='Training steps'):
         last_step = (step == args.num_steps)
         # This effectively ignores timing first 10 steps, which are slower for weird reasons.
         # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
@@ -261,12 +267,15 @@ def main(args, model_config):
 
             with torch.no_grad():
                 input_ids = valid_loader.next_batch()
+                pbar = tqdm(desc='Validating', total=len(valid_loader), leave=False)
                 while input_ids.numel():
                     batch_valid_tokens = (input_ids != pad_id).sum()
                     valid_tokens += batch_valid_tokens
                     val_loss += model(input_ids, sliding_window_size).loss * batch_valid_tokens
                     input_ids = valid_loader.next_batch()
-            
+                    pbar.update(1)
+                pbar.close()
+
             if ddp_world_size > 1:
                 dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
                 dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
