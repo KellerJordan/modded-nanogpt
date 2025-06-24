@@ -171,7 +171,7 @@ class PLM(PreTrainedModel):
 
     def get_last_hidden_state(self, input_ids: torch.Tensor, sliding_window_size: int) -> torch.Tensor: # (l,)
         docs = (input_ids == self.cls_token_id).cumsum(0)
-        last_eos = (input_ids == self.eos_token_id).nonzero()[-1]
+        last_eos = (input_ids == self.eos_token_id).nonzero()[-1].item()
         seq_len = len(input_ids)
 
         def doc_mask_mod(b, h, q_idx, kv_idx):
