@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from typing import Optional
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
+from model.flex_mods import generate_tanh_softcap
 from model.utils import norm, Linear
 
 
@@ -49,6 +50,9 @@ class SelfAttention(nn.Module):
         
         if config.unet:
             self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+
+        if config.attention_soft_cap:
+            self.soft_cap_mod = generate_tanh_softcap(config.attention_soft_cap, approx=True)
         self.unet = config.unet
 
     def forward(

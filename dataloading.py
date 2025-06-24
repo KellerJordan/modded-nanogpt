@@ -385,43 +385,6 @@ class DistributedPaddedIterableDataset(IterableDataset):
         return noisy_batch, labels, mask_rate
 
 
-def create_optimized_dataloader(
-    filename_pattern: str,
-    seq_len: int,
-    process_rank: int,
-    num_processes: int,
-    max_epochs: int,
-    training: bool,
-    tokenizer: EsmTokenizer,
-    num_workers: int = 4,
-    prefetch_factor: int = 2,
-) -> DataLoader:
-    """Create an optimized DataLoader with multiple workers for parallel data loading."""
-    
-    dataset = DistributedPaddedIterableDataset(
-        filename_pattern=filename_pattern,
-        seq_len=seq_len,
-        process_rank=process_rank,
-        num_processes=num_processes,
-        max_epochs=max_epochs,
-        training=training,
-        tokenizer=tokenizer,
-        num_workers=num_workers,
-    )
-    
-    # Create DataLoader with optimized settings
-    dataloader = DataLoader(
-        dataset,
-        batch_size=None,  # Dataset returns complete batches
-        num_workers=num_workers,
-        pin_memory=True,  # Pin memory for faster GPU transfer
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
-    )
-    
-    return dataloader
-
-
 class OptimizedDistributedPaddedDataLoader:
     """Drop-in replacement for DistributedPaddedDataLoader using multi-worker optimization."""
     

@@ -22,7 +22,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from optimizer import Muon
-from dataloading import DistributedPaddedDataLoader, OptimizedDistributedPaddedDataLoader
+from dataloading import OptimizedDistributedPaddedDataLoader
 from model.model import PLM, PLMConfig
 from model.utils import Linear
 
@@ -402,7 +402,9 @@ def arg_parser():
     parser.add_argument("--num_att_tokens", type=int, default=512, help="Number of attention tokens")
     parser.add_argument("--vocab_size", type=int, default=33, help="Vocabulary size")
     parser.add_argument("--expansion_ratio", type=float, default=8/3, help="Expansion ratio for MLP")
-    parser.add_argument("--soft_logit_cap", type=float, default=16.0, help="Soft logit cap")
+    parser.add_argument("--soft_logit_cap", type=float, default=32.0, help="Soft logit cap")
+    parser.add_argument("--attention_soft_cap", type=float, default=64.0, help="Attention softmax cap")
+    parser.add_argument("--add_att_soft_cap", type=bool, default=True, help="Add attention softmax cap")
     parser.add_argument("--p_attention", action="store_true", help="Use P attention")
     parser.add_argument("--tie_embeddings", action="store_true", help="Tie embeddings")
     parser.add_argument("--unet", action="store_true", default=True, help="Use UNet architecture")
