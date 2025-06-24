@@ -237,7 +237,9 @@ class PLM(PreTrainedModel):
             loss = self.ce(
                 lm_logits.view(-1, self.vocab_size),
                 labels.view(-1).long()
-            ).mean()
+            )
+            print(loss.shape)
+            loss = loss.mean()
         return loss
 
 

@@ -359,7 +359,8 @@ def main(args, model_config):
         while input_ids.numel():
             batch_test_tokens = (input_ids != pad_token_id).sum()
             test_tokens += batch_test_tokens
-            test_loss += model(input_ids, labels, mask_rate, sliding_window_size) * batch_test_tokens
+            test_loss += model(input_ids, labels, mask_rate, sliding_window_size)
+            test_steps += 1
             input_ids, labels, mask_rate = test_loader.next_batch()
             pbar.update(1)
         pbar.close()
@@ -368,7 +369,7 @@ def main(args, model_config):
         dist.all_reduce(test_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(test_tokens, op=dist.ReduceOp.SUM)
     
-    test_loss /= test_tokens
+    test_loss /= test_steps
     print0(f'Test tokens: {test_tokens.item()}')
     print0(f'Loss: {test_loss:.4f} | Perplexity: {math.e**test_loss:.4f}')
     print0(f"peak memory consumption testing: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")

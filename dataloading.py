@@ -99,6 +99,7 @@ class DistributedDataLoaderWithMasking:
             mask_rate = torch.rand(1, device=sequence.device)
             mask_rate = (1 - eps) * mask_rate + eps
         else:
+            print("Using mask rate 0.15")
             mask_rate = torch.full((1,), 0.15, device=sequence.device)
 
         p_mask = mask_rate.repeat(len(sequence))
