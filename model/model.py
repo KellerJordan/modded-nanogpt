@@ -166,7 +166,7 @@ class PLM(PreTrainedModel):
         if config.tie_embeddings:
             self.lm_head.decoder.weight = self.embedding.weight
 
-        self.ce = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
+        self.ce = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
 
     def get_last_hidden_state(self, input_ids: torch.Tensor, sliding_window_size: int) -> torch.Tensor: # (l,)
         docs = (input_ids == self.cls_token_id).cumsum(0)
@@ -227,19 +227,14 @@ class PLM(PreTrainedModel):
 
         lm_logits = self.lm_head(norm(last_hidden_state)) # (l, v)
 
+        loss = self.ce(
+            lm_logits.view(-1, self.vocab_size),
+            labels.view(-1).long()
+        )
+        
         if self.training:
-            token_loss = self.ce(
-                lm_logits.view(-1, self.vocab_size),
-                labels.view(-1).long()
-            ) / mask_rate
-            loss = token_loss.sum() / len(input_ids)
-        else:
-            loss = self.ce(
-                lm_logits.view(-1, self.vocab_size),
-                labels.view(-1).long()
-            )
-            print(loss.shape)
-            loss = loss.mean()
+            loss = loss / mask_rate
+
         return loss
 
 
