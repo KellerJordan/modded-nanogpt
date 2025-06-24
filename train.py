@@ -22,7 +22,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from optimizer import Muon
-from dataloading import DistributedPaddedDataLoader
+from dataloading import DistributedPaddedDataLoader, OptimizedDistributedPaddedDataLoader
 from model.model import PLM, PLMConfig
 from model.utils import Linear
 
@@ -107,7 +107,8 @@ def main(args, model_config):
     tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
     pad_token_id = tokenizer.pad_token_id
     
-    train_loader = DistributedPaddedDataLoader(
+    # Use optimized dataloader with multiple workers
+    train_loader = OptimizedDistributedPaddedDataLoader(
         filename_pattern=args.input_bin,
         seq_len=batch_size,
         process_rank=ddp_rank,
@@ -115,8 +116,10 @@ def main(args, model_config):
         max_epochs=100,
         training=True,
         tokenizer=tokenizer,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
     )
-    valid_loader = DistributedPaddedDataLoader(
+    valid_loader = OptimizedDistributedPaddedDataLoader(
         filename_pattern=args.input_valid_bin,
         seq_len=batch_size,
         process_rank=ddp_rank,
@@ -124,8 +127,10 @@ def main(args, model_config):
         max_epochs=1,
         training=False,
         tokenizer=tokenizer,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
     )
-    test_loader = DistributedPaddedDataLoader(
+    test_loader = OptimizedDistributedPaddedDataLoader(
         filename_pattern=args.input_test_bin,
         seq_len=batch_size,
         process_rank=ddp_rank,
@@ -133,6 +138,8 @@ def main(args, model_config):
         max_epochs=1,
         training=False,
         tokenizer=tokenizer,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
     )
 
     print0(f'Training DataLoader: {len(train_loader.files)} files')
@@ -423,6 +430,10 @@ def arg_parser():
     parser.add_argument("--valid_loss_every", type=int, default=250, help="Validate every N steps")
     parser.add_argument("--hf_model_name", type=str, default=None, help="Huggingface model name for saving")
     parser.add_argument("--save_every", type=int, default=None, help="Save checkpoint every N steps")
+    
+    # Optimized dataloader params
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for optimized dataloader")
+    parser.add_argument("--prefetch_factor", type=int, default=2, help="Prefetch factor for optimized dataloader")
     
     return parser.parse_args()
 
