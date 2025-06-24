@@ -148,6 +148,7 @@ class PLM(PreTrainedModel):
         self.config = config
         self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
         self.cls_token_id = self.tokenizer.cls_token_id
+        self.eos_token_id = self.tokenizer.eos_token_id
         self.pad_token_id = self.tokenizer.pad_token_id
         self.mask_token_id = self.tokenizer.mask_token_id
 
@@ -170,19 +171,21 @@ class PLM(PreTrainedModel):
 
     def get_last_hidden_state(self, input_ids: torch.Tensor, sliding_window_size: int) -> torch.Tensor: # (l,)
         docs = (input_ids == self.cls_token_id).cumsum(0)
+        last_eos = (input_ids == self.eos_token_id).nonzero()[-1]
+        seq_len = len(input_ids)
 
         def doc_mask_mod(b, h, q_idx, kv_idx):
             bidirectional_sliding_window_mask = torch.abs(q_idx - kv_idx) < sliding_window_size
             doc_mask = docs[q_idx] == docs[kv_idx]
-            return bidirectional_sliding_window_mask & doc_mask
+            pad_mask = (q_idx <= last_eos) & (kv_idx <= last_eos)
+            return bidirectional_sliding_window_mask & doc_mask & pad_mask
 
-        Q_len = KV_len = len(input_ids)
         attention_mask = create_block_mask(
             mask_mod=doc_mask_mod,
             B=1,
             H=self.n_heads,
-            Q_LEN=Q_len,
-            KV_LEN=KV_len,
+            Q_LEN=seq_len,
+            KV_LEN=seq_len,
             device=input_ids.device,
         )
 
