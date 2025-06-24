@@ -29,7 +29,7 @@ from model.model import PLM, PLMConfig
 from model.utils import Linear
 
 
-inductor_config.max_autotune_gemm_backends = {"aten", "cutlass", "fbgemm"}
+inductor_config.max_autotune_gemm_backends = "aten,cutlass,fbgemm"
 
 
 @dataclass
