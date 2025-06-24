@@ -248,7 +248,7 @@ def main(args, model_config):
             # run validation batches
             model.eval()
             valid_loader.reset()
-            val_loss, valid_tokens = 0.0, 0
+            val_loss, valid_tokens, val_steps = 0.0, 0, 0
 
             with torch.no_grad():
                 input_ids, labels, mask_rate = valid_loader.next_batch()
@@ -256,7 +256,8 @@ def main(args, model_config):
                 while input_ids.numel():
                     batch_valid_tokens = (input_ids != pad_token_id).sum()
                     valid_tokens += batch_valid_tokens
-                    val_loss += model(input_ids, labels, mask_rate, sliding_window_size) * batch_valid_tokens
+                    val_loss += model(input_ids, labels, mask_rate, sliding_window_size)
+                    val_steps += 1
                     input_ids, labels, mask_rate = valid_loader.next_batch()
                     pbar.update(1)
                 pbar.close()
@@ -265,7 +266,7 @@ def main(args, model_config):
                 dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
                 dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
             
-            val_loss /= valid_tokens
+            val_loss /= val_steps
             # log val loss to console and to logfile
             print0(f'step:{step}/{args.num_steps} \
                    val_loss:{val_loss:.4f} \
@@ -351,7 +352,7 @@ def main(args, model_config):
     model.eval()
     test_loader.reset()
 
-    test_loss, test_tokens = 0.0, 0
+    test_loss, test_tokens, test_steps = 0.0, 0, 0
     with torch.no_grad():
         input_ids, labels, mask_rate = test_loader.next_batch()
         pbar = tqdm(desc='Testing', leave=False)
