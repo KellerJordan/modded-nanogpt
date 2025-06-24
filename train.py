@@ -54,7 +54,7 @@ class TrainingArguments:
     # Optimization hyperparams
     batch_size: int = 8*64*1024
     grad_accum: int = 8
-    num_steps: int = 20000
+    num_steps: int = 500
     cooldown_steps: int = 5000
     max_length: int = 1024
 
@@ -67,7 +67,7 @@ class TrainingArguments:
     muon_momentum_warmup_steps: int = 300  # steps for warmup momentum, 0.85 -> 0.95
 
     # Evaluation and logging hyperparams
-    valid_loss_every: int = 500
+    valid_loss_every: int = 250
     hf_model_name: Optional[str] = None
     save_every: Optional[int] = None
 
