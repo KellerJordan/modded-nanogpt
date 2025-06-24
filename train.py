@@ -146,14 +146,14 @@ def main(args, model_config):
     tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
     cls_id, eos_id, pad_id = tokenizer.cls_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id
     
-    train_loader = DistributedPaddedDataLoader2(args.input_bin, batch_size, ddp_rank, ddp_world_size,
-                                               cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=100)
+    #train_loader = DistributedPaddedDataLoader2(args.input_bin, batch_size, ddp_rank, ddp_world_size,
+    #                                           cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=100)
     valid_loader = DistributedPaddedDataLoader2(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size,
                                                cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
     test_loader = DistributedPaddedDataLoader2(args.input_test_bin, batch_size, ddp_rank, ddp_world_size,
                                               cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
     
-    #train_loader = DistributedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size)
+    train_loader = DistributedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size)
     #valid_loader = DistributedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size)
     #test_loader = DistributedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size)
 
@@ -374,11 +374,14 @@ def main(args, model_config):
     test_loss, test_tokens = 0.0, 0
     with torch.no_grad():
         input_ids = test_loader.next_batch()
+        pbar = tqdm(desc='Testing', leave=False)
         while input_ids.numel():
             batch_test_tokens = (input_ids != pad_id).sum()
             test_tokens += batch_test_tokens
             test_loss += model(input_ids, sliding_window_size).loss * batch_test_tokens
             input_ids = test_loader.next_batch()
+            pbar.update(1)
+        pbar.close()
     
     if ddp_world_size > 1:
         dist.all_reduce(test_loss, op=dist.ReduceOp.SUM)
