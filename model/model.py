@@ -35,12 +35,12 @@ class PLMConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.expansion_ratio = expansion_ratio
         self.soft_logit_cap = soft_logit_cap
+        self.attention_soft_cap = attention_soft_cap
+        self.add_att_soft_cap = add_att_soft_cap
         self.sliding_window_size = sliding_window_size
         self.p_attention = p_attention
         self.tie_embeddings = tie_embeddings
         self.unet = unet
-        self.attention_soft_cap = attention_soft_cap
-        self.add_att_soft_cap = add_att_soft_cap
 
 
 @dataclass

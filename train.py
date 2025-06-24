@@ -471,6 +471,8 @@ if __name__ == '__main__':
         vocab_size=args.vocab_size,
         expansion_ratio=args.expansion_ratio,
         soft_logit_cap=args.soft_logit_cap,
+        attention_soft_cap=args.attention_soft_cap,
+        add_att_soft_cap=args.add_att_soft_cap,
         p_attention=args.p_attention,
         tie_embeddings=args.tie_embeddings,
         unet=args.unet,
