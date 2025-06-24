@@ -1,6 +1,8 @@
 import torch
 import random
 from pathlib import Path
+from transformers import EsmTokenizer
+from typing import Tuple, Optional
 
 
 def _load_data_shard(file: Path):
@@ -113,3 +115,167 @@ class DistributedPaddedDataLoader(DistributedDataLoader):
 
         self._leftover_tokens = raw_tokens[curr_eos+1:]
         self.tokens = torch.cat(processed_chunks, dim=0)
+
+
+class MaskedDistributedPaddedDataLoader(DistributedPaddedDataLoader):
+    """
+    Enhanced dataloader that applies masking on the CPU side and supports async processing.
+    """
+    def __init__(
+        self, 
+        filename_pattern, 
+        seq_len, 
+        process_rank, 
+        num_processes, 
+        cls_id, 
+        eos_id, 
+        pad_id, 
+        max_epochs=1,
+        mask_token_id=None,
+        special_token_ids=None,
+        training=True,
+        num_workers=0,
+        prefetch_factor=2
+    ):
+        super().__init__(filename_pattern, seq_len, process_rank, num_processes, cls_id, eos_id, pad_id, max_epochs)
+        
+        # Masking parameters
+        self.mask_token_id = mask_token_id if mask_token_id is not None else 32  # Default ESM2 mask token
+        self.special_token_ids = special_token_ids if special_token_ids is not None else torch.tensor([cls_id, eos_id, pad_id])
+        self.training = training
+        
+        # Async processing parameters (simplified)
+        self.num_workers = num_workers
+        self.prefetch_factor = prefetch_factor
+        
+        # Pre-computed batches cache for async processing
+        self._batch_cache = []
+        self._cache_size = max(1, num_workers * prefetch_factor)
+        self._fill_cache()
+
+    def _fill_cache(self):
+        """Pre-fill the batch cache for async processing."""
+        while len(self._batch_cache) < self._cache_size:
+            try:
+                raw_batch = super().next_batch()
+                if raw_batch.numel() == 0:
+                    break
+                masked_batch, labels = self._apply_masking(raw_batch)
+                self._batch_cache.append((masked_batch, labels))
+            except Exception as e:
+                print(f"Cache fill error: {e}")
+                break
+
+    def _apply_masking(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply masking logic to input sequence."""
+        eps = 1e-3
+        input_ids = input_ids.flatten()
+        seq_len = len(input_ids)
+        device = input_ids.device
+
+        if self.training:  # sample uniform between 0 and 1
+            t = torch.rand(1, device=device)
+            t = (1 - eps) * t + eps
+        else:  # evaluate at classic 15%
+            t = torch.full((1,), 0.15, device=device)
+
+        p_mask = t.repeat(seq_len)
+        mask_indices = torch.rand(seq_len, device=device) < p_mask
+        
+        # prevent special tokens from being masked (cls, sep, eos, etc.)
+        special_token_ids = self.special_token_ids.to(device)
+        special_mask = torch.isin(input_ids, special_token_ids)
+        mask_indices = mask_indices & ~special_mask
+
+        # Create masked input
+        noisy_batch = torch.where(mask_indices, self.mask_token_id, input_ids)
+        
+        # Create labels
+        labels = input_ids.clone()
+        non_mask_indices = ~mask_indices
+        labels[non_mask_indices] = -100
+
+        return noisy_batch, labels
+
+    def next_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get next batch with masking applied."""
+        # Try to get from cache first
+        if self._batch_cache:
+            batch = self._batch_cache.pop(0)
+            # Refill cache in background if needed
+            if len(self._batch_cache) < self._cache_size // 2:
+                self._fill_cache()
+            return batch
+        
+        # If cache is empty, generate batch on-demand
+        raw_batch = super().next_batch()
+        if raw_batch.numel() == 0:
+            return torch.empty(0, dtype=torch.int32), torch.empty(0, dtype=torch.int32)
+        return self._apply_masking(raw_batch)
+
+    def set_training(self, training: bool):
+        """Set training mode for masking probability."""
+        self.training = training
+        # Clear cache when switching modes to ensure fresh batches
+        self._batch_cache.clear()
+        self._fill_cache()
+
+    def reset(self):
+        """Reset the dataloader and clear cache."""
+        super().reset()
+        self._batch_cache.clear()
+        self._fill_cache()
+
+
+def create_masked_dataloaders(
+    train_pattern: str,
+    valid_pattern: str,
+    test_pattern: str,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+    tokenizer: Optional[EsmTokenizer] = None,
+    num_workers: int = 0,
+    prefetch_factor: int = 2
+) -> Tuple[MaskedDistributedPaddedDataLoader, MaskedDistributedPaddedDataLoader, MaskedDistributedPaddedDataLoader]:
+    """
+    Factory function to create masked dataloaders for train/valid/test.
+    """
+    if tokenizer is None:
+        tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
+    
+    cls_id, eos_id, pad_id = tokenizer.cls_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id
+    mask_token_id = tokenizer.mask_token_id
+    
+    # Get special token IDs (excluding mask token)
+    mask_token = tokenizer.mask_token
+    special_token_ids = [
+        tokenizer.convert_tokens_to_ids(v) 
+        for k, v in tokenizer.special_tokens_map.items() 
+        if v != mask_token
+    ]
+    special_token_ids = torch.tensor(list(set(special_token_ids)))
+    
+    # Create dataloaders
+    train_loader = MaskedDistributedPaddedDataLoader(
+        train_pattern, batch_size, rank, world_size,
+        cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=100,
+        mask_token_id=mask_token_id, special_token_ids=special_token_ids,
+        training=True, num_workers=num_workers, prefetch_factor=prefetch_factor
+    )
+    
+    valid_loader = MaskedDistributedPaddedDataLoader(
+        valid_pattern, batch_size // 8, rank, world_size,
+        cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1,
+        mask_token_id=mask_token_id, special_token_ids=special_token_ids,
+        training=False, num_workers=num_workers, prefetch_factor=prefetch_factor
+    )
+    
+    test_loader = MaskedDistributedPaddedDataLoader(
+        test_pattern, batch_size // 8, rank, world_size,
+        cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1,
+        mask_token_id=mask_token_id, special_token_ids=special_token_ids,
+        training=False, num_workers=num_workers, prefetch_factor=prefetch_factor
+    )
+    
+    return train_loader, valid_loader, test_loader

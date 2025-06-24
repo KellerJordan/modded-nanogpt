@@ -3,11 +3,11 @@
 ```console
 git clone https://github.com/Synthyra/SpeedrunningPLMs.git
 cd SpeedrunningPLMs
-pip install --upgrade pip setuptools
-pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu126
-pip install --force-reinstall flatbuffers
+git clone https://github.com/Synthyra/SpeedRunningESM2
+cd SpeedRunningESM2
 pip install -r requirements.txt
-python data/download_omgprot50.py # --num_chunks 10 you can download less chunks to save time
+pip install --pre torch==2.6.0.dev20241231+cu124 torchvision --index-url https://download.pytorch.org/whl/nightly/cu124 --upgrade
+python data/download_omgprot50.py --num_chunks 10
 ./run.sh
 ```
 

@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional, List
 from dataclasses import dataclass
 from torch.nn.attention.flex_attention import create_block_mask
@@ -140,7 +139,7 @@ class UnetTransformer(nn.Module):
             x = x + self.skip_weights[i] * skip_connections.pop()
             x = self.layers[self.num_encoder_layers + i](x, attention_mask, ve_dec[i], x0)
         return x
-    
+
 
 class PLM(PreTrainedModel):
     config_class = PLMConfig
@@ -271,9 +270,16 @@ class PLM(PreTrainedModel):
 
 if __name__ == "__main__":
     # py -m model.model
-    config = PLMConfig(p_attention=False, unet=True)
+    from torchinfo import summary
+    config = PLMConfig(
+        hidden_size=768,
+        num_attention_heads=6,
+        num_hidden_layers=24,
+        expansion_ratio=8/3,
+        unet=True,
+    )
     model = PLM(config).cuda()
-    print(model)
+    summary(model)
 
     input_ids = torch.randint(0, 33, (1, 100)).cuda()
     output = model(input_ids)

@@ -39,13 +39,13 @@ class SelfAttention(nn.Module):
         self.n_heads = config.num_attention_heads
         self.d_head = self.hidden_size // self.n_heads
 
-        corrected_dim = self.n_heads * self.d_head
-        std = 0.5 * (self.d_head ** -0.5)
-        bound = (3 ** 0.5) * std
-
-        self.Wqkv = nn.Parameter(torch.empty(3, self.hidden_size, corrected_dim).uniform_(-bound, bound))
+        assert self.hidden_size % self.n_heads == 0
+        self.Wq = Linear(self.hidden_size, self.hidden_size)
+        self.Wk = Linear(self.hidden_size, self.hidden_size)
+        self.Wv = Linear(self.hidden_size, self.hidden_size)
+        self.rotary = Rotary(self.d_head) # dim // num_attention_heads = head_dim
         self.Wo = Linear(self.hidden_size, self.hidden_size)
-        self.rotary = Rotary(self.d_head)
+        self.Wo.weight.data.zero_() # zero init suggested by @Grad6230497
         
         if config.unet:
             self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
@@ -58,21 +58,28 @@ class SelfAttention(nn.Module):
             vi: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         l, d = x.size() # batch size must be 1 for FlexAttention
-        q, k, v = F.linear(x, self.Wqkv.flatten(end_dim=1).type_as(x)).view(1, l, 3 * self.n_heads, self.d_head).chunk(3, dim=-2)
-        # (1, l, n_heads, d_head), (1, l, n_heads, d_head), (1, l, n_heads, d_head)
+        q, k, v = self.Wq(x), self.Wk(x), self.Wv(x)
+
+        q = q.view(1, l, self.n_heads, self.d_head)
+        k = k.view(1, l, self.n_heads, self.d_head)
+        v = v.view(1, l, self.n_heads, self.d_head)
+
         if self.unet and vi is not None:
             # Reshape vi from (l, d) to (1, l, n_heads, d_head) to match v's shape
-            vi_reshaped = vi.view(1, l, self.n_heads, self.d_head)
-            v = self.lambdas[0] * v + self.lambdas[1] * vi_reshaped
+            v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v)
         
         q, k = norm(q), norm(k)
         q, k = self.rotary(q), self.rotary(k)
         
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=attention_mask).transpose(1, 2)
-        # (1, n_heads, l, d_head), (1, n_heads, l, d_head), (1, n_heads, l, d_head)
-        # -> (1, l, n_heads, d_head)
-        y = y.contiguous().view(1, l, self.n_heads * self.d_head) # (1, l, n_heads * d_head)
-        y = self.Wo(y).squeeze(0) # (l, hidden_size)
+        y = flex_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            block_mask=attention_mask,
+            enable_gqa=True,
+        )
+        y = y.transpose(1, 2).contiguous().view_as(x)
+        y = self.Wo(y)
         return y
 
 
