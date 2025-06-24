@@ -24,9 +24,12 @@ from pathlib import Path
 from tqdm import tqdm
 
 from optimizer import Muon
-from dataloading import DistributedPaddedDataLoader, DistributedDataLoader, DistributedPaddedDataLoader2
+from dataloading import DistributedPaddedDataLoader
 from model.model import PLM, PLMConfig
 from model.utils import Linear
+
+
+inductor_config.max_autotune_gemm_backends = {"aten", "cutlass", "fbgemm"}
 
 
 @dataclass
@@ -49,8 +52,8 @@ class TrainingArguments:
     input_test_bin: str = 'data/omgprot50/omgprot50_test_*.bin'
 
     # Optimization hyperparams
-    batch_size: int = 1*64*1024
-    grad_accum: int = 4
+    batch_size: int = 8*64*1024
+    grad_accum: int = 8
     num_steps: int = 20000
     cooldown_steps: int = 5000
     max_length: int = 1024
@@ -146,16 +149,12 @@ def main(args, model_config):
     tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
     cls_id, eos_id, pad_id = tokenizer.cls_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id
     
-    #train_loader = DistributedPaddedDataLoader2(args.input_bin, batch_size, ddp_rank, ddp_world_size,
-    #                                           cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=100)
-    valid_loader = DistributedPaddedDataLoader2(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size,
+    train_loader = DistributedPaddedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size,
+                                               cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=100)
+    valid_loader = DistributedPaddedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size,
                                                cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
-    test_loader = DistributedPaddedDataLoader2(args.input_test_bin, batch_size, ddp_rank, ddp_world_size,
+    test_loader = DistributedPaddedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size,
                                               cls_id=cls_id, eos_id=eos_id, pad_id=pad_id, max_epochs=1)
-    
-    train_loader = DistributedDataLoader(args.input_bin, batch_size, ddp_rank, ddp_world_size)
-    #valid_loader = DistributedDataLoader(args.input_valid_bin, batch_size, ddp_rank, ddp_world_size)
-    #test_loader = DistributedDataLoader(args.input_test_bin, batch_size, ddp_rank, ddp_world_size)
 
     print0(f'Training DataLoader: {len(train_loader.files)} files')
     print0(f'Validation DataLoader: {len(valid_loader.files)} files')
@@ -172,9 +171,9 @@ def main(args, model_config):
     
     #print0("Coordinate descent tuning - can take up to 30 minutes")
     #inductor_config.coordinate_descent_tuning = True
-    #print0("torch.compile()")
+    print0("torch.compile()")
     
-    #model = torch.compile(model)
+    model = torch.compile(model)
 
     # wrap model in DDP only if using distributed training
     if ddp_world_size > 1:
@@ -208,7 +207,6 @@ def main(args, model_config):
     ], betas=(0.8, 0.95), fused=True)
     optimizer2 = Muon(hidden_matrix_params, lr=args.lr_hidden, momentum=0.95)
     optimizers = [optimizer1, optimizer2]
-
 
     # learning rate decay scheduler (linear warmup and cooldown)
     def get_lr(it):
