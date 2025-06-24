@@ -267,7 +267,7 @@ def main(args, model_config):
 
             with torch.no_grad():
                 input_ids = valid_loader.next_batch()
-                pbar = tqdm(desc='Validating', total=len(valid_loader), leave=False)
+                pbar = tqdm(desc='Validating', leave=False)
                 while input_ids.numel():
                     batch_valid_tokens = (input_ids != pad_id).sum()
                     valid_tokens += batch_valid_tokens
