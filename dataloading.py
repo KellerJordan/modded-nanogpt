@@ -2,7 +2,9 @@ import torch
 import random
 from pathlib import Path
 from transformers import EsmTokenizer
-from typing import Tuple, Optional
+from typing import Tuple
+import torch.utils.data as data
+from torch.utils.data import DataLoader, IterableDataset
 
 
 def _load_data_shard(file: Path):
@@ -188,13 +190,6 @@ class DistributedPaddedDataLoader(DistributedDataLoaderWithMasking):
 
         self._leftover_tokens = raw_tokens[curr_eos+1:]
         self.tokens = torch.cat(processed_chunks, dim=0)
-
-
-# Optimized implementation using PyTorch DataLoader with multiple workers
-import torch.utils.data as data
-from torch.utils.data import DataLoader, IterableDataset
-import queue
-import threading
 
 
 class DistributedPaddedIterableDataset(IterableDataset):
