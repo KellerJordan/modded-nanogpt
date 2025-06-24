@@ -13,7 +13,7 @@ def _load_data_shard(file: Path):
     assert header[1] == 1, 'unsupported version'
     num_tokens = int(header[2]) # number of tokens (claimed)
     with file.open('rb', buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint8, pin_memory=True)
+        tokens = torch.empty(num_tokens, dtype=torch.uint8)
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy())
         assert nbytes == num_tokens, 'number of tokens read does not match header?'
