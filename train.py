@@ -158,6 +158,8 @@ def main(args, model_config):
     print0("Coordinate descent tuning - can take up to 30 minutes")
     inductor_config.coordinate_descent_tuning = True
     print0("torch.compile()")
+    # Enable scalar output capture for .item() calls in compiled functions
+    #torch._dynamo.config.capture_scalar_outputs = True
     model = torch.compile(model)
 
     # wrap model in DDP only if using distributed training
