@@ -20,6 +20,8 @@ class PLMConfig(PretrainedConfig):
         num_att_tokens: int = 512,
         vocab_size: int = 33,
         expansion_ratio: float = 2.0,
+        attention_soft_cap: float = 64.0,
+        add_att_soft_cap: bool = True,
         soft_logit_cap: float = 16.0,
         sliding_window_size: int = 2048,
         p_attention: bool = False,
@@ -37,6 +39,8 @@ class PLMConfig(PretrainedConfig):
         self.p_attention = p_attention
         self.tie_embeddings = tie_embeddings
         self.unet = unet
+        self.attention_soft_cap = attention_soft_cap
+        self.add_att_soft_cap = add_att_soft_cap
 
 
 @dataclass
