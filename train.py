@@ -95,8 +95,8 @@ def main(args, model_config):
 
     # calculate the steps of gradient accumulation required to attain the desired global batch size
     # args.batch_size should refer to the total amount of tokens per backward pass
-    # reducing batch_size by ddp_world_size is done in the data loader
-    batch_size = args.batch_size // args.grad_accum
+    # reducing batch_size by ddp_world_size to get the local batch size per GPU
+    batch_size = args.batch_size // args.grad_accum // ddp_world_size
 
     print0(f'Train accumulation steps: {args.grad_accum}')
     print0(f'Adjusted local batch size: {batch_size} tokens')
