@@ -270,6 +270,9 @@ def main(args, model_config):
                 pbar.close()
 
             if ddp_world_size > 1:
+                # Convert to tensors before all_reduce
+                val_loss = torch.tensor(val_loss, device=device)
+                valid_tokens = torch.tensor(valid_tokens, device=device)
                 dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
                 dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
             
@@ -373,6 +376,9 @@ def main(args, model_config):
         pbar.close()
     
     if ddp_world_size > 1:
+        # Convert to tensors before all_reduce
+        test_loss = torch.tensor(test_loss, device=device)
+        test_tokens = torch.tensor(test_tokens, device=device)
         dist.all_reduce(test_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(test_tokens, op=dist.ReduceOp.SUM)
     
