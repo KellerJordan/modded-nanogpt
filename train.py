@@ -286,7 +286,7 @@ def main(args, model_config):
 
             if ddp_world_size > 1:
                 # Convert to tensors before all_reduce
-                #val_loss = torch.tensor(val_loss, device=device) # already a tensor
+                val_loss = torch.tensor(val_loss, device=device)
                 valid_tokens = torch.tensor(valid_tokens, device=device)
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
                 dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
@@ -371,6 +371,25 @@ def main(args, model_config):
         if step % 100 == 0:
             approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
             print0(f'step:{step+1}/{args.num_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms')
+            
+            # Log training progress to wandb
+            if master_process and args.wandb_token:
+                current_lr_hidden = optimizers[1].param_groups[0]['lr']
+                current_lr_embed = optimizers[0].param_groups[0]['lr']
+                current_lr_head = optimizers[0].param_groups[1]['lr']
+                current_lr_scalar = optimizers[0].param_groups[2]['lr']
+                
+                wandb.log({
+                    "train_time_ms": approx_time,
+                    "train_step_avg_ms": approx_time/timed_steps if timed_steps > 0 else 0,
+                    "step": step,
+                    "lr_hidden": current_lr_hidden,
+                    "lr_embed": current_lr_embed,
+                    "lr_head": current_lr_head,
+                    "lr_scalar": current_lr_scalar,
+                    "sliding_window_size": sliding_window_size.item() if hasattr(sliding_window_size, 'item') else sliding_window_size,
+                    "muon_momentum": optimizers[1].param_groups[0]['momentum']
+                })
 
     print0(f'peak memory consumption training: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB')
     print0(f'Train Time: {training_time_ms:.0f}ms | Step Avg: {training_time_ms/(timed_steps-1):.2f}ms | Param Count: {get_param_count(model):,}')
@@ -406,15 +425,40 @@ def main(args, model_config):
     
     if ddp_world_size > 1:
         # Convert to tensors before all_reduce
-        #test_loss = torch.tensor(test_loss, device=device) # already a tensor
+        test_loss = torch.tensor(test_loss, device=device)
         test_tokens = torch.tensor(test_tokens, device=device)
         dist.all_reduce(test_loss, op=dist.ReduceOp.AVG)
         dist.all_reduce(test_tokens, op=dist.ReduceOp.SUM)
     
     test_loss /= test_steps
+    test_perplexity = math.e**test_loss
     print0(f'Test tokens: {test_tokens.item()}')
-    print0(f'Loss: {test_loss:.4f} | Perplexity: {math.e**test_loss:.4f}')
+    print0(f'Loss: {test_loss:.4f} | Perplexity: {test_perplexity:.4f}')
     print0(f"peak memory consumption testing: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
+    
+    # Final wandb logging
+    if master_process and args.wandb_token:
+        wandb.log({
+            "test_loss": test_loss,
+            "test_perplexity": test_perplexity,
+            "test_tokens": test_tokens.item(),
+            "final_train_time_ms": training_time_ms,
+            "final_step_avg_ms": training_time_ms/(timed_steps-1) if timed_steps > 1 else 0,
+            "peak_memory_training_gb": torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024,
+            "param_count": get_param_count(model)
+        })
+        
+        # Log final summary
+        wandb.summary.update({
+            "final_val_loss": val_loss,
+            "final_test_loss": test_loss,
+            "final_test_perplexity": test_perplexity,
+            "total_train_time_hours": training_time_ms / 3600000,
+            "param_count": get_param_count(model)
+        })
+        
+        wandb.finish()
+    
     # -------------------------------------------------------------------------
     # clean up nice
     if ddp_world_size > 1:
@@ -517,6 +561,6 @@ if __name__ == '__main__':
     if args.token:
         from huggingface_hub import login
         login(args.token)
-        args.token = None
+        args.token = None  # Clear token for security
     
     val_loss, test_loss = main(args, model_config)
