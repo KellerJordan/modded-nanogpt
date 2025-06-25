@@ -20,6 +20,7 @@ from transformers import EsmTokenizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
 from tqdm import tqdm
+import wandb
 
 from optimizer import Muon
 from dataloading import OptimizedDistributedPaddedDataLoader
@@ -80,6 +81,20 @@ def main(args, model_config):
                 if not logonly:
                     print(s)
                 print(s, file=f)
+
+    # Initialize wandb if token is provided
+    if master_process and args.wandb_token:
+        wandb.login(key=args.wandb_token)
+        wandb.init(
+            project="speedrunning-esm2",
+            name=args.save_path,
+            config={
+                **vars(args),
+                **vars(model_config),
+                "ddp_world_size": ddp_world_size,
+                "device": str(device)
+            }
+        )
 
     # log information about the hardware/software environment this is running on
     # and print the full `nvidia-smi` to file
@@ -271,20 +286,34 @@ def main(args, model_config):
 
             if ddp_world_size > 1:
                 # Convert to tensors before all_reduce
-                val_loss = torch.tensor(val_loss, device=device)
+                #val_loss = torch.tensor(val_loss, device=device) # already a tensor
                 valid_tokens = torch.tensor(valid_tokens, device=device)
-                dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
                 dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
             
             val_loss /= val_steps
+            perplexity = math.e**val_loss
             # log val loss to console and to logfile
             print0(f'step:{step}/{args.num_steps} \
                    val_loss:{val_loss:.4f} \
                    train_time:{training_time_ms:.0f}ms \
                    step_avg:{training_time_ms/(timed_steps-1):.2f}ms \
-                   perplexity:{(math.e**val_loss):.4f} \
+                   perplexity:{perplexity:.4f} \
                    param_count:{get_param_count(model):,} \
                    tokens: {valid_tokens.item():,}')
+            
+            # Log to wandb
+            if master_process and args.wandb_token:
+                wandb.log({
+                    "val_loss": val_loss,
+                    "val_perplexity": perplexity,
+                    "train_time_ms": training_time_ms,
+                    "step_avg_ms": training_time_ms/(timed_steps-1) if timed_steps > 1 else 0,
+                    "valid_tokens": valid_tokens.item(),
+                    "step": step,
+                    "sliding_window_size": sliding_window_size.item() if hasattr(sliding_window_size, 'item') else sliding_window_size
+                })
+            
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -377,9 +406,9 @@ def main(args, model_config):
     
     if ddp_world_size > 1:
         # Convert to tensors before all_reduce
-        test_loss = torch.tensor(test_loss, device=device)
+        #test_loss = torch.tensor(test_loss, device=device) # already a tensor
         test_tokens = torch.tensor(test_tokens, device=device)
-        dist.all_reduce(test_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(test_loss, op=dist.ReduceOp.AVG)
         dist.all_reduce(test_tokens, op=dist.ReduceOp.SUM)
     
     test_loss /= test_steps
@@ -398,6 +427,7 @@ def arg_parser():
     
     # CLI-specific arguments
     parser.add_argument("--token", type=str, default=None, help="Huggingface token")
+    parser.add_argument("--wandb_token", type=str, default=None, help="Weights & Biases API token")
     parser.add_argument("--save_path", type=str, default="Synthyra/speedrun_test", help="Path to save the model and report to wandb")
     parser.add_argument("--bugfix", action="store_true", help="Use small batch size and max length for debugging")
     
