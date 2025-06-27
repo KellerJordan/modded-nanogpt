@@ -336,30 +336,30 @@ class Trainer:
             torch.save(log, 'logs/state_step%06d.pt' % step)
 
     def train_step(self, step):
-            self.model.train()
-            for i in range(self.args.grad_accum):
-                with contextlib.ExitStack() as stack:
-                    # Only sync gradients on last accumulation step
-                    if self.ddp_world_size > 1 and i < self.args.grad_accum - 1:
-                        stack.enter_context(self.model.no_sync())
-                    input_ids, labels, mask_rate = self.train_loader.next_batch()
-                    loss = self.model(input_ids, labels, mask_rate, self.sliding_window_size) / self.args.grad_accum
-                    loss.backward()
+        self.model.train()
+        for i in range(self.args.grad_accum):
+            with contextlib.ExitStack() as stack:
+                # Only sync gradients on last accumulation step
+                if self.ddp_world_size > 1 and i < self.args.grad_accum - 1:
+                    stack.enter_context(self.model.no_sync())
+                input_ids, labels, mask_rate = self.train_loader.next_batch()
+                loss = self.model(input_ids, labels, mask_rate, self.sliding_window_size) / self.args.grad_accum
+                loss.backward()
 
-            # momentum warmup for Muon
-            if self.args.use_muon:
-                frac = min(step/self.args.muon_momentum_warmup_steps, 1)
-                for group in self.optimizers[-1].param_groups:
-                    group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+        # momentum warmup for Muon
+        if self.args.use_muon:
+            frac = min(step/self.args.muon_momentum_warmup_steps, 1)
+            for group in self.optimizers[-1].param_groups:
+                group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
 
-            # step the optimizers and schedulers
-            for opt, sched in zip(self.optimizers, self.lr_schedulers):
-                opt.step()
-                sched.step()
+        # step the optimizers and schedulers
+        for opt, sched in zip(self.optimizers, self.lr_schedulers):
+            opt.step()
+            sched.step()
 
-            # null the gradients
-            self.model.zero_grad(set_to_none=True)
-            return loss.item()
+        # null the gradients
+        self.model.zero_grad(set_to_none=True)
+        return loss.item() * self.args.grad_accum
 
     def train(self):
         self.init_training()
