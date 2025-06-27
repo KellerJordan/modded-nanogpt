@@ -238,7 +238,6 @@ class PLM(PreTrainedModel):
             lm_logits.view(-1, self.vocab_size),
             labels.view(-1).long()
         )
-        
         if self.training:
             loss = loss / mask_rate
 

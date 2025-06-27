@@ -16,454 +16,449 @@ import torch
 import torch.distributed as dist
 import argparse
 import torch._inductor.config as inductor_config
-from transformers import EsmTokenizer
+from torchinfo import summary
+from transformers import EsmTokenizer, get_scheduler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
 from tqdm import tqdm
-import wandb
 
 from optimizer import Muon
 from dataloading import OptimizedDistributedPaddedDataLoader
 from model.model import PLM, PLMConfig
 from model.utils import Linear
+from utils import LerpTensor
+
+
+global WANDB_AVAILABLE
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 
 inductor_config.max_autotune_gemm_backends = "aten,cutlass,fbgemm"
 
 
-def get_param_count(model):
-    total_params = 0
-    for _, param in model.named_parameters():
-        total_params += param.numel()
-    return total_params
+class GlobalTimer:
+    """Global timer that tracks elapsed time and can be paused/resumed."""
+    def __init__(self):
+        self.total_time = 0.0
+        self.start_time = None
+        self.is_running = False
+    
+    def start(self):
+        """Start the timer."""
+        if not self.is_running:
+            torch.cuda.synchronize()
+            self.start_time = time.perf_counter()
+            self.is_running = True
+    
+    def pause(self):
+        """Pause the timer and add elapsed time to total."""
+        if self.is_running:
+            torch.cuda.synchronize()
+            self.total_time += time.perf_counter() - self.start_time
+            self.is_running = False
+    
+    def resume(self):
+        """Resume the timer."""
+        self.start()
+    
+    def get_time(self):
+        """Get total elapsed time including current session if running."""
+        current_time = self.total_time
+        if self.is_running:
+            torch.cuda.synchronize()
+            current_time += time.perf_counter() - self.start_time
+        return current_time
+    
+    def reset(self):
+        """Reset the timer to zero."""
+        self.total_time = 0.0
+        self.start_time = None
+        self.is_running = False
 
 
-def main(args, model_config):
-    # set up DDP (distributed data parallel) if available, otherwise single GPU
-    # requires torchrun or equivalent
-    if 'RANK' in os.environ:
-        ddp_rank = int(os.environ['RANK'])
-        ddp_local_rank = int(os.environ['LOCAL_RANK'])
-        ddp_world_size = int(os.environ['WORLD_SIZE'])
-        device = torch.device(f'cuda:{ddp_local_rank}')
-        torch.cuda.set_device(device)
-        dist.init_process_group(backend='nccl', device_id=device)
-        dist.barrier()
-        master_process = (ddp_rank == 0)
-    else:
-        ddp_rank = 0
-        ddp_local_rank = 0
-        ddp_world_size = 1
-        device = torch.device('cuda:0')
-        torch.cuda.set_device(device)
-        master_process = True
+def exclude_from_timer(timer):
+    """Decorator that pauses the timer during function execution."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            timer.pause()
+            try:
+                result = func(*args, **kwargs)
+            finally:
+                timer.resume()
+            return result
+        return wrapper
+    return decorator
 
-    print(f'using device: {device}')
 
-    # begin logging
-    logfile = None
-    if master_process:
-        run_id = uuid.uuid4()
-        Path('logs').mkdir(exist_ok=True)
-        # logdir = Path('logs') / f'{run_id}'
-        # logdir.mkdir()
-        logfile = Path('logs') / f'{run_id}.txt'
-        print(logfile.stem)
-        # create the log file
-        with logfile.open('w') as f:
-            # begin the log by printing this file (the Python code)
-            print(code, file=f)
-            print('=' * 100, file=f)
+class Trainer:
+    def __init__(self, args, model_config):
+        self.args = args
+        self.model_config = model_config
+        
+        # Initialize global timer
+        self.train_timer = GlobalTimer()
 
-    def print0(s, logonly=False):
-        if master_process:
-            with logfile.open('a') as f:
+        if 'RANK' in os.environ:
+            self.ddp_rank = int(os.environ['RANK'])
+            self.ddp_local_rank = int(os.environ['LOCAL_RANK'])
+            self.ddp_world_size = int(os.environ['WORLD_SIZE'])
+            self.device = torch.device(f'cuda:{self.ddp_local_rank}')
+            torch.cuda.set_device(self.device)
+            dist.init_process_group(backend='nccl', device_id=self.device)
+            dist.barrier()
+            self.master_process = (self.ddp_rank == 0)
+        else:
+            self.ddp_rank = 0
+            self.ddp_local_rank = 0
+            self.ddp_world_size = 1
+            self.device = torch.device('cuda:0')
+            torch.cuda.set_device(self.device)
+            self.master_process = True
+
+        print(f'using device: {self.device}')
+
+    def print0(self, s, logonly=False):
+        if self.master_process:
+            with self.logfile.open('a', encoding='utf-8') as f:
                 if not logonly:
                     print(s)
                 print(s, file=f)
+    
+    def log_wandb(self, log_dict, prefix='train'):
+        if self.master_process and self.args.wandb_token:
+            wandb.log({f'{prefix}/{k}': v for k, v in log_dict.items()})
 
-    # Initialize wandb if token is provided
-    if master_process and args.wandb_token:
-        wandb.login(key=args.wandb_token)
-        wandb.init(
-            project="speedrunning-esm2",
-            name=args.save_path,
-            config={
-                **vars(args),
-                **vars(model_config),
-                "ddp_world_size": ddp_world_size,
-                "device": str(device)
-            }
+    def init_training(self):
+        self.logfile = None
+        if self.master_process:
+            run_id = uuid.uuid4()
+            Path('logs').mkdir(exist_ok=True)
+            # logdir = Path('logs') / f'{run_id}'
+            # logdir.mkdir()
+            self.logfile = Path('logs') / f'{run_id}.txt'
+            print(self.logfile.stem)
+            # create the log file
+            with self.logfile.open('w', encoding='utf-8') as f:
+                # begin the log by printing this file (the Python code)
+                print(code, file=f)
+                print('=' * 100, file=f)
+
+        if self.master_process and self.args.wandb_token:
+            wandb.login(key=self.args.wandb_token)
+            wandb.init(
+                project="speedrunning-esm2",
+                name=self.args.save_path,
+                config={
+                    **vars(self.args),
+                    **vars(self.model_config),
+                    "ddp_world_size": self.ddp_world_size,
+                    "device": str(self.device)
+                }
+            )
+
+        self.print0(f'Running python {sys.version}')
+        self.print0(f'Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:')
+        import subprocess
+        result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.print0(f'{result.stdout}', logonly=True)
+        self.print0('='*100, logonly=True)
+
+        self.print0(f'Model config: {self.model_config}')
+        self.print0(f'Args: {self.args.__dict__}')
+
+        # calculate local batch size
+        self.batch_size = self.args.batch_size // self.args.grad_accum // self.ddp_world_size
+
+        self.print0(f'Train accumulation steps: {self.args.grad_accum}')
+        self.print0(f'Adjusted local batch size: {self.batch_size} tokens')
+        self.print0(f'Across {self.ddp_world_size} GPUs')
+        self.print0(f'Total batch size: {self.args.batch_size} tokens')
+
+        self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
+        self.pad_token_id = self.tokenizer.pad_token_id
+
+        self.train_loader = self.init_dataloader(self.args.input_bin, training=True)
+        self.valid_loader = self.init_dataloader(self.args.input_valid_bin, training=False)
+        self.test_loader = self.init_dataloader(self.args.input_test_bin, training=False)
+
+        self.print0(f'Training DataLoader: {len(self.train_loader.files)} files')
+        self.print0(f'Validation DataLoader: {len(self.valid_loader.files)} files')
+        self.print0(f'Testing DataLoader: {len(self.test_loader.files)} files')
+        self.print0('='*100, logonly=True)
+
+        self.model = self.init_model()
+        self.print0(summary(self.model))
+        self.optimizers = self.init_optimizers()
+        self.lr_schedulers, self.sliding_window_size_scheduler = self.init_schedulers()
+        self.print0(f"Ready for training!")
+        
+        # Create decorated versions of methods that should be excluded from timing
+        self._run_eval_loader_timed = exclude_from_timer(self.train_timer)(self.run_eval_loader)
+        self._save_checkpoint_timed = exclude_from_timer(self.train_timer)(self.save_checkpoint)
+
+    def init_dataloader(self, filename_pattern, training=True):
+        return OptimizedDistributedPaddedDataLoader(
+            filename_pattern=filename_pattern,
+            seq_len=self.batch_size,
+            process_rank=self.ddp_rank,
+            num_processes=self.ddp_world_size,
+            max_epochs=1,
+            training=training,
+            tokenizer=self.tokenizer,
+            num_workers=self.args.num_workers,
+            prefetch_factor=self.args.prefetch_factor,
         )
 
-    # log information about the hardware/software environment this is running on
-    # and print the full `nvidia-smi` to file
-    print0(f'Running python {sys.version}')
-    print0(f'Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:')
-    import subprocess
-    result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    print0(f'{result.stdout}', logonly=True)
-    print0('='*100, logonly=True)
+    def init_model(self):
+        self.print0("Initializing model...")
+        model = PLM(self.model_config)
+        self.print0(model)
+        model = model.cuda().bfloat16()
+        for m in model.modules():
+            if isinstance(m, Linear):
+                m.float()
+        
+        self.print0("Coordinate descent tuning - can take up to 30 minutes")
+        inductor_config.coordinate_descent_tuning = True
+        self.print0("Calling torch.compile()")
+        # Enable scalar output capture for .item() calls in compiled functions
+        #torch._dynamo.config.capture_scalar_outputs = True
+        model = torch.compile(model)
+        if self.ddp_world_size > 1:
+            model = DDP(model, device_ids=[self.ddp_local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
+        return model
 
-    print0(f'Model config: {model_config}')
-    print0(f'Args: {args.__dict__}')
-
-    # calculate the steps of gradient accumulation required to attain the desired global batch size
-    # args.batch_size should refer to the total amount of tokens per backward pass
-    # reducing batch_size by ddp_world_size to get the local batch size per GPU
-    batch_size = args.batch_size // args.grad_accum // ddp_world_size
-
-    print0(f'Train accumulation steps: {args.grad_accum}')
-    print0(f'Adjusted local batch size: {batch_size} tokens')
-    print0(f'Across {ddp_world_size} GPUs')
-    print0(f'Total batch size: {args.batch_size} tokens')
-
-    # load tokens
-    tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
-    pad_token_id = tokenizer.pad_token_id
-    
-    # Use optimized dataloader with multiple workers
-    train_loader = OptimizedDistributedPaddedDataLoader(
-        filename_pattern=args.input_bin,
-        seq_len=batch_size,
-        process_rank=ddp_rank,
-        num_processes=ddp_world_size,
-        max_epochs=100,
-        training=True,
-        tokenizer=tokenizer,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-    )
-    valid_loader = OptimizedDistributedPaddedDataLoader(
-        filename_pattern=args.input_valid_bin,
-        seq_len=batch_size,
-        process_rank=ddp_rank,
-        num_processes=ddp_world_size,
-        max_epochs=1,
-        training=False,
-        tokenizer=tokenizer,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-    )
-    test_loader = OptimizedDistributedPaddedDataLoader(
-        filename_pattern=args.input_test_bin,
-        seq_len=batch_size,
-        process_rank=ddp_rank,
-        num_processes=ddp_world_size,
-        max_epochs=1,
-        training=False,
-        tokenizer=tokenizer,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-    )
-
-    print0(f'Training DataLoader: {len(train_loader.files)} files')
-    print0(f'Validation DataLoader: {len(valid_loader.files)} files')
-    print0(f'Testing DataLoader: {len(test_loader.files)} files')
-    print0('='*100, logonly=True)
-
-    print0("Initializing model...")
-    model = PLM(model_config)
-    print0(model)
-    model = model.cuda().bfloat16()
-    for m in model.modules():
-        if isinstance(m, Linear):
-            m.float()
-    
-    print0("Coordinate descent tuning - can take up to 30 minutes")
-    inductor_config.coordinate_descent_tuning = True
-    print0("torch.compile()")
-    # Enable scalar output capture for .item() calls in compiled functions
-    #torch._dynamo.config.capture_scalar_outputs = True
-    model = torch.compile(model)
-
-    # wrap model in DDP only if using distributed training
-    if ddp_world_size > 1:
-        model = DDP(model, device_ids=[ddp_local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
-        raw_model = model.module
-    else:
-        raw_model = model
-
-    # init the optimizers
-    print0("Initializing optimizers...")
-    hidden_matrix_params = [
-        p for n, p in model.named_parameters() 
-        if p.ndim >= 2 and "embed" not in n.lower() and "lm_head" not in n.lower() and p.requires_grad
-    ]
-    embed_params = [
-        p for n, p in model.named_parameters() if "embed" in n.lower() and p.requires_grad
-    ]
-    head_params = [
-        p for n, p in model.named_parameters() if "lm_head" in n.lower() and p.requires_grad
-    ]
-    scalar_params = [
-        p for n, p in model.named_parameters() 
-        if p.ndim < 2 and "embed" not in n.lower() and "lm_head" not in n.lower() and p.requires_grad
-    ]
-
-    # init the optimizer(s)
-    optimizer1 = torch.optim.Adam([
-        dict(params=embed_params, lr=args.lr_embed),
-        dict(params=head_params, lr=args.lr_head),
-        dict(params=scalar_params, lr=args.lr_scalar)
-    ], betas=(0.8, 0.95), fused=True)
-    optimizer2 = Muon(hidden_matrix_params, lr=args.lr_hidden, momentum=0.95)
-    optimizers = [optimizer1, optimizer2]
-
-    # learning rate decay scheduler (linear warmup and cooldown)
-    def get_lr(it):
-        assert it <= args.num_steps
-        # 1) constant lr for a while
-        if it < args.num_steps - args.cooldown_steps:
-            return 1.0
-        # 2) linear cooldown
+    def init_optimizers(self):
+        self.print0("Initializing optimizers...")
+        if self.args.use_muon:
+            hidden_matrix_params = [
+                p for n, p in self.model.named_parameters() 
+                if p.ndim >= 2 and "embed" not in n.lower() and "lm_head" not in n.lower() and p.requires_grad
+            ]
+            embed_params = [
+                p for n, p in self.model.named_parameters() if "embed" in n.lower() and p.requires_grad
+            ]
+            head_params = [
+                p for n, p in self.model.named_parameters() if "lm_head" in n.lower() and p.requires_grad
+            ]
+            scalar_params = [
+                p for n, p in self.model.named_parameters() 
+                if p.ndim < 2 and "embed" not in n.lower() and "lm_head" not in n.lower() and p.requires_grad
+            ]
+            optimizer1 = torch.optim.Adam([
+                dict(params=embed_params, lr=self.args.lr_embed),
+                dict(params=head_params, lr=self.args.lr_head),
+                dict(params=scalar_params, lr=self.args.lr_scalar)
+            ], betas=(0.8, 0.95), fused=True)
+            optimizer2 = Muon(hidden_matrix_params, lr=self.args.lr_hidden, momentum=0.95)
+            optimizers = [optimizer1, optimizer2]
         else:
-            decay_ratio = (args.num_steps - it) / args.cooldown_steps
-            return decay_ratio
+            optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.args.lr)
+            optimizers = [optimizer]
+        return optimizers
+    
+    def init_schedulers(self):
+        self.print0("Initializing schedulers...")
+        lr_schedulers = []
+        adam_scheduler = get_scheduler(
+            self.args.scheduler_type,
+            optimizer=self.optimizers[0],
+            num_warmup_steps=self.args.lr_warmup_steps,
+            num_training_steps=self.args.num_steps
+        )
+        lr_schedulers.append(adam_scheduler)
+        if self.args.use_muon:
+            muon_scheduler = get_scheduler(
+                self.args.scheduler_type,
+                optimizer=self.optimizers[-1],
+                num_warmup_steps=0, # apparently muon does not need a warmup
+                num_training_steps=self.args.num_steps
+            )
+            lr_schedulers.append(muon_scheduler)
+        sliding_window_size_scheduler = LerpTensor(start_val=512, end_val=self.args.max_length, precision=128)
+        return lr_schedulers, sliding_window_size_scheduler
 
+    @torch.no_grad()
+    def run_eval_loader(self, loader, prefix='val'): # returns loss, tokens
+        loader.reset()
+        self.model.eval()
 
-    class LerpTensor:
-        def __init__(self, start_val, end_val, precision):
-            self.start, self.end, self.prec = start_val, end_val, precision
-            self.prev_val = None
-            dtype = torch.int32 if isinstance(precision, int) else torch.float
-            self.gpu_val = torch.tensor(0, dtype=dtype, device="cuda")
-
-        def __call__(self, frac_done):
-            val = ((1 - frac_done) * self.start + frac_done * self.end) // self.prec * self.prec
-            if val != self.prev_val:
-                self.gpu_val.copy_(val, non_blocking=True)
-                self.prev_val = val
-            return self.gpu_val
-
-    lerp_sw_size = LerpTensor(start_val=512, end_val=args.max_length, precision=128)
-
-    schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
-
-    training_time_ms = 0
-    # start the clock
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-
-    ### BEGIN TRAINING LOOP ###
-    print0("Beginning training loop...")
-    for step in tqdm(range(args.num_steps + 1), desc='Training steps'):
-        last_step = (step == args.num_steps)
-        # This effectively ignores timing first 10 steps, which are slower for weird reasons.
-        # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
-        # steps with dummy data first, and then re-initialize the model and reset the loader.
-        # TODO
-        # We should add this before the hackathon
-        if step == 10:
-            training_time_ms = 0
-            t0 = time.perf_counter()
-        timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
-
-        frac_done = step / args.num_steps  # training progress
-        sliding_window_size = lerp_sw_size(frac_done)
-
-        # once in a while evaluate the validation dataset
-        if args.valid_loss_every > 0 and step % args.valid_loss_every == 0 or last_step:
-            # stop the clock
-            torch.cuda.synchronize()
-            training_time_ms += 1000 * (time.perf_counter() - t0)
-            # run validation batches
-            model.eval()
-            valid_loader.reset()
-            val_loss, valid_tokens, val_steps = 0.0, 0, 0
-
-            with torch.no_grad():
-                input_ids, labels, mask_rate = valid_loader.next_batch()
-                pbar = tqdm(desc='Validating', leave=False)
-                while input_ids.numel():
-                    batch_valid_tokens = (input_ids != pad_token_id).sum()
-                    valid_tokens += batch_valid_tokens
-                    val_loss += model(input_ids, labels, mask_rate, sliding_window_size)
-                    val_steps += 1
-                    input_ids, labels, mask_rate = valid_loader.next_batch()
-                    pbar.update(1)
-                pbar.close()
-
-            if ddp_world_size > 1:
-                # Convert to tensors before all_reduce
-                val_loss = torch.tensor(val_loss, device=device)
-                valid_tokens = torch.tensor(valid_tokens, device=device)
-                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-                dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
-            
-            val_loss /= val_steps
-            perplexity = math.e**val_loss
-            # log val loss to console and to logfile
-            print0(f'step:{step}/{args.num_steps} \
-                   val_loss:{val_loss:.4f} \
-                   train_time:{training_time_ms:.0f}ms \
-                   step_avg:{training_time_ms/(timed_steps-1):.2f}ms \
-                   perplexity:{perplexity:.4f} \
-                   param_count:{get_param_count(model):,} \
-                   tokens: {valid_tokens.item():,}')
-            
-            # Log to wandb
-            if master_process and args.wandb_token:
-                wandb.log({
-                    "val_loss": val_loss,
-                    "val_perplexity": perplexity,
-                    "train_time_ms": training_time_ms,
-                    "step_avg_ms": training_time_ms/(timed_steps-1) if timed_steps > 1 else 0,
-                    "valid_tokens": valid_tokens.item(),
-                    "step": step,
-                    "sliding_window_size": sliding_window_size.item() if hasattr(sliding_window_size, 'item') else sliding_window_size
-                })
-            
-            # start the clock again
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-
-        # save checkpoint every `save_every` steps
-        if master_process and args.save_every:
-            if last_step or (step % args.save_every == 0):
-                # stop the clock
-                torch.cuda.synchronize()
-                training_time_ms += 1000 * (time.perf_counter() - t0)
-                # save the state of the training process
-                log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-                torch.save(log, 'logs/state_step%06d.pt' % step)
-
-                if args.hf_model_name:
-                    try:
-                        if ddp_world_size > 1:
-                            model.module.push_to_hub(args.hf_model_name, subfolder='step%06d' % step)
-                        else:
-                            model.push_to_hub(args.hf_model_name, subfolder='step%06d' % step)
-                    except Exception as e:
-                        print0(e)
-
-                torch.cuda.synchronize()
-                t0 = time.perf_counter()
-
-        if last_step:
-            break
-
-        # --------------- FORWARD AND BACKWARD PASS -----------------
-        model.train()
-        for i in range(args.grad_accum):
-            with contextlib.ExitStack() as stack:
-                # Only sync gradients on last accumulation step
-                if ddp_world_size > 1 and i < args.grad_accum - 1:
-                    stack.enter_context(model.no_sync())
-                input_ids, labels, mask_rate = train_loader.next_batch()
-                loss = model(input_ids, labels, mask_rate, sliding_window_size) / args.grad_accum
-                loss.backward()
-
-        # momentum warmup for Muon
-        frac = min(step/args.muon_momentum_warmup_steps, 1)
-        for group in optimizer2.param_groups:
-            group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
-
-        # step the optimizers and schedulers
-        for opt, sched in zip(optimizers, schedulers):
-            opt.step()
-            sched.step()
-
-        # null the gradients
-        model.zero_grad(set_to_none=True)
-        # --------------- FORWARD AND BACKWARD PASS END -------------------
-        # everything that follows now is just eval, diagnostics, prints, logging, etc.
-        if step % 100 == 0:
-            approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-            print0(f'step:{step+1}/{args.num_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms')
-            
-            # Log training progress to wandb
-            if master_process and args.wandb_token:
-                current_lr_hidden = optimizers[1].param_groups[0]['lr']
-                current_lr_embed = optimizers[0].param_groups[0]['lr']
-                current_lr_head = optimizers[0].param_groups[1]['lr']
-                current_lr_scalar = optimizers[0].param_groups[2]['lr']
-                
-                wandb.log({
-                    "train_time_ms": approx_time,
-                    "train_step_avg_ms": approx_time/timed_steps if timed_steps > 0 else 0,
-                    "step": step,
-                    "lr_hidden": current_lr_hidden,
-                    "lr_embed": current_lr_embed,
-                    "lr_head": current_lr_head,
-                    "lr_scalar": current_lr_scalar,
-                    "sliding_window_size": sliding_window_size.item() if hasattr(sliding_window_size, 'item') else sliding_window_size,
-                    "muon_momentum": optimizers[1].param_groups[0]['momentum']
-                })
-
-    print0(f'peak memory consumption training: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB')
-    print0(f'Train Time: {training_time_ms:.0f}ms | Step Avg: {training_time_ms/(timed_steps-1):.2f}ms | Param Count: {get_param_count(model):,}')
-    print0(f'Total train time (min): {training_time_ms / 60000:.2f}')
-    print0(f'Total train time (hours): {training_time_ms / 3600000:.2f}')
-    # save the model to huggingface
-    try:
-        if ddp_world_size > 1:
-            model.module.push_to_hub(args.hf_model_name)
-        else:
-            model.push_to_hub(args.hf_model_name)
-    except Exception as e:
-        print(e)
-
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-    torch.manual_seed(42)
-    model.eval()
-    test_loader.reset()
-
-    test_loss, test_tokens, test_steps = 0.0, 0, 0
-    with torch.no_grad():
-        input_ids, labels, mask_rate = test_loader.next_batch()
-        pbar = tqdm(desc='Testing', leave=False)
+        losses, total_tokens = [], 0
+        input_ids, labels, mask_rate = loader.next_batch()
+        pbar = tqdm(desc=f'{prefix} set', leave=False)
         while input_ids.numel():
-            batch_test_tokens = (input_ids != pad_token_id).sum()
-            test_tokens += batch_test_tokens
-            test_loss += model(input_ids, labels, mask_rate, sliding_window_size)
-            test_steps += 1
-            input_ids, labels, mask_rate = test_loader.next_batch()
+            batch_valid_tokens = (input_ids != self.pad_token_id).sum()
+            total_tokens += batch_valid_tokens
+            loss = self.model(input_ids, labels, mask_rate, self.sliding_window_size)
+            losses.append(loss.item())
+            input_ids, labels, mask_rate = loader.next_batch()
             pbar.update(1)
         pbar.close()
+
+        avg_loss = sum(losses) / len(losses)
+
+        if self.ddp_world_size > 1:
+            # Convert to tensors before all_reduce
+            avg_loss = torch.tensor(avg_loss, device=self.device)
+            total_tokens = torch.tensor(total_tokens, device=self.device)
+            dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
+            dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
+
+        perplexity = math.e**avg_loss
+
+        self.print0(f'{prefix} set: loss: {avg_loss:.4f} perplexity: {perplexity:.4f} tokens: {total_tokens.item():,}')
+
+        return avg_loss, perplexity, total_tokens
+
+    def save_checkpoint(self, step):
+        self.print0(f'Saving checkpoint at step {step}...')
+
+        if self.ddp_world_size > 1:
+            model = self.model.module
+        else:
+            model = self.model
+
+        log = dict(step=step, model=model.state_dict(), optimizers=[opt.state_dict() for opt in self.optimizers])
+        if self.args.hf_model_name:
+            try:
+                model.push_to_hub(self.args.hf_model_name, subfolder='step%06d' % step)
+            except Exception as e:
+                self.print0(e)
+                self.print0(f'Pushing failed, defaulting to local save')
+                torch.save(log, 'logs/state_step%06d.pt' % step)
+        else:
+            torch.save(log, 'logs/state_step%06d.pt' % step)
+
+    def train_step(self, step):
+            self.model.train()
+            for i in range(self.args.grad_accum):
+                with contextlib.ExitStack() as stack:
+                    # Only sync gradients on last accumulation step
+                    if self.ddp_world_size > 1 and i < self.args.grad_accum - 1:
+                        stack.enter_context(self.model.no_sync())
+                    input_ids, labels, mask_rate = self.train_loader.next_batch()
+                    loss = self.model(input_ids, labels, mask_rate, self.sliding_window_size) / self.args.grad_accum
+                    loss.backward()
+
+            # momentum warmup for Muon
+            if self.args.use_muon:
+                frac = min(step/self.args.muon_momentum_warmup_steps, 1)
+                for group in self.optimizers[-1].param_groups:
+                    group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+
+            # step the optimizers and schedulers
+            for opt, sched in zip(self.optimizers, self.lr_schedulers):
+                opt.step()
+                sched.step()
+
+            # null the gradients
+            self.model.zero_grad(set_to_none=True)
+            return loss.item()
+
+    def train(self):
+        self.init_training()
+
+        train_losses = []
+
+        ### BEGIN TRAINING LOOP ###
+        self.print0("Beginning training loop...")
+        for step in tqdm(range(self.args.num_steps + 1), desc='Training steps'):
+            if step == 10: # ignore first 10 steps of timing because they are slower
+                self.train_timer.reset()
+                self.train_timer.start()
+            timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+
+            frac_done = step / self.args.num_steps  # training progress
+            self.sliding_window_size = self.sliding_window_size_scheduler(frac_done)
+
+            # once in a while evaluate the validation dataset
+            if self.args.eval_every > 0 and step % self.args.eval_every == 0:
+                val_loss, val_perplexity, val_tokens = self._run_eval_loader_timed(self.valid_loader, prefix='Validation')
+                training_time_sec = self.train_timer.get_time()
+                step_avg_ms = 1000 * training_time_sec / (timed_steps - 1) if timed_steps > 1 else 0
+                self.print0(f'step:{step}/{self.args.num_steps} step_avg:{step_avg_ms:.2f}ms')
+                self.log_wandb(
+                    {'loss': val_loss, 'perplexity': val_perplexity, 'tokens': val_tokens, 'sliding_window_size': self.sliding_window_size},
+                    prefix='val'
+                )
+
+            # save checkpoint every `save_every` steps
+            if self.args.save_every:
+                if step % self.args.save_every == 0:
+                    self._save_checkpoint_timed(step)
+
+            loss = self.train_step(step)
+            train_losses.append(loss)
+
+            # everything that follows now is just eval, diagnostics, prints, logging, etc.
+            if step % 100 == 0:
+                train_time_sec = self.train_timer.get_time()
+                avg_loss = sum(train_losses) / len(train_losses)
+                self.print0(f'step:{step+1}/{self.args.num_steps} train_time:{train_time_sec:.0f} sec step_avg:{1000*train_time_sec/timed_steps:.2f}ms loss:{avg_loss:.4f}')
+                train_losses = []
+
+                # Log training progress to wandb
+                if self.master_process and self.args.wandb_token:
+                    log_dict = {
+                        "time_sec": train_time_sec,
+                        "step_avg_ms": 1000*train_time_sec/timed_steps if timed_steps > 0 else 0,
+                        "step": step,
+                        "loss": avg_loss
+                    }
+                    self.log_wandb(log_dict, prefix='train')
+
+        # Stop the timer and get final training time
+        self.train_timer.pause()
+        final_training_time_sec = self.train_timer.get_time()
+        
+        self.print0(f'peak memory consumption training: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB')
+        self.print0(f'Train Time: {final_training_time_sec:.0f}s | Step Avg: {final_training_time_sec/timed_steps:.2f}s')
+        self.print0(f'Total train time (min): {final_training_time_sec / 60:.2f}')
+        self.print0(f'Total train time (hours): {final_training_time_sec / 3600:.2f}')
+        # save the model to huggingface
+        self._save_checkpoint_timed(self.args.num_steps)
+
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.manual_seed(42)
+
+        test_loss, test_perplexity, test_tokens = self._run_eval_loader_timed(self.test_loader, prefix='Test')
+
+        self.print0(f"peak memory consumption testing: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
     
-    if ddp_world_size > 1:
-        # Convert to tensors before all_reduce
-        test_loss = torch.tensor(test_loss, device=device)
-        test_tokens = torch.tensor(test_tokens, device=device)
-        dist.all_reduce(test_loss, op=dist.ReduceOp.AVG)
-        dist.all_reduce(test_tokens, op=dist.ReduceOp.SUM)
-    
-    test_loss /= test_steps
-    test_perplexity = math.e**test_loss
-    print0(f'Test tokens: {test_tokens.item()}')
-    print0(f'Loss: {test_loss:.4f} | Perplexity: {test_perplexity:.4f}')
-    print0(f"peak memory consumption testing: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
-    
-    # Final wandb logging
-    if master_process and args.wandb_token:
-        wandb.log({
+        # Final wandb logging
+        if self.master_process and self.args.wandb_token:
+            log_dict = {
+                "test_loss": test_loss,
+                "test_perplexity": test_perplexity,
+                "test_tokens": test_tokens.item(),
+                "final_train_time_sec": final_training_time_sec,
+                "final_step_avg_sec": final_training_time_sec/(timed_steps-1) if timed_steps > 1 else 0,
+                "peak_memory_training_gb": torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024,
+            }
+            self.log_wandb(log_dict, prefix='test')
+
+        # Log final summary
+        log_dict = {
+            "val_loss": val_loss,
             "test_loss": test_loss,
             "test_perplexity": test_perplexity,
-            "test_tokens": test_tokens.item(),
-            "final_train_time_ms": training_time_ms,
-            "final_step_avg_ms": training_time_ms/(timed_steps-1) if timed_steps > 1 else 0,
+            "train_time_sec": final_training_time_sec,
+            "step_avg_sec": final_training_time_sec/(timed_steps-1) if timed_steps > 1 else 0,
             "peak_memory_training_gb": torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024,
-            "param_count": get_param_count(model)
-        })
+        }
+        self.log_wandb(log_dict, prefix='final')
         
-        # Log final summary
-        wandb.summary.update({
-            "final_val_loss": val_loss,
-            "final_test_loss": test_loss,
-            "final_test_perplexity": test_perplexity,
-            "total_train_time_hours": training_time_ms / 3600000,
-            "param_count": get_param_count(model)
-        })
-        
-        wandb.finish()
+        if self.master_process and self.args.wandb_token:
+            wandb.finish()
     
-    # -------------------------------------------------------------------------
-    # clean up nice
-    if ddp_world_size > 1:
-        dist.destroy_process_group()
-    return val_loss, test_loss
+        # clean up nice
+        if self.ddp_world_size > 1:
+            dist.destroy_process_group()
 
 
 def arg_parser():
@@ -500,25 +495,28 @@ def arg_parser():
     parser.add_argument("--num_steps", type=int, default=50000, help="Number of training steps")
     parser.add_argument("--cooldown_steps", type=int, default=5000, help="Number of cooldown steps")
     parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
-    
+    parser.add_argument("--scheduler_type", type=str, default='cosine', help="Scheduler type")
+    parser.add_argument("--lr_warmup_steps", type=int, default=1000, help="Number of warmup steps")
+
     # Adam optimizer params
+    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate for Adam optimizer when not using Muon")
     parser.add_argument("--lr_embed", type=float, default=0.06, help="Learning rate for embeddings")
     parser.add_argument("--lr_head", type=float, default=0.008, help="Learning rate for head")
     parser.add_argument("--lr_scalar", type=float, default=0.04, help="Learning rate for scalar params")
     
     # Muon optimizer params
+    parser.add_argument("--use_muon", type=bool, default=True, help="Use Muon optimizer")
     parser.add_argument("--lr_hidden", type=float, default=0.05, help="Learning rate for hidden layers (Muon)")
     parser.add_argument("--muon_momentum_warmup_steps", type=int, default=300, help="Steps for warmup momentum (0.85 -> 0.95)")
     
     # Evaluation and logging hyperparams
-    parser.add_argument("--valid_loss_every", type=int, default=1000, help="Validate every N steps")
+    parser.add_argument("--eval_every", type=int, default=1000, help="Evaluate on validation set every N steps")
     parser.add_argument("--hf_model_name", type=str, default='lhallee/speedrun', help="Huggingface model name for saving")
     parser.add_argument("--save_every", type=int, default=None, help="Save checkpoint every N steps")
     
-    # Optimized dataloader params
+    # Dataloader params
     parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for optimized dataloader")
     parser.add_argument("--prefetch_factor", type=int, default=2, help="Prefetch factor for optimized dataloader")
-    
     return parser.parse_args()
 
 
@@ -540,8 +538,6 @@ if __name__ == '__main__':
         args.num_steps = 10
         args.cooldown_steps = 2
         args.max_length = 512
-        args.lr_embed = 0.06
-        args.lr_head = 0.0008
 
     model_config = PLMConfig(
         hidden_size=args.hidden_size,
@@ -563,4 +559,5 @@ if __name__ == '__main__':
         login(args.token)
         args.token = None  # Clear token for security
     
-    val_loss, test_loss = main(args, model_config)
+    trainer = Trainer(args, model_config)
+    trainer.train()
