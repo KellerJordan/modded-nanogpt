@@ -11,6 +11,7 @@ code += open('model/model.py', 'r', encoding='utf-8').read()
 import uuid
 import time
 import contextlib
+import subprocess
 import math
 import torch
 import torch.distributed as dist
@@ -162,7 +163,6 @@ class Trainer:
 
         self.print0(f'Running python {sys.version}')
         self.print0(f'Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:')
-        import subprocess
         result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.print0(f'{result.stdout}', logonly=True)
         self.print0('='*100, logonly=True)
@@ -211,6 +211,8 @@ class Trainer:
             tokenizer=self.tokenizer,
             num_workers=self.args.num_workers,
             prefetch_factor=self.args.prefetch_factor,
+            mlm=self.args.mlm,
+            mask_rate=self.args.mask_rate,
         )
 
     def init_model(self):
@@ -488,6 +490,8 @@ def arg_parser():
     parser.add_argument("--input_bin", type=str, default='data/omgprot50/omgprot50_train_*.bin', help="Input training bin files pattern")
     parser.add_argument("--input_valid_bin", type=str, default='data/omgprot50/omgprot50_valid_*.bin', help="Input validation bin files pattern")
     parser.add_argument("--input_test_bin", type=str, default='data/omgprot50/omgprot50_test_*.bin', help="Input test bin files pattern")
+    parser.add_argument("--mlm", type=bool, default=False, help="Use masked language modeling")
+    parser.add_argument("--mask_rate", type=float, default=0.2, help="Mask rate for masked language modeling")
     
     # Optimization hyperparams
     parser.add_argument("--batch_size", type=int, default=8*64*1024, help="Total batch size in tokens")
@@ -552,6 +556,7 @@ if __name__ == '__main__':
         p_attention=args.p_attention,
         tie_embeddings=args.tie_embeddings,
         unet=args.unet,
+        mlm=args.mlm,
     )
 
     if args.token:

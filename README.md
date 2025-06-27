@@ -3,9 +3,9 @@
 ```console
 git clone https://github.com/Synthyra/SpeedrunningPLMs.git
 cd SpeedrunningPLMs
-pip install -r requirements.txt
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128 -U
-python data/download_omgprot50.py --num_chunks 10
+pip install -r requirements.txt
+python data/download_omgprot50.py --num_chunks 100
 ./run.sh
 ```
 
