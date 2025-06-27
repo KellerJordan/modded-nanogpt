@@ -289,6 +289,10 @@ class Trainer:
         loader.reset()
         self.model.eval()
 
+        # Ensure all ranks participate in evaluation
+        if self.ddp_world_size > 1:
+            dist.barrier()
+
         losses, total_tokens = [], 0
         input_ids, labels, mask_rate = loader.next_batch()
         pbar = tqdm(desc=f'{prefix} set', leave=False)
@@ -301,18 +305,42 @@ class Trainer:
             pbar.update(1)
         pbar.close()
 
-        avg_loss = sum(losses) / len(losses)
+        # Handle case where this rank has no data
+        if len(losses) == 0:
+            avg_loss = 0.0
+            num_batches = 0
+        else:
+            avg_loss = sum(losses) / len(losses)
+            num_batches = len(losses)
 
         if self.ddp_world_size > 1:
-            # Convert to tensors before all_reduce
-            avg_loss = torch.tensor(avg_loss, device=self.device)
-            total_tokens = torch.tensor(total_tokens, device=self.device)
-            dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
-            dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
+            # Convert to tensors for distributed communication
+            avg_loss_tensor = torch.tensor(avg_loss, device=self.device)
+            total_tokens_tensor = torch.tensor(total_tokens, device=self.device)
+            num_batches_tensor = torch.tensor(num_batches, device=self.device)
+            
+            # Sum losses and batch counts across all ranks
+            dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_tokens_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_batches_tensor, op=dist.ReduceOp.SUM)
+            
+            # Calculate global average loss
+            if num_batches_tensor.item() > 0:
+                avg_loss = avg_loss_tensor.item() / num_batches_tensor.item()
+            else:
+                avg_loss = 0.0
+            
+            total_tokens = total_tokens_tensor.item()
+        else:
+            total_tokens = total_tokens
 
-        perplexity = math.e**avg_loss
+        perplexity = math.e**avg_loss if avg_loss > 0 else 1.0
 
-        self.print0(f'{prefix} set: loss: {avg_loss:.4f} perplexity: {perplexity:.4f} tokens: {total_tokens.item():,}')
+        self.print0(f'{prefix} set: loss: {avg_loss:.4f} perplexity: {perplexity:.4f} tokens: {total_tokens:,}')
+
+        # Ensure all ranks complete evaluation before returning
+        if self.ddp_world_size > 1:
+            dist.barrier()
 
         return avg_loss, perplexity, total_tokens
 
@@ -437,7 +465,7 @@ class Trainer:
             log_dict = {
                 "test_loss": test_loss,
                 "test_perplexity": test_perplexity,
-                "test_tokens": test_tokens.item(),
+                "test_tokens": test_tokens,
                 "final_train_time_sec": final_training_time_sec,
                 "final_step_avg_sec": final_training_time_sec/(timed_steps-1) if timed_steps > 1 else 0,
                 "peak_memory_training_gb": torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024,
