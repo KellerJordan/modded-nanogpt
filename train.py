@@ -24,7 +24,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from optimizer import Muon
-from dataloading import OptimizedDistributedPaddedDataLoader
+from dataloading import OptimizedTrainLoader, OptimizedEvalLoader
 from model.model import PLM, PLMConfig
 from model.utils import Linear
 from utils import LerpTensor
@@ -201,19 +201,28 @@ class Trainer:
         self._save_checkpoint_timed = exclude_from_timer(self.train_timer)(self.save_checkpoint)
 
     def init_dataloader(self, filename_pattern, training=True):
-        return OptimizedDistributedPaddedDataLoader(
-            filename_pattern=filename_pattern,
-            seq_len=self.batch_size,
-            process_rank=self.ddp_rank,
-            num_processes=self.ddp_world_size,
-            max_epochs=1,
-            training=training,
-            tokenizer=self.tokenizer,
-            num_workers=self.args.num_workers,
-            prefetch_factor=self.args.prefetch_factor,
-            mlm=self.args.mlm,
-            mask_rate=self.args.mask_rate,
-        )
+        if training:
+            return OptimizedTrainLoader(
+                filename_pattern=filename_pattern,
+                seq_len=self.batch_size,
+                process_rank=self.ddp_rank,
+                num_processes=self.ddp_world_size,
+                max_epochs=1,
+                tokenizer=self.tokenizer,
+                num_workers=self.args.num_workers,
+                prefetch_factor=self.args.prefetch_factor,
+                mlm=self.args.mlm,
+                mask_rate=self.args.mask_rate,
+            )
+        else:
+            # Use evaluation dataloader that distributes data by sequences, not files
+            return OptimizedEvalLoader(
+                filename_pattern=filename_pattern,
+                seq_len=self.batch_size,
+                process_rank=self.ddp_rank,
+                num_processes=self.ddp_world_size,
+                tokenizer=self.tokenizer,
+            )
 
     def init_model(self):
         self.print0("Initializing model...")

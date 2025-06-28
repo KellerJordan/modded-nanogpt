@@ -22,7 +22,208 @@ def _load_data_shard(file: Path):
     return tokens
 
 
-class DistributedPaddedIterableDataset(IterableDataset):
+class EvalLoader(IterableDataset):
+    """An IterableDataset specifically for evaluation that distributes data by sequences, not files."""
+    
+    def __init__(
+        self,
+        filename_pattern: str,
+        seq_len: int,
+        process_rank: int,
+        num_processes: int,
+        tokenizer: EsmTokenizer,
+    ):
+        self.filename_pattern = filename_pattern
+        self.seq_len = seq_len
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        # Tokenizer IDs
+        self.cls_token_id = tokenizer.cls_token_id
+        self.eos_token_id = tokenizer.eos_token_id
+        self.pad_token_id = tokenizer.pad_token_id
+        self.mask_token_id = tokenizer.mask_token_id
+        self.special_tokens = [self.cls_token_id, self.eos_token_id, self.pad_token_id]
+        
+        # All processes load all files (since we're distributing by sequences, not files)
+        self.all_files = sorted(Path.cwd().glob(filename_pattern))
+        if not self.all_files:
+            raise ValueError(f"No files found matching pattern: {filename_pattern}")
+    
+    def __iter__(self):
+        """Generate batches, with each process taking every num_processes-th batch."""
+        batch_count = 0
+        
+        for file in self.all_files:
+            raw_tokens = _load_data_shard(file)
+            
+            # Process the tokens into batches
+            eos_positions = (raw_tokens == self.eos_token_id).nonzero(as_tuple=True)[0]
+            
+            if len(eos_positions) == 0:
+                continue
+            
+            # Process samples and create batches
+            batch_tokens = []
+            curr_batch_len = 0
+            
+            for i in range(len(eos_positions)):
+                curr_eos = eos_positions[i]
+                prev_eos_plus_one = 0 if i == 0 else eos_positions[i-1] + 1
+                sample = raw_tokens[prev_eos_plus_one:curr_eos+1]
+                
+                # Handle samples that exceed batch size
+                if len(sample) > self.seq_len:
+                    # Split large samples into multiple batches
+                    for j in range(0, len(sample), self.seq_len):
+                        chunk = sample[j:j+self.seq_len]
+                        if len(chunk) < self.seq_len:
+                            # Pad the last chunk
+                            padding = torch.full((self.seq_len - len(chunk),), self.pad_token_id, dtype=torch.uint8)
+                            chunk = torch.cat([chunk, padding])
+                        
+                        # Check if this batch should be yielded by this process
+                        if batch_count % self.num_processes == self.process_rank:
+                            # Apply masking and yield batch
+                            input_ids, labels, mask_rate = self._apply_masking(chunk)
+                            yield input_ids, labels, mask_rate
+                        batch_count += 1
+                    continue
+                
+                # Check if adding this sample would exceed batch size
+                if len(sample) + curr_batch_len > self.seq_len:
+                    # Pad current batch and yield
+                    if curr_batch_len > 0:
+                        padding = torch.full((self.seq_len - curr_batch_len,), self.pad_token_id, dtype=torch.uint8)
+                        batch_tokens.append(padding)
+                        batch = torch.cat(batch_tokens)
+                        
+                        # Check if this batch should be yielded by this process
+                        if batch_count % self.num_processes == self.process_rank:
+                            # Apply masking and yield
+                            input_ids, labels, mask_rate = self._apply_masking(batch)
+                            yield input_ids, labels, mask_rate
+                        batch_count += 1
+                    
+                    # Start new batch
+                    batch_tokens = [sample]
+                    curr_batch_len = len(sample)
+                else:
+                    # Add to current batch
+                    batch_tokens.append(sample)
+                    curr_batch_len += len(sample)
+                
+                # Yield complete batch
+                if curr_batch_len == self.seq_len:
+                    batch = torch.cat(batch_tokens)
+                    
+                    # Check if this batch should be yielded by this process
+                    if batch_count % self.num_processes == self.process_rank:
+                        input_ids, labels, mask_rate = self._apply_masking(batch)
+                        yield input_ids, labels, mask_rate
+                    batch_count += 1
+                    batch_tokens = []
+                    curr_batch_len = 0
+            
+            # Yield final incomplete batch if it exists
+            if curr_batch_len > 0:
+                padding = torch.full((self.seq_len - curr_batch_len,), self.pad_token_id, dtype=torch.uint8)
+                batch_tokens.append(padding)
+                batch = torch.cat(batch_tokens)
+                
+                # Check if this batch should be yielded by this process
+                if batch_count % self.num_processes == self.process_rank:
+                    input_ids, labels, mask_rate = self._apply_masking(batch)
+                    yield input_ids, labels, mask_rate
+                batch_count += 1
+    
+    def _apply_masking(self, sequence: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply masking to a sequence (on CPU)."""
+        # Convert to int32
+        sequence = sequence.to(dtype=torch.int32)
+        
+        # Use fixed mask rate for evaluation
+        mask_rate = torch.full((1,), 0.15)
+        
+        # Create mask
+        p_mask = mask_rate.repeat(len(sequence))
+        mask_indices = torch.rand(len(sequence)) < p_mask
+        
+        # Don't mask special tokens
+        special_mask = torch.isin(sequence, torch.tensor(self.special_tokens, dtype=torch.int32))
+        mask_indices = mask_indices & ~special_mask
+        
+        # Create noisy batch and labels
+        noisy_batch = torch.where(mask_indices, self.mask_token_id, sequence)
+        labels = sequence.clone()
+        labels[~mask_indices] = -100
+        
+        return noisy_batch, labels, mask_rate
+
+
+class OptimizedEvalLoader:
+    """Drop-in replacement for evaluation that distributes data by sequences rather than files."""
+    
+    def __init__(
+        self,
+        filename_pattern: str,
+        seq_len: int,
+        process_rank: int,
+        num_processes: int,
+        tokenizer: EsmTokenizer,
+    ):
+        self.filename_pattern = filename_pattern
+        self.seq_len = seq_len
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        
+        # Create the dataset
+        self._dataset = EvalLoader(
+            filename_pattern=filename_pattern,
+            seq_len=seq_len,
+            process_rank=process_rank,
+            num_processes=num_processes,
+            tokenizer=tokenizer,
+        )
+        
+        # Store file list for compatibility - all processes see all files
+        self.files = self._dataset.all_files
+        
+        # Create the dataloader (single worker for evaluation to ensure deterministic order)
+        self.dataloader = DataLoader(
+            self._dataset,
+            batch_size=None,  # Dataset returns complete batches
+            num_workers=0,    # Single worker for deterministic eval order
+            pin_memory=True,  # Pin memory for faster GPU transfer
+        )
+        
+        # Create iterator
+        self._iterator = None
+        self._exhausted = False
+    
+    def reset(self):
+        """Reset the dataloader iterator."""
+        self._iterator = iter(self.dataloader)
+        self._exhausted = False
+    
+    def next_batch(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get the next batch, ensuring GPU transfer happens here."""
+        if self._iterator is None:
+            self.reset()
+        
+        try:
+            input_ids, labels, mask_rate = next(self._iterator)
+            # Transfer to GPU with non-blocking
+            input_ids = input_ids.cuda(non_blocking=True)
+            labels = labels.cuda(non_blocking=True)
+            mask_rate = mask_rate.cuda(non_blocking=True)
+            return input_ids, labels, mask_rate
+        except StopIteration:
+            self._exhausted = True
+            # Return empty tensors to signal end of data
+            return torch.empty(0, device='cuda'), torch.empty(0, device='cuda'), torch.empty(0, device='cuda')
+
+
+class TrainLoader(IterableDataset):
     """An IterableDataset that handles distributed padded data loading with masking."""
     
     def __init__(
@@ -32,7 +233,6 @@ class DistributedPaddedIterableDataset(IterableDataset):
         process_rank: int,
         num_processes: int,
         max_epochs: int,
-        training: bool,
         tokenizer: EsmTokenizer,
         num_workers: int = 1,
         mlm: bool = False,
@@ -43,7 +243,6 @@ class DistributedPaddedIterableDataset(IterableDataset):
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.max_epochs = max_epochs
-        self.training = training
         self.num_workers = num_workers
         self.mask_rate = mask_rate
         # Tokenizer IDs
@@ -219,7 +418,7 @@ class DistributedPaddedIterableDataset(IterableDataset):
         return noisy_batch, labels, mask_rate
 
 
-class OptimizedDistributedPaddedDataLoader:
+class OptimizedTrainLoader:
     """Drop-in replacement for DistributedPaddedDataLoader using multi-worker optimization."""
     
     def __init__(
@@ -229,7 +428,6 @@ class OptimizedDistributedPaddedDataLoader:
         process_rank: int,
         num_processes: int,
         max_epochs: int,
-        training: bool,
         tokenizer: EsmTokenizer,
         num_workers: int = 4,
         prefetch_factor: int = 2,
@@ -240,16 +438,14 @@ class OptimizedDistributedPaddedDataLoader:
         self.seq_len = seq_len
         self.process_rank = process_rank
         self.num_processes = num_processes
-        self.training = training
         
         # Create the dataset to get file count
-        self._dataset = DistributedPaddedIterableDataset(
+        self._dataset = TrainLoader(
             filename_pattern=filename_pattern,
             seq_len=seq_len,
             process_rank=process_rank,
             num_processes=num_processes,
             max_epochs=max_epochs,
-            training=training,
             tokenizer=tokenizer,
             num_workers=num_workers,
             mlm=mlm,
