@@ -394,13 +394,12 @@ class TrainLoader(IterableDataset):
         
         # Pick mask rate
         eps = 1e-3
-        if self.training and not self.mlm:
-            mask_rate = torch.rand(1)
-            mask_rate = (1 - eps) * mask_rate + eps
-        elif self.mlm:
+
+        if self.mlm:
             mask_rate = torch.full((1,), self.mask_rate)
         else:
-            mask_rate = torch.full((1,), 0.15)
+            mask_rate = torch.rand(1)
+            mask_rate = (1 - eps) * mask_rate + eps
         
         # Create mask
         p_mask = mask_rate.repeat(len(sequence))
