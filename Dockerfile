@@ -41,8 +41,11 @@ RUN pip install --upgrade pip setuptools && \
 # 5️⃣  Copy the rest of the source
 COPY . .
 
+# 6️⃣  Change working directory to where the volume will be mounted
+WORKDIR /workspace
+
 # ──────────────────────────────────────────────────────────────────────────────
-# 6️⃣  Single persistent host volume (/workspace) for *all* artefacts & caches
+# 7️⃣  Single persistent host volume (/workspace) for *all* artefacts & caches
 #     Bind-mount it when you run the container:  -v ${PWD}:/workspace
 # ──────────────────────────────────────────────────────────────────────────────
 ENV PROJECT_ROOT=/workspace \
@@ -64,5 +67,5 @@ RUN mkdir -p \
 # Declare the volume so other developers know it's intended to persist
 VOLUME ["/workspace"]
 
-# 7️⃣  Default command – override in `docker run … python train.py`
+# 8️⃣  Default command – override in `docker run … python train.py`
 CMD ["bash"]
