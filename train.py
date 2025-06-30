@@ -397,6 +397,9 @@ class Trainer:
         if step % self.args.clear_cache_every == 0:
             torch.cuda.empty_cache()
         
+        # Accumulate losses for proper averaging
+        accumulated_loss = 0.0
+        
         for i in range(self.args.grad_accum):
             with contextlib.ExitStack() as stack:
                 # Only sync gradients on last accumulation step
@@ -404,6 +407,7 @@ class Trainer:
                     stack.enter_context(self.model.no_sync())
                 input_ids, labels, mask_rate = self.train_loader.next_batch()
                 loss = self.model(input_ids, labels, mask_rate, self.sliding_window_size) / self.args.grad_accum
+                accumulated_loss += loss.item()  # Accumulate the scaled loss
                 loss.backward()
 
         # momentum warmup for Muon
@@ -427,7 +431,9 @@ class Trainer:
 
         # null the gradients
         self.model.zero_grad(set_to_none=True)
-        return loss.item() * self.args.grad_accum
+        
+        # Return the total accumulated loss (already properly scaled)
+        return accumulated_loss
 
     def train(self):
         self.init_training()
@@ -477,6 +483,13 @@ class Trainer:
                 if step % 100 == 0:
                     train_time_sec = self.train_timer.get_time()
                     avg_loss = sum(train_losses) / len(train_losses)
+                    
+                    # Gather training loss across all processes for accurate logging
+                    if self.ddp_world_size > 1:
+                        avg_loss_tensor = torch.tensor(avg_loss, device=self.device)
+                        dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.AVG)
+                        avg_loss = avg_loss_tensor.item()
+                    
                     self.print0(f'step:{step+1}/{self.args.num_steps} train_time:{train_time_sec:.0f} sec step_avg:{1000*train_time_sec/timed_steps:.2f}ms loss:{avg_loss:.4f}')
                     train_losses = []
 

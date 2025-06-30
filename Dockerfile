@@ -1,12 +1,5 @@
-# docker build -t speedrun_plm .
-# docker run --gpus all -v $(pwd)/data:/app/data -v $(pwd)/results:/app/results -v $(pwd)/logs:/app/logs speedrun_plm python train.py
-# docker run --gpus all -v ${PWD}/data:/app/data -v ${PWD}/results:/app/results -v ${PWD}/logs:/app/logs speedrun_plm python train.py
-# Use PyTorch official image with CUDA support
-# ──────────────────────────────────────────────────────────────────────────────
-#  speedrun_plm  – ready-to-run Dockerfile
-#  Everything the code *downloads* ends up on the host via a single mount
-#      docker run --gpus all -v ${PWD}:/workspace speedrun_plm python train.py
-# ──────────────────────────────────────────────────────────────────────────────
+# sudo docker build -t speedrun_plm .
+# sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm torchrun --standalone --nproc_per_node=4 train.py
 
 # 1️⃣  CUDA / cuDNN base with no Python
 FROM nvidia/cuda:12.6.2-cudnn-devel-ubuntu24.04

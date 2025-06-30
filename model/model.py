@@ -182,7 +182,12 @@ class PLM(PreTrainedModel):
 
     def get_last_hidden_state(self, input_ids: torch.Tensor, sliding_window_size: int) -> torch.Tensor: # (l,)
         docs = (input_ids == self.cls_token_id).cumsum(0)
-        last_eos = (input_ids == self.eos_token_id).nonzero()[-1].squeeze()
+        eos_positions = (input_ids == self.eos_token_id).nonzero()
+        if eos_positions.numel() > 0:
+            last_eos = eos_positions[-1].squeeze()
+        else:
+            # If no EOS token found, use the last position of the sequence
+            last_eos = len(input_ids) - 1
         seq_len = len(input_ids)
 
         def doc_mask_mod(b, h, q_idx, kv_idx):
