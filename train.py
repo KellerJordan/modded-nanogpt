@@ -115,8 +115,6 @@ class Trainer:
         self.train_timer = GlobalTimer()
 
         # Set environment variables for distributed training
-        if self.args.ddp_timeout > 0:
-            os.environ['NCCL_TIMEOUT'] = str(self.args.ddp_timeout)
         if self.args.nccl_debug:
             os.environ['NCCL_DEBUG'] = 'INFO'
         
