@@ -13,9 +13,12 @@ import time
 import contextlib
 import subprocess
 import math
+import random
+import numpy as np
+import argparse
 import torch
 import torch.distributed as dist
-import argparse
+
 import torch._inductor.config as inductor_config
 from torchinfo import summary
 from transformers import EsmTokenizer, get_scheduler
@@ -39,6 +42,14 @@ except ImportError:
 
 
 inductor_config.max_autotune_gemm_backends = "aten,cutlass,fbgemm"
+
+
+def set_seed(seed):
+    """Set seed for reproducibility across all processes."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
 
 
 class GlobalTimer:
@@ -103,6 +114,12 @@ class Trainer:
         # Initialize global timer
         self.train_timer = GlobalTimer()
 
+        # Set environment variables for distributed training
+        if self.args.ddp_timeout > 0:
+            os.environ['NCCL_TIMEOUT'] = str(self.args.ddp_timeout)
+        if self.args.nccl_debug:
+            os.environ['NCCL_DEBUG'] = 'INFO'
+        
         if 'RANK' in os.environ:
             self.ddp_rank = int(os.environ['RANK'])
             self.ddp_local_rank = int(os.environ['LOCAL_RANK'])
@@ -120,7 +137,10 @@ class Trainer:
             torch.cuda.set_device(self.device)
             self.master_process = True
 
-        print(f'using device: {self.device}')
+        # Set seed for reproducibility
+        set_seed(self.args.seed + self.ddp_rank)
+        
+        print(f'Process {self.ddp_rank}: using device: {self.device}')
 
     def print0(self, s, logonly=False):
         if self.master_process:
@@ -147,6 +167,10 @@ class Trainer:
                 # begin the log by printing this file (the Python code)
                 print(code, file=f)
                 print('=' * 100, file=f)
+
+        # Synchronize before initializing wandb
+        if self.ddp_world_size > 1:
+            dist.barrier()
 
         if self.master_process and self.args.wandb_token:
             wandb.login(key=self.args.wandb_token)
@@ -233,14 +257,27 @@ class Trainer:
             if isinstance(m, Linear):
                 m.float()
         
+        # Synchronize before compilation
+        if self.ddp_world_size > 1:
+            dist.barrier()
+        
         self.print0("Coordinate descent tuning - can take up to 30 minutes")
         inductor_config.coordinate_descent_tuning = True
         self.print0("Calling torch.compile()")
         # Enable scalar output capture for .item() calls in compiled functions
         #torch._dynamo.config.capture_scalar_outputs = True
         model = torch.compile(model)
+        
         if self.ddp_world_size > 1:
-            model = DDP(model, device_ids=[self.ddp_local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
+            # Use static graph if model architecture doesn't change
+            model = DDP(
+                model, 
+                device_ids=[self.ddp_local_rank], 
+                broadcast_buffers=False, 
+                gradient_as_bucket_view=True,
+                static_graph=self.args.ddp_static_graph,
+                find_unused_parameters=not self.args.ddp_static_graph
+            )
         return model
 
     def init_optimizers(self):
@@ -295,12 +332,19 @@ class Trainer:
 
     @torch.no_grad()
     def run_eval_loader(self, loader, prefix='val'): # returns loss, tokens
+        # Synchronize before evaluation
+        if self.ddp_world_size > 1:
+            dist.barrier()
+            
         loader.reset()
         self.model.eval()
 
         losses, total_tokens = [], 0
         input_ids, labels, mask_rate = loader.next_batch()
-        pbar = tqdm(desc=f'{prefix} set', leave=False)
+        
+        # Only show progress bar on master process
+        pbar = tqdm(desc=f'{prefix} set', leave=False, disable=not self.master_process)
+        
         while input_ids.numel():
             batch_valid_tokens = (input_ids != self.pad_token_id).sum()
             total_tokens += batch_valid_tokens
@@ -310,7 +354,7 @@ class Trainer:
             pbar.update(1)
         pbar.close()
 
-        avg_loss = sum(losses) / len(losses)
+        avg_loss = sum(losses) / len(losses) if losses else 0.0
 
         if self.ddp_world_size > 1:
             # Convert to tensors before all_reduce
@@ -318,34 +362,47 @@ class Trainer:
             total_tokens = torch.tensor(total_tokens, device=self.device)
             dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
             dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
+            # Ensure all processes finish evaluation
+            dist.barrier()
 
-        perplexity = math.e**avg_loss
+        perplexity = math.e**avg_loss if isinstance(avg_loss, float) else math.e**avg_loss.item()
 
-        self.print0(f'{prefix} set: loss: {avg_loss:.4f} perplexity: {perplexity:.4f} tokens: {total_tokens.item():,}')
+        self.print0(f'{prefix} set: loss: {avg_loss:.4f} perplexity: {perplexity:.4f} tokens: {total_tokens.item() if hasattr(total_tokens, "item") else total_tokens:,}')
 
         return avg_loss, perplexity, total_tokens
 
     def save_checkpoint(self, step):
-        self.print0(f'Saving checkpoint at step {step}...')
+        # Only master saves, but all processes wait
+        if self.master_process:
+            self.print0(f'Saving checkpoint at step {step}...')
 
-        if self.ddp_world_size > 1:
-            model = self.model.module
-        else:
-            model = self.model
+            if self.ddp_world_size > 1:
+                model = self.model.module
+            else:
+                model = self.model
 
-        log = dict(step=step, model=model.state_dict(), optimizers=[opt.state_dict() for opt in self.optimizers])
-        if self.args.hf_model_name:
-            try:
-                model.push_to_hub(self.args.hf_model_name, subfolder='step%06d' % step)
-            except Exception as e:
-                self.print0(e)
-                self.print0(f'Pushing failed, defaulting to local save')
+            log = dict(step=step, model=model.state_dict(), optimizers=[opt.state_dict() for opt in self.optimizers])
+            if self.args.hf_model_name:
+                try:
+                    model.push_to_hub(self.args.hf_model_name, subfolder='step%06d' % step)
+                except Exception as e:
+                    self.print0(e)
+                    self.print0(f'Pushing failed, defaulting to local save')
+                    torch.save(log, 'logs/state_step%06d.pt' % step)
+            else:
                 torch.save(log, 'logs/state_step%06d.pt' % step)
-        else:
-            torch.save(log, 'logs/state_step%06d.pt' % step)
+        
+        # Synchronize after saving
+        if self.ddp_world_size > 1:
+            dist.barrier()
 
     def train_step(self, step):
         self.model.train()
+        
+        # Clear cache periodically to prevent memory fragmentation
+        if step % self.args.clear_cache_every == 0:
+            torch.cuda.empty_cache()
+        
         for i in range(self.args.grad_accum):
             with contextlib.ExitStack() as stack:
                 # Only sync gradients on last accumulation step
@@ -360,6 +417,14 @@ class Trainer:
             frac = min(step/self.args.muon_momentum_warmup_steps, 1)
             for group in self.optimizers[-1].param_groups:
                 group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+
+        # Apply gradient clipping if specified
+        if self.args.grad_clip > 0:
+            if self.ddp_world_size > 1:
+                # For DDP, use the module's parameters
+                torch.nn.utils.clip_grad_norm_(self.model.module.parameters(), self.args.grad_clip)
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
 
         # step the optimizers and schedulers
         for opt, sched in zip(self.optimizers, self.lr_schedulers):
@@ -377,40 +442,49 @@ class Trainer:
 
         ### BEGIN TRAINING LOOP ###
         self.print0("Beginning training loop...")
-        for step in tqdm(range(self.args.num_steps + 1), desc='Training steps'):
-            if step == 10: # ignore first 10 steps of timing because they are slower
-                self.train_timer.reset()
-                self.train_timer.start()
-            timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+        
+        # Synchronize before starting training
+        if self.ddp_world_size > 1:
+            dist.barrier()
+        
+        # Show progress only on master
+        pbar = tqdm(range(self.args.num_steps + 1), desc='Training steps', disable=not self.master_process)
+        
+        try:
+            for step in pbar:
+                if step == 10: # ignore first 10 steps of timing because they are slower
+                    self.train_timer.reset()
+                    self.train_timer.start()
+                timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-            frac_done = step / self.args.num_steps  # training progress
-            self.sliding_window_size = self.sliding_window_size_scheduler(frac_done)
+                frac_done = step / self.args.num_steps  # training progress
+                self.sliding_window_size = self.sliding_window_size_scheduler(frac_done)
 
-            # once in a while evaluate the validation dataset
-            if self.args.eval_every > 0 and step % self.args.eval_every == 0:
-                val_loss, val_perplexity, val_tokens = self._run_eval_loader_timed(self.valid_loader, prefix='Validation')
-                training_time_sec = self.train_timer.get_time()
-                step_avg_ms = 1000 * training_time_sec / (timed_steps - 1) if timed_steps > 1 else 0
-                self.print0(f'step:{step}/{self.args.num_steps} step_avg:{step_avg_ms:.2f}ms')
-                self.log_wandb(
-                    {'loss': val_loss, 'perplexity': val_perplexity, 'tokens': val_tokens, 'sliding_window_size': self.sliding_window_size},
-                    prefix='val'
-                )
+                # once in a while evaluate the validation dataset
+                if self.args.eval_every > 0 and step % self.args.eval_every == 0:
+                    val_loss, val_perplexity, val_tokens = self._run_eval_loader_timed(self.valid_loader, prefix='Validation')
+                    training_time_sec = self.train_timer.get_time()
+                    step_avg_ms = 1000 * training_time_sec / (timed_steps - 1) if timed_steps > 1 else 0
+                    self.print0(f'step:{step}/{self.args.num_steps} step_avg:{step_avg_ms:.2f}ms')
+                    self.log_wandb(
+                        {'loss': val_loss, 'perplexity': val_perplexity, 'tokens': val_tokens, 'sliding_window_size': self.sliding_window_size},
+                        prefix='val'
+                    )
 
-            # save checkpoint every `save_every` steps
-            if self.args.save_every:
-                if step % self.args.save_every == 0:
-                    self._save_checkpoint_timed(step)
+                # save checkpoint every `save_every` steps
+                if self.args.save_every:
+                    if step % self.args.save_every == 0:
+                        self._save_checkpoint_timed(step)
 
-            loss = self.train_step(step)
-            train_losses.append(loss)
+                loss = self.train_step(step)
+                train_losses.append(loss)
 
-            # everything that follows now is just eval, diagnostics, prints, logging, etc.
-            if step % 100 == 0:
-                train_time_sec = self.train_timer.get_time()
-                avg_loss = sum(train_losses) / len(train_losses)
-                self.print0(f'step:{step+1}/{self.args.num_steps} train_time:{train_time_sec:.0f} sec step_avg:{1000*train_time_sec/timed_steps:.2f}ms loss:{avg_loss:.4f}')
-                train_losses = []
+                # everything that follows now is just eval, diagnostics, prints, logging, etc.
+                if step % 100 == 0:
+                    train_time_sec = self.train_timer.get_time()
+                    avg_loss = sum(train_losses) / len(train_losses)
+                    self.print0(f'step:{step+1}/{self.args.num_steps} train_time:{train_time_sec:.0f} sec step_avg:{1000*train_time_sec/timed_steps:.2f}ms loss:{avg_loss:.4f}')
+                    train_losses = []
 
                 # Log training progress to wandb
                 if self.master_process and self.args.wandb_token:
@@ -422,54 +496,62 @@ class Trainer:
                     }
                     self.log_wandb(log_dict, prefix='train')
 
-        # Stop the timer and get final training time
-        self.train_timer.pause()
-        final_training_time_sec = self.train_timer.get_time()
+            # Stop the timer and get final training time
+            self.train_timer.pause()
+            final_training_time_sec = self.train_timer.get_time()
+            
+            self.print0(f'peak memory consumption training: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB')
+            self.print0(f'Train Time: {final_training_time_sec:.0f}s | Step Avg: {final_training_time_sec/timed_steps:.2f}s')
+            self.print0(f'Total train time (min): {final_training_time_sec / 60:.2f}')
+            self.print0(f'Total train time (hours): {final_training_time_sec / 3600:.2f}')
+            # save the model to huggingface
+            self._save_checkpoint_timed(self.args.num_steps)
+
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            torch.manual_seed(42)
+
+            test_loss, test_perplexity, test_tokens = self._run_eval_loader_timed(self.test_loader, prefix='Test')
+
+            self.print0(f"peak memory consumption testing: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
         
-        self.print0(f'peak memory consumption training: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB')
-        self.print0(f'Train Time: {final_training_time_sec:.0f}s | Step Avg: {final_training_time_sec/timed_steps:.2f}s')
-        self.print0(f'Total train time (min): {final_training_time_sec / 60:.2f}')
-        self.print0(f'Total train time (hours): {final_training_time_sec / 3600:.2f}')
-        # save the model to huggingface
-        self._save_checkpoint_timed(self.args.num_steps)
+            # Final wandb logging
+            if self.master_process and self.args.wandb_token:
+                log_dict = {
+                    "test_loss": test_loss,
+                    "test_perplexity": test_perplexity,
+                    "test_tokens": test_tokens.item() if hasattr(test_tokens, "item") else test_tokens,
+                    "final_train_time_sec": final_training_time_sec,
+                    "final_step_avg_sec": final_training_time_sec/(timed_steps-1) if timed_steps > 1 else 0,
+                    "peak_memory_training_gb": torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024,
+                }
+                self.log_wandb(log_dict, prefix='test')
 
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        torch.manual_seed(42)
-
-        test_loss, test_perplexity, test_tokens = self._run_eval_loader_timed(self.test_loader, prefix='Test')
-
-        self.print0(f"peak memory consumption testing: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
-    
-        # Final wandb logging
-        if self.master_process and self.args.wandb_token:
+            # Log final summary
             log_dict = {
+                "val_loss": val_loss,
                 "test_loss": test_loss,
                 "test_perplexity": test_perplexity,
-                "test_tokens": test_tokens.item(),
-                "final_train_time_sec": final_training_time_sec,
-                "final_step_avg_sec": final_training_time_sec/(timed_steps-1) if timed_steps > 1 else 0,
+                "train_time_sec": final_training_time_sec,
+                "step_avg_sec": final_training_time_sec/(timed_steps-1) if timed_steps > 1 else 0,
                 "peak_memory_training_gb": torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024,
             }
-            self.log_wandb(log_dict, prefix='test')
-
-        # Log final summary
-        log_dict = {
-            "val_loss": val_loss,
-            "test_loss": test_loss,
-            "test_perplexity": test_perplexity,
-            "train_time_sec": final_training_time_sec,
-            "step_avg_sec": final_training_time_sec/(timed_steps-1) if timed_steps > 1 else 0,
-            "peak_memory_training_gb": torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024,
-        }
-        self.log_wandb(log_dict, prefix='final')
+            self.log_wandb(log_dict, prefix='final')
+            
+        except KeyboardInterrupt:
+            self.print0("\nTraining interrupted by user!")
+        except Exception as e:
+            self.print0(f"\nTraining failed with error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Clean up resources
+            if self.master_process and self.args.wandb_token:
+                wandb.finish()
         
-        if self.master_process and self.args.wandb_token:
-            wandb.finish()
-    
-        # clean up nice
-        if self.ddp_world_size > 1:
-            dist.destroy_process_group()
+            # clean up nice
+            if self.ddp_world_size > 1:
+                dist.destroy_process_group()
 
 
 def arg_parser():
@@ -480,6 +562,11 @@ def arg_parser():
     parser.add_argument("--wandb_token", type=str, default=None, help="Weights & Biases API token")
     parser.add_argument("--save_path", type=str, default="Synthyra/speedrun_test", help="Path to save the model and report to wandb")
     parser.add_argument("--bugfix", action="store_true", help="Use small batch size and max length for debugging")
+    
+    # Distributed training arguments
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--clear_cache_every", type=int, default=1000, help="Clear CUDA cache every N steps")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value (0 to disable)")
     
     # Model hyperparams
     parser.add_argument("--hidden_size", type=int, default=768, help="Hidden size of the model")

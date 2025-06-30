@@ -293,7 +293,8 @@ class TrainLoader(IterableDataset):
         while epoch < self.max_epochs:
             # Shuffle files at the start of each epoch
             if file_idx == 0 and epoch > 0:
-                random.seed(epoch + worker_id * 1000)
+                # Include process rank for proper distributed shuffling
+                random.seed(epoch + self.process_rank * 10000 + worker_id * 1000)
                 random.shuffle(worker_files)
             
             # Load current file
