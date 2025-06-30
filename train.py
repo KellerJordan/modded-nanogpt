@@ -113,10 +113,6 @@ class Trainer:
         
         # Initialize global timer
         self.train_timer = GlobalTimer()
-
-        # Set environment variables for distributed training
-        if self.args.nccl_debug:
-            os.environ['NCCL_DEBUG'] = 'INFO'
         
         if 'RANK' in os.environ:
             self.ddp_rank = int(os.environ['RANK'])
