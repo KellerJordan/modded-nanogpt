@@ -3,11 +3,16 @@
 ```console
 git clone https://github.com/Synthyra/SpeedrunningPLMs.git
 cd SpeedrunningPLMs
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128 -U
-pip install -r requirements.txt
-python data/download_omgprot50.py --num_chunks 100
-./run.sh
+python data/download_omgprot50.py # --num_chunks 100 download less data to save time for smaller runs
+sudo docker build -t speedrun_plm .
+sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm \
+    torchrun --standalone --nproc_per_node=NUM_GPUS_ON_YOUR_SYSTEM train.py \
+    --token YOUR_HUGGINGFACE_TOKEN
+    --wandb_token YOUR_WANDB_TOKEN
 ```
+
+A batch size of 8x64x1024 (524288) or 4x64x1024 (262144) tokens has worked very well. We recommend a local batch size of 64*1024 (65536) tokens for 80gb VRAM machines, and less if working with a smaller rig. For example, if 524288 is desired and you have 4 A100 80gb gpus, use gradient accumulation (--grad_accum) of 2 (524288 / 4 / 2 = 65536).
+
 
 <details>
 <summary>Previous Speed runnning ESM2 repo readme with preliminary results</summary>
@@ -59,13 +64,13 @@ These match the [results](https://github.com/Synthyra/SpeedRunningESM2/pull/2#is
 
 |~Matches |Parameters|Time      |Hardware |Log | Val loss |
 |---------|----------|----------|---------|----|----------|
-|ESM2-150|140M      |9.44 hours |1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs/f48932cb-f41f-4c0c-8f24-90c839e9dc9e.txt)| 2.2272 |
+|ESM2-150|140M      |9.44 hours |1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs_to_keep/f48932cb-f41f-4c0c-8f24-90c839e9dc9e.txt)| 2.2272 |
 |ESMC-300|44M       |7.01 hours |4 x 4090 |[Link](https://gist.github.com/lapp0/8553e911c649eea11cc2d7426f26eab6)                                        | 2.1906 |
 
 |~Matches |Parameters|Time      |Hardware |Log | Val loss | Test loss |
 |---------|----------|----------|---------|----|----------|-----------|
-|ESM2-150|132M      |9.00 hours |1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs/e631bf18-f202-492b-a3b8-fbae2cb7484a.txt)| 2.2137 | 2.2093 |
-|ESM2-650|132M      |45.16 hours|1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs/a0a3dc4e-6f27-43e0-96fb-b1c2372a164b.txt)| 2.1044 | 2.1058 |
+|ESM2-150|132M      |9.00 hours |1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs_to_keep/e631bf18-f202-492b-a3b8-fbae2cb7484a.txt)| 2.2137 | 2.2093 |
+|ESM2-650|132M      |45.16 hours|1 x GH200|[Link](https://github.com/Synthyra/SpeedRunningESM2/blob/master/logs_to_keep/a0a3dc4e-6f27-43e0-96fb-b1c2372a164b.txt)| 2.1044 | 2.1058 |
 
 
 </details>

@@ -197,8 +197,7 @@ class Trainer:
             torch.cuda.set_device(self.device)
             self.master_process = True
 
-        # Set seed for reproducibility
-        set_seed(self.args.seed + self.ddp_rank)
+        set_seed(self.args.seed)
         
         print(f'Process {self.ddp_rank}: using device: {self.device}')
 
@@ -251,8 +250,11 @@ class Trainer:
         self.print0(f'{result.stdout}', logonly=True)
         self.print0('='*100, logonly=True)
 
-        self.print0(f'Model config: {self.model_config}')
-        self.print0(f'Args: {self.args.__dict__}')
+        self.print0(f'Model config:\n{self.model_config}')
+        self.print0('Args:')
+        for k, v in self.args.__dict__.items():
+            self.print0(f'{k}: {v}')
+        self.print0('='*100, logonly=True)
 
         # calculate local batch size
         self.batch_size = self.args.batch_size // self.args.grad_accum // self.ddp_world_size
@@ -582,7 +584,7 @@ class Trainer:
 
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-            torch.manual_seed(42)
+            set_seed(self.args.seed)
 
             test_loss, test_perplexity, test_tokens = self._run_eval_loader_timed(self.test_loader, prefix='Test')
 
@@ -665,7 +667,9 @@ if __name__ == '__main__':
     if args.token:
         from huggingface_hub import login
         login(args.token)
-        args.token = None  # Clear token for security
+        # Clear token for security
+        args.token = None 
+        args.wandb_token = None
     
     trainer = Trainer(args, model_config)
     trainer.train()
