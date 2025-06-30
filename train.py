@@ -44,6 +44,72 @@ except ImportError:
 inductor_config.max_autotune_gemm_backends = "aten,cutlass,fbgemm"
 
 
+def arg_parser():
+    parser = argparse.ArgumentParser(description="Synthyra Trainer")
+    
+    # CLI-specific arguments
+    parser.add_argument("--token", type=str, default=None, help="Huggingface token")
+    parser.add_argument("--wandb_token", type=str, default=None, help="Weights & Biases API token")
+    parser.add_argument("--save_path", type=str, default="Synthyra/speedrun_test", help="Path to save the model and report to wandb")
+    parser.add_argument("--bugfix", action="store_true", help="Use small batch size and max length for debugging")
+    
+    # Distributed training arguments
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--clear_cache_every", type=int, default=1000, help="Clear CUDA cache every N steps")
+    parser.add_argument("--grad_clip", type=float, default=0.0, help="Gradient clipping value (0 to disable)")
+    
+    # Model hyperparams
+    parser.add_argument("--hidden_size", type=int, default=768, help="Hidden size of the model")
+    parser.add_argument("--num_attention_heads", type=int, default=6, help="Number of attention heads")
+    parser.add_argument("--num_hidden_layers", type=int, default=24, help="Number of hidden layers")
+    parser.add_argument("--num_att_tokens", type=int, default=512, help="Number of attention tokens")
+    parser.add_argument("--vocab_size", type=int, default=33, help="Vocabulary size")
+    parser.add_argument("--expansion_ratio", type=float, default=8/3, help="Expansion ratio for MLP")
+    parser.add_argument("--soft_logit_cap", type=float, default=32.0, help="Soft logit cap")
+    parser.add_argument("--attention_soft_cap", type=float, default=64.0, help="Attention softmax cap")
+    parser.add_argument("--add_att_soft_cap", type=bool, default=True, help="Add attention softmax cap")
+    parser.add_argument("--p_attention", action="store_true", help="Use P attention")
+    parser.add_argument("--tie_embeddings", action="store_true", help="Tie embeddings")
+    parser.add_argument("--unet", type=bool, default=True, help="Use UNet architecture")
+    
+    # Data hyperparams
+    parser.add_argument("--input_bin", type=str, default='data/omgprot50/omgprot50_train_*.bin', help="Input training bin files pattern")
+    parser.add_argument("--input_valid_bin", type=str, default='data/omgprot50/omgprot50_valid_*.bin', help="Input validation bin files pattern")
+    parser.add_argument("--input_test_bin", type=str, default='data/omgprot50/omgprot50_test_*.bin', help="Input test bin files pattern")
+    parser.add_argument("--mlm", type=bool, default=False, help="Use masked language modeling")
+    parser.add_argument("--mask_rate", type=float, default=0.2, help="Mask rate for masked language modeling")
+    
+    # Optimization hyperparams
+    parser.add_argument("--batch_size", type=int, default=8*64*1024, help="Total batch size in tokens")
+    parser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--num_steps", type=int, default=50000, help="Number of training steps")
+    parser.add_argument("--cooldown_steps", type=int, default=5000, help="Number of cooldown steps")
+    parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
+    parser.add_argument("--scheduler_type", type=str, default='cosine', help="Scheduler type")
+    parser.add_argument("--lr_warmup_steps", type=int, default=1000, help="Number of warmup steps")
+
+    # Adam optimizer params
+    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate for Adam optimizer when not using Muon")
+    parser.add_argument("--lr_embed", type=float, default=0.06, help="Learning rate for embeddings")
+    parser.add_argument("--lr_head", type=float, default=0.008, help="Learning rate for head")
+    parser.add_argument("--lr_scalar", type=float, default=0.04, help="Learning rate for scalar params")
+    
+    # Muon optimizer params
+    parser.add_argument("--use_muon", type=bool, default=True, help="Use Muon optimizer")
+    parser.add_argument("--lr_hidden", type=float, default=0.05, help="Learning rate for hidden layers (Muon)")
+    parser.add_argument("--muon_momentum_warmup_steps", type=int, default=300, help="Steps for warmup momentum (0.85 -> 0.95)")
+    
+    # Evaluation and logging hyperparams
+    parser.add_argument("--eval_every", type=int, default=1000, help="Evaluate on validation set every N steps")
+    parser.add_argument("--hf_model_name", type=str, default='lhallee/speedrun', help="Huggingface model name for saving")
+    parser.add_argument("--save_every", type=int, default=None, help="Save checkpoint every N steps")
+    
+    # Dataloader params
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for optimized dataloader")
+    parser.add_argument("--prefetch_factor", type=int, default=2, help="Prefetch factor for optimized dataloader")
+    return parser.parse_args()
+
+
 def set_seed(seed):
     """Set seed for reproducibility across all processes."""
     random.seed(seed)
@@ -559,72 +625,6 @@ class Trainer:
             # clean up nice
             if self.ddp_world_size > 1:
                 dist.destroy_process_group()
-
-
-def arg_parser():
-    parser = argparse.ArgumentParser(description="Synthyra Trainer")
-    
-    # CLI-specific arguments
-    parser.add_argument("--token", type=str, default=None, help="Huggingface token")
-    parser.add_argument("--wandb_token", type=str, default=None, help="Weights & Biases API token")
-    parser.add_argument("--save_path", type=str, default="Synthyra/speedrun_test", help="Path to save the model and report to wandb")
-    parser.add_argument("--bugfix", action="store_true", help="Use small batch size and max length for debugging")
-    
-    # Distributed training arguments
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--clear_cache_every", type=int, default=1000, help="Clear CUDA cache every N steps")
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value (0 to disable)")
-    
-    # Model hyperparams
-    parser.add_argument("--hidden_size", type=int, default=768, help="Hidden size of the model")
-    parser.add_argument("--num_attention_heads", type=int, default=6, help="Number of attention heads")
-    parser.add_argument("--num_hidden_layers", type=int, default=24, help="Number of hidden layers")
-    parser.add_argument("--num_att_tokens", type=int, default=512, help="Number of attention tokens")
-    parser.add_argument("--vocab_size", type=int, default=33, help="Vocabulary size")
-    parser.add_argument("--expansion_ratio", type=float, default=8/3, help="Expansion ratio for MLP")
-    parser.add_argument("--soft_logit_cap", type=float, default=32.0, help="Soft logit cap")
-    parser.add_argument("--attention_soft_cap", type=float, default=64.0, help="Attention softmax cap")
-    parser.add_argument("--add_att_soft_cap", type=bool, default=True, help="Add attention softmax cap")
-    parser.add_argument("--p_attention", action="store_true", help="Use P attention")
-    parser.add_argument("--tie_embeddings", action="store_true", help="Tie embeddings")
-    parser.add_argument("--unet", type=bool, default=True, help="Use UNet architecture")
-    
-    # Data hyperparams
-    parser.add_argument("--input_bin", type=str, default='data/omgprot50/omgprot50_train_*.bin', help="Input training bin files pattern")
-    parser.add_argument("--input_valid_bin", type=str, default='data/omgprot50/omgprot50_valid_*.bin', help="Input validation bin files pattern")
-    parser.add_argument("--input_test_bin", type=str, default='data/omgprot50/omgprot50_test_*.bin', help="Input test bin files pattern")
-    parser.add_argument("--mlm", type=bool, default=False, help="Use masked language modeling")
-    parser.add_argument("--mask_rate", type=float, default=0.2, help="Mask rate for masked language modeling")
-    
-    # Optimization hyperparams
-    parser.add_argument("--batch_size", type=int, default=8*64*1024, help="Total batch size in tokens")
-    parser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation steps")
-    parser.add_argument("--num_steps", type=int, default=50000, help="Number of training steps")
-    parser.add_argument("--cooldown_steps", type=int, default=5000, help="Number of cooldown steps")
-    parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
-    parser.add_argument("--scheduler_type", type=str, default='cosine', help="Scheduler type")
-    parser.add_argument("--lr_warmup_steps", type=int, default=1000, help="Number of warmup steps")
-
-    # Adam optimizer params
-    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate for Adam optimizer when not using Muon")
-    parser.add_argument("--lr_embed", type=float, default=0.06, help="Learning rate for embeddings")
-    parser.add_argument("--lr_head", type=float, default=0.008, help="Learning rate for head")
-    parser.add_argument("--lr_scalar", type=float, default=0.04, help="Learning rate for scalar params")
-    
-    # Muon optimizer params
-    parser.add_argument("--use_muon", type=bool, default=True, help="Use Muon optimizer")
-    parser.add_argument("--lr_hidden", type=float, default=0.05, help="Learning rate for hidden layers (Muon)")
-    parser.add_argument("--muon_momentum_warmup_steps", type=int, default=300, help="Steps for warmup momentum (0.85 -> 0.95)")
-    
-    # Evaluation and logging hyperparams
-    parser.add_argument("--eval_every", type=int, default=1000, help="Evaluate on validation set every N steps")
-    parser.add_argument("--hf_model_name", type=str, default='lhallee/speedrun', help="Huggingface model name for saving")
-    parser.add_argument("--save_every", type=int, default=None, help="Save checkpoint every N steps")
-    
-    # Dataloader params
-    parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for optimized dataloader")
-    parser.add_argument("--prefetch_factor", type=int, default=2, help="Prefetch factor for optimized dataloader")
-    return parser.parse_args()
 
 
 if __name__ == '__main__':
