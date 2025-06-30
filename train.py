@@ -269,8 +269,8 @@ class Trainer:
                 device_ids=[self.ddp_local_rank], 
                 broadcast_buffers=False, 
                 gradient_as_bucket_view=True,
-                static_graph=self.args.ddp_static_graph,
-                find_unused_parameters=not self.args.ddp_static_graph
+                static_graph=True,
+                find_unused_parameters=False
             )
         return model
 
