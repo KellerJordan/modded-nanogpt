@@ -54,6 +54,8 @@ If you know how to get our docker image working (or a solution with different co
 
 ## Running experiments
 
+Check out our documented experiments thus far [here](https://synthyra.github.io/SpeedrunningPLMs/).
+
 You can set up experiments by editing the example yaml files with desired settings (`example_yamls/default.yaml`). Simply build a yaml file for each experiment you would like to run and drag them into the `experiments` folder on your training rig. Then, run:
 
 ```
