@@ -61,8 +61,9 @@ chmod +x run_experiments.sh
 ./run_experiments.sh
 ```
 
-which will automatically determine how many GPUs your machine has, and prompt you for Huggingface and Wandb tokens.
+which will automatically determine how many GPUs your machine has, prompt you for Huggingface and Wandb tokens, and then run all the yaml files in `experiments` sequentially.
 
+For more information about CLI or yaml arguments you can reference the table in the drop down below:
 
 <details>
 <summary><strong>Command-line Arguments Reference</strong></summary>
@@ -110,7 +111,7 @@ which will automatically determine how many GPUs your machine has, and prompt yo
 | <code>--lr_hidden</code> | float | 0.05 | Learning rate for hidden layers (Muon). |
 | <code>--muon_momentum_warmup_steps</code> | int | 300 | Steps for Muon momentum warmup (0.85 → 0.95). |
 | <code>--eval_every</code> | int | 1000 | Evaluate on validation set every N steps. |
-| <code>--hf_model_name</code> | str | "lhallee/speedrun" | HuggingFace model name for saving. |
+| <code>--hf_model_name</code> | str | "Synthyra/speedrun" | HuggingFace model name for saving. |
 | <code>--save_every</code> | int | None | Save checkpoint every N steps (if set). |
 | <code>--num_workers</code> | int | 4 | Number of workers for optimized dataloader. |
 | <code>--prefetch_factor</code> | int | 2 | Prefetch factor for optimized dataloader. |
