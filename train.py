@@ -255,10 +255,10 @@ class Trainer:
             
             # Use provided log_name or generate a random UUID
             if self.args.log_name:
-                log_filename = f'{self.args.log_name}.txt'
+                run_id = self.args.log_name
             else:
                 run_id = uuid.uuid4()
-                log_filename = f'{run_id}.txt'
+            log_filename = f'{run_id}.txt'
                 
             self.logfile = Path('logs') / log_filename
             print(self.logfile.stem)
@@ -275,8 +275,8 @@ class Trainer:
         if self.master_process and self.args.wandb_token:
             wandb.login(key=self.args.wandb_token)
             wandb.init(
-                project="speedrunning-esm2",
-                name=self.args.save_path,
+                project="speedrunning-plms",
+                name=run_id,
                 config={
                     **vars(self.args),
                     **vars(self.model_config),

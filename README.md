@@ -2,7 +2,7 @@
 
 ## Get started
 
-```console
+```
 git clone https://github.com/Synthyra/SpeedrunningPLMs.git
 cd SpeedrunningPLMs
 pip install huggingface_hub
@@ -10,14 +10,14 @@ python data/download_omgprot50.py # --num_chunks 100 download less data to save 
 ```
 
 For ARM64 systems (GH200)
-```console
+```
 pip install -r requirements.txt -U
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 -U
 torchrun --standalone --nproc_per_node=NUM_GPUS_ON_YOUR_SYSTEM train.py
 ```
 
 For non ARM64 systems you can use Docker
-```console
+```
 git clone https://github.com/Synthyra/SpeedrunningPLMs.git
 cd SpeedrunningPLMs
 sudo docker build -t speedrun_plm .
@@ -49,6 +49,71 @@ You can suppress this exception and fall back to eager by setting:
 Suppressing dynamo leads to its own error. There is something delicate going on here.
 
 If you know how to get our docker image working (or a solution with different container software) on GH200 please open an issue or pull request! There is some triton version mismatch that breaks the <code>torch.compile</code>. So in principle the docker image works for GH200 without <code>torch.compile</code>, but obviously that is not ideal.
+
+</details>
+
+## Running experiments
+
+You can set up experiments by editing the example yaml files with desired settings (`example_yamls/default.yaml`). Simply build a yaml file for each experiment you would like to run and drag them into the `experiments` folder on your training rig. Then, run:
+
+```
+chmod +x run_experiments.sh
+./run_experiments.sh
+```
+
+which will automatically determine how many GPUs your machine has, and prompt you for Huggingface and Wandb tokens.
+
+
+<details>
+<summary><strong>Command-line Arguments Reference</strong></summary>
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| <code>--yaml_path</code> | str | None | Path to YAML file with experiment configuration. CLI arguments override YAML. |
+| <code>--token</code> | str | None | HuggingFace token (required for model saving/uploading). Prompted if not provided. |
+| <code>--wandb_token</code> | str | None | Weights & Biases API token (for experiment tracking). Prompted if not provided. |
+| <code>--log_name</code> | str | None | Name for the log file and wandb run. If not set, a random UUID is used. |
+| <code>--bugfix</code> | flag | False | Use small batch size and max length for debugging. |
+| <code>--save_path</code> | str | "Synthyra/speedrun_test" | Path to save the model and report to wandb. |
+| <code>--seed</code> | int | 42 | Random seed for reproducibility. |
+| <code>--clear_cache_every</code> | int | 1000 | Clear CUDA cache every N steps. |
+| <code>--grad_clip</code> | float | 0.0 | Gradient clipping value (0 to disable). |
+| <code>--hidden_size</code> | int | 768 | Hidden size of the model. |
+| <code>--num_attention_heads</code> | int | 6 | Number of attention heads. |
+| <code>--num_hidden_layers</code> | int | 24 | Number of hidden layers. |
+| <code>--num_att_tokens</code> | int | 512 | Number of attention tokens. |
+| <code>--vocab_size</code> | int | 33 | Vocabulary size. |
+| <code>--expansion_ratio</code> | float | 2.6667 | Expansion ratio for MLP (e.g., 8/3). |
+| <code>--soft_logit_cap</code> | float | 32.0 | Soft logit cap for output logits. |
+| <code>--attention_soft_cap</code> | float | 64.0 | Attention softmax cap. |
+| <code>--add_att_soft_cap</code> | bool | True | Whether to add attention softmax cap. |
+| <code>--p_attention</code> | flag | False | Use P attention variant. |
+| <code>--tie_embeddings</code> | flag | False | Tie input and output embeddings. |
+| <code>--unet</code> | bool | True | Use UNet architecture. |
+| <code>--input_bin</code> | str | "data/omgprot50/omgprot50_train_*.bin" | Input training bin files pattern. |
+| <code>--input_valid_bin</code> | str | "data/omgprot50/omgprot50_valid_*.bin" | Input validation bin files pattern. |
+| <code>--input_test_bin</code> | str | "data/omgprot50/omgprot50_test_*.bin" | Input test bin files pattern. |
+| <code>--mlm</code> | bool | False | Use masked language modeling objective. |
+| <code>--mask_rate</code> | float | 0.2 | Mask rate for masked language modeling. |
+| <code>--batch_size</code> | int | 524288 | Total batch size in tokens (default: 8*64*1024). |
+| <code>--grad_accum</code> | int | 1 | Gradient accumulation steps. |
+| <code>--num_steps</code> | int | 50000 | Number of training steps. |
+| <code>--cooldown_steps</code> | int | 5000 | Number of cooldown steps after main training. |
+| <code>--max_length</code> | int | 1024 | Maximum sequence length. |
+| <code>--scheduler_type</code> | str | "cosine" | Scheduler type for learning rate. |
+| <code>--lr_warmup_steps</code> | int | 1000 | Number of warmup steps for learning rate. |
+| <code>--lr</code> | float | 0.001 | Learning rate for Adam optimizer (when not using Muon). |
+| <code>--lr_embed</code> | float | 0.06 | Learning rate for embeddings. |
+| <code>--lr_head</code> | float | 0.008 | Learning rate for head. |
+| <code>--lr_scalar</code> | float | 0.04 | Learning rate for scalar parameters. |
+| <code>--use_muon</code> | bool | True | Use Muon optimizer for hidden layers. |
+| <code>--lr_hidden</code> | float | 0.05 | Learning rate for hidden layers (Muon). |
+| <code>--muon_momentum_warmup_steps</code> | int | 300 | Steps for Muon momentum warmup (0.85 → 0.95). |
+| <code>--eval_every</code> | int | 1000 | Evaluate on validation set every N steps. |
+| <code>--hf_model_name</code> | str | "lhallee/speedrun" | HuggingFace model name for saving. |
+| <code>--save_every</code> | int | None | Save checkpoint every N steps (if set). |
+| <code>--num_workers</code> | int | 4 | Number of workers for optimized dataloader. |
+| <code>--prefetch_factor</code> | int | 2 | Prefetch factor for optimized dataloader. |
 
 </details>
 
