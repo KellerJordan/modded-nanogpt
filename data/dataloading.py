@@ -1,9 +1,9 @@
 import torch
 import random
+import torch.utils.data as data
 from pathlib import Path
 from transformers import EsmTokenizer
 from typing import Tuple
-import torch.utils.data as data
 from torch.utils.data import DataLoader, IterableDataset
 
 
@@ -22,177 +22,208 @@ def _load_data_shard(file: Path):
     return tokens
 
 
-class DistributedDataLoader:
-    def __init__(self, filename_pattern: str, batch_size: int, rank: int, world_size: int):
-        assert batch_size % world_size == 0
-        self.world_size = world_size
-        self.rank = rank
-        self.files = sorted(Path.cwd().glob(filename_pattern))
-        self.batch_size = batch_size
-        self.local_batch_size = self.batch_size // self.world_size
-        self.reset()
-
-    def reset(self):
-        self.next_shard = 0
-        self.advance()
-
-    def advance(self): # advance to next data shard
-        self.pos = 0
-        self.tokens = _load_data_shard(self.files[self.next_shard])
-        self.next_shard = (self.next_shard + 1) % len(self.files)
-
-    def next_batch(self):
-        buf = self.tokens[self.pos + self.rank * self.local_batch_size:][:self.local_batch_size]
-        # by @YouJiacheng: host side async is sufficient;
-        # no performance improvement was observed when introducing a separate stream.
-        sequence = buf.to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
-        # advance current position and load next shard if necessary
-        self.pos += self.batch_size
-        if self.pos + self.batch_size >= len(self.tokens):
-            self.advance()
-        return sequence
-
-
-class DistributedDataLoaderWithMasking:
+class EvalLoader(IterableDataset):
+    """An IterableDataset specifically for evaluation that distributes data by sequences, not files."""
+    
     def __init__(
-            self,
-            filename_pattern: str,
-            batch_size: int,
-            rank: int,
-            world_size: int,
-            training: bool,
-            tokenizer: EsmTokenizer
-        ):
-        assert batch_size % world_size == 0
-        self.world_size = world_size
-        self.rank = rank
-        self.files = sorted(Path.cwd().glob(filename_pattern))
-        self.batch_size = batch_size
-        self.local_batch_size = self.batch_size // self.world_size
-        self.training = training
+        self,
+        filename_pattern: str,
+        seq_len: int,
+        process_rank: int,
+        num_processes: int,
+        tokenizer: EsmTokenizer,
+    ):
+        self.filename_pattern = filename_pattern
+        self.seq_len = seq_len
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        # Tokenizer IDs
         self.cls_token_id = tokenizer.cls_token_id
         self.eos_token_id = tokenizer.eos_token_id
         self.pad_token_id = tokenizer.pad_token_id
         self.mask_token_id = tokenizer.mask_token_id
-        special_tokens = [self.cls_token_id, self.eos_token_id, self.pad_token_id]
-        self.special_tokens = torch.tensor(special_tokens, device="cuda")
-        self.reset()
-
-    def reset(self):
-        self.next_shard = 0
-        self.advance()
-
-    def advance(self): # advance to next data shard
-        self.pos = 0
-        self.tokens = _load_data_shard(self.files[self.next_shard])
-        self.next_shard = (self.next_shard + 1) % len(self.files)
-
-    def next_batch(self):
-        buf = self.tokens[self.pos + self.rank * self.local_batch_size:][:self.local_batch_size]
-        # by @YouJiacheng: host side async is sufficient;
-        # no performance improvement was observed when introducing a separate stream.
-        sequence = buf.to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
-        sequence = sequence.flatten()
-
-        # pick mask rate
-        eps = 1e-3
-
-        if self.training:
-            mask_rate = torch.rand(1, device=sequence.device)
-            mask_rate = (1 - eps) * mask_rate + eps
-        else:
-            mask_rate = torch.full((1,), 0.15, device=sequence.device)
-
+        self.special_tokens = [self.cls_token_id, self.eos_token_id, self.pad_token_id]
+        
+        # All processes load all files (since we're distributing by sequences, not files)
+        self.all_files = sorted(Path.cwd().glob(filename_pattern))
+        if not self.all_files:
+            raise ValueError(f"No files found matching pattern: {filename_pattern}")
+    
+    def __iter__(self):
+        """Generate batches, with each process taking every num_processes-th batch."""
+        batch_count = 0
+        
+        for file in self.all_files:
+            raw_tokens = _load_data_shard(file)
+            
+            # Process the tokens into batches
+            eos_positions = (raw_tokens == self.eos_token_id).nonzero(as_tuple=True)[0]
+            
+            if len(eos_positions) == 0:
+                continue
+            
+            # Process samples and create batches
+            batch_tokens = []
+            curr_batch_len = 0
+            
+            for i in range(len(eos_positions)):
+                curr_eos = eos_positions[i]
+                prev_eos_plus_one = 0 if i == 0 else eos_positions[i-1] + 1
+                sample = raw_tokens[prev_eos_plus_one:curr_eos+1]
+                
+                # Handle samples that exceed batch size
+                if len(sample) > self.seq_len:
+                    # Split large samples into multiple batches
+                    for j in range(0, len(sample), self.seq_len):
+                        chunk = sample[j:j+self.seq_len]
+                        if len(chunk) < self.seq_len:
+                            # Pad the last chunk
+                            padding = torch.full((self.seq_len - len(chunk),), self.pad_token_id, dtype=torch.uint8)
+                            chunk = torch.cat([chunk, padding])
+                        
+                        # Check if this batch should be yielded by this process
+                        if batch_count % self.num_processes == self.process_rank:
+                            # Apply masking and yield batch
+                            input_ids, labels, mask_rate = self._apply_masking(chunk)
+                            yield input_ids, labels, mask_rate
+                        batch_count += 1
+                    continue
+                
+                # Check if adding this sample would exceed batch size
+                if len(sample) + curr_batch_len > self.seq_len:
+                    # Pad current batch and yield
+                    if curr_batch_len > 0:
+                        padding = torch.full((self.seq_len - curr_batch_len,), self.pad_token_id, dtype=torch.uint8)
+                        batch_tokens.append(padding)
+                        batch = torch.cat(batch_tokens)
+                        
+                        # Check if this batch should be yielded by this process
+                        if batch_count % self.num_processes == self.process_rank:
+                            # Apply masking and yield
+                            input_ids, labels, mask_rate = self._apply_masking(batch)
+                            yield input_ids, labels, mask_rate
+                        batch_count += 1
+                    
+                    # Start new batch
+                    batch_tokens = [sample]
+                    curr_batch_len = len(sample)
+                else:
+                    # Add to current batch
+                    batch_tokens.append(sample)
+                    curr_batch_len += len(sample)
+                
+                # Yield complete batch
+                if curr_batch_len == self.seq_len:
+                    batch = torch.cat(batch_tokens)
+                    
+                    # Check if this batch should be yielded by this process
+                    if batch_count % self.num_processes == self.process_rank:
+                        input_ids, labels, mask_rate = self._apply_masking(batch)
+                        yield input_ids, labels, mask_rate
+                    batch_count += 1
+                    batch_tokens = []
+                    curr_batch_len = 0
+            
+            # Yield final incomplete batch if it exists
+            if curr_batch_len > 0:
+                padding = torch.full((self.seq_len - curr_batch_len,), self.pad_token_id, dtype=torch.uint8)
+                batch_tokens.append(padding)
+                batch = torch.cat(batch_tokens)
+                
+                # Check if this batch should be yielded by this process
+                if batch_count % self.num_processes == self.process_rank:
+                    input_ids, labels, mask_rate = self._apply_masking(batch)
+                    yield input_ids, labels, mask_rate
+                batch_count += 1
+    
+    def _apply_masking(self, sequence: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply masking to a sequence (on CPU)."""
+        # Convert to int32
+        sequence = sequence.to(dtype=torch.int32)
+        
+        # Use fixed mask rate for evaluation
+        mask_rate = torch.full((1,), 0.15)
+        
+        # Create mask
         p_mask = mask_rate.repeat(len(sequence))
-        mask_indices = torch.rand(len(sequence), device=sequence.device) < p_mask
-        special_mask = torch.isin(sequence, self.special_tokens)
+        mask_indices = torch.rand(len(sequence)) < p_mask
+        
+        # Don't mask special tokens
+        special_mask = torch.isin(sequence, torch.tensor(self.special_tokens, dtype=torch.int32))
         mask_indices = mask_indices & ~special_mask
-
+        
+        # Create noisy batch and labels
         noisy_batch = torch.where(mask_indices, self.mask_token_id, sequence)
         labels = sequence.clone()
-        non_mask_indices = ~mask_indices
-        labels[non_mask_indices] = -100
-
-        # advance current position and load next shard if necessary
-        self.pos += self.batch_size
-        if self.pos + self.batch_size >= len(self.tokens):
-            self.advance()
+        labels[~mask_indices] = -100
+        
         return noisy_batch, labels, mask_rate
 
 
-class DistributedPaddedDataLoader(DistributedDataLoaderWithMasking):
+class OptimizedEvalLoader:
+    """Drop-in replacement for evaluation that distributes data by sequences rather than files."""
+    
     def __init__(
-            self,
-            filename_pattern,
-            seq_len,
-            process_rank,
-            num_processes,
-            max_epochs,
-            training,
-            tokenizer
-        ):
-        self._leftover_tokens = torch.empty(0, dtype=torch.uint8)
-        self.max_epochs = max_epochs
-        super().__init__(filename_pattern, seq_len, process_rank, num_processes, training, tokenizer)
-
-    def advance(self):
-        self.pos = 0
-
-        # handle epoch limit
-        if self.next_shard // len(self.files) < self.max_epochs:
-            raw_tokens = _load_data_shard(self.files[self.next_shard % len(self.files)])
-            raw_tokens = torch.cat([self._leftover_tokens, raw_tokens], dim=0)
-            self.next_shard += 1
-        else:
-            raw_tokens = self._leftover_tokens
-        if not raw_tokens.numel():
-            self._leftover_tokens = torch.empty(0, dtype=torch.uint8)
-            self.tokens = torch.empty(0, dtype=torch.uint8)
-            return
+        self,
+        filename_pattern: str,
+        seq_len: int,
+        process_rank: int,
+        num_processes: int,
+        tokenizer: EsmTokenizer,
+    ):
+        self.filename_pattern = filename_pattern
+        self.seq_len = seq_len
+        self.process_rank = process_rank
+        self.num_processes = num_processes
         
-        # shuffle each epoch
-        if self.next_shard % len(self.files) == 0:
-            random.seed(self.next_shard)
-            random.shuffle(self.files)
+        # Create the dataset
+        self._dataset = EvalLoader(
+            filename_pattern=filename_pattern,
+            seq_len=seq_len,
+            process_rank=process_rank,
+            num_processes=num_processes,
+            tokenizer=tokenizer,
+        )
+        
+        # Store file list for compatibility - all processes see all files
+        self.files = self._dataset.all_files
+        
+        # Create the dataloader (single worker for evaluation to ensure deterministic order)
+        self.dataloader = DataLoader(
+            self._dataset,
+            batch_size=None,  # Dataset returns complete batches
+            num_workers=0,    # Single worker for deterministic eval order
+            pin_memory=True,  # Pin memory for faster GPU transfer
+        )
+        
+        # Create iterator
+        self._iterator = None
+        self._exhausted = False
+    
+    def reset(self):
+        """Reset the dataloader iterator."""
+        self._iterator = iter(self.dataloader)
+        self._exhausted = False
+    
+    def next_batch(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get the next batch, ensuring GPU transfer happens here."""
+        if self._iterator is None:
+            self.reset()
+        
+        try:
+            input_ids, labels, mask_rate = next(self._iterator)
+            # Transfer to GPU with non-blocking
+            input_ids = input_ids.cuda(non_blocking=True)
+            labels = labels.cuda(non_blocking=True)
+            mask_rate = mask_rate.cuda(non_blocking=True)
+            return input_ids, labels, mask_rate
+        except StopIteration:
+            self._exhausted = True
+            # Return empty tensors to signal end of data
+            return torch.empty(0, device='cuda'), torch.empty(0, device='cuda'), torch.empty(0, device='cuda')
 
-        processed_chunks = []
-        curr_batch_len = 0
-        eos_positions = (raw_tokens == self.eos_token_id).nonzero(as_tuple=True)[0]
 
-        for i in range(len(eos_positions)):
-            curr_eos = eos_positions[i]
-            prev_eos_plus_one = 0 if i == 0 else eos_positions[i-1] + 1  # EOS_idx + 1 = CLS_idx
-            sample = raw_tokens[prev_eos_plus_one:curr_eos+1]  # One sample: "CLS ... EOS"
-
-            if not sample[0] == self.cls_token_id and sample[-1] == self.eos_token_id:
-                print(f"Warning: sample[0]=={sample[0]}, sample[-1]=={sample[-1]}, sample.numel()=={sample.numel()}")
-                print(f"\ti={i}, eos_positions[:i]=={eos_positions[:i]}")
-            assert curr_batch_len < self.local_batch_size, str((curr_batch_len, self.local_batch_size))
-
-            # if adding sample exceeds the batch size resulting in truncation, pad to end of batch, starting a fresh batch
-            if len(sample) + curr_batch_len >= self.local_batch_size:
-                num_pad = self.local_batch_size - curr_batch_len
-                processed_chunks.append(torch.full((num_pad,), self.pad_token_id, dtype=torch.uint8))
-                curr_batch_len = 0
-
-            # if len(sample) > local batch size, chunk evenly, making multiple padded batches, starting a fresh batch
-            if len(sample) > self.local_batch_size:
-                for split_sample in torch.chunk(sample, len(sample) // self.local_batch_size + 1):
-                    processed_chunks.append(split_sample)
-                    num_pad = self.local_batch_size - len(split_sample)
-                    processed_chunks.append(torch.full((num_pad,), self.pad_token_id, dtype=torch.uint8))
-                curr_batch_len = 0
-                continue
-
-            processed_chunks.append(sample)
-            curr_batch_len += len(sample)
-            curr_batch_len = 0 if curr_batch_len == self.local_batch_size else curr_batch_len
-
-        self._leftover_tokens = raw_tokens[curr_eos+1:]
-        self.tokens = torch.cat(processed_chunks, dim=0)
-
-
-class DistributedPaddedIterableDataset(IterableDataset):
+class TrainLoader(IterableDataset):
     """An IterableDataset that handles distributed padded data loading with masking."""
     
     def __init__(
@@ -202,25 +233,25 @@ class DistributedPaddedIterableDataset(IterableDataset):
         process_rank: int,
         num_processes: int,
         max_epochs: int,
-        training: bool,
         tokenizer: EsmTokenizer,
         num_workers: int = 1,
+        mlm: bool = False,
+        mask_rate: float = 0.15,
     ):
         self.filename_pattern = filename_pattern
         self.seq_len = seq_len
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.max_epochs = max_epochs
-        self.training = training
         self.num_workers = num_workers
-        
+        self.mask_rate = mask_rate
         # Tokenizer IDs
         self.cls_token_id = tokenizer.cls_token_id
         self.eos_token_id = tokenizer.eos_token_id
         self.pad_token_id = tokenizer.pad_token_id
         self.mask_token_id = tokenizer.mask_token_id
         self.special_tokens = [self.cls_token_id, self.eos_token_id, self.pad_token_id]
-        
+        self.mlm = mlm
         # Get all files and distribute across processes (GPUs)
         all_files = sorted(Path.cwd().glob(filename_pattern))
         if not all_files:
@@ -262,7 +293,8 @@ class DistributedPaddedIterableDataset(IterableDataset):
         while epoch < self.max_epochs:
             # Shuffle files at the start of each epoch
             if file_idx == 0 and epoch > 0:
-                random.seed(epoch + worker_id * 1000)
+                # Include process rank for proper distributed shuffling
+                random.seed(epoch + self.process_rank * 10000 + worker_id * 1000)
                 random.shuffle(worker_files)
             
             # Load current file
@@ -363,11 +395,12 @@ class DistributedPaddedIterableDataset(IterableDataset):
         
         # Pick mask rate
         eps = 1e-3
-        if self.training:
+
+        if self.mlm:
+            mask_rate = torch.full((1,), self.mask_rate)
+        else:
             mask_rate = torch.rand(1)
             mask_rate = (1 - eps) * mask_rate + eps
-        else:
-            mask_rate = torch.full((1,), 0.15)
         
         # Create mask
         p_mask = mask_rate.repeat(len(sequence))
@@ -385,7 +418,7 @@ class DistributedPaddedIterableDataset(IterableDataset):
         return noisy_batch, labels, mask_rate
 
 
-class OptimizedDistributedPaddedDataLoader:
+class OptimizedTrainLoader:
     """Drop-in replacement for DistributedPaddedDataLoader using multi-worker optimization."""
     
     def __init__(
@@ -395,27 +428,28 @@ class OptimizedDistributedPaddedDataLoader:
         process_rank: int,
         num_processes: int,
         max_epochs: int,
-        training: bool,
         tokenizer: EsmTokenizer,
         num_workers: int = 4,
         prefetch_factor: int = 2,
+        mlm: bool = False,
+        mask_rate: float = 0.15,
     ):
         self.filename_pattern = filename_pattern
         self.seq_len = seq_len
         self.process_rank = process_rank
         self.num_processes = num_processes
-        self.training = training
         
         # Create the dataset to get file count
-        self._dataset = DistributedPaddedIterableDataset(
+        self._dataset = TrainLoader(
             filename_pattern=filename_pattern,
             seq_len=seq_len,
             process_rank=process_rank,
             num_processes=num_processes,
             max_epochs=max_epochs,
-            training=training,
             tokenizer=tokenizer,
             num_workers=num_workers,
+            mlm=mlm,
+            mask_rate=mask_rate,
         )
         
         # Store file list for compatibility - only this process's files

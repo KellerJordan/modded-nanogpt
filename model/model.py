@@ -27,7 +27,10 @@ class PLMConfig(PretrainedConfig):
         p_attention: bool = False,
         tie_embeddings: bool = False,
         unet: bool = False,
+        mlm: bool = False,
+        **kwargs,
     ):
+        super().__init__(**kwargs)
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_hidden_layers = num_hidden_layers
@@ -41,7 +44,8 @@ class PLMConfig(PretrainedConfig):
         self.p_attention = p_attention
         self.tie_embeddings = tie_embeddings
         self.unet = unet
-
+        self.mlm = mlm
+    
 
 @dataclass
 class ESMOutput(ModelOutput):
@@ -161,21 +165,29 @@ class PLM(PreTrainedModel):
         self.sliding_window_size = config.sliding_window_size
 
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+
         self.unet = config.unet
         if config.unet:
             self.transformer = UnetTransformer(config)
             self.value_embeds = ValueEmbedding(config)
         else:
             self.transformer = Transformer(config)
+    
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, config.soft_logit_cap)
         if config.tie_embeddings:
             self.lm_head.decoder.weight = self.embedding.weight
 
+        self.mlm = config.mlm
         self.ce = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
 
     def get_last_hidden_state(self, input_ids: torch.Tensor, sliding_window_size: int) -> torch.Tensor: # (l,)
         docs = (input_ids == self.cls_token_id).cumsum(0)
-        last_eos = (input_ids == self.eos_token_id).nonzero()[-1].squeeze()
+        eos_positions = (input_ids == self.eos_token_id).nonzero()
+        if eos_positions.numel() > 0:
+            last_eos = eos_positions[-1].squeeze()
+        else:
+            # If no EOS token found, use the last position of the sequence
+            last_eos = len(input_ids) - 1
         seq_len = len(input_ids)
 
         def doc_mask_mod(b, h, q_idx, kv_idx):
@@ -238,8 +250,7 @@ class PLM(PreTrainedModel):
             lm_logits.view(-1, self.vocab_size),
             labels.view(-1).long()
         )
-        
-        if self.training:
+        if self.training and not self.mlm:
             loss = loss / mask_rate
 
         return loss
