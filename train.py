@@ -19,7 +19,7 @@ import numpy as np
 import argparse
 import torch
 import torch.distributed as dist
-import torch._dynamo
+#import torch._dynamo
 import torch._inductor.config as inductor_config
 from torchinfo import summary
 from transformers import EsmTokenizer, get_scheduler
@@ -42,7 +42,7 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 
-torch._dynamo.config.suppress_errors = True
+#torch._dynamo.config.suppress_errors = True
 inductor_config.max_autotune_gemm_backends = "aten,cutlass,fbgemm"
 
 
