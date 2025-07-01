@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# chmod +x run_experiments.sh
+# ./run_experiments.sh
 set -euo pipefail
 
 # ─── Config ────────────────────────────────────────────────────────────────────
