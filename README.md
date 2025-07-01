@@ -61,7 +61,7 @@ chmod +x run_experiments.sh
 ./run_experiments.sh
 ```
 
-which will automatically determine how many GPUs your machine has, prompt you for Huggingface and Wandb tokens, and then run all the yaml files in `experiments` sequentially.
+which will automatically determine how many GPUs your machine has, prompt you for Huggingface and Wandb tokens, and then run all the yaml files in `experiments` sequentially. Each yaml file corresponds to a set of settings that will start a training run.
 
 For more information about CLI or yaml arguments you can reference the table in the drop down below:
 
@@ -135,10 +135,10 @@ Here's a table of some current throughput during training for the default model 
 
 This implies that you could train ESM2-150 (batch size 2 million tokens for 500,000 steps) in 129 hours for $3091 (lambda 8xH100 6/30/2025) - assuming no improvements to model architecture, any training associated algorithms, or datasets.
 
-Clearly, data connects and read/write speeds are still a major bottleneck (looking at the GH200 domination).
+Clearly, memory and disk read/write speeds are still a major bottleneck on some HPC systems (looking at the GH200 domination). Perhaps enhancements to the dataloading and prefetching can reduce this further. 
 
 <details>
-<summary>Previous Speed runnning ESM2 repo readme with preliminary results</summary>
+<summary>Preliminary SpeedrunnningESM2 repo readme with early results</summary>
 # Replicating ESM2 at the speed of sound
 This repo is an open-source collaboration to reproduce ESM2 models with the same or less parameters in as little time as possible, inspired by the fantastic [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) repo. Mostly interested in 8xH100 or 1xH200 runs which are currently available through many vendors.
 
