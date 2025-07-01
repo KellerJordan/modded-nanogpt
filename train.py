@@ -4,7 +4,7 @@ import yaml
 
 code = open(sys.argv[0]).read()
 code += open('optimizer.py', 'r', encoding='utf-8').read()
-code += open('dataloading.py', 'r', encoding='utf-8').read()
+code += open('data/dataloading.py', 'r', encoding='utf-8').read()
 code += open('model/utils.py', 'r', encoding='utf-8').read()
 code += open('model/attention.py', 'r', encoding='utf-8').read()
 code += open('model/model.py', 'r', encoding='utf-8').read()
