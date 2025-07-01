@@ -16,26 +16,12 @@
     const csvText = await response.text();
     console.log('CSV data received:', csvText.slice(0, 200) + '...');
     
-    // Check if Papa is available
-    if (typeof Papa === 'undefined') {
-      throw new Error('PapaParse (Papa) is not loaded');
-    }
-    
     const { data, meta } = Papa.parse(csvText, { header: true, skipEmptyLines: true });
     console.log('Parsed data:', data);
     console.log('Meta fields:', meta.fields);
 
     // Build the column list for DataTables from CSV headers
     const columns = meta.fields.map(field => ({ title: field, data: field }));
-
-    // Check if jQuery and DataTable are available
-    if (typeof $ === 'undefined') {
-      throw new Error('jQuery is not loaded');
-    }
-    
-    if (typeof DataTable === 'undefined') {
-      throw new Error('DataTables is not loaded');
-    }
 
     // Inject DataTable
     new DataTable('#exp-table', {
