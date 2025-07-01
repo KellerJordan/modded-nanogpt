@@ -517,8 +517,8 @@ class Trainer:
                     stack.enter_context(self.model.no_sync())
                 input_ids, labels, mask_rate = self.train_loader.next_batch()
                 loss = self.model(input_ids, labels, mask_rate, self.sliding_window_size) / self.args.grad_accum
-                accumulated_loss += loss.item()  # Accumulate the scaled loss
                 loss.backward()
+                accumulated_loss += loss.item()  # Accumulate the scaled loss
 
         # momentum warmup for Muon
         if self.args.use_muon:

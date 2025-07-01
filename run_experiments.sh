@@ -15,7 +15,8 @@ if [ ! -d "$EXPERIMENT_DIR" ]; then
 fi
 
 # ─── Prompt for token ──────────────────────────────────────────────────────────
-read -rp "🔑 Enter your token: " TOKEN
+read -rp "🔑 Enter your HuggingFace token: " HF_TOKEN
+read -rp "🔑 Enter your wandb token: " WANDB_TOKEN
 
 # ─── Detect GPUs ──────────────────────────────────────────────────────────────
 if command -v nvidia-smi &> /dev/null; then
@@ -40,6 +41,7 @@ for yaml_file in "$EXPERIMENT_DIR"/*.yaml; do
     "$IMAGE" \
     torchrun --standalone --nproc_per_node="$NUM_GPUS" \
       train.py \
-        --token "$TOKEN" \
+        --token "$HF_TOKEN" \
+        --wandb_token "$WANDB_TOKEN" \
         --yaml_path "$yaml_file"
 done
