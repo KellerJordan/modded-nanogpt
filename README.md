@@ -1,10 +1,24 @@
 # Speedrunning PLM Pretraining
 
+## Get started
+
 ```console
 git clone https://github.com/Synthyra/SpeedrunningPLMs.git
 cd SpeedrunningPLMs
-python -m pip install -r requirements.txt # you need these to download
+pip install -r requirements.txt
 python data/download_omgprot50.py # --num_chunks 100 download less data to save time for smaller runs
+```
+
+For ARM64 systems (GH200)
+```console
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126 -U
+torchrun --standalone --nproc_per_node=NUM_GPUS_ON_YOUR_SYSTEM train.py
+```
+
+For non ARM64 systems you can use Docker
+```console
+git clone https://github.com/Synthyra/SpeedrunningPLMs.git
+cd SpeedrunningPLMs
 sudo docker build -t speedrun_plm .
 sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm \
     torchrun --standalone --nproc_per_node=NUM_GPUS_ON_YOUR_SYSTEM train.py \
@@ -12,6 +26,33 @@ sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm \
     --wandb_token YOUR_WANDB_TOKEN
 ```
 
+<details>
+<summary><strong>Note about Docker on ARM64 (GH200)</strong></summary>
+
+Currently, the docker image results in various issues on ARM64 systems.
+
+<pre>
+  File "/usr/local/lib/python3.12/site-packages/torch/_inductor/scheduler.py", line 3432, in create_backend
+    raise RuntimeError(
+torch._dynamo.exc.BackendCompilerFailed: backend='inductor' raised:
+RuntimeError: Cannot find a working triton installation. Either the package is not installed or it is too old. More information on installing Triton can be found at https://github.com/openai/triton
+
+Set TORCH_LOGS="+dynamo" and TORCHDYNAMO_VERBOSE=1 for more information
+
+
+You can suppress this exception and fall back to eager by setting:
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True
+</pre>
+
+Suppressing dynamo leads to its own error. There is something delicate going on here.
+
+If you know how to get our docker image working (or a solution with different container software) on GH200 please open an issue or pull request! There is some triton version mismatch that breaks the <code>torch.compile</code>. So in principle the docker image works for GH200 without <code>torch.compile</code>, but obviously that is not ideal.
+
+</details>
+
+
+## Some general info
 A batch size of 8x64x1024 (524288) or 4x64x1024 (262144) tokens has worked very well. We recommend a local batch size of 64*1024 (65536) tokens for 80gb VRAM machines, and less if working with a smaller rig. For example, if 524288 is desired and you have 4 A100 80gb gpus, use gradient accumulation (--grad_accum) of 2 (524288 / 4 / 2 = 65536).
 
 Our newer trainer and dataloader incorporates prefetching and multiple workers per GPU to accelerate data handling - the masking is also accomplished at this stage. In general, this has led to a small increase in throughput, which should have a larger effect for systems with slower disk read rates (University HPC systems, Jarvis Labs, Many azure blob types, etc.).
@@ -21,12 +62,13 @@ Here's a table of some current throughput during training for the default model 
 |Hardware |Tokens per sec|
 |---------|----------------------------|
 | 1xH100  | 275,900 |
-| 1xGH200 |  |
+| 1xGH200 | 660,600 |
 |4xA100 80gb PCIe gen4| 340,700 |
 |8xH100 SXM5 | 2,149,500 |
 
 This implies that you could train ESM2-150 (batch size 2 million tokens for 500,000 steps) in 129 hours for $3091 (lambda 8xH100 6/30/2025) - assuming no improvements to model architecture, any training associated algorithms, or datasets.
 
+Clearly, data connects and read/write speeds are still a major bottleneck (looking at the GH200 domination over H100 and 4xA100).
 
 <details>
 <summary>Previous Speed runnning ESM2 repo readme with preliminary results</summary>

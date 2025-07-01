@@ -43,7 +43,7 @@ except ImportError:
 
 
 #torch._dynamo.config.suppress_errors = True
-inductor_config.max_autotune_gemm_backends = "aten,cutlass,fbgemm"
+inductor_config.max_autotune_gemm_backends = "ATEN,CUTLASS,FBGEMM"
 
 
 def load_config_from_yaml(yaml_path):
