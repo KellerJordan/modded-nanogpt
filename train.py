@@ -381,14 +381,7 @@ class Trainer:
         
         if self.ddp_world_size > 1:
             # Use static graph if model architecture doesn't change
-            model = DDP(
-                model, 
-                device_ids=[self.ddp_local_rank], 
-                broadcast_buffers=False, 
-                gradient_as_bucket_view=True,
-                static_graph=True,
-                find_unused_parameters=False
-            )
+            model = DDP(model, device_ids=[self.ddp_local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
         return model
 
     def init_optimizers(self):
