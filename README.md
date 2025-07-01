@@ -3,6 +3,7 @@
 ```console
 git clone https://github.com/Synthyra/SpeedrunningPLMs.git
 cd SpeedrunningPLMs
+python -m pip install -r requirements.txt # you need these to download
 python data/download_omgprot50.py # --num_chunks 100 download less data to save time for smaller runs
 sudo docker build -t speedrun_plm .
 sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm \
@@ -12,6 +13,19 @@ sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm \
 ```
 
 A batch size of 8x64x1024 (524288) or 4x64x1024 (262144) tokens has worked very well. We recommend a local batch size of 64*1024 (65536) tokens for 80gb VRAM machines, and less if working with a smaller rig. For example, if 524288 is desired and you have 4 A100 80gb gpus, use gradient accumulation (--grad_accum) of 2 (524288 / 4 / 2 = 65536).
+
+Our newer trainer and dataloader incorporates prefetching and multiple workers per GPU to accelerate data handling - the masking is also accomplished at this stage. In general, this has led to a small increase in throughput, which should have a larger effect for systems with slower disk read rates (University HPC systems, Jarvis Labs, Many azure blob types, etc.).
+
+Here's a table of some current throughput during training for the default model size (133 million params, 24 blocks, UNET + Value embedddings, hidden size 768)
+
+|Hardware |Tokens per sec|
+|---------|----------------------------|
+| 1xH100  | 275,900 |
+| 1xGH200 |  |
+|4xA100 80gb PCIe gen4| 340,700 |
+|8xH100 SXM5 | 2,149,500 |
+
+This implies that you could train ESM2-150 (batch size 2 million tokens for 500,000 steps) in 129 hours for $3091 (lambda 8xH100 6/30/2025) - assuming no improvements to model architecture, any training associated algorithms, or datasets.
 
 
 <details>

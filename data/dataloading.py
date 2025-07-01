@@ -1,9 +1,9 @@
 import torch
 import random
+import torch.utils.data as data
 from pathlib import Path
 from transformers import EsmTokenizer
 from typing import Tuple
-import torch.utils.data as data
 from torch.utils.data import DataLoader, IterableDataset
 
 

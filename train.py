@@ -1,5 +1,6 @@
 import os
 import sys
+import yaml
 
 code = open(sys.argv[0]).read()
 code += open('optimizer.py', 'r', encoding='utf-8').read()
@@ -18,7 +19,7 @@ import numpy as np
 import argparse
 import torch
 import torch.distributed as dist
-
+import torch._dynamo
 import torch._inductor.config as inductor_config
 from torchinfo import summary
 from transformers import EsmTokenizer, get_scheduler
@@ -26,10 +27,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
 from tqdm import tqdm
 
-from optimizer import Muon
-from dataloading import OptimizedTrainLoader, OptimizedEvalLoader
 from model.model import PLM, PLMConfig
 from model.utils import Linear
+from data.dataloading import OptimizedTrainLoader, OptimizedEvalLoader
+from optimizer import Muon
 from utils import LerpTensor
 
 
@@ -41,17 +42,29 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 
+torch._dynamo.config.suppress_errors = True
 inductor_config.max_autotune_gemm_backends = "aten,cutlass,fbgemm"
+
+
+def load_config_from_yaml(yaml_path):
+    """Load configuration from YAML file."""
+    with open(yaml_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config or {}
 
 
 def arg_parser():
     parser = argparse.ArgumentParser(description="Synthyra Trainer")
-    
-    # CLI-specific arguments
+    parser.add_argument("--yaml_path", type=str, default=None, help="Path to YAML file")
+
+    # CLI-specific arguments (always from CLI for security)
     parser.add_argument("--token", type=str, default=None, help="Huggingface token")
     parser.add_argument("--wandb_token", type=str, default=None, help="Weights & Biases API token")
-    parser.add_argument("--save_path", type=str, default="Synthyra/speedrun_test", help="Path to save the model and report to wandb")
+    parser.add_argument("--log_name", type=str, default=None, help="Name of the log file, else will be randomly generated")
     parser.add_argument("--bugfix", action="store_true", help="Use small batch size and max length for debugging")
+    
+    # All other arguments with defaults (can be overridden by YAML)
+    parser.add_argument("--save_path", type=str, default="Synthyra/speedrun_test", help="Path to save the model and report to wandb")
     
     # Distributed training arguments
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
@@ -107,7 +120,30 @@ def arg_parser():
     # Dataloader params
     parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for optimized dataloader")
     parser.add_argument("--prefetch_factor", type=int, default=2, help="Prefetch factor for optimized dataloader")
-    return parser.parse_args()
+    
+    # Parse CLI args first
+    args = parser.parse_args()
+    
+    # Load YAML config if provided
+    if args.yaml_path:
+        yaml_config = load_config_from_yaml(args.yaml_path)
+        
+        # Security: Never load tokens from YAML files
+        cli_only_params = {'token', 'wandb_token', 'yaml_path'}
+        
+        # Override defaults with YAML values, but preserve CLI overrides
+        for key, value in yaml_config.items():
+            if key not in cli_only_params and hasattr(args, key):
+                # Only override if the argument wasn't explicitly provided via CLI
+                # Check if the current value is the default by comparing with parser defaults
+                action = next((action for action in parser._actions if action.dest == key), None)
+                if action and getattr(args, key) == action.default:
+                    # Convert boolean strings to boolean values
+                    if isinstance(action.default, bool) and isinstance(value, str):
+                        value = value.lower() in ('true', '1', 'yes', 'on')
+                    setattr(args, key, value)
+    
+    return args
 
 
 def set_seed(seed):
@@ -215,11 +251,16 @@ class Trainer:
     def init_training(self):
         self.logfile = None
         if self.master_process:
-            run_id = uuid.uuid4()
             Path('logs').mkdir(exist_ok=True)
-            # logdir = Path('logs') / f'{run_id}'
-            # logdir.mkdir()
-            self.logfile = Path('logs') / f'{run_id}.txt'
+            
+            # Use provided log_name or generate a random UUID
+            if self.args.log_name:
+                log_filename = f'{self.args.log_name}.txt'
+            else:
+                run_id = uuid.uuid4()
+                log_filename = f'{run_id}.txt'
+                
+            self.logfile = Path('logs') / log_filename
             print(self.logfile.stem)
             # create the log file
             with self.logfile.open('w', encoding='utf-8') as f:
@@ -250,6 +291,14 @@ class Trainer:
         self.print0(f'{result.stdout}', logonly=True)
         self.print0('='*100, logonly=True)
 
+        # Log configuration source
+        if self.args.yaml_path:
+            self.print0(f'Configuration loaded from YAML: {self.args.yaml_path}')
+            self.print0('CLI arguments override YAML where provided (tokens always from CLI for security)')
+        else:
+            self.print0('Configuration from CLI arguments only')
+        self.print0('='*50)
+        
         self.print0(f'Model config:\n{self.model_config}')
         self.print0('Args:')
         for k, v in self.args.__dict__.items():
