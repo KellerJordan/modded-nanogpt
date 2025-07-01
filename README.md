@@ -5,13 +5,14 @@
 ```console
 git clone https://github.com/Synthyra/SpeedrunningPLMs.git
 cd SpeedrunningPLMs
-pip install -r requirements.txt
+pip install huggingface_hub
 python data/download_omgprot50.py # --num_chunks 100 download less data to save time for smaller runs
 ```
 
 For ARM64 systems (GH200)
 ```console
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126 -U
+pip install -r requirements.txt -U
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 -U
 torchrun --standalone --nproc_per_node=NUM_GPUS_ON_YOUR_SYSTEM train.py
 ```
 
@@ -60,15 +61,15 @@ Our newer trainer and dataloader incorporates prefetching and multiple workers p
 Here's a table of some current throughput during training for the default model size (133 million params, 24 blocks, UNET + Value embedddings, hidden size 768)
 
 |Hardware |Tokens per sec|
-|---------|----------------------------|
+|---------|--------------|
 | 1xH100  | 275,900 |
-| 1xGH200 | 660,600 |
+| 1xGH200 | 1,011,800 |
 |4xA100 80gb PCIe gen4| 340,700 |
 |8xH100 SXM5 | 2,149,500 |
 
 This implies that you could train ESM2-150 (batch size 2 million tokens for 500,000 steps) in 129 hours for $3091 (lambda 8xH100 6/30/2025) - assuming no improvements to model architecture, any training associated algorithms, or datasets.
 
-Clearly, data connects and read/write speeds are still a major bottleneck (looking at the GH200 domination over H100 and 4xA100).
+Clearly, data connects and read/write speeds are still a major bottleneck (looking at the GH200 domination).
 
 <details>
 <summary>Previous Speed runnning ESM2 repo readme with preliminary results</summary>
