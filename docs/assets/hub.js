@@ -2,7 +2,7 @@
 (async () => {
   try {
     // Update the repository name to match the actual repository
-    const csvUrl = 'https://raw.githubusercontent.com/Synthyra/SpeedrunningPLMs/main/data/experiments.csv';
+    const csvUrl = 'https://raw.githubusercontent.com/Synthyra/SpeedrunningPLMs/main/misc/experiments.tsv';
     
     console.log('Attempting to fetch CSV from:', csvUrl);
 

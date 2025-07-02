@@ -1,5 +1,45 @@
 # Speedrunning PLM Pretraining
 
+![Speedrunning PLM Pretraining](docs/assets/model_costs.png)
+
+<details>
+<summary><strong>Pretraining cost details over time</strong></summary>
+
+ESM-1b
+- 4.25 hours per epoch, 56 epochs, 128 V100 GPUs
+- [Source](https://epoch.ai/data/notable-ai-models)
+- 238 hours x 128 gpus is 30,464 V100 hours
+- 8xV100 on AWS is ~$24.48 [on demand](https://instances.vantage.sh/aws/ec2/p3.16xlarge)
+- Assume 1/2 of that per hours because of scale and year is 2020, but the GPUs were newer so this is generous
+- $1.53 gpu/hour * 30,464 hours is $46,610
+
+ProtBERT, ProtT5, Progen2
+- Estimated from [here](https://epoch.ai/data/notable-ai-models)
+
+ESM2-15B
+- Approximated at $1.5 million USD
+- [Source](https://www.biorxiv.org/content/10.1101/2024.09.23.614603v1.full)
+ESM2-3B
+- Roughly 1/2 of 15B FLOPs
+- [Source](https://github.com/facebookresearch/esm/discussions/414)
+ESM2-650M
+- Roughly 1/4 of 3B FLOPs
+- [Source](https://github.com/facebookresearch/esm/discussions/414)
+ESM2-150M
+- Approximated at 1/4 of 650M FlOPs
+ESM2-35M
+- Approximated at 1/4 of 150M FlOPs
+ESM2-8M
+- Approximated at 1/4 of 35M FlOPs
+
+ESM3-98B
+- We don't have much details about training cost beyond FLOPs at 1.07E24 from the [paper](https://www.science.org/doi/10.1126/science.ads0018)
+- If we assume same FLOP per dollar efficiency of [Llama 3.1-405B](https://epoch.ai/data/notable-ai-models) we get 1.34E-18 $/FLOP
+- So that's ~$1.4 million for ESM3 training
+
+<details>
+
+
 ## Get started
 
 ```
