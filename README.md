@@ -36,8 +36,7 @@ ESM3-98B
 - We don't have much details about training cost beyond FLOPs at 1.07E24 from the [paper](https://www.science.org/doi/10.1126/science.ads0018)
 - If we assume same FLOP per dollar efficiency of [Llama 3.1-405B](https://epoch.ai/data/notable-ai-models) we get 1.34E-18 $/FLOP
 - So that's ~$1.4 million for ESM3 training
-
-<details>
+</details>
 
 
 ## Get started
