@@ -1,7 +1,4 @@
 """
-Version of OMGprot50 dataset
-https://huggingface.co/datasets/Synthyra/omg_prot50
-
 example doc to highlight the structure of the dataset:
 {
   "sequence": "MYDSNIFEKVNQYKFLYIWWLIMINVNH"
@@ -15,6 +12,29 @@ from functools import partial
 from transformers import EsmTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
+from huggingface_hub import HfApi, upload_file
+
+
+def upload_to_hf(filename, repo_id, repo_type="dataset", token=None):
+    """
+    Upload a file to Hugging Face Hub
+    """
+    if repo_id is None:
+        print(f"Skipping upload for {filename} - no repo_id specified")
+        return
+    
+    try:
+        print(f"Uploading {filename} to {repo_id}...")
+        upload_file(
+            path_or_fileobj=filename,
+            path_in_repo=os.path.basename(filename),
+            repo_id=repo_id,
+            repo_type=repo_type,
+            token=token
+        )
+        print(f"Successfully uploaded {filename}")
+    except Exception as e:
+        print(f"Error uploading {filename}: {e}")
 
 
 def write_datafile(filename, toks):
@@ -42,7 +62,7 @@ def tokenize(doc, tokenizer, max_length):
     return np.array(tokenizer.encode(doc["sequence"], add_special_tokens=True, truncation=True, padding=False, max_length=max_length), dtype=np.uint8)
 
 
-def tokenize_fw(fw, split='train', max_length=1024):
+def tokenize_fw(fw, split='train', data_name='omgprot50', max_length=1024, upload_repo=None, token=None):
     # tokenize all documents and write output shards, each of approximately shard_size tokens
     # ensures each shard contains complete sequences only
     tokenizer = EsmTokenizer.from_pretrained("facebook/esm2_t6_8M_UR50D")
@@ -63,8 +83,12 @@ def tokenize_fw(fw, split='train', max_length=1024):
             if current_size + len(tokens) > args.shard_size and current_size > 0:
                 # Convert accumulated tokens to numpy array and write
                 all_tokens_np = np.concatenate(current_shard)
-                filename = os.path.join(DATA_CACHE_DIR, f"omgprot50_{split}_{shard_index:06d}.bin")
+                filename = os.path.join(DATA_CACHE_DIR, f"{data_name}_{split}_{shard_index:06d}.bin")
                 write_datafile(filename, all_tokens_np)
+                
+                # Upload to Hugging Face if specified
+                if upload_repo:
+                    upload_to_hf(filename, upload_repo, token=token)
                 
                 # Reset for next shard
                 shard_index += 1
@@ -81,27 +105,39 @@ def tokenize_fw(fw, split='train', max_length=1024):
         # Write final shard if there are remaining sequences
         if current_size > 0:
             all_tokens_np = np.concatenate(current_shard)
-            filename = os.path.join(DATA_CACHE_DIR, f"omgprot50_{split}_{shard_index:06d}.bin")
+            filename = os.path.join(DATA_CACHE_DIR, f"{data_name}_{split}_{shard_index:06d}.bin")
             write_datafile(filename, all_tokens_np)
+            
+            # Upload to Hugging Face if specified
+            if upload_repo:
+                upload_to_hf(filename, upload_repo, token=token)
 
 
-parser = argparse.ArgumentParser(description="FineWeb dataset preprocessing")
+parser = argparse.ArgumentParser(description="OMGprot50 dataset preprocessing")
 parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of each shard in tokens")
 parser.add_argument("-m", "--max_length", type=int, default=1024, help="Maximum sequence length")
+parser.add_argument("-d", "--data_name", type=str, default="omgprot50", help="Name of the dataset")
+parser.add_argument("-r", "--upload_repo", type=str, default=None, help="Hugging Face repository ID to upload to (e.g., 'username/repo_name')")
+parser.add_argument("-t", "--token", type=str, default=None, help="Hugging Face token for authentication (or set token environment variable)")
 
 
 if __name__ == "__main__":
     args = parser.parse_args()
-    local_dir = 'omgprot50'
+    data_name = args.data_name
+    
+    # Get HF token from args or environment
+    token = args.token or os.environ.get("token")
+    if args.upload_repo and not token:
+        print("Warning: Upload repository specified but no HF token provided. Set --token or token environment variable.")
 
     # create the cache the local directory if it doesn't exist yet
-    DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
+    DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), data_name)
     os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
     # download the dataset
-    train_fw = load_dataset("Synthyra/omg_prot50", split="train")
-    valid_fw = load_dataset("Synthyra/omg_prot50", split="valid")
-    test_fw = load_dataset("Synthyra/omg_prot50", split="test")
-    tokenize_fw(valid_fw, split='valid', max_length=args.max_length)
-    tokenize_fw(test_fw, split='test', max_length=args.max_length)
-    tokenize_fw(train_fw, split='train', max_length=100000) # don't trim training data
+    train_fw = load_dataset(f"Synthyra/{data_name}", split="train")
+    valid_fw = load_dataset(f"Synthyra/{data_name}", split="valid")
+    test_fw = load_dataset(f"Synthyra/{data_name}", split="test")
+    tokenize_fw(valid_fw, split='valid', data_name=data_name, max_length=args.max_length, upload_repo=args.upload_repo, token=token)
+    tokenize_fw(test_fw, split='test', data_name=data_name, max_length=args.max_length, upload_repo=args.upload_repo, token=token)
+    tokenize_fw(train_fw, split='train', data_name=data_name, max_length=100000, upload_repo=args.upload_repo, token=token) # don't trim training data
