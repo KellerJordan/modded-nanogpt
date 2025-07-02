@@ -4,15 +4,15 @@
 
 This project aims to democratize protein language model (pLM) training by reducing costs from $10,000-1,000,000 to $10-100 using modern NLP techniques. We have successfully reproduced ESMC-300M and ESMC-650M performance with fewer parameters and dramatically lower costs. The project features non-trivial changes to the vanilla transformer is planning virtual competitions to curate innovation.
 
-![Speedrunning PLM Pretraining](docs/assets/model_costs.png)
-
 ## Table of Contents
 
 - [Introduction](#introduction)
-  - [Interested in contributing?](#interested-in-contributing)
+- [Interested in contributing?](#interested-in-contributing)
 - [Getting started](#getting-started)
 - [Running experiments](#running-experiments)
 - [Some general info](#some-general-info)
+
+![Speedrunning PLM Pretraining](docs/assets/model_costs.png)
 
 ## Introduction
 
