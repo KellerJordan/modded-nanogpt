@@ -6,6 +6,14 @@ This project aims to democratize protein language model (pLM) training by reduci
 
 ![Speedrunning PLM Pretraining](docs/assets/model_costs.png)
 
+## Table of Contents
+
+- [Introduction](#introduction)
+  - [Interested in contributing?](#interested-in-contributing)
+- [Getting started](#getting-started)
+- [Running experiments](#running-experiments)
+- [Some general info](#some-general-info)
+
 ## Introduction
 
 Protein Language Models (pLMs) are representation learning algorithms which, primarily, map discrete amino acids to a continuous latent space. By training pLMs through semi-supervised denoising, like Masked Language Modeling (MLM), pLMs become adept at filling in hidden amino acids to make plasuible sequence. After many types of training, the internal representations of pLMs correlate highly with valuable protein properties - the type of catalytic characteristics or biological associations that wet-lab experiments can take years and millions of dollars to verify. With the immense value of accelerated protein annotation and design backing pLM projects, they have become cornerstones of various life science communities.
@@ -242,7 +250,7 @@ These match the [results](https://github.com/Synthyra/SpeedRunningESM2/pull/2#is
 
 
 <details>
-<summary><strong>Pretraining cost calculation details</strong></summary>
+<summary>Pretraining cost calculation details</summary>
 
 ESM-1b
 - 4.25 hours per epoch, 56 epochs, 128 V100 GPUs
