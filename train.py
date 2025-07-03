@@ -604,15 +604,15 @@ class Trainer:
                     self.print0(f'step:{step+1}/{self.args.num_steps} train_time:{train_time_sec:.0f} sec step_avg:{1000*train_time_sec/timed_steps:.2f}ms loss:{avg_loss:.4f}')
                     train_losses = []
 
-                # Log training progress to wandb
-                if self.master_process and self.wandb_initialized:
-                    log_dict = {
-                        "time_sec": train_time_sec,
-                        "step_avg_ms": 1000*train_time_sec/timed_steps if timed_steps > 0 else 0,
-                        "step": step,
-                        "loss": avg_loss
-                    }
-                    self.log_wandb(log_dict, prefix='train')
+                    # Log training progress to wandb
+                    if self.master_process and self.wandb_initialized:
+                        log_dict = {
+                            "time_sec": train_time_sec,
+                            "step_avg_ms": 1000*train_time_sec/timed_steps if timed_steps > 0 else 0,
+                            "step": step,
+                            "loss": avg_loss
+                        }
+                        self.log_wandb(log_dict, prefix='train')
 
             # Stop the timer and get final training time
             self.train_timer.pause()
