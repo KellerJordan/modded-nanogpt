@@ -212,6 +212,8 @@ class Trainer:
     def __init__(self, args, model_config):
         self.args = args
         self.model_config = model_config
+
+        self.wandb_initialized = False
         
         # Initialize global timer
         self.train_timer = GlobalTimer()
@@ -245,7 +247,7 @@ class Trainer:
                 print(s, file=f)
     
     def log_wandb(self, log_dict, prefix='train'):
-        if self.master_process and self.args.wandb_token:
+        if self.master_process and self.wandb_initialized:
             wandb.log({f'{prefix}/{k}': v for k, v in log_dict.items()})
 
     def init_training(self):
@@ -272,8 +274,7 @@ class Trainer:
         if self.ddp_world_size > 1:
             dist.barrier()
 
-        if self.master_process and self.args.wandb_token:
-            wandb.login(key=self.args.wandb_token)
+        if self.master_process and self.wandb_initialized:
             wandb.init(
                 project="speedrunning-plms",
                 name=run_id,
@@ -604,7 +605,7 @@ class Trainer:
                     train_losses = []
 
                 # Log training progress to wandb
-                if self.master_process and self.args.wandb_token:
+                if self.master_process and self.wandb_initialized:
                     log_dict = {
                         "time_sec": train_time_sec,
                         "step_avg_ms": 1000*train_time_sec/timed_steps if timed_steps > 0 else 0,
@@ -633,7 +634,7 @@ class Trainer:
             self.print0(f"peak memory consumption testing: {torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024} GiB")
         
             # Final wandb logging
-            if self.master_process and self.args.wandb_token:
+            if self.master_process and self.wandb_initialized:
                 log_dict = {
                     "test_loss": test_loss,
                     "test_perplexity": test_perplexity,
@@ -663,7 +664,7 @@ class Trainer:
             traceback.print_exc()
         finally:
             # Clean up resources
-            if self.master_process and self.args.wandb_token:
+            if self.master_process and self.wandb_initialized:
                 wandb.finish()
         
             # clean up nice
@@ -706,12 +707,22 @@ if __name__ == '__main__':
         mlm=args.mlm,
     )
 
+    # Initialize wandb before clearing tokens for security
+    wandb_initialized = False
+    if args.wandb_token:
+        wandb.login(key=args.wandb_token)
+        wandb_initialized = True
+    
     if args.token:
         from huggingface_hub import login
         login(args.token)
-        # Clear token for security
-        args.token = None 
+        # Clear tokens for security
+        args.token = None
+    
+    # Clear wandb token for security but keep track that we logged in
+    if args.wandb_token:
         args.wandb_token = None
     
     trainer = Trainer(args, model_config)
+    trainer.wandb_initialized = wandb_initialized
     trainer.train()

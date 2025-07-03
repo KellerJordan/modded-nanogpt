@@ -11,6 +11,8 @@ def get(fname, data_name):
             hf_hub_download(repo_id=f"Synthyra/{data_name}_packed", filename=fname, repo_type="dataset", local_dir=local_dir)
         except Exception as e:
             print(f"Error downloading {fname}: {e}")
+    else:
+        print(f"File {fname} already exists in {local_dir}")
 
 
 if __name__ == "__main__":
