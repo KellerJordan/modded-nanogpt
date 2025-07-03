@@ -12,7 +12,8 @@ from functools import partial
 from transformers import EsmTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
-from huggingface_hub import HfApi, upload_file
+from huggingface_hub import HfApi, upload_file, create_repo, HfFolder
+from huggingface_hub.errors import RepositoryNotFoundError
 
 
 def upload_to_hf(filename, repo_id, repo_type="dataset", token=None):
@@ -33,6 +34,28 @@ def upload_to_hf(filename, repo_id, repo_type="dataset", token=None):
             token=token
         )
         print(f"Successfully uploaded {filename}")
+    except RepositoryNotFoundError:
+        # Repository doesn't exist, create it first
+        print(f"Repository {repo_id} not found. Creating it...")
+        try:
+            create_repo(
+                repo_id=repo_id,
+                repo_type=repo_type,
+                token=token,
+                exist_ok=True
+            )
+            print(f"Created repository {repo_id}")
+            # Now try uploading again
+            upload_file(
+                path_or_fileobj=filename,
+                path_in_repo=os.path.basename(filename),
+                repo_id=repo_id,
+                repo_type=repo_type,
+                token=token
+            )
+            print(f"Successfully uploaded {filename}")
+        except Exception as e:
+            print(f"Error creating repository or uploading {filename}: {e}")
     except Exception as e:
         print(f"Error uploading {filename}: {e}")
 
