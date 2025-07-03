@@ -2,7 +2,7 @@ import argparse
 from datasets import load_dataset, DatasetDict
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--token', type=str, defualt=None)
+parser.add_argument('--token', type=str, default=None)
 
 args = parser.parse_args()
 
