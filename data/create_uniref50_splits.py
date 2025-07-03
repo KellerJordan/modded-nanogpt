@@ -1,5 +1,5 @@
 import argparse
-from datasets import load_dataset, DatasetDict
+from datasets import load_dataset, DatasetDict, concatenate_datasets
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--token', type=str, default=None)
@@ -10,9 +10,11 @@ if args.token:
     import huggingface_hub
     huggingface_hub.login(token=args.token)
 
-data = load_dataset('tattabio/OMG_prot50', split='train').remove_columns('id').shuffle(seed=11)
-#data = data.cast_column('sequence', Value(dtype='string'))
+data = load_dataset('agemagician/uniref50_09012025').remove_columns('id').remove_columns('name').shuffle(seed=11)
+data = data.rename_column('text', 'sequence')
 print(data)
+
+data = concatenate_datasets([data['train'], data['validation'], data['test']])
 
 data = data.train_test_split(test_size=20000, seed=22)
 
@@ -30,4 +32,4 @@ data = DatasetDict({
 
 print(data)
 
-data.push_to_hub('Synthyra/omg_prot50')
+data.push_to_hub('Synthyra/uniref50')

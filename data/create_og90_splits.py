@@ -10,7 +10,7 @@ if args.token:
     import huggingface_hub
     huggingface_hub.login(token=args.token)
 
-data = load_dataset('tattabio/OMG_prot50', split='train').remove_columns('id').shuffle(seed=11)
+data = load_dataset('tattabio/OG_prot90', split='train').remove_columns('id').shuffle(seed=11)
 #data = data.cast_column('sequence', Value(dtype='string'))
 print(data)
 
@@ -30,4 +30,4 @@ data = DatasetDict({
 
 print(data)
 
-data.push_to_hub('Synthyra/omg_prot50')
+data.push_to_hub('Synthyra/og_prot90')
