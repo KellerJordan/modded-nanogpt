@@ -8,56 +8,87 @@ import os
 import argparse
 import multiprocessing as mp
 import numpy as np
+import glob
 from functools import partial
 from transformers import EsmTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
-from huggingface_hub import HfApi, upload_file, create_repo, HfFolder
-from huggingface_hub.errors import RepositoryNotFoundError
+from huggingface_hub import HfApi
 
 
-def upload_to_hf(filename, repo_id, repo_type="dataset", token=None):
+def upload_folder_to_hf(folder_path, repo_id, repo_type="dataset", token=None):
     """
-    Upload a file to Hugging Face Hub
+    Upload an entire folder to Hugging Face Hub (bulk upload to avoid rate limiting)
+    
+    Benefits:
+    - Uploads all files in a single operation instead of individual requests
+    - Automatically handles large uploads with multi-commit strategy
+    - Reduces API rate limiting issues
+    - More efficient for large numbers of files
     """
     if repo_id is None:
-        print(f"Skipping upload for {filename} - no repo_id specified")
+        print(f"Skipping upload for {folder_path} - no repo_id specified")
         return
     
     try:
-        print(f"Uploading {filename} to {repo_id}...")
-        upload_file(
-            path_or_fileobj=filename,
-            path_in_repo=os.path.basename(filename),
-            repo_id=repo_id,
-            repo_type=repo_type,
-            token=token
-        )
-        print(f"Successfully uploaded {filename}")
-    except RepositoryNotFoundError:
-        # Repository doesn't exist, create it first
-        print(f"Repository {repo_id} not found. Creating it...")
+        from huggingface_hub import HfApi
+        api = HfApi()
+        
+        print(f"Uploading folder {folder_path} to {repo_id}...")
+        
+        # Create repository if it doesn't exist
         try:
-            create_repo(
+            api.create_repo(
                 repo_id=repo_id,
                 repo_type=repo_type,
                 token=token,
                 exist_ok=True
             )
-            print(f"Created repository {repo_id}")
-            # Now try uploading again
-            upload_file(
-                path_or_fileobj=filename,
-                path_in_repo=os.path.basename(filename),
-                repo_id=repo_id,
-                repo_type=repo_type,
-                token=token
-            )
-            print(f"Successfully uploaded {filename}")
+            print(f"Repository {repo_id} ready")
         except Exception as e:
-            print(f"Error creating repository or uploading {filename}: {e}")
+            print(f"Repository might already exist: {e}")
+        
+        # Count files to upload
+        file_count = len([f for f in os.listdir(folder_path) if f.endswith('.bin')])
+        print(f"Found {file_count} files to upload")
+        
+        # Try to use multi_commits for large uploads (if supported)
+        try:
+            if file_count > 100:  # Use multi-commit for large uploads
+                print("Using multi-commit upload for large number of files...")
+                api.upload_folder(
+                    folder_path=folder_path,
+                    repo_id=repo_id,
+                    repo_type=repo_type,
+                    token=token,
+                    multi_commits=True,
+                    multi_commits_verbose=True
+                )
+            else:
+                # Standard upload for smaller sets
+                api.upload_folder(
+                    folder_path=folder_path,
+                    repo_id=repo_id,
+                    repo_type=repo_type,
+                    token=token
+                )
+        except TypeError as e:
+            if "multi_commits" in str(e):
+                print("multi_commits not supported in this version of huggingface_hub, using standard upload...")
+                # Fall back to standard upload
+                api.upload_folder(
+                    folder_path=folder_path,
+                    repo_id=repo_id,
+                    repo_type=repo_type,
+                    token=token
+                )
+            else:
+                raise e
+        
+        print(f"Successfully uploaded folder {folder_path} to {repo_id}")
+        
     except Exception as e:
-        print(f"Error uploading {filename}: {e}")
+        print(f"Error uploading folder {folder_path}: {e}")
 
 
 def write_datafile(filename, toks):
@@ -88,6 +119,23 @@ def tokenize(doc, tokenizer, max_length):
 def tokenize_fw(fw, split='train', data_name='omgprot50', max_length=1024, upload_repo=None, token=None):
     # tokenize all documents and write output shards, each of approximately shard_size tokens
     # ensures each shard contains complete sequences only
+    
+    # Check if .bin files already exist for this dataset/split
+    existing_files = glob.glob(os.path.join(DATA_CACHE_DIR, f"{data_name}_{split}_*.bin"))
+    
+    if existing_files:
+        print(f"Found {len(existing_files)} existing .bin files for {data_name}_{split}")
+        print("Skipping tokenization and proceeding to upload...")
+        
+        # Upload existing files if upload_repo is specified
+        if upload_repo:
+            upload_folder_to_hf(DATA_CACHE_DIR, upload_repo, token=token)
+        else:
+            print("No upload repository specified, files are ready locally")
+        return
+    
+    print(f"No existing .bin files found for {data_name}_{split}, proceeding with tokenization...")
+    
     tokenizer = EsmTokenizer.from_pretrained("facebook/esm2_t6_8M_UR50D")
     nprocs = max(1, os.cpu_count() - 2) # don't hog the entire system
     with mp.Pool(nprocs) as pool:
@@ -109,10 +157,6 @@ def tokenize_fw(fw, split='train', data_name='omgprot50', max_length=1024, uploa
                 filename = os.path.join(DATA_CACHE_DIR, f"{data_name}_{split}_{shard_index:06d}.bin")
                 write_datafile(filename, all_tokens_np)
                 
-                # Upload to Hugging Face if specified
-                if upload_repo:
-                    upload_to_hf(filename, upload_repo, token=token)
-                
                 # Reset for next shard
                 shard_index += 1
                 current_shard = []
@@ -130,10 +174,10 @@ def tokenize_fw(fw, split='train', data_name='omgprot50', max_length=1024, uploa
             all_tokens_np = np.concatenate(current_shard)
             filename = os.path.join(DATA_CACHE_DIR, f"{data_name}_{split}_{shard_index:06d}.bin")
             write_datafile(filename, all_tokens_np)
-            
-            # Upload to Hugging Face if specified
-            if upload_repo:
-                upload_to_hf(filename, upload_repo, token=token)
+    
+    # Upload all files at once after tokenization is complete
+    if upload_repo:
+        upload_folder_to_hf(DATA_CACHE_DIR, upload_repo, token=token)
 
 
 parser = argparse.ArgumentParser(description="OMGprot50 dataset preprocessing")
