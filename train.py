@@ -267,7 +267,7 @@ class Trainer:
         self.model = self.init_model()
         self.print0(summary(self.model))
         self.optimizers = self.init_optimizers()
-        self.lr_schedulers, self.sliding_window_size_scheduler = self.init_schedulers()
+        self.lr_schedulers, self.sliding_window_size_scheduler, self.mask_rate_scheduler = self.init_schedulers()
         self.print0(f"Ready for training!")
         
         # Create decorated versions of methods that should be excluded from timing
