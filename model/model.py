@@ -28,6 +28,7 @@ class PLMConfig(PretrainedConfig):
         tie_embeddings: bool = False,
         unet: bool = False,
         mlm: bool = False,
+        token_dropout: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -45,7 +46,8 @@ class PLMConfig(PretrainedConfig):
         self.tie_embeddings = tie_embeddings
         self.unet = unet
         self.mlm = mlm
-    
+        self.token_dropout = token_dropout
+
 
 @dataclass
 class ESMOutput(ModelOutput):
@@ -159,6 +161,7 @@ class PLM(PreTrainedModel):
         self.eos_token_id = self.tokenizer.eos_token_id
         self.pad_token_id = self.tokenizer.pad_token_id
         self.mask_token_id = self.tokenizer.mask_token_id
+        self.token_dropout = config.token_dropout
 
         self.vocab_size = config.vocab_size
         self.n_heads = config.num_attention_heads
@@ -206,6 +209,13 @@ class PLM(PreTrainedModel):
         )
 
         x = self.embedding(input_ids)
+
+        if self.token_dropout:
+            x = x.masked_fill((input_ids == self.mask_token_id).unsqueeze(-1), 0.0)
+            real_token_count = len(input_ids[:last_eos])
+            mask_ratio_observed = (input_ids == self.mask_token_id).sum().float() / real_token_count
+            x = (x * mask_ratio_observed).to(x.dtype)
+
         x = norm(x)
         if self.unet:
             ve = self.value_embeds(input_ids)
