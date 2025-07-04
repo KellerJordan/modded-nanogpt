@@ -39,7 +39,6 @@ class ProteinMasker(nn.Module):
 
         # Default to 15% masking if t not provided
         t = torch.full((batch_size,), self.mask_rate, device=device)
-
         
         p_mask = t[:, None].repeat(1, seq_len)
         mask_indices = torch.rand(batch_size, seq_len, device=device) < p_mask

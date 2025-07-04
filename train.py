@@ -10,12 +10,9 @@ code += open('model/attention.py', 'r', encoding='utf-8').read()
 code += open('model/model.py', 'r', encoding='utf-8').read()
 
 import uuid
-import time
 import contextlib
 import subprocess
 import math
-import random
-import numpy as np
 import argparse
 import torch
 import torch.distributed as dist
@@ -31,7 +28,12 @@ from model.model import PLM, PLMConfig
 from model.utils import Linear
 from data.dataloading import OptimizedTrainLoader, OptimizedEvalLoader
 from optimizer import Muon
-from utils import LerpTensor
+from utils import (
+    set_seed,
+    load_config_from_yaml,
+    exclude_from_timer,
+    GlobalTimer
+)
 
 
 global WANDB_AVAILABLE
@@ -44,13 +46,6 @@ except ImportError:
 
 #torch._dynamo.config.suppress_errors = True
 inductor_config.max_autotune_gemm_backends = "ATEN,CUTLASS,FBGEMM"
-
-
-def load_config_from_yaml(yaml_path):
-    """Load configuration from YAML file."""
-    with open(yaml_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config or {}
 
 
 def arg_parser():
@@ -144,68 +139,6 @@ def arg_parser():
                     setattr(args, key, value)
     
     return args
-
-
-def set_seed(seed):
-    """Set seed for reproducibility across all processes."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-
-
-class GlobalTimer:
-    """Global timer that tracks elapsed time and can be paused/resumed."""
-    def __init__(self):
-        self.total_time = 0.0
-        self.start_time = None
-        self.is_running = False
-    
-    def start(self):
-        """Start the timer."""
-        if not self.is_running:
-            torch.cuda.synchronize()
-            self.start_time = time.perf_counter()
-            self.is_running = True
-    
-    def pause(self):
-        """Pause the timer and add elapsed time to total."""
-        if self.is_running:
-            torch.cuda.synchronize()
-            self.total_time += time.perf_counter() - self.start_time
-            self.is_running = False
-    
-    def resume(self):
-        """Resume the timer."""
-        self.start()
-    
-    def get_time(self):
-        """Get total elapsed time including current session if running."""
-        current_time = self.total_time
-        if self.is_running:
-            torch.cuda.synchronize()
-            current_time += time.perf_counter() - self.start_time
-        return current_time
-    
-    def reset(self):
-        """Reset the timer to zero."""
-        self.total_time = 0.0
-        self.start_time = None
-        self.is_running = False
-
-
-def exclude_from_timer(timer):
-    """Decorator that pauses the timer during function execution."""
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            timer.pause()
-            try:
-                result = func(*args, **kwargs)
-            finally:
-                timer.resume()
-            return result
-        return wrapper
-    return decorator
 
 
 class Trainer:
