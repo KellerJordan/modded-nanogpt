@@ -214,7 +214,7 @@ class PLM(PreTrainedModel):
             x = x.masked_fill((input_ids == self.mask_token_id).unsqueeze(-1), 0.0)
             real_token_count = len(input_ids[:last_eos])
             mask_ratio_observed = (input_ids == self.mask_token_id).sum().float() / real_token_count
-            x = (x * mask_ratio_observed).to(x.dtype)
+            x = (x * (1 - mask_ratio_observed)).to(x.dtype)
 
         x = norm(x)
         if self.unet:
