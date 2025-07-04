@@ -399,7 +399,8 @@ class TrainLoader(IterableDataset):
         if self.mlm:
             mask_rate = torch.full((1,), self.mask_rate)
         else:
-            mask_rate = torch.rand(1) * self.mask_rate
+            rand_mask_rate = torch.rand(1)
+            mask_rate = rand_mask_rate * self.mask_rate
             mask_rate = (1 - eps) * mask_rate + eps
         
         # Create mask
@@ -415,7 +416,7 @@ class TrainLoader(IterableDataset):
         labels = sequence.clone()
         labels[~mask_indices] = -100
         
-        return noisy_batch, labels, mask_rate
+        return noisy_batch, labels, rand_mask_rate
 
 
 class OptimizedTrainLoader:
