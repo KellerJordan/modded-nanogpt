@@ -266,10 +266,6 @@ class TrainLoader(IterableDataset):
         
         self.process_files = all_files[start_idx:end_idx]
 
-    def set_mask_rate(self, mask_rate: float):
-        """Set the mask rate for the next batch(es)."""
-        self.mask_rate = mask_rate
-
     def __iter__(self):
         worker_info = data.get_worker_info()
         if worker_info is None:
@@ -472,7 +468,11 @@ class OptimizedTrainLoader:
         # Create iterator
         self._iterator = None
         self._exhausted = False
-    
+
+    def set_mask_rate(self, mask_rate: float):
+        """Set the mask rate for the next batch(es)."""
+        self._dataset.mask_rate = mask_rate
+
     def reset(self):
         """Reset the dataloader iterator."""
         self._iterator = iter(self.dataloader)
