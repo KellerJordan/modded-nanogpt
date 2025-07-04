@@ -398,6 +398,7 @@ class TrainLoader(IterableDataset):
 
         if self.mlm:
             mask_rate = torch.full((1,), self.mask_rate)
+            rand_mask_rate = mask_rate
         else:
             rand_mask_rate = torch.rand(1)
             mask_rate = rand_mask_rate * self.mask_rate
