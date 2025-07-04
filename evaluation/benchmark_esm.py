@@ -107,13 +107,13 @@ def main():
     
     # Define models once
     model_names = {
-        'facebook/esm2_t6_8M_UR50D': 'ESM2-8M',
-        'facebook/esm2_t12_35M_UR50D': 'ESM2-35M',
-        'facebook/esm2_t30_150M_UR50D': 'ESM2-150M',
+        'Synthyra/ESM2-650M': 'ESM2-650M',
+        'Synthyra/ESM2-8M': 'ESM2-8M',
+        'Synthyra/ESM2-35M': 'ESM2-35M',
+        'Synthyra/ESM2-150M': 'ESM2-150M',
         'Synthyra/ESMplusplus_small': 'ESMC-300M',
         'Synthyra/ESMplusplus_large': 'ESMC-600M',
-        'facebook/esm2_t33_650M_UR50D': 'ESM2-650M',
-        'facebook/esm2_t36_3B_UR50D': 'ESM2-3B',
+        'Synthyra/ESM2-3B': 'ESM2-3B',
     }
 
     all_results = []
