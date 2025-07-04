@@ -73,7 +73,10 @@ class ProteinMasker(nn.Module):
 
 
 if __name__ == "__main__":
+    import torch
+    import matplotlib.pyplot as plt
     from transformers import EsmTokenizer
+
     tokenizer = EsmTokenizer.from_pretrained("facebook/esm2_t6_8M_UR50D")
     test_seqs = [
         'MNFKYKLYSYITIFQIILILPTIVASNERCIALGGVCKDFSDCTGNYKPIDKHCDGSNNIKCCIRKIECPTSQNSNFTISGKNKEDEALPFIFKSEGGCQNDKNDNGNKINGKIGYTCAGITPMVGWKNKENYFSYAIKECTNDTNFTYCAYKLNENKFREGAKNIYIDKYAVAGKCNNLPQPAYYVCFDTSVNHGSGWSSKTITANPIGNMDGREYGLLLNKKSREKYINIVKNDSSQEKYLNGWLSRADDREKYCNNYCTSNCNCDNSASKASVSSNTNTTDIYNSVNTVDSDICNCDDNEPTDFLDDDYINNEEEIDEEIIDQEEY',
@@ -82,37 +85,32 @@ if __name__ == "__main__":
     tokenized = tokenizer(test_seqs, return_tensors="pt", padding=True)
     test_ids = tokenized.input_ids
     attention_mask = tokenized.attention_mask
-    
+
     masker = ProteinMasker(tokenizer)
-    
-    # Test with default 15% masking
-    masked_ids1, labels1 = masker.forward(test_ids.clone(), attention_mask)
-    
-    # Test with custom probability
-    custom_t = torch.tensor([0.2, 0.3])
-    masked_ids2, labels2 = masker.forward(test_ids.clone(), attention_mask, custom_t)
-    
-    print("Original:")
-    print(f'Start: {test_ids[0][:20].tolist()}')
-    print(f'End:   {test_ids[0][-20:].tolist()}')
-    print(f'Start: {test_ids[1][:20].tolist()}')
-    print(f'End:   {test_ids[1][-20:].tolist()}')
-    print("Masked (15%):")
-    print(f'Start: {masked_ids1[0][:20].tolist()}')
-    print(f'End:   {masked_ids1[0][-20:].tolist()}')
-    print(f'Start: {masked_ids1[1][:20].tolist()}')
-    print(f'End:   {masked_ids1[1][-20:].tolist()}')
-    print("Masked (custom):")
-    print(f'Start: {masked_ids2[0][:20].tolist()}')
-    print(f'End:   {masked_ids2[0][-20:].tolist()}')
-    print(f'Start: {masked_ids2[1][:20].tolist()}')
-    print(f'End:   {masked_ids2[1][-20:].tolist()}')
-    
-    # Test with seed
-    torch.manual_seed(42)
-    masked_ids4, labels4 = masker.forward(test_ids.clone())
-    torch.manual_seed(42)
-    masked_ids5, labels5 = masker.forward(test_ids.clone())
-    
-    print("\nAfter setting seed:")
-    print("Are they equal?", torch.equal(masked_ids4, masked_ids5))
+
+    n_repeats = 1000
+    mask_token_id = masker.mask_token_id
+    num_seqs, seq_len = test_ids.shape
+
+    # Collect the number of masked tokens per sequence per run
+    masked_token_fractions = []
+
+    for i in range(n_repeats):
+        masked_ids, _ = masker.forward(test_ids.clone(), attention_mask)
+        # For all sequences, count number of masked tokens (excluding padding)
+        num_masked = ((masked_ids == mask_token_id) & (attention_mask == 1)).sum(dim=1)
+        num_valid = (attention_mask == 1).sum(dim=1)
+        frac_masked = (num_masked.float() / num_valid.float()).tolist()
+        masked_token_fractions.extend(frac_masked)
+
+    # Plot histogram of all masked token fractions
+    import numpy as np
+    plt.figure(figsize=(7, 4))
+    plt.hist(masked_token_fractions, bins=20, color='skyblue', edgecolor='black', alpha=0.8)
+    plt.axvline(0.15, color='red', linestyle='--', label='Expected mask rate (0.15)')
+    plt.title(f"Distribution of fraction of masked tokens per sequence (n={n_repeats*len(test_seqs)})")
+    plt.xlabel("Fraction of tokens masked")
+    plt.ylabel("Count")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
