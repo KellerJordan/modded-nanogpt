@@ -107,12 +107,12 @@ def main():
     
     # Define models once
     model_names = {
-        'Synthyra/ESM2-650M': 'ESM2-650M',
         'Synthyra/ESM2-8M': 'ESM2-8M',
         'Synthyra/ESM2-35M': 'ESM2-35M',
         'Synthyra/ESM2-150M': 'ESM2-150M',
         'Synthyra/ESMplusplus_small': 'ESMC-300M',
         'Synthyra/ESMplusplus_large': 'ESMC-600M',
+        'Synthyra/ESM2-650M': 'ESM2-650M',
         'Synthyra/ESM2-3B': 'ESM2-3B',
     }
 
