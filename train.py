@@ -26,14 +26,15 @@ from tqdm import tqdm
 
 from model.model import PLM, PLMConfig
 from model.utils import Linear
-from data.dataloading import OptimizedTrainLoader, OptimizedEvalLoader
+from data.dataloading import OptimizedTrainLoader, OptimizedEvalLoader, DynamicMaskRateWrapper
 from optimizer import Muon
 from utils import (
     set_seed,
     load_config_from_yaml,
     exclude_from_timer,
     GlobalTimer,
-    LerpTensor
+    LerpTensor,
+    LerpFloat
 )
 
 
@@ -87,6 +88,9 @@ def arg_parser():
     parser.add_argument("--input_test_bin", type=str, default='data/omgprot50/omgprot50_test_*.bin', help="Input test bin files pattern")
     parser.add_argument("--mlm", type=bool, default=False, help="Use masked language modeling")
     parser.add_argument("--mask_rate", type=float, default=0.2, help="Mask rate for masked language modeling")
+    parser.add_argument("--starting_mask_rate", type=float, default=0.1, help="Starting mask rate for masked language modeling")
+    parser.add_argument("--mask_rate_steps", type=int, default=2500, help="Number of steps to reach mask rate")
+    parser.add_argument("--mask_rate_schedule", type=bool, default=True, help="Use mask rate schedule")
     
     # Optimization hyperparams
     parser.add_argument("--batch_size", type=int, default=8*64*1024, help="Total batch size in tokens")
@@ -272,7 +276,13 @@ class Trainer:
 
     def init_dataloader(self, filename_pattern, training=True):
         if training:
-            return OptimizedTrainLoader(
+            if self.args.mlm:
+                mask_rate = self.args.mask_rate
+            else:
+                # we set to 1.0, which properly scales the masked diffusion random mask rate
+                # we can schedule the mask rate with any float, which is torch.rand(1) * mask_rate
+                mask_rate = 1.0 
+            train_loader = OptimizedTrainLoader(
                 filename_pattern=filename_pattern,
                 seq_len=self.batch_size,
                 process_rank=self.ddp_rank,
@@ -282,8 +292,11 @@ class Trainer:
                 num_workers=self.args.num_workers,
                 prefetch_factor=self.args.prefetch_factor,
                 mlm=self.args.mlm,
-                mask_rate=self.args.mask_rate,
+                mask_rate=mask_rate,
             )
+            # we wrap so we can have a mask rate scheduler
+            train_loader = DynamicMaskRateWrapper(train_loader)
+            return train_loader
         else:
             # Use evaluation dataloader that distributes data by sequences, not files
             return OptimizedEvalLoader(
@@ -367,7 +380,15 @@ class Trainer:
             )
             lr_schedulers.append(muon_scheduler)
         sliding_window_size_scheduler = LerpTensor(start_val=512, end_val=self.args.max_length, precision=128)
-        return lr_schedulers, sliding_window_size_scheduler
+        if self.args.mask_rate_schedule:
+            mask_rate_scheduler = LerpFloat(
+                start_val=self.args.starting_mask_rate, 
+                end_val=self.args.mask_rate,
+                precision=0.01
+            )
+        else:
+            mask_rate_scheduler = None
+        return lr_schedulers, sliding_window_size_scheduler, mask_rate_scheduler
 
     @torch.no_grad()
     def run_eval_loader(self, loader, prefix='val'): # returns loss, tokens
@@ -504,6 +525,11 @@ class Trainer:
 
                 frac_done = step / self.args.num_steps  # training progress
                 self.sliding_window_size = self.sliding_window_size_scheduler(frac_done)
+                if self.mask_rate_scheduler:
+                    frac_done_mask = step / self.args.mask_rate_steps
+                    mask_rate = self.mask_rate_scheduler(frac_done_mask)
+                    self.train_loader.set_mask_rate(mask_rate)
+                    self.print0(f'mask rate: {mask_rate}')
 
                 # once in a while evaluate the validation dataset
                 if self.args.eval_every > 0 and step % self.args.eval_every == 0:

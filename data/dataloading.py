@@ -3,7 +3,7 @@ import random
 import torch.utils.data as data
 from pathlib import Path
 from transformers import EsmTokenizer
-from typing import Tuple
+from typing import Tuple, Optional
 from torch.utils.data import DataLoader, IterableDataset
 
 
@@ -20,6 +20,57 @@ def _load_data_shard(file: Path):
         nbytes = f.readinto(tokens.numpy())
         assert nbytes == num_tokens, 'number of tokens read does not match header?'
     return tokens
+
+
+class DynamicMaskRateWrapper:
+    """Wrapper that allows dynamic mask rate changes for TrainLoader."""
+    
+    def __init__(self, train_loader):
+        """
+        Args:
+            train_loader: Either OptimizedTrainLoader or TrainLoader instance
+        """
+        self.train_loader = train_loader
+        self._original_mask_rate = None
+        
+        # Store reference to the underlying dataset for mask_rate modification
+        if hasattr(train_loader, '_dataset'):
+            # OptimizedTrainLoader case
+            self._dataset = train_loader._dataset
+        else:
+            # TrainLoader case
+            self._dataset = train_loader
+            
+        self._original_mask_rate = self._dataset.mask_rate
+    
+    def set_mask_rate(self, mask_rate: float):
+        """Set the mask rate for the next batch(es)."""
+        self._dataset.mask_rate = mask_rate
+    
+    def reset_mask_rate(self):
+        """Reset to the original mask rate."""
+        self._dataset.mask_rate = self._original_mask_rate
+    
+    def next_batch(self, mask_rate: float = None):
+        """Get next batch with optional dynamic mask rate."""
+        if mask_rate is not None:
+            old_mask_rate = self._dataset.mask_rate
+            self._dataset.mask_rate = mask_rate
+            try:
+                return self.train_loader.next_batch()
+            finally:
+                # Restore previous mask rate
+                self._dataset.mask_rate = old_mask_rate
+        else:
+            return self.train_loader.next_batch()
+    
+    def reset(self):
+        """Reset the underlying dataloader."""
+        return self.train_loader.reset()
+    
+    # Forward other attributes/methods to the wrapped loader
+    def __getattr__(self, name):
+        return getattr(self.train_loader, name)
 
 
 class EvalLoader(IterableDataset):
@@ -399,7 +450,7 @@ class TrainLoader(IterableDataset):
         if self.mlm:
             mask_rate = torch.full((1,), self.mask_rate)
         else:
-            mask_rate = torch.rand(1)
+            mask_rate = torch.rand(1) * self.mask_rate
             mask_rate = (1 - eps) * mask_rate + eps
         
         # Create mask
