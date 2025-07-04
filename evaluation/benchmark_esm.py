@@ -229,6 +229,7 @@ def main():
                 print(f"  Tokens: {result['num_tokens']:,}")
                 
                 # Clean up GPU memory
+                model.cpu()
                 del model, tokenizer, collator
                 torch.cuda.empty_cache()
 
