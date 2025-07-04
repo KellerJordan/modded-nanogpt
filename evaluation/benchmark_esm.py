@@ -13,7 +13,7 @@ from sklearn.metrics import (
     accuracy_score,
     matthews_corrcoef
 )
-from transformers import AutoModelForMaskedLM
+from transformers import AutoModelForMaskedLM, AutoTokenizer
 
 from evaluation.masker import ProteinMasker
 from utils import set_seed
@@ -107,13 +107,14 @@ def main():
     
     # Define models once
     model_names = {
-        'Synthyra/ESM2-8M': 'ESM2-8M',
-        'Synthyra/ESM2-35M': 'ESM2-35M',
-        'Synthyra/ESM2-150M': 'ESM2-150M',
-        'Synthyra/ESMplusplus_small': 'ESMC-300M',
-        'Synthyra/ESMplusplus_large': 'ESMC-600M',
-        'Synthyra/ESM2-650M': 'ESM2-650M',
-        'Synthyra/ESM2-3B': 'ESM2-3B',
+        #'Synthyra/ESM2-8M': 'ESM2-8M',
+        #'Synthyra/ESM2-35M': 'ESM2-35M',
+        #'Synthyra/ESM2-150M': 'ESM2-150M',
+        #'Synthyra/ESMplusplus_small': 'ESMC-300M',
+        #'Synthyra/ESMplusplus_large': 'ESMC-600M',
+        #'Synthyra/ESM2-650M': 'ESM2-650M',
+        #'Synthyra/ESM2-3B': 'ESM2-3B',
+        'facebook/esm2_t33_650M_UR50D': 'ESM2-650M-UR50D',
     }
 
     all_results = []
@@ -139,7 +140,11 @@ def main():
                 set_seed(42)
 
                 model = AutoModelForMaskedLM.from_pretrained(model_name, trust_remote_code=True).to(device).eval()
-                tokenizer = model.tokenizer
+                try:
+                    tokenizer = model.tokenizer
+                except:
+                    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
                 collator = ProteinCollator(tokenizer)
                 dataset = ProteinDataset(sequences)
                 dataloader = DataLoader(
