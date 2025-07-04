@@ -156,6 +156,9 @@ class Trainer:
         # Initialize global timer
         self.train_timer = GlobalTimer()
         
+        # Initialize mask rate tracking
+        self.current_mask_rate = 0.0
+        
         if 'RANK' in os.environ:
             self.ddp_rank = int(os.environ['RANK'])
             self.ddp_local_rank = int(os.environ['LOCAL_RANK'])
@@ -525,6 +528,7 @@ class Trainer:
                 if self.mask_rate_scheduler:
                     frac_done_mask = step / self.args.mask_rate_steps
                     mask_rate = self.mask_rate_scheduler(frac_done_mask)
+                    self.current_mask_rate = mask_rate
                     self.train_loader.set_mask_rate(mask_rate)
 
                 # once in a while evaluate the validation dataset
@@ -557,7 +561,7 @@ class Trainer:
                         dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.AVG)
                         avg_loss = avg_loss_tensor.item()
                     
-                    self.print0(f'step:{step+1}/{self.args.num_steps} train_time:{train_time_sec:.0f} sec step_avg:{1000*train_time_sec/timed_steps:.2f}ms loss:{avg_loss:.4f}')
+                    self.print0(f'step:{step+1}/{self.args.num_steps} train_time:{train_time_sec:.0f} sec step_avg:{1000*train_time_sec/timed_steps:.2f}ms loss:{avg_loss:.4f} mask_rate:{self.current_mask_rate:.4f}')
                     train_losses = []
 
                     # Log training progress to wandb
@@ -566,7 +570,8 @@ class Trainer:
                             "time_sec": train_time_sec,
                             "step_avg_ms": 1000*train_time_sec/timed_steps if timed_steps > 0 else 0,
                             "step": step,
-                            "loss": avg_loss
+                            "loss": avg_loss,
+                            "mask_rate": self.current_mask_rate
                         }
                         self.log_wandb(log_dict, prefix='train')
 
