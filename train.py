@@ -26,7 +26,7 @@ from tqdm import tqdm
 
 from model.model import PLM, PLMConfig
 from model.utils import Linear
-from data.dataloading import OptimizedTrainLoader, OptimizedEvalLoader, DynamicMaskRateWrapper
+from data.dataloading import OptimizedTrainLoader, OptimizedEvalLoader
 from optimizer import Muon
 from utils import (
     set_seed,
@@ -282,7 +282,7 @@ class Trainer:
                 # we set to 1.0, which properly scales the masked diffusion random mask rate
                 # we can schedule the mask rate with any float, which is torch.rand(1) * mask_rate
                 mask_rate = 1.0 
-            train_loader = OptimizedTrainLoader(
+            return OptimizedTrainLoader(
                 filename_pattern=filename_pattern,
                 seq_len=self.batch_size,
                 process_rank=self.ddp_rank,
@@ -294,9 +294,6 @@ class Trainer:
                 mlm=self.args.mlm,
                 mask_rate=mask_rate,
             )
-            # we wrap so we can have a mask rate scheduler
-            train_loader = DynamicMaskRateWrapper(train_loader)
-            return train_loader
         else:
             # Use evaluation dataloader that distributes data by sequences, not files
             return OptimizedEvalLoader(
@@ -529,7 +526,6 @@ class Trainer:
                     frac_done_mask = step / self.args.mask_rate_steps
                     mask_rate = self.mask_rate_scheduler(frac_done_mask)
                     self.train_loader.set_mask_rate(mask_rate)
-                    self.print0(f'mask rate: {mask_rate}')
 
                 # once in a while evaluate the validation dataset
                 if self.args.eval_every > 0 and step % self.args.eval_every == 0:

@@ -22,57 +22,6 @@ def _load_data_shard(file: Path):
     return tokens
 
 
-class DynamicMaskRateWrapper:
-    """Wrapper that allows dynamic mask rate changes for TrainLoader."""
-    
-    def __init__(self, train_loader):
-        """
-        Args:
-            train_loader: Either OptimizedTrainLoader or TrainLoader instance
-        """
-        self.train_loader = train_loader
-        self._original_mask_rate = None
-        
-        # Store reference to the underlying dataset for mask_rate modification
-        if hasattr(train_loader, '_dataset'):
-            # OptimizedTrainLoader case
-            self._dataset = train_loader._dataset
-        else:
-            # TrainLoader case
-            self._dataset = train_loader
-            
-        self._original_mask_rate = self._dataset.mask_rate
-    
-    def set_mask_rate(self, mask_rate: float):
-        """Set the mask rate for the next batch(es)."""
-        self._dataset.mask_rate = mask_rate
-    
-    def reset_mask_rate(self):
-        """Reset to the original mask rate."""
-        self._dataset.mask_rate = self._original_mask_rate
-    
-    def next_batch(self, mask_rate: float = None):
-        """Get next batch with optional dynamic mask rate."""
-        if mask_rate is not None:
-            old_mask_rate = self._dataset.mask_rate
-            self._dataset.mask_rate = mask_rate
-            try:
-                return self.train_loader.next_batch()
-            finally:
-                # Restore previous mask rate
-                self._dataset.mask_rate = old_mask_rate
-        else:
-            return self.train_loader.next_batch()
-    
-    def reset(self):
-        """Reset the underlying dataloader."""
-        return self.train_loader.reset()
-    
-    # Forward other attributes/methods to the wrapped loader
-    def __getattr__(self, name):
-        return getattr(self.train_loader, name)
-
-
 class EvalLoader(IterableDataset):
     """An IterableDataset specifically for evaluation that distributes data by sequences, not files."""
     
@@ -316,7 +265,11 @@ class TrainLoader(IterableDataset):
         end_idx = start_idx + files_per_process + (1 if self.process_rank < extra_files else 0)
         
         self.process_files = all_files[start_idx:end_idx]
-    
+
+    def set_mask_rate(self, mask_rate: float):
+        """Set the mask rate for the next batch(es)."""
+        self.mask_rate = mask_rate
+
     def __iter__(self):
         worker_info = data.get_worker_info()
         if worker_info is None:
