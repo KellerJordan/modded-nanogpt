@@ -1,6 +1,5 @@
 import os
 import sys
-import yaml
 
 code = open(sys.argv[0]).read()
 code += open('optimizer.py', 'r', encoding='utf-8').read()
@@ -18,9 +17,10 @@ import torch
 import torch.distributed as dist
 #import torch._dynamo
 import torch._inductor.config as inductor_config
+from torch.nn.utils import clip_grad_norm_
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torchinfo import summary
 from transformers import EsmTokenizer, get_scheduler
-from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
 from tqdm import tqdm
 
@@ -486,9 +486,9 @@ class Trainer:
         if self.args.grad_clip > 0:
             if self.ddp_world_size > 1:
                 # For DDP, use the module's parameters
-                torch.nn.utils.clip_grad_norm_(self.model.module.parameters(), self.args.grad_clip)
+                clip_grad_norm_(self.model.module.parameters(), self.args.grad_clip)
             else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+                clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
 
         # step the optimizers and schedulers
         for opt, sched in zip(self.optimizers, self.lr_schedulers):
