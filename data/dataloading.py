@@ -3,7 +3,7 @@ import random
 import torch.utils.data as data
 from pathlib import Path
 from transformers import EsmTokenizer
-from typing import Tuple
+from typing import Tuple, Optional
 from torch.utils.data import DataLoader, IterableDataset
 
 
@@ -265,7 +265,7 @@ class TrainLoader(IterableDataset):
         end_idx = start_idx + files_per_process + (1 if self.process_rank < extra_files else 0)
         
         self.process_files = all_files[start_idx:end_idx]
-    
+
     def __iter__(self):
         worker_info = data.get_worker_info()
         if worker_info is None:
@@ -398,8 +398,10 @@ class TrainLoader(IterableDataset):
 
         if self.mlm:
             mask_rate = torch.full((1,), self.mask_rate)
+            rand_mask_rate = mask_rate
         else:
-            mask_rate = torch.rand(1)
+            rand_mask_rate = torch.rand(1)
+            mask_rate = rand_mask_rate * self.mask_rate
             mask_rate = (1 - eps) * mask_rate + eps
         
         # Create mask
@@ -415,7 +417,7 @@ class TrainLoader(IterableDataset):
         labels = sequence.clone()
         labels[~mask_indices] = -100
         
-        return noisy_batch, labels, mask_rate
+        return noisy_batch, labels, rand_mask_rate
 
 
 class OptimizedTrainLoader:
@@ -468,7 +470,11 @@ class OptimizedTrainLoader:
         # Create iterator
         self._iterator = None
         self._exhausted = False
-    
+
+    def set_mask_rate(self, mask_rate: float):
+        """Set the mask rate for the next batch(es)."""
+        self._dataset.mask_rate = mask_rate
+
     def reset(self):
         """Reset the dataloader iterator."""
         self._iterator = iter(self.dataloader)

@@ -35,11 +35,23 @@ class LerpTensor:
         self.gpu_val = torch.tensor(0, dtype=dtype, device="cuda")
 
     def __call__(self, frac_done):
-        val = ((1 - frac_done) * self.start + frac_done * self.end) // self.prec * self.prec
+        val = (max((1 - frac_done), 0) * self.start + min(frac_done, 1) * self.end) // self.prec * self.prec
         if val != self.prev_val:
             self.gpu_val.copy_(val, non_blocking=True)
             self.prev_val = val
         return self.gpu_val
+    
+
+class LerpFloat:
+    def __init__(self, start_val, end_val, precision):
+        self.start, self.end, self.prec = start_val, end_val, precision
+        self.prev_val = None
+        
+    def __call__(self, frac_done):
+        val = (max((1 - frac_done), 0) * self.start + min(frac_done, 1) * self.end) // self.prec * self.prec
+        if val != self.prev_val:
+            self.prev_val = val
+        return self.prev_val
 
 
 class GlobalTimer:

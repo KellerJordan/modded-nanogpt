@@ -1,6 +1,5 @@
 import os
 import sys
-import yaml
 
 code = open(sys.argv[0]).read()
 code += open('optimizer.py', 'r', encoding='utf-8').read()
@@ -18,9 +17,10 @@ import torch
 import torch.distributed as dist
 #import torch._dynamo
 import torch._inductor.config as inductor_config
+from torch.nn.utils import clip_grad_norm_
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torchinfo import summary
 from transformers import EsmTokenizer, get_scheduler
-from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
 from tqdm import tqdm
 
@@ -33,7 +33,8 @@ from utils import (
     load_config_from_yaml,
     exclude_from_timer,
     GlobalTimer,
-    LerpTensor
+    LerpTensor,
+    LerpFloat
 )
 
 
@@ -87,6 +88,9 @@ def arg_parser():
     parser.add_argument("--input_test_bin", type=str, default='data/omgprot50/omgprot50_test_*.bin', help="Input test bin files pattern")
     parser.add_argument("--mlm", type=bool, default=False, help="Use masked language modeling")
     parser.add_argument("--mask_rate", type=float, default=0.2, help="Mask rate for masked language modeling")
+    parser.add_argument("--starting_mask_rate", type=float, default=0.1, help="Starting mask rate for masked language modeling")
+    parser.add_argument("--mask_rate_steps", type=int, default=2500, help="Number of steps to reach mask rate")
+    parser.add_argument("--mask_rate_schedule", type=bool, default=True, help="Use mask rate schedule")
     
     # Optimization hyperparams
     parser.add_argument("--batch_size", type=int, default=8*64*1024, help="Total batch size in tokens")
@@ -151,6 +155,9 @@ class Trainer:
         
         # Initialize global timer
         self.train_timer = GlobalTimer()
+        
+        # Initialize mask rate tracking
+        self.current_mask_rate = 0.0
         
         if 'RANK' in os.environ:
             self.ddp_rank = int(os.environ['RANK'])
@@ -263,7 +270,7 @@ class Trainer:
         self.model = self.init_model()
         self.print0(summary(self.model))
         self.optimizers = self.init_optimizers()
-        self.lr_schedulers, self.sliding_window_size_scheduler = self.init_schedulers()
+        self.lr_schedulers, self.sliding_window_size_scheduler, self.mask_rate_scheduler = self.init_schedulers()
         self.print0(f"Ready for training!")
         
         # Create decorated versions of methods that should be excluded from timing
@@ -272,6 +279,12 @@ class Trainer:
 
     def init_dataloader(self, filename_pattern, training=True):
         if training:
+            if self.args.mlm:
+                mask_rate = self.args.mask_rate
+            else:
+                # we set to 1.0, which properly scales the masked diffusion random mask rate
+                # we can schedule the mask rate with any float, which is torch.rand(1) * mask_rate
+                mask_rate = 1.0 
             return OptimizedTrainLoader(
                 filename_pattern=filename_pattern,
                 seq_len=self.batch_size,
@@ -282,7 +295,7 @@ class Trainer:
                 num_workers=self.args.num_workers,
                 prefetch_factor=self.args.prefetch_factor,
                 mlm=self.args.mlm,
-                mask_rate=self.args.mask_rate,
+                mask_rate=mask_rate,
             )
         else:
             # Use evaluation dataloader that distributes data by sequences, not files
@@ -367,7 +380,15 @@ class Trainer:
             )
             lr_schedulers.append(muon_scheduler)
         sliding_window_size_scheduler = LerpTensor(start_val=512, end_val=self.args.max_length, precision=128)
-        return lr_schedulers, sliding_window_size_scheduler
+        if self.args.mask_rate_schedule:
+            mask_rate_scheduler = LerpFloat(
+                start_val=self.args.starting_mask_rate, 
+                end_val=self.args.mask_rate,
+                precision=0.01
+            )
+        else:
+            mask_rate_scheduler = None
+        return lr_schedulers, sliding_window_size_scheduler, mask_rate_scheduler
 
     @torch.no_grad()
     def run_eval_loader(self, loader, prefix='val'): # returns loss, tokens
@@ -465,9 +486,9 @@ class Trainer:
         if self.args.grad_clip > 0:
             if self.ddp_world_size > 1:
                 # For DDP, use the module's parameters
-                torch.nn.utils.clip_grad_norm_(self.model.module.parameters(), self.args.grad_clip)
+                clip_grad_norm_(self.model.module.parameters(), self.args.grad_clip)
             else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+                clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
 
         # step the optimizers and schedulers
         for opt, sched in zip(self.optimizers, self.lr_schedulers):
@@ -504,6 +525,11 @@ class Trainer:
 
                 frac_done = step / self.args.num_steps  # training progress
                 self.sliding_window_size = self.sliding_window_size_scheduler(frac_done)
+                if self.mask_rate_scheduler:
+                    frac_done_mask = step / self.args.mask_rate_steps
+                    mask_rate = self.mask_rate_scheduler(frac_done_mask)
+                    self.current_mask_rate = mask_rate
+                    self.train_loader.set_mask_rate(mask_rate)
 
                 # once in a while evaluate the validation dataset
                 if self.args.eval_every > 0 and step % self.args.eval_every == 0:
@@ -535,7 +561,7 @@ class Trainer:
                         dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.AVG)
                         avg_loss = avg_loss_tensor.item()
                     
-                    self.print0(f'step:{step+1}/{self.args.num_steps} train_time:{train_time_sec:.0f} sec step_avg:{1000*train_time_sec/timed_steps:.2f}ms loss:{avg_loss:.4f}')
+                    self.print0(f'step:{step+1}/{self.args.num_steps} train_time:{train_time_sec:.0f} sec step_avg:{1000*train_time_sec/timed_steps:.2f}ms loss:{avg_loss:.4f} mask_rate:{self.current_mask_rate:.4f}')
                     train_losses = []
 
                     # Log training progress to wandb
@@ -544,7 +570,8 @@ class Trainer:
                             "time_sec": train_time_sec,
                             "step_avg_ms": 1000*train_time_sec/timed_steps if timed_steps > 0 else 0,
                             "step": step,
-                            "loss": avg_loss
+                            "loss": avg_loss,
+                            "mask_rate": self.current_mask_rate
                         }
                         self.log_wandb(log_dict, prefix='train')
 

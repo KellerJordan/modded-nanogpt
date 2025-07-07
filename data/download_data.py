@@ -17,8 +17,8 @@ def get(fname, data_name):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download data from huggingface")
-    parser.add_argument("-d", "--data_name", type=str, default="omgprot50", help="Name of the dataset")
-    parser.add_argument("-n", "--num_chunks", type=int, default=442, help="Number of chunks to download")
+    parser.add_argument("-d", "--data_name", type=str, default="uniref50", help="Name of the dataset")
+    parser.add_argument("-n", "--num_chunks", type=int, default=100, help="Number of chunks to download")
     # each chunk is 100M tokens
     args = parser.parse_args()
     get(f"{args.data_name}_valid_%06d.bin" % 0, args.data_name)

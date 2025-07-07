@@ -13,7 +13,6 @@ from functools import partial
 from transformers import EsmTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
-from huggingface_hub import HfApi
 
 
 def upload_folder_to_hf(folder_path, repo_id, repo_type="dataset", token=None):
@@ -183,7 +182,7 @@ def tokenize_fw(fw, split='train', data_name='omgprot50', max_length=1024, uploa
 parser = argparse.ArgumentParser(description="OMGprot50 dataset preprocessing")
 parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of each shard in tokens")
 parser.add_argument("-m", "--max_length", type=int, default=1024, help="Maximum sequence length")
-parser.add_argument("-d", "--data_name", type=str, default="omgprot50", help="Name of the dataset")
+parser.add_argument("-d", "--data_name", type=str, default="omg_prot50", help="Name of the dataset")
 parser.add_argument("-r", "--upload_repo", type=str, default=None, help="Hugging Face repository ID to upload to (e.g., 'username/repo_name')")
 parser.add_argument("-t", "--token", type=str, default=None, help="Hugging Face token for authentication (or set token environment variable)")
 
