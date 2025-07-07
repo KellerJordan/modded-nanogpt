@@ -34,7 +34,8 @@ from utils import (
     exclude_from_timer,
     GlobalTimer,
     LerpTensor,
-    LerpFloat
+    LerpFloat,
+    AutoGradClipper
 )
 
 
@@ -67,6 +68,8 @@ def arg_parser():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--clear_cache_every", type=int, default=1000, help="Clear CUDA cache every N steps")
     parser.add_argument("--grad_clip", type=float, default=0.0, help="Gradient clipping value (0 to disable)")
+    parser.add_argument("--auto_grad_clip", action="store_true", help="Enable auto gradient clipping")
+    parser.add_argument("--auto_grad_clip_p", type=float, default=10.0, help="Percentile for auto gradient clipping")
     
     # Model hyperparams
     parser.add_argument("--hidden_size", type=int, default=768, help="Hidden size of the model")
@@ -81,6 +84,7 @@ def arg_parser():
     parser.add_argument("--p_attention", action="store_true", help="Use P attention")
     parser.add_argument("--tie_embeddings", action="store_true", help="Tie embeddings")
     parser.add_argument("--unet", type=bool, default=True, help="Use UNet architecture")
+    parser.add_argument("--token_dropout", type=bool, default=True, help="Use token dropout")
     
     # Data hyperparams
     parser.add_argument("--input_bin", type=str, default='data/omgprot50/omgprot50_train_*.bin', help="Input training bin files pattern")
@@ -158,6 +162,10 @@ class Trainer:
         
         # Initialize mask rate tracking
         self.current_mask_rate = 0.0
+        
+        # Initialize auto gradient clipper
+        self.auto_grad_clipper = None
+        self.last_clip_value = None
         
         if 'RANK' in os.environ:
             self.ddp_rank = int(os.environ['RANK'])
@@ -269,6 +277,16 @@ class Trainer:
 
         self.model = self.init_model()
         self.print0(summary(self.model))
+        
+        # Initialize auto gradient clipper if enabled
+        if self.args.auto_grad_clip:
+            model_for_clipper = self.model.module if self.ddp_world_size > 1 else self.model
+            self.auto_grad_clipper = AutoGradClipper(
+                model=model_for_clipper,
+                clip_percentile=self.args.auto_grad_clip_p,
+            )
+            self.print0(f"Auto gradient clipping enabled with {self.args.auto_grad_clip_p}% percentile")
+        
         self.optimizers = self.init_optimizers()
         self.lr_schedulers, self.sliding_window_size_scheduler, self.mask_rate_scheduler = self.init_schedulers()
         self.print0(f"Ready for training!")
@@ -471,7 +489,18 @@ class Trainer:
                 # Only sync gradients on last accumulation step
                 if self.ddp_world_size > 1 and i < self.args.grad_accum - 1:
                     stack.enter_context(self.model.no_sync())
+                
                 input_ids, labels, mask_rate = self.train_loader.next_batch()
+                
+                # Check if dataloader is exhausted (returns empty tensors)
+                if input_ids.numel() == 0:
+                    # Reset the dataloader and get a fresh batch
+                    self.train_loader.reset()
+                    input_ids, labels, mask_rate = self.train_loader.next_batch()
+                    # Double-check we have valid data after reset
+                    if input_ids.numel() == 0:
+                        raise RuntimeError("Dataloader returned empty batch even after reset")
+                
                 loss = self.model(input_ids, labels, mask_rate, self.sliding_window_size) / self.args.grad_accum
                 loss.backward()
                 accumulated_loss += loss.item()  # Accumulate the scaled loss
@@ -483,12 +512,17 @@ class Trainer:
                 group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
 
         # Apply gradient clipping if specified
-        if self.args.grad_clip > 0:
+        clip_value = None
+        if self.args.auto_grad_clip and self.auto_grad_clipper is not None:
+            # Use auto gradient clipping
+            clip_value = self.auto_grad_clipper.clip_gradients()
+        elif self.args.grad_clip > 0:
+            # Use regular gradient clipping
             if self.ddp_world_size > 1:
-                # For DDP, use the module's parameters
                 clip_grad_norm_(self.model.module.parameters(), self.args.grad_clip)
             else:
                 clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+            clip_value = self.args.grad_clip
 
         # step the optimizers and schedulers
         for opt, sched in zip(self.optimizers, self.lr_schedulers):
@@ -497,6 +531,9 @@ class Trainer:
 
         # null the gradients
         self.model.zero_grad(set_to_none=True)
+        
+        # Store clip value for logging
+        self.last_clip_value = clip_value
         
         # Return the total accumulated loss (already properly scaled)
         return accumulated_loss
@@ -561,7 +598,10 @@ class Trainer:
                         dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.AVG)
                         avg_loss = avg_loss_tensor.item()
                     
-                    self.print0(f'step:{step+1}/{self.args.num_steps} train_time:{train_time_sec:.0f} sec step_avg:{1000*train_time_sec/timed_steps:.2f}ms loss:{avg_loss:.4f} mask_rate:{self.current_mask_rate:.4f}')
+                    log_msg = f'step:{step+1}/{self.args.num_steps} train_time:{train_time_sec:.0f} sec step_avg:{1000*train_time_sec/timed_steps:.2f}ms loss:{avg_loss:.4f} mask_rate:{self.current_mask_rate:.4f}'
+                    if hasattr(self, 'last_clip_value') and self.last_clip_value is not None:
+                        log_msg += f' clip_value:{self.last_clip_value:.4f}'
+                    self.print0(log_msg)
                     train_losses = []
 
                     # Log training progress to wandb
@@ -573,6 +613,8 @@ class Trainer:
                             "loss": avg_loss,
                             "mask_rate": self.current_mask_rate
                         }
+                        if hasattr(self, 'last_clip_value') and self.last_clip_value is not None:
+                            log_dict["clip_value"] = self.last_clip_value
                         self.log_wandb(log_dict, prefix='train')
 
             # Stop the timer and get final training time
@@ -651,7 +693,13 @@ if __name__ == '__main__':
         args.num_steps = 10
         args.cooldown_steps = 2
         args.max_length = 512
+        args.auto_grad_clip = True
+        args.grad_clip = 0.0  # Disable regular grad clip for bugfix testing
 
+    # Validate gradient clipping arguments
+    if args.auto_grad_clip and args.grad_clip > 0:
+        raise ValueError("Cannot use both --auto_grad_clip and --grad_clip at the same time. Choose one.")
+    
     model_config = PLMConfig(
         hidden_size=args.hidden_size,
         num_attention_heads=args.num_attention_heads,

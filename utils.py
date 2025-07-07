@@ -5,6 +5,42 @@ import time
 import yaml
 
 
+def _get_grad_norm(model):
+    total_norm = 0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+    total_norm = total_norm ** (1. / 2)
+    return total_norm 
+
+
+class AutoGradClipper:
+    """Auto gradient clipping that adapts based on gradient history."""
+    
+    def __init__(self, model, clip_percentile=10, history_length=1000000):
+        self.model = model
+        self.clip_percentile = clip_percentile
+        self.history_length = history_length
+        self.grad_history = []
+    
+    def clip_gradients(self):
+        """Clip gradients based on percentile of gradient history."""
+        obs_grad_norm = _get_grad_norm(self.model)
+        self.grad_history.append(obs_grad_norm)
+        
+        # Keep history length manageable
+        if len(self.grad_history) > self.history_length:
+            self.grad_history = self.grad_history[-self.history_length:]
+        
+        # Only start clipping after we have some history
+        if len(self.grad_history) >= 10:
+            clip_value = np.percentile(self.grad_history, self.clip_percentile)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_value)
+            return clip_value
+        return None
+
+
 def load_config_from_yaml(yaml_path):
     """Load configuration from YAML file."""
     with open(yaml_path, 'r') as f:
