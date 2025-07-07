@@ -197,7 +197,7 @@ Memory and disk I/O remain primary bottlenecks on some systems, as evidenced by 
 
 ## ESM Model Evaluation
 
-Models achieving validation losses below 2.0 on certain splits may indicate training on similar sequences. A validation loss target of approximately 2.1 without data leakage appears highly competitive.
+Models achieving validation losses below 2.0 on certain splits may indicate training on similar sequences (or direct training, especially in the case of ESMC on the metagenomic data). A validation loss target of approximately 2.1 without data leakage appears highly competitive.
 
 ### OMG Prot50 Dataset
 
