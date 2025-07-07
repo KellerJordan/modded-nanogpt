@@ -16,8 +16,9 @@ def _get_grad_norm(model):
 
 
 class AutoGradClipper:
-    """Auto gradient clipping that adapts based on gradient history."""
-    
+    # Auto gradient clipping that adapts based on gradient history.
+    # adapted from https://github.com/pseeth/autoclip/tree/master
+
     def __init__(self, model, clip_percentile=10, history_length=1000000):
         self.model = model
         self.clip_percentile = clip_percentile

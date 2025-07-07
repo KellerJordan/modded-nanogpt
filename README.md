@@ -1,16 +1,18 @@
-# Speedrunning PLM Training
+# Speedrunning Protein Language Model Training
 
-## TL;DR
+## Overview
 
-This project aims to democratize protein language model (pLM) training by reducing costs from $10,000-1,000,000 to $10-100 using modern NLP techniques. We have successfully reproduced ESMC-300M and ESMC-650M performance with fewer parameters and dramatically lower costs. The project features non-trivial changes to the vanilla transformer is planning virtual competitions to curate innovation.
+This project aims to democratize protein language model (pLM) training by reducing costs from $10,000-1,000,000 to $10-100 through modern NLP techniques. We have successfully reproduced ESMC-300M and ESMC-650M performance with fewer parameters and dramatically reduced costs. The project features significant improvements to the vanilla transformer architecture and is planning virtual competitions to drive innovation.
 
 ## Table of Contents
 
 - [Introduction](#introduction)
-- [Interested in contributing?](#interested-in-contributing)
-- [Getting started](#getting-started)
-- [Running experiments](#running-experiments)
-- [Some general info](#some-general-info)
+- [Contributing](#contributing)
+- [Getting Started](#getting-started)
+- [Running Experiments](#running-experiments)
+- [Performance Benchmarks](#performance-benchmarks)
+- [ESM Model Evaluation](#esm-model-evaluation)
+- [Technical Details](#technical-details)
 
 ![Speedrunning PLM Pretraining](docs/assets/model_costs.png)
 
@@ -24,181 +26,186 @@ The large cost associated with pLM pretraining was notably questioned in the [AM
 
 And so, this repository is our attempt to take PLM training to the next level. We have gathered the non-trivial improvements to the vanilla transformer architecture, typical optimizers, dataloading and distributed training, as well as high quality modern meta-genomic datasets to speedrun pLM pretraining between ~$10-100. The preliminary results are promising, with several runs in the $10-100 range matching the validation loss of ESM2-650 and ESMC-300 models, often using a fraction of the parameters as well. So the project is done, right? Not quite.
 
-One training trick that increase the quality of the pLM representations, basically the correlation between the last hidden state and valuable properties, is tieing the weights from the token embeddings to the language modeling head. It has been shown in numerous papers ([1](https://arxiv.org/abs/2111.09543), [2](https://arxiv.org/abs/2412.13663), [3](https://arxiv.org/pdf/2506.08293)) that a tied language modeling head improves the representation quality. Unfortunately, this severely dampens the convergence of the language modeling loss - leading to much slower and expensive training runs.
+### Research Opportunities
 
-Interestingly, this may no longer be a significant problem. Several works have shown that the last hidden state of transformer models rarely produces the highest quality embeddings ([1](https://arxiv.org/pdf/2502.02013), [2](https://www.biorxiv.org/content/10.1101/2024.02.05.578959v2)). Intuitively, this makes a lot of sense - there is some severe expansion and compression of the hidden state at the beginning and end of the models, respectively. So, if we do not care about the quality of the last hidden state anymore (as it is rarely the best anyways) maybe we can curate an internal representation while avoiding weight tieing - maintaining speed and quality. This is even more promising when analyzing the unique UNET transformer inspired from NanoGPT.
+One training technique that enhances pLM representation quality—improving correlation between hidden states and valuable properties is weight tying between token embeddings and the language modeling head. Multiple studies ([1](https://arxiv.org/abs/2111.09543), [2](https://arxiv.org/abs/2412.13663), [3](https://arxiv.org/pdf/2506.08293)) have demonstrated that tied language modeling heads improve representation quality. However, this approach significantly slows convergence of the language modeling loss, resulting in slower and more expensive training.
+
+Recent work suggests this may no longer be a significant limitation. Several studies have shown that the final hidden state of transformer models rarely produces the highest quality embeddings ([1](https://arxiv.org/pdf/2502.02013), [2](https://www.biorxiv.org/content/10.1101/2024.02.05.578959v2)). This makes intuitive sense—significant expansion and compression of hidden states occur at the model's beginning and end, respectively. If we no longer prioritize final hidden state quality (since it's rarely optimal), we may be able to optimize internal representations while avoiding weight tying, maintaining both speed and quality. This approach shows particular promise with the innovative UNet transformer architecture inspired by NanoGPT.
 
 ![Speedrunning PLM Pretraining](docs/assets/speedrun_unet.png)
 
-More direct encoder-decoder schemas to stratify representaiton learning and generative capabilities? Autoencoders or clever regularization at the nth transformer layer? The sky is the limit here.
+Additional research directions include direct encoder-decoder architectures to stratify representation learning and generative capabilities, autoencoders, and clever regularization at intermediate transformer layers.
 
-Another disadvantage of traditional pLM training lies in the MLM itself, as it leads to poor generation capabilies, hampering protein design prospects. Recent work of our group introduced DSM, a simple way to reformat pLM MLM into masked diffusion, increasing the generative qualities. Of course, naively switching to masked diffusion instead of MLM in the speedrun does not work pefectly either. So some warmup from fixed rate MLM to varied rate masked diffusion may give us the best of both worlds.
+Another limitation of traditional pLM training lies in MLM itself, which results in poor generation capabilities and hampers protein design prospects. Recent work from our group introduced Discrete State Masking (DSM), which reformats pLM MLM into masked diffusion, enhancing generative qualities. However, naive replacement of MLM with masked diffusion in speedrun contexts doesn't work perfectly. A warmup strategy from fixed-rate MLM to variable-rate masked diffusion may provide optimal results for both objectives.
 
-### Interested in contributing?
-This is an open-source initiative to help the entire community. We are planning a month-long virtual hackathon/competition to see which team can produce the best solutions, with two main tracks:
+## Contributing
 
-1. **Speed Track**: Fastest time to reach less than 2.1 validation loss with fewer than 150 million parameters
-2. **Quality Track**: Best scoring representations in 8 hours
+This open-source initiative aims to benefit the entire community. We are planning a month-long virtual hackathon/competition with two main tracks:
 
-Representations will be evaluated using a version of the [Protify](https://github.com/Synthyra/Protify) project for standardized and fair comparisons.
+1. **Speed Track**: Fastest time to achieve validation loss below 2.1 with fewer than 150 million parameters
+2. **Quality Track**: Best-scoring representations within 8 hours of training
 
-We plan to use an 8xH100 rig for consistent training comparisons on the competition leaderboard. However, supporting multiple teams with 8xH100 access is expensive! We are seeking sponsors who can pledge:
+Representations will be evaluated using a standardized version of the [Protify](https://github.com/Synthyra/Protify) project for fair comparisons.
+
+### Competition Infrastructure
+
+We plan to use an 8×H100 system for consistent training comparisons on the competition leaderboard. Supporting multiple teams with 8×H100 access is expensive, so we are seeking sponsors who can provide:
 
 1. Direct H100 access
-2. Compute credits  
+2. Compute credits
 3. Prizes for winners
 
-Please reach out to `info@synthyra.com` if you are interested in sponsoring.
+Please contact `info@synthyra.com` if you're interested in sponsoring this initiative.
 
-## Getting started
+## Getting Started
 
-```
+### Quick Start
+
+```bash
 git clone https://github.com/Synthyra/SpeedrunningPLMs.git
 cd SpeedrunningPLMs
 pip install huggingface_hub
-python data/download_omgprot50.py # --num_chunks 100 download less data to save time for smaller runs
+python data/download_omgprot50.py # Add --num_chunks 100 to download less data for smaller runs
 ```
 
-For ARM64 systems (GH200)
-```
+### ARM64 Systems (GH200)
+
+```bash
 pip install -r requirements.txt -U
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 -U
 torchrun --standalone --nproc_per_node=NUM_GPUS_ON_YOUR_SYSTEM train.py
 ```
 
-For non ARM64 systems you can use Docker
-```
+### Docker Installation (Non-ARM64 Systems)
+
+```bash
 git clone https://github.com/Synthyra/SpeedrunningPLMs.git
 cd SpeedrunningPLMs
 sudo docker build -t speedrun_plm .
 sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm \
     torchrun --standalone --nproc_per_node=NUM_GPUS_ON_YOUR_SYSTEM train.py \
-    --token YOUR_HUGGINGFACE_TOKEN
+    --token YOUR_HUGGINGFACE_TOKEN \
     --wandb_token YOUR_WANDB_TOKEN
 ```
 
-<details>
-<summary><strong>Note about Docker on ARM64 (GH200)</strong></summary>
+> **Note for ARM64 (GH200) Systems**: The Docker image currently experiences compatibility issues on ARM64 systems due to Triton version conflicts that break `torch.compile`. If you have a solution for this issue, please open an issue or pull request.
 
-Currently, the docker image results in various issues on ARM64 systems.
+## Running Experiments
 
-<pre>
-  File "/usr/local/lib/python3.12/site-packages/torch/_inductor/scheduler.py", line 3432, in create_backend
-    raise RuntimeError(
-torch._dynamo.exc.BackendCompilerFailed: backend='inductor' raised:
-RuntimeError: Cannot find a working triton installation. Either the package is not installed or it is too old. More information on installing Triton can be found at https://github.com/openai/triton
+### Experiment Documentation
 
-Set TORCH_LOGS="+dynamo" and TORCHDYNAMO_VERBOSE=1 for more information
+View our documented experiments at [https://synthyra.github.io/SpeedrunningPLMs/](https://synthyra.github.io/SpeedrunningPLMs/).
 
+### Configuration
 
-You can suppress this exception and fall back to eager by setting:
-    import torch._dynamo
-    torch._dynamo.config.suppress_errors = True
-</pre>
+Configure experiments by editing the example YAML files with your desired settings (`example_yamls/default.yaml`). Create a YAML file for each experiment and place them in the `experiments` folder on your training system.
 
-Suppressing dynamo leads to its own error. There is something delicate going on here.
+### Execution
 
-If you know how to get our docker image working (or a solution with different container software) on GH200 please open an issue or pull request! There is some triton version mismatch that breaks the <code>torch.compile</code>. So in principle the docker image works for GH200 without <code>torch.compile</code>, but obviously that is not ideal.
-</details>
-
-## Running experiments
-
-Check out our documented experiments thus far [here](https://synthyra.github.io/SpeedrunningPLMs/).
-
-You can set up experiments by editing the example yaml files with desired settings (`example_yamls/default.yaml`). Simply build a yaml file for each experiment you would like to run and drag them into the `experiments` folder on your training rig. Then, run:
-
-```
+```bash
 chmod +x run_experiments.sh
 ./run_experiments.sh
 ```
 
-which will automatically determine how many GPUs your machine has, prompt you for Huggingface and Wandb tokens, and then run all the yaml files in `experiments` sequentially. Each yaml file corresponds to a set of settings that will start a training run.
-
-For more information about CLI or yaml arguments you can reference the table in the drop down below:
+This script will automatically:
+- Determine the number of GPUs on your system
+- Prompt for HuggingFace and Weights & Biases tokens
+- Execute all YAML files in the `experiments` directory sequentially
 
 <details>
 <summary><strong>Command-line Arguments Reference</strong></summary>
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| <code>--yaml_path</code> | str | None | Path to YAML file with experiment configuration. CLI arguments override YAML. |
-| <code>--token</code> | str | None | HuggingFace token (required for model saving/uploading). Prompted if not provided. |
-| <code>--wandb_token</code> | str | None | Weights & Biases API token (for experiment tracking). Prompted if not provided. |
-| <code>--log_name</code> | str | None | Name for the log file and wandb run. If not set, a random UUID is used. |
-| <code>--bugfix</code> | flag | False | Use small batch size and max length for debugging. |
-| <code>--save_path</code> | str | "Synthyra/speedrun_test" | Path to save the model and report to wandb. |
-| <code>--seed</code> | int | 42 | Random seed for reproducibility. |
-| <code>--clear_cache_every</code> | int | 1000 | Clear CUDA cache every N steps. |
-| <code>--grad_clip</code> | float | 0.0 | Gradient clipping value (0 to disable). |
-| <code>--hidden_size</code> | int | 768 | Hidden size of the model. |
-| <code>--num_attention_heads</code> | int | 6 | Number of attention heads. |
-| <code>--num_hidden_layers</code> | int | 24 | Number of hidden layers. |
-| <code>--num_att_tokens</code> | int | 512 | Number of attention tokens. |
-| <code>--vocab_size</code> | int | 33 | Vocabulary size. |
-| <code>--expansion_ratio</code> | float | 2.6667 | Expansion ratio for MLP (e.g., 8/3). |
-| <code>--soft_logit_cap</code> | float | 32.0 | Soft logit cap for output logits. |
-| <code>--attention_soft_cap</code> | float | 64.0 | Attention softmax cap. |
-| <code>--add_att_soft_cap</code> | bool | True | Whether to add attention softmax cap. |
-| <code>--p_attention</code> | flag | False | Use P attention variant. |
-| <code>--tie_embeddings</code> | flag | False | Tie input and output embeddings. |
-| <code>--unet</code> | bool | True | Use UNet architecture. |
-| <code>--input_bin</code> | str | "data/omgprot50/omgprot50_train_*.bin" | Input training bin files pattern. |
-| <code>--input_valid_bin</code> | str | "data/omgprot50/omgprot50_valid_*.bin" | Input validation bin files pattern. |
-| <code>--input_test_bin</code> | str | "data/omgprot50/omgprot50_test_*.bin" | Input test bin files pattern. |
-| <code>--mlm</code> | bool | False | Use masked language modeling objective. |
-| <code>--mask_rate</code> | float | 0.2 | Mask rate for masked language modeling. |
-| <code>--batch_size</code> | int | 524288 | Total batch size in tokens (default: 8*64*1024). |
-| <code>--grad_accum</code> | int | 1 | Gradient accumulation steps. |
-| <code>--num_steps</code> | int | 50000 | Number of training steps. |
-| <code>--cooldown_steps</code> | int | 5000 | Number of cooldown steps after main training. |
-| <code>--max_length</code> | int | 1024 | Maximum sequence length. |
-| <code>--scheduler_type</code> | str | "cosine" | Scheduler type for learning rate. |
-| <code>--lr_warmup_steps</code> | int | 1000 | Number of warmup steps for learning rate. |
-| <code>--lr</code> | float | 0.001 | Learning rate for Adam optimizer (when not using Muon). |
-| <code>--lr_embed</code> | float | 0.06 | Learning rate for embeddings. |
-| <code>--lr_head</code> | float | 0.008 | Learning rate for head. |
-| <code>--lr_scalar</code> | float | 0.04 | Learning rate for scalar parameters. |
-| <code>--use_muon</code> | bool | True | Use Muon optimizer for hidden layers. |
-| <code>--lr_hidden</code> | float | 0.05 | Learning rate for hidden layers (Muon). |
-| <code>--muon_momentum_warmup_steps</code> | int | 300 | Steps for Muon momentum warmup (0.85 → 0.95). |
-| <code>--eval_every</code> | int | 1000 | Evaluate on validation set every N steps. |
-| <code>--hf_model_name</code> | str | "Synthyra/speedrun" | HuggingFace model name for saving. |
-| <code>--save_every</code> | int | None | Save checkpoint every N steps (if set). |
-| <code>--num_workers</code> | int | 4 | Number of workers for optimized dataloader. |
-| <code>--prefetch_factor</code> | int | 2 | Prefetch factor for optimized dataloader. |
+| `--yaml_path` | str | None | Path to YAML file with experiment configuration. CLI arguments override YAML. |
+| `--token` | str | None | HuggingFace token (required for model saving/uploading). Prompted if not provided. |
+| `--wandb_token` | str | None | Weights & Biases API token (for experiment tracking). Prompted if not provided. |
+| `--log_name` | str | None | Name for the log file and wandb run. If not set, a random UUID is used. |
+| `--bugfix` | flag | False | Use small batch size and max length for debugging. |
+| `--save_path` | str | "Synthyra/speedrun_test" | Path to save the model and report to wandb. |
+| `--seed` | int | 42 | Random seed for reproducibility. |
+| `--clear_cache_every` | int | 1000 | Clear CUDA cache every N steps. |
+| `--grad_clip` | float | 0.0 | Gradient clipping value (0 to disable). |
+| `--hidden_size` | int | 768 | Hidden size of the model. |
+| `--num_attention_heads` | int | 6 | Number of attention heads. |
+| `--num_hidden_layers` | int | 24 | Number of hidden layers. |
+| `--num_att_tokens` | int | 512 | Number of attention tokens. |
+| `--vocab_size` | int | 33 | Vocabulary size. |
+| `--expansion_ratio` | float | 2.6667 | Expansion ratio for MLP (e.g., 8/3). |
+| `--soft_logit_cap` | float | 32.0 | Soft logit cap for output logits. |
+| `--attention_soft_cap` | float | 64.0 | Attention softmax cap. |
+| `--add_att_soft_cap` | bool | True | Whether to add attention softmax cap. |
+| `--p_attention` | flag | False | Use P attention variant. |
+| `--tie_embeddings` | flag | False | Tie input and output embeddings. |
+| `--unet` | bool | True | Use UNet architecture. |
+| `--input_bin` | str | "data/omgprot50/omgprot50_train_*.bin" | Input training bin files pattern. |
+| `--input_valid_bin` | str | "data/omgprot50/omgprot50_valid_*.bin" | Input validation bin files pattern. |
+| `--input_test_bin` | str | "data/omgprot50/omgprot50_test_*.bin" | Input test bin files pattern. |
+| `--mlm` | bool | False | Use masked language modeling objective. |
+| `--mask_rate` | float | 0.2 | Mask rate for masked language modeling. |
+| `--batch_size` | int | 524288 | Total batch size in tokens (default: 8×64×1024). |
+| `--grad_accum` | int | 1 | Gradient accumulation steps. |
+| `--num_steps` | int | 50000 | Number of training steps. |
+| `--cooldown_steps` | int | 5000 | Number of cooldown steps after main training. |
+| `--max_length` | int | 1024 | Maximum sequence length. |
+| `--scheduler_type` | str | "cosine" | Scheduler type for learning rate. |
+| `--lr_warmup_steps` | int | 1000 | Number of warmup steps for learning rate. |
+| `--lr` | float | 0.001 | Learning rate for Adam optimizer (when not using Muon). |
+| `--lr_embed` | float | 0.06 | Learning rate for embeddings. |
+| `--lr_head` | float | 0.008 | Learning rate for head. |
+| `--lr_scalar` | float | 0.04 | Learning rate for scalar parameters. |
+| `--use_muon` | bool | True | Use Muon optimizer for hidden layers. |
+| `--lr_hidden` | float | 0.05 | Learning rate for hidden layers (Muon). |
+| `--muon_momentum_warmup_steps` | int | 300 | Steps for Muon momentum warmup (0.85 → 0.95). |
+| `--eval_every` | int | 1000 | Evaluate on validation set every N steps. |
+| `--hf_model_name` | str | "Synthyra/speedrun" | HuggingFace model name for saving. |
+| `--save_every` | int | None | Save checkpoint every N steps (if set). |
+| `--num_workers` | int | 4 | Number of workers for optimized dataloader. |
+| `--prefetch_factor` | int | 2 | Prefetch factor for optimized dataloader. |
 
 </details>
 
+## Performance Benchmarks
 
-## Some general info
-A batch size of 8x64x1024 (524288) or 4x64x1024 (262144) tokens has worked very well. We recommend a local batch size of 64*1024 (65536) tokens for 80gb VRAM machines, and less if working with a smaller rig. For example, if 524288 is desired and you have 4 A100 80gb gpus, use gradient accumulation (`--grad_accum`) of 2 (524288 / 4 / 2 = 65536).
+### Recommended Configuration
 
-Our newer trainer and dataloader incorporates prefetching and multiple workers per GPU to accelerate data handling - the masking is also accomplished at this stage. In general, this has led to a small increase in throughput, which should have a larger effect for systems with slower disk read rates (University HPC systems, Jarvis Labs, Many azure blob types, etc.).
+Batch sizes of 8×64×1024 (524,288) or 4×64×1024 (262,144) tokens have demonstrated excellent performance. We recommend a local batch size of 64×1024 (65,536) tokens for 80GB VRAM systems, with adjustments for smaller configurations.
 
-Here is a table of some current throughput during training for the default model size (133 million params, 24 blocks, UNET + Value embedddings, hidden size 768):
+**Example**: For a desired batch size of 524,288 tokens on 4×A100 80GB GPUs, use gradient accumulation (`--grad_accum`) of 2:
+```
+524,288 ÷ 4 ÷ 2 = 65,536 tokens per GPU
+```
 
-|Hardware |Tokens per sec|
-|---------|--------------|
-| 1xH100  | 275,900 |
-| 1xGH200 | 1,011,800 |
-|4xA100 80gb PCIe gen4| 340,700 |
-|8xH100 SXM5 | 2,149,500 |
+### System Performance
 
-This implies that you could train ESM2-150 (batch size 2 million tokens for 500,000 steps) in 129 hours for $3091 (lambda 8xH100 6/30/2025) - assuming no improvements to model architecture, any training associated algorithms, or datasets. Compared to the ~$46k that ESM2-150 would have cost through vendors like AWS in 2022 this is a big improvement on its own!
+Our optimized trainer and dataloader incorporate prefetching and multiple workers per GPU to accelerate data handling, with masking performed at the data loading stage. This results in improved throughput, particularly beneficial for systems with slower disk I/O.
 
-Clearly, memory and disk read/write speeds are still a major bottleneck on some rigs (looking at the GH200 domination). Perhaps enhancements to the dataloading and prefetching can reduce this further. 
+**Training Throughput** (Default model: 133M parameters, 24 blocks, UNet + Value embeddings, 768 hidden size):
 
-## Benchmarks for ESM models
+| Hardware | Tokens/Second |
+|----------|---------------|
+| 1×H100 | 275,900 |
+| 1×GH200 | 1,011,800 |
+| 4×A100 80GB PCIe Gen4 | 340,700 |
+| 8×H100 SXM5 | 2,149,500 |
 
-Some models have exceedingly low (< 2.0) losses on some of the splits. We suspect that this is due to the models training on or near these sequences. It looks like a loss goal of ~2.1 without data leakage is very competitve.  
+### Cost Analysis
 
-### OMG prot50
-- [Source](https://huggingface.co/datasets/tattabio/OMG_prot50)
-- [Version with splits](https://huggingface.co/datasets/Synthyra/omg_prot50)
+Based on current performance metrics, training ESM2-150M equivalent (2M token batch size, 500K steps) would require approximately 129 hours at $3,091 using 8×H100 systems (Lambda pricing as of June 2025). This represents a significant improvement over the estimated $46,000 cost for ESM2-150M training via AWS in 2022.
 
-All results evaluated on 10,000 sequences and 2,500 batches.
+Memory and disk I/O remain primary bottlenecks on some systems, as evidenced by the GH200's superior performance. Further optimizations to data loading and prefetching may yield additional improvements.
 
-#### Validation Split (303,545 tokens)
+## ESM Model Evaluation
+
+Models achieving validation losses below 2.0 on certain splits may indicate training on similar sequences. A validation loss target of approximately 2.1 without data leakage appears highly competitive.
+
+### OMG Prot50 Dataset
+
+- **Source**: [tattabio/OMG_prot50](https://huggingface.co/datasets/tattabio/OMG_prot50)
+- **Split Version**: [Synthyra/omg_prot50](https://huggingface.co/datasets/Synthyra/omg_prot50)
+- **Evaluation**: 10,000 sequences, 2,500 batches
+
+#### Validation Split Results (303,545 tokens)
 
 | Model | Loss | Perplexity | Accuracy | Precision | Recall | F1 | MCC |
 |-------|------|-----------|----------|-----------|--------|----|----|
@@ -210,7 +217,7 @@ All results evaluated on 10,000 sequences and 2,500 batches.
 | ESM2-650M | 2.267 | 9.652 | 0.352 | 0.382 | 0.352 | 0.348 | 0.307 |
 | ESM2-3B | 2.200 | 9.024 | 0.378 | 0.403 | 0.378 | 0.375 | 0.335 |
 
-#### Test Split (307,141 tokens)
+#### Test Split Results (307,141 tokens)
 
 | Model | Loss | Perplexity | Accuracy | Precision | Recall | F1 | MCC |
 |-------|------|-----------|----------|-----------|--------|----|----|
@@ -222,13 +229,13 @@ All results evaluated on 10,000 sequences and 2,500 batches.
 | ESM2-650M | 2.268 | 9.655 | 0.353 | 0.382 | 0.353 | 0.349 | 0.308 |
 | ESM2-3B | 2.203 | 9.051 | 0.377 | 0.402 | 0.377 | 0.374 | 0.334 |
 
-### OG prot90
-- [Source](https://huggingface.co/datasets/tattabio/OG_prot90)
-- [Version with splits](https://huggingface.co/datasets/Synthyra/og_prot90)
+### OG Prot90 Dataset
 
-All results evaluated on 10,000 sequences and 2,500 batches.
+- **Source**: [tattabio/OG_prot90](https://huggingface.co/datasets/tattabio/OG_prot90)
+- **Split Version**: [Synthyra/og_prot90](https://huggingface.co/datasets/Synthyra/og_prot90)
+- **Evaluation**: 10,000 sequences, 2,500 batches
 
-#### Validation Split (442,548 tokens)
+#### Validation Split Results (442,548 tokens)
 
 | Model | Loss | Perplexity | Accuracy | Precision | Recall | F1 | MCC |
 |-------|------|-----------|----------|-----------|--------|----|----|
@@ -240,7 +247,7 @@ All results evaluated on 10,000 sequences and 2,500 batches.
 | ESM2-650M | 1.800 | 6.051 | 0.460 | 0.472 | 0.460 | 0.455 | 0.422 |
 | ESM2-3B | 1.662 | 5.271 | 0.505 | 0.513 | 0.505 | 0.501 | 0.470 |
 
-#### Test Split (449,207 tokens)
+#### Test Split Results (449,207 tokens)
 
 | Model | Loss | Perplexity | Accuracy | Precision | Recall | F1 | MCC |
 |-------|------|-----------|----------|-----------|--------|----|----|
@@ -252,14 +259,13 @@ All results evaluated on 10,000 sequences and 2,500 batches.
 | ESM2-650M | 1.787 | 5.969 | 0.465 | 0.477 | 0.465 | 0.460 | 0.427 |
 | ESM2-3B | 1.651 | 5.212 | 0.508 | 0.515 | 0.508 | 0.504 | 0.473 |
 
-### Uniref50 
-- [Source](https://huggingface.co/datasets/agemagician/uniref50_09012025)
-- [Version with splits](https://huggingface.co/datasets/Synthyra/uniref50)
+### UniRef50 Dataset
 
+- **Source**: [agemagician/uniref50_09012025](https://huggingface.co/datasets/agemagician/uniref50_09012025)
+- **Split Version**: [Synthyra/uniref50](https://huggingface.co/datasets/Synthyra/uniref50)
+- **Evaluation**: 10,000 sequences, 2,500 batches
 
-All results evaluated on 10,000 sequences and 2,500 batches.
-
-#### Validation Split (405,314 tokens)
+#### Validation Split Results (405,314 tokens)
 
 | Model | Loss | Perplexity | Accuracy | Precision | Recall | F1 | MCC |
 |-------|------|-----------|----------|-----------|--------|----|----|
@@ -271,7 +277,7 @@ All results evaluated on 10,000 sequences and 2,500 batches.
 | ESM2-650M | 2.165 | 8.717 | 0.357 | 0.387 | 0.357 | 0.355 | 0.313 |
 | ESM2-3B | 2.053 | 7.788 | 0.395 | 0.419 | 0.395 | 0.393 | 0.354 |
 
-#### Test Split (400,117 tokens)
+#### Test Split Results (400,117 tokens)
 
 | Model | Loss | Perplexity | Accuracy | Precision | Recall | F1 | MCC |
 |-------|------|-----------|----------|-----------|--------|----|----|
@@ -283,38 +289,30 @@ All results evaluated on 10,000 sequences and 2,500 batches.
 | ESM2-650M | 2.165 | 8.717 | 0.357 | 0.385 | 0.357 | 0.354 | 0.313 |
 | ESM2-3B | 2.059 | 7.835 | 0.393 | 0.416 | 0.393 | 0.391 | 0.352 |
 
+## Technical Details
+
 <details>
-<summary>Pretraining cost calculation details</summary>
+<summary><strong>Pretraining Cost Calculation Methodology</strong></summary>
 
-ESM-1b
-- 4.25 hours per epoch, 56 epochs, 128 V100 GPUs
-- [Source](https://epoch.ai/data/notable-ai-models)
-- 238 hours x 128 gpus is 30,464 V100 hours
-- 8xV100 on AWS is ~$24.48 [on demand](https://instances.vantage.sh/aws/ec2/p3.16xlarge)
-- Assume 1/2 of that per hours because of scale and year is 2020, but the GPUs were newer so this is generous
-- $1.53 gpu/hour * 30,464 hours is $46,610
+### ESM-1B
+- **Training**: 4.25 hours per epoch × 56 epochs on 128 V100 GPUs
+- **Source**: [Notable AI Models Database](https://epoch.ai/data/notable-ai-models)
+- **Calculation**: 238 hours × 128 GPUs = 30,464 V100 hours
+- **Cost Estimate**: Based on AWS 8×V100 (~$24.48 on-demand), adjusted for 2020 pricing and scale, estimated at $1.53/GPU-hour
+- **Total**: $1.53 × 30,464 = $46,610
 
-ProtBERT, ProtT5, Progen2
-- Estimated from [here](https://epoch.ai/data/notable-ai-models)
+### Other Models
+- **ProtBERT, ProtT5, Progen2**: Estimates from [Notable AI Models Database](https://epoch.ai/data/notable-ai-models)
+- **ESM2-15B**: Approximately $1.5M USD ([AMPLIFY paper](https://www.biorxiv.org/content/10.1101/2024.09.23.614603v1.full))
+- **ESM2-3B**: ~50% of ESM2-15B FLOPs ([ESM Discussion](https://github.com/facebookresearch/esm/discussions/414))
+- **ESM2-650M**: ~25% of ESM2-3B FLOPs
+- **ESM2-150M**: ~25% of ESM2-650M FLOPs
+- **ESM2-35M**: ~25% of ESM2-150M FLOPs
+- **ESM2-8M**: ~25% of ESM2-35M FLOPs
 
-ESM2-15B
-- Approximated at $1.5 million USD
-- [Source](https://www.biorxiv.org/content/10.1101/2024.09.23.614603v1.full)
-ESM2-3B
-- Roughly 1/2 of 15B FLOPs
-- [Source](https://github.com/facebookresearch/esm/discussions/414)
-ESM2-650M
-- Roughly 1/4 of 3B FLOPs
-- [Source](https://github.com/facebookresearch/esm/discussions/414)
-ESM2-150M
-- Approximated at 1/4 of 650M FlOPs
-ESM2-35M
-- Approximated at 1/4 of 150M FlOPs
-ESM2-8M
-- Approximated at 1/4 of 35M FlOPs
+### ESM3-98B
+- **FLOPs**: 1.07×10²⁴ ([ESM3 paper](https://www.science.org/doi/10.1126/science.ads0018))
+- **Efficiency**: Assumed similar to Llama 3.1-405B (1.34×10⁻¹⁸ $/FLOP)
+- **Estimated Cost**: ~$1.4M
 
-ESM3-98B
-- We don not have much details about training cost beyond FLOPs at 1.07E24 from the [paper](https://www.science.org/doi/10.1126/science.ads0018)
-- If we assume same FLOP per dollar efficiency of [Llama 3.1-405B](https://epoch.ai/data/notable-ai-models) we get 1.34E-18 $/FLOP
-- So that is ~$1.4 million for ESM3 training
 </details>
