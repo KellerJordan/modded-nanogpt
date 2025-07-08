@@ -120,9 +120,18 @@ class Transformer(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_hidden_layers)])
 
-    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+            self,
+            x: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            **kwargs,
+        ) -> torch.Tensor:
         for layer in self.layers:
-            x = layer(x, attention_mask)
+            x = layer(
+                x=x,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
         return x
     
 
@@ -137,17 +146,29 @@ class UnetTransformer(nn.Module):
 
         self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_hidden_layers)])
 
-    def forward(self, x: torch.Tensor, ve: List[torch.Tensor], attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, ve: List[torch.Tensor], attention_mask: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
         x0 = x
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
         skip_connections = []
         for i in range(self.num_encoder_layers):
-            x = self.layers[i](x, attention_mask, ve_enc[i], x0)
+            x = self.layers[i](
+                x=x,
+                attention_mask=attention_mask,
+                ve=ve_enc[i],
+                x0=x0,
+                **kwargs,
+            )
             skip_connections.append(x)
         
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
-            x = self.layers[self.num_encoder_layers + i](x, attention_mask, ve_dec[i], x0)
+            x = self.layers[self.num_encoder_layers + i](
+                x=x,
+                attention_mask=attention_mask,
+                ve=ve_dec[i],
+                x0=x0,
+                **kwargs,
+            )
         return x
 
 
@@ -219,9 +240,18 @@ class PLM(PreTrainedModel):
         x = norm(x)
         if self.unet:
             ve = self.value_embeds(input_ids)
-            x = self.transformer(x, ve, attention_mask)
+            x = self.transformer(
+                x=x,
+                ve=ve,
+                attention_mask=attention_mask,
+                last_eos=last_eos,
+            )
         else:
-            x = self.transformer(x, attention_mask)
+            x = self.transformer(
+                x=x,
+                attention_mask=attention_mask,
+                last_eos=last_eos,
+            )
         return x
 
     def get_vector_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
