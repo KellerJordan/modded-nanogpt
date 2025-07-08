@@ -35,8 +35,8 @@ COPY requirements.txt .
 
 RUN pip install --upgrade pip setuptools && \
     # force-install torch built for CUDA 12.6
-    pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu126 && \
-    pip install -r requirements.txt
+    pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu128 -U && \
+    pip install -r requirements.txt -U
 
 # 5️⃣  Copy the rest of the source
 COPY . .
