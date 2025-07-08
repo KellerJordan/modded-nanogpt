@@ -401,7 +401,7 @@ class Trainer:
         if self.args.mask_rate_schedule:
             mask_rate_scheduler = LerpFloat(
                 start_val=self.args.starting_mask_rate, 
-                end_val=self.args.mask_rate,
+                end_val=self.args.mask_rate + 0.01,
                 precision=0.01
             )
         else:
