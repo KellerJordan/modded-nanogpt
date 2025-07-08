@@ -85,6 +85,7 @@ def arg_parser():
     parser.add_argument("--tie_embeddings", action="store_true", help="Tie embeddings")
     parser.add_argument("--unet", type=bool, default=True, help="Use UNet architecture")
     parser.add_argument("--token_dropout", type=bool, default=True, help="Use token dropout")
+    parser.add_argument("--bfloat16", action="store_true", help="Use bfloat16")
     
     # Data hyperparams
     parser.add_argument("--input_bin", type=str, default='data/omgprot50/omgprot50_train_*.bin', help="Input training bin files pattern")
@@ -329,11 +330,10 @@ class Trainer:
         self.print0("Initializing model...")
         model = PLM(self.model_config)
         self.print0(model)
-        model = model.cuda().bfloat16()
-        for m in model.modules():
-            if isinstance(m, Linear):
-                m.float()
-        
+        model = model.cuda()
+        if self.args.bfloat16:
+            model = model.bfloat16()
+            
         # Synchronize before compilation
         if self.ddp_world_size > 1:
             dist.barrier()
