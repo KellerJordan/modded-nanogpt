@@ -105,7 +105,7 @@ class PAttention(nn.Module):
         self.Pv = nn.Parameter(torch.randn(self.n_tokens, config.hidden_size))
 
     def act(self, x: torch.Tensor) -> torch.Tensor:
-        o = x / torch.norm(x, p=2, dim=-1, keepdim=True) * math.sqrt(x.shape[-1])
+        o = x / (torch.norm(x, p=2, dim=-1, keepdim=True) + 1e-3) * math.sqrt(x.shape[-1])
         o = F.gelu(o)
         return o
 
@@ -122,7 +122,7 @@ class PAttention(nn.Module):
         v = self.Pv # (n_tokens, d)
 
         attn_weight = q @ k.transpose(0, 1) # (Q_len, n_tokens)
-        #attn_weight *= attention_mask
+        attn_weight *= attention_mask
         attn_weight = self.act(attn_weight)
 
         y = attn_weight @ v # (Q_len, d)
