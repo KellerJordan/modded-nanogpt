@@ -104,6 +104,11 @@ class PAttention(nn.Module):
         self.Pk = nn.Parameter(torch.randn(self.n_tokens, config.hidden_size))
         self.Pv = nn.Parameter(torch.randn(self.n_tokens, config.hidden_size))
 
+    def act(self, x: torch.Tensor) -> torch.Tensor:
+        o = x / torch.norm(x, p=2, dim=-1, keepdim=True) * math.sqrt(x.shape[-1])
+        o = F.gelu(o)
+        return o
+
     def forward(self, x: torch.Tensor, last_eos: Optional[int] = None) -> torch.Tensor:
         if last_eos is None:
             last_eos = x.shape[1] - 1
@@ -116,11 +121,10 @@ class PAttention(nn.Module):
         k = self.Pk # (n_tokens, d)
         v = self.Pv # (n_tokens, d)
 
-        a_norm = F.normalize(q, p=2, dim=-1)
-        b_norm = F.normalize(k, p=2, dim=-1)
-        # get cosine sims
-        attn_weight = a_norm @ b_norm.transpose(0, 1) # (Q_len, n_tokens)
-        attn_weight *= attention_mask
+        attn_weight = q @ k.transpose(0, 1) # (Q_len, n_tokens)
+        #attn_weight *= attention_mask
+        attn_weight = self.act(attn_weight)
+
         y = attn_weight @ v # (Q_len, d)
         return y.unsqueeze(0) # (1, Q_len, d)
 
