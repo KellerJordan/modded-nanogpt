@@ -105,12 +105,25 @@ class TransformerBlock(nn.Module):
             attention_mask: Optional[torch.Tensor] = None,
             vi: Optional[torch.Tensor] = None,
             x0: Optional[torch.Tensor] = None,
+            last_eos: Optional[int] = None,
+            **kwargs,
         ) -> torch.Tensor:
         if self.unet:
             x = self.lambdas[0] * x + self.lambdas[1] * x0
-            x = x + self.attn(norm(x), attention_mask, vi)
+            x = x + self.attn(
+                x=norm(x),
+                attention_mask=attention_mask,
+                vi=vi,
+                last_eos=last_eos,
+                **kwargs,
+            )
         else:
-            x = x + self.attn(norm(x), attention_mask)
+            x = x + self.attn(
+                x=norm(x),
+                attention_mask=attention_mask,
+                last_eos=last_eos,
+                **kwargs,
+            )
         x = x + self.mlp(norm(x))
         return x
 
@@ -146,7 +159,13 @@ class UnetTransformer(nn.Module):
 
         self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_hidden_layers)])
 
-    def forward(self, x: torch.Tensor, ve: List[torch.Tensor], attention_mask: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
+    def forward(
+            self,
+            x: torch.Tensor,
+            ve: List[torch.Tensor],
+            attention_mask: Optional[torch.Tensor] = None,
+            **kwargs,
+        ) -> torch.Tensor:
         x0 = x
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
         skip_connections = []
@@ -154,7 +173,7 @@ class UnetTransformer(nn.Module):
             x = self.layers[i](
                 x=x,
                 attention_mask=attention_mask,
-                ve=ve_enc[i],
+                vi=ve_enc[i],
                 x0=x0,
                 **kwargs,
             )
@@ -165,7 +184,7 @@ class UnetTransformer(nn.Module):
             x = self.layers[self.num_encoder_layers + i](
                 x=x,
                 attention_mask=attention_mask,
-                ve=ve_dec[i],
+                vi=ve_dec[i],
                 x0=x0,
                 **kwargs,
             )

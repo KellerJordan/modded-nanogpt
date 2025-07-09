@@ -104,27 +104,23 @@ class PAttention(nn.Module):
         self.Pk = nn.Parameter(torch.randn(self.n_tokens, config.hidden_size))
         self.Pv = nn.Parameter(torch.randn(self.n_tokens, config.hidden_size))
 
-    def act(self, x: torch.Tensor) -> torch.Tensor:
-        norm_outputs = x / torch.norm(x, p=2, dim=-1, keepdim=True) * math.sqrt(x.shape[-1])
-        nonlinear_outputs = F.gelu(norm_outputs)
-        return nonlinear_outputs
-
     def forward(self, x: torch.Tensor, last_eos: Optional[int] = None) -> torch.Tensor:
         if last_eos is None:
             last_eos = x.shape[1] - 1
         Q_len, d = x.size() # batch size must be 1 for FlexAttention
 
-        attention_mask = torch.ones(Q_len, self.n_tokens)
+        attention_mask = torch.ones(Q_len, self.n_tokens, device=x.device)
         attention_mask[:last_eos, :] = 0
 
         q = self.Wq(x) # (Q_len, d)
         k = self.Pk # (n_tokens, d)
         v = self.Pv # (n_tokens, d)
 
-        attn_weight = q @ k.transpose(0, 1) # (Q_len, n_tokens)
+        a_norm = F.normalize(q, p=2, dim=-1)
+        b_norm = F.normalize(k, p=2, dim=-1)
+        # get cosine sims
+        attn_weight = a_norm @ b_norm.transpose(0, 1) # (Q_len, n_tokens)
         attn_weight *= attention_mask
-
-        attn_weight = self.act(attn_weight)
         y = attn_weight @ v # (Q_len, d)
         return y.unsqueeze(0) # (1, Q_len, d)
 
@@ -152,6 +148,7 @@ class MultiHeadPAttention(nn.Module):
             attention_mask: Optional[torch.Tensor] = None,
             vi: Optional[torch.Tensor] = None,
             last_eos: Optional[int] = None,
+            **kwargs,
         ) -> torch.Tensor:
         # attention mask already prepped for sdpa shape (bs, 1, seq_len, seq_len)
         l, d = x.size()
