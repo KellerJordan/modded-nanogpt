@@ -110,7 +110,7 @@ class PAttention(nn.Module):
         Q_len, d = x.size() # batch size must be 1 for FlexAttention
 
         attention_mask = torch.ones(Q_len, self.n_tokens, device=x.device)
-        attention_mask[:last_eos, :] = 0
+        attention_mask[last_eos:, :] = 0
 
         q = self.Wq(x) # (Q_len, d)
         k = self.Pk # (n_tokens, d)
