@@ -88,9 +88,9 @@ def arg_parser():
     parser.add_argument("--bfloat16", action="store_true", help="Use bfloat16")
     
     # Data hyperparams
-    parser.add_argument("--input_bin", type=str, default='data/omgprot50/omgprot50_train_*.bin', help="Input training bin files pattern")
-    parser.add_argument("--input_valid_bin", type=str, default='data/omgprot50/omgprot50_valid_*.bin', help="Input validation bin files pattern")
-    parser.add_argument("--input_test_bin", type=str, default='data/omgprot50/omgprot50_test_*.bin', help="Input test bin files pattern")
+    parser.add_argument("--input_bin", type=str, default='data/omg_prot50/omg_prot50_train_*.bin', help="Input training bin files pattern")
+    parser.add_argument("--input_valid_bin", type=str, default='data/omg_prot50/omg_prot50_valid_*.bin', help="Input validation bin files pattern")
+    parser.add_argument("--input_test_bin", type=str, default='data/omg_prot50/omg_prot50_test_*.bin', help="Input test bin files pattern")
     parser.add_argument("--mlm", type=bool, default=False, help="Use masked language modeling")
     parser.add_argument("--mask_rate", type=float, default=0.2, help="Mask rate for masked language modeling")
     parser.add_argument("--starting_mask_rate", type=float, default=0.1, help="Starting mask rate for masked language modeling")
@@ -401,7 +401,7 @@ class Trainer:
         if self.args.mask_rate_schedule:
             mask_rate_scheduler = LerpFloat(
                 start_val=self.args.starting_mask_rate, 
-                end_val=self.args.mask_rate + 0.01,
+                end_val=self.args.mask_rate,
                 precision=0.01
             )
         else:
@@ -561,10 +561,17 @@ class Trainer:
                 timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
                 frac_done = step / self.args.num_steps  # training progress
-                self.sliding_window_size = self.sliding_window_size_scheduler(frac_done)
+                if frac_done > 1:
+                    self.sliding_window_size = self.args.max_length
+                else:
+                    self.sliding_window_size = self.sliding_window_size_scheduler(frac_done)
+                
                 if self.mask_rate_scheduler:
                     frac_done_mask = step / self.args.mask_rate_steps
-                    mask_rate = self.mask_rate_scheduler(frac_done_mask)
+                    if frac_done_mask > 1:
+                        mask_rate = self.args.mask_rate
+                    else:
+                        mask_rate = self.mask_rate_scheduler(frac_done_mask)
                     self.current_mask_rate = mask_rate
                     self.train_loader.set_mask_rate(mask_rate)
 
@@ -685,7 +692,7 @@ if __name__ == '__main__':
         args.num_att_tokens = 128
         args.expansion_ratio = 2.0
         args.soft_logit_cap = 16.0
-        args.p_attention = False
+        args.p_attention = True
         args.tie_embeddings = False
         args.unet = True
         args.batch_size = 2048
