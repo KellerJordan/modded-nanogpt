@@ -87,6 +87,13 @@ def arg_parser():
     parser.add_argument("--token_dropout", type=bool, default=True, help="Use token dropout")
     parser.add_argument("--bfloat16", action="store_true", help="Use bfloat16")
     
+    # MHMoE hyperparams
+    parser.add_argument("--use_mhmoe", type=bool, default=False, help="Use Multi-Head Mixture of Experts")
+    parser.add_argument("--moe_num_heads", type=int, default=4, help="Number of heads in MHMoE")
+    parser.add_argument("--moe_num_experts", type=int, default=8, help="Number of experts in MHMoE")
+    parser.add_argument("--topk", type=int, default=2, help="Top-k experts to use in MHMoE")
+    parser.add_argument("--load_balancing_loss_weight", type=float, default=0.01, help="Weight for load balancing loss in MHMoE")
+    
     # Data hyperparams
     parser.add_argument("--input_bin", type=str, default='data/omg_prot50/omg_prot50_train_*.bin', help="Input training bin files pattern")
     parser.add_argument("--input_valid_bin", type=str, default='data/omg_prot50/omg_prot50_valid_*.bin', help="Input validation bin files pattern")
@@ -702,6 +709,11 @@ if __name__ == '__main__':
         args.max_length = 512
         args.auto_grad_clip = True
         args.grad_clip = 0.0  # Disable regular grad clip for bugfix testing
+        args.use_mhmoe = True
+        args.moe_num_heads = 2
+        args.moe_num_experts = 4
+        args.topk = 2
+        args.load_balancing_loss_weight = 0.01
 
     # Validate gradient clipping arguments
     if args.auto_grad_clip and args.grad_clip > 0:
@@ -721,6 +733,11 @@ if __name__ == '__main__':
         tie_embeddings=args.tie_embeddings,
         unet=args.unet,
         mlm=args.mlm,
+        use_mhmoe=args.use_mhmoe,
+        moe_num_heads=args.moe_num_heads,
+        moe_num_experts=args.moe_num_experts,
+        topk=args.topk,
+        load_balancing_loss_weight=args.load_balancing_loss_weight,
     )
 
     # Initialize wandb before clearing tokens for security

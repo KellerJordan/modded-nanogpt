@@ -8,7 +8,7 @@ from transformers.modeling_outputs import ModelOutput
 
 from model.attention import SelfAttention, MultiHeadPAttention
 from model.utils import norm
-from model.mlp import MLP
+from model.mlp import MLP, MHMoE
 
 
 @dataclass
@@ -30,6 +30,11 @@ class PLMConfig(PretrainedConfig):
         unet: bool = False,
         mlm: bool = False,
         token_dropout: bool = True,
+        use_mhmoe: bool = False,
+        moe_num_heads: int = 4,
+        moe_num_experts: int = 8,
+        topk: int = 2,
+        load_balancing_loss_weight: float = 0.01,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -48,6 +53,11 @@ class PLMConfig(PretrainedConfig):
         self.unet = unet
         self.mlm = mlm
         self.token_dropout = token_dropout
+        self.use_mhmoe = use_mhmoe
+        self.moe_num_heads = moe_num_heads
+        self.moe_num_experts = moe_num_experts
+        self.topk = topk
+        self.load_balancing_loss_weight = load_balancing_loss_weight
 
 
 @dataclass
@@ -95,7 +105,13 @@ class TransformerBlock(nn.Module):
             self.attn = MultiHeadPAttention(config)
         else:
             self.attn = SelfAttention(config)
-        self.mlp = MLP(config)
+        
+        # Use MHMoE if configured, otherwise use standard MLP
+        if config.use_mhmoe:
+            self.mlp = MHMoE(config)
+        else:
+            self.mlp = MLP(config)
+            
         self.unet = config.unet
         if config.unet:
             self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
@@ -127,6 +143,12 @@ class TransformerBlock(nn.Module):
             )
         x = x + self.mlp(norm(x))
         return x
+    
+    def get_load_balancing_loss(self) -> Optional[torch.Tensor]:
+        """Get load balancing loss from MHMoE layer if present."""
+        if hasattr(self.mlp, 'load_balancing_loss'):
+            return self.mlp.load_balancing_loss
+        return None
 
 
 class Transformer(nn.Module):
@@ -148,6 +170,18 @@ class Transformer(nn.Module):
             )
         return x
     
+    def get_load_balancing_loss(self) -> Optional[torch.Tensor]:
+        """Collect load balancing losses from all transformer blocks."""
+        losses = []
+        for layer in self.layers:
+            loss = layer.get_load_balancing_loss()
+            if loss is not None:
+                losses.append(loss)
+        
+        if losses:
+            return torch.stack(losses).sum()
+        return None
+
 
 class UnetTransformer(nn.Module):
     def __init__(self, config: PLMConfig):
@@ -190,6 +224,18 @@ class UnetTransformer(nn.Module):
                 **kwargs,
             )
         return x
+    
+    def get_load_balancing_loss(self) -> Optional[torch.Tensor]:
+        """Collect load balancing losses from all transformer blocks."""
+        losses = []
+        for layer in self.layers:
+            loss = layer.get_load_balancing_loss()
+            if loss is not None:
+                losses.append(loss)
+        
+        if losses:
+            return torch.stack(losses).sum()
+        return None
 
 
 class PLM(PreTrainedModel):
@@ -222,6 +268,7 @@ class PLM(PreTrainedModel):
             self.lm_head.decoder.weight = self.embedding.weight
 
         self.mlm = config.mlm
+        self.load_balancing_loss_weight = config.load_balancing_loss_weight
         self.ce = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
 
     def get_last_hidden_state(self, input_ids: torch.Tensor, sliding_window_size: int) -> torch.Tensor: # (l,)
@@ -310,9 +357,13 @@ class PLM(PreTrainedModel):
             lm_logits.view(-1, self.vocab_size),
             labels.view(-1).long()
         )
-        #if self.training and not self.mlm:
-        #    loss = loss / mask_rate
-
+        
+        # Add load balancing loss if using MHMoE
+        if self.config.use_mhmoe:
+            load_balancing_loss = self.transformer.get_load_balancing_loss()
+            if load_balancing_loss is not None:
+                loss = loss + self.load_balancing_loss_weight * load_balancing_loss
+        
         return loss
 
 
@@ -322,16 +373,28 @@ if __name__ == "__main__":
     config = PLMConfig(
         hidden_size=768,
         num_attention_heads=6,
-        num_hidden_layers=24,
-        expansion_ratio=8/3,
+        num_hidden_layers=6,
+        expansion_ratio=2,
         unet=True,
+        use_mhmoe=True,
     )
     model = PLM(config).cuda()
     summary(model)
 
-    input_ids = torch.randint(0, 33, (1, 100)).cuda()
-    output = model(input_ids)
-    print(f"loss: {output.loss}")
-    print(f"logits: {output.logits[0].shape}")
-    print(f"labels: {output.logits[1].shape}")
-    print(f"last_hidden_state: {output.last_hidden_state.shape}")
+    input_ids = torch.randint(0, 33, (100,)).cuda()
+    labels = torch.randint(0, 33, (100,)).cuda()
+    mask_rate = torch.tensor(0.1).cuda()
+    loss = model(
+        input_ids=input_ids,
+        labels=labels,
+        mask_rate=mask_rate,
+    )
+    print(f"loss: {loss}")
+    
+    # Test get_last_hidden_state separately
+    last_hidden_state = model.get_last_hidden_state(input_ids, model.sliding_window_size)
+    print(f"last_hidden_state shape: {last_hidden_state.shape}")
+    
+    # Test get_vector_embeddings
+    vector_embeddings = model.get_vector_embeddings(input_ids)
+    print(f"vector_embeddings shape: {vector_embeddings.shape}")
