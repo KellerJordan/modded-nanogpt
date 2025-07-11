@@ -135,13 +135,16 @@ class TransformerBlock(nn.Module):
                 **kwargs,
             )
         else:
+            print(f'x before attn: {x.shape}')
             x = x + self.attn(
                 x=norm(x),
                 attention_mask=attention_mask,
                 last_eos=last_eos,
                 **kwargs,
             )
+            print(f'x after attn: {x.shape}')
         x = x + self.mlp(norm(x))
+        print(f'x after mlp: {x.shape}')
         return x
     
     def get_load_balancing_loss(self) -> Optional[torch.Tensor]:
@@ -371,15 +374,17 @@ if __name__ == "__main__":
     # py -m model.model
     from torchinfo import summary
     config = PLMConfig(
-        hidden_size=768,
+        hidden_size=768,   
         num_attention_heads=6,
         num_hidden_layers=6,
         expansion_ratio=2,
-        unet=True,
-        use_mhmoe=True,
+        unet=False,
+        use_mhmoe=False,
+        add_att_soft_cap=False,
     )
     model = PLM(config).cuda()
-    summary(model)
+    #summary(model)
+    model = torch.compile(model)
 
     input_ids = torch.randint(0, 33, (100,)).cuda()
     labels = torch.randint(0, 33, (100,)).cuda()
