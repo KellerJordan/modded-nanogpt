@@ -7,7 +7,8 @@ from transformers import EsmTokenizer, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from model.attention import SelfAttention, MultiHeadPAttention
-from model.utils import norm, MLP
+from model.utils import norm
+from model.mlp import MLP
 
 
 @dataclass

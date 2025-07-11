@@ -17,16 +17,3 @@ class Linear(nn.Linear):
 
 def correction_fn(expansion_ratio: float, d_model: int) -> int:
     return int(((expansion_ratio * d_model) + 255) // 256 * 256)
-
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        corrected_dim = correction_fn(config.expansion_ratio, config.hidden_size)
-        self.up = Linear(config.hidden_size, corrected_dim)
-        self.down = Linear(corrected_dim, config.hidden_size)
-        self.down.weight.data.zero_()
-        self.relu = nn.ReLU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(self.relu(self.up(x)).square())
