@@ -516,8 +516,8 @@ def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch
     boundary_positions = torch.nonzero(boundary_mask, as_tuple=False).squeeze(-1) + pos
     start = boundary_positions[0].item()
     starts = []
-    for i in range(len(boundary_positions) - 1):
-        end = boundary_positions[i + 1].item() 
+    for i in range(1, len(boundary_positions)):
+        end = boundary_positions[i].item() 
         if end - start >= local_batch_size:
             starts.append(start) # append start once end pos is confirmed
             if len(starts) == dist.get_world_size():
