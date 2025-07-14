@@ -152,6 +152,7 @@ class CausalSelfAttention(nn.Module):
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = 0.12
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask, lambdas: Tensor):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -161,9 +162,9 @@ class CausalSelfAttention(nn.Module):
         q, k = self.rotary(q), self.rotary(k)
         v = norm(v)
         if ve is not None:
-            v = lambdas[0] * v + lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
-            v = lambdas[0] * v
+            v = self.lambdas[0] * v
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, self.qkvo_w[3].bfloat16())
@@ -188,9 +189,10 @@ class Block(nn.Module):
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
         self.mlp = MLP(dim)
+        self.lambdas = nn.Parameter(torch.tensor([1.0, 0.0]))
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask, lambdas: Tensor, sa_lambdas: Tensor):
-        x = lambdas[0] * x + lambdas[1] * x0
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
             x = x + self.attn(x, ve, block_mask, sa_lambdas)
         x = x + self.mlp(norm(x))
@@ -215,11 +217,7 @@ class GPT(nn.Module):
         self.lm_head_w = nn.Parameter(torch.zeros(next_multiple_of_n(vocab_size, n=128), model_dim))
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
-        self.scalars = nn.Parameter(torch.cat([
-            torch.ones(num_layers), # skip_weights
-            *[torch.tensor([1.0, 0.0]) for _ in range(num_layers)], # block lambdas
-            *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)], # SA lambdas
-        ]))
+        self.skip_weights = nn.Parameter(torch.ones(num_layers)) # skip_weights
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
@@ -412,9 +410,9 @@ for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
 # collect the parameters to optimize
-hidden_matrix_params = sorted((p for p in model.blocks.parameters() if p.ndim >= 2), key=lambda x: x.size(), reverse=True)
+hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
 embed_params = [*model.embed.parameters(), *model.value_embeds.parameters()]
-scalar_params = [model.scalars]
+scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params: list[nn.Parameter] = [model.lm_head_w]
 # sanity check
 params_collections = [hidden_matrix_params, embed_params, scalar_params, head_params]
