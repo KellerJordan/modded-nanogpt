@@ -113,7 +113,6 @@ class Muon(torch.optim.Optimizer):
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
-@torch.no_grad()
 def init_linear(w: Tensor):
     std = 0.5 * (w.size(-1) ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
     bound = (3 ** 0.5) * std
@@ -186,8 +185,7 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
         super().__init__()
-        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
+        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len)
         self.mlp = MLP(dim)
         self.lambdas = nn.Parameter(torch.tensor([1.0, 0.0]))
 
@@ -268,35 +266,25 @@ class GPT(nn.Module):
         assert len(ve) == len(self.blocks)
 
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
-        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, 
+                       short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
         assert len(block_masks) == len(self.blocks)
 
         x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
-
-        skip_connections = []
-        skip_map = {
-            9: 6,
-            10: 4,
-            11: 2,
-        }
-        skip_weights = self.skip_weights
-        for i in range(len(self.blocks)):
-            if i in skip_map:
-                x = x + skip_weights[skip_map[i]] * skip_connections[skip_map[i]]
-            x = self.blocks[i](x, ve[i], x0, block_masks[i])
-            skip_connections.append(x)
-
+        for i, block in enumerate(self.blocks):
+            x = block(x, ve[i], x0, block_masks[i])
         x = norm(x)
+
         if self.training:
-            logits: Tensor = F.linear(x.flatten(end_dim=1), self.lm_head_w.bfloat16()).float()
+            logits = F.linear(x.flatten(end_dim=1), self.lm_head_w.bfloat16()).float()
             loss = F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq)
             return loss
-
-        loss = 0
-        for i in range(4):
-            logits: Tensor = F.linear(x.flatten(end_dim=1).chunk(4)[i], self.lm_head_w.bfloat16()).float()
-            loss += F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq.chunk(4)[i]) / 4
-        return loss
+        else:
+            loss = 0
+            for i in range(4):
+                logits = F.linear(x.flatten(end_dim=1).chunk(4)[i], self.lm_head_w.bfloat16()).float()
+                loss += F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq.chunk(4)[i]) / 4
+            return loss
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
