@@ -511,23 +511,22 @@ def _load_data_shard(file: Path):
     return tokens
 
 # find world_size starting indicies, such that each begins with token 50256 and local_batches don't overlap
-def find_batch_starts(tokens: Tensor, pos: int, world_size: int, local_batch_size: int, max_batch_span: int):
-    boundary_mask = tokens[pos:pos+max_batch_span] == 50256
+def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int):
+    boundary_mask = tokens[pos : pos + max_batch_span] == 50256
     boundary_positions = torch.nonzero(boundary_mask, as_tuple=False).squeeze(-1) + pos
     start = boundary_positions[0].item()
-
     starts = []
-    batch_end=None
+    batch_end = None
     for i in range(len(boundary_positions) - 1):
         end = boundary_positions[i + 1].item() 
         if end - start >= local_batch_size:
             starts.append(start) # append start once end pos is confirmed
-            if len(starts) == world_size:
+            if len(starts) == dist.get_world_size():
                 batch_end = end
                 break
             start = end
     assert batch_end is not None # increase max_batch_span if necessary
-    batch_span = batch_end-pos
+    batch_span = batch_end - pos
     return starts, batch_span
 
 def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
@@ -539,12 +538,12 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
     file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
     tokens, pos = _load_data_shard(next(file_iter)), 0
     batch_span = batch_size
-    max_batch_span = 2*batch_size if align_to_bos else batch_size #provide buffer to handle samples up to length local_batch_size
+    max_batch_span = 2 * batch_size if align_to_bos else batch_size # provide buffer to handle samples up to length local_batch_size
     while True:
         if pos + max_batch_span + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
         if align_to_bos:
-            batch_starts, batch_span = find_batch_starts(tokens, pos, world_size, local_batch_size, max_batch_span)
+            batch_starts, batch_span = find_batch_starts(tokens, pos, local_batch_size, max_batch_span)
             start_idx = batch_starts[rank]
         else:
             start_idx = pos + rank * local_batch_size
@@ -665,7 +664,7 @@ model: nn.Module = torch.compile(model, dynamic=False)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.seq_len, rank, world_size, align_to_bos=True)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size, align_to_bos=True)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(1)).backward()
