@@ -175,7 +175,7 @@ class Muon(torch.optim.Optimizer):
                 if base_i + rank < len(params):
                     grad = params[base_i + rank].grad
                 # This gives strange dynamo warnings
-                reduce_scatter_futures.append(dist.reduce_scatter(grad, grad_pad[base_i:base_i + world_size]).get_future())
+                reduce_scatter_futures.append(dist.reduce_scatter(grad, grad_pad[base_i:base_i + world_size], op=dist.ReduceOp.AVG, async_op=True).get_future())
 
         idx = 0
         for group in self.param_groups:
