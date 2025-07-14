@@ -100,6 +100,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 21 | 3.014 minutes | 21st record with latest torch | 05/24/25 | [log](records/052425_StableTorch/89d9f224-3b01-4581-966e-358d692335e0.txt) | not a new record, just re-timing #21 with latest torch
 22 | 2.990 minutes | [Faster gradient all-reduce](https://x.com/KonstantinWille/status/1927137223238909969) | 05/24/25 | [log](records/052425_FasterReduce/23f40b75-06fb-4c3f-87a8-743524769a35.txt) | @KonstantinWilleke, @alexrgilbert, @adricarda, @tuttyfrutyee, @vdlad; The Enigma project
 23 | 2.979 minutes | Overlap computation and gradient communication | 05/25/25 | [log](records/052525_EvenFasterReduce/6ae86d05-5cb2-4e40-a512-63246fd08e45.txt) | @ryanyang0
+24 | 2.966 minutes | Replace gradient all_reduce with reduce_scatter | 05/30/25 | [log](records/053025_noallreduce/8054c239-3a18-499e-b0c8-dbd27cb4b3ab.txt) | @vagrawal
 
 ## Rules
 
