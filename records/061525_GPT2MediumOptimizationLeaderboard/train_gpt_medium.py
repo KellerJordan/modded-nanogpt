@@ -154,7 +154,7 @@ class CausalSelfAttention(nn.Module):
         self.attn_scale = 0.12
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
 
-    def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask, lambdas: Tensor):
+    def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         q, k, v = F.linear(x, self.qkvo_w[:3].flatten(end_dim=1).bfloat16()).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
@@ -191,10 +191,10 @@ class Block(nn.Module):
         self.mlp = MLP(dim)
         self.lambdas = nn.Parameter(torch.tensor([1.0, 0.0]))
 
-    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask, lambdas: Tensor, sa_lambdas: Tensor):
+    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
-            x = x + self.attn(x, ve, block_mask, sa_lambdas)
+            x = x + self.attn(x, ve, block_mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -279,13 +279,11 @@ class GPT(nn.Module):
             10: 4,
             11: 2,
         }
-        skip_weights = self.scalars[:len(self.blocks)]
-        lambdas = self.scalars[1 * len(self.blocks): 3 * len(self.blocks)].view(-1, 2)
-        sa_lambdas = self.scalars[3 * len(self.blocks): 5 * len(self.blocks)].view(-1, 2)
+        skip_weights = self.skip_weights
         for i in range(len(self.blocks)):
             if i in skip_map:
                 x = x + skip_weights[skip_map[i]] * skip_connections[skip_map[i]]
-            x = self.blocks[i](x, ve[i], x0, block_masks[i], lambdas[i], sa_lambdas[i])
+            x = self.blocks[i](x, ve[i], x0, block_masks[i])
             skip_connections.append(x)
 
         x = norm(x)
