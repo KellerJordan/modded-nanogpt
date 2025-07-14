@@ -1,3 +1,5 @@
+## New record 07/12/25
+
 1. Included engineering optimizations from https://github.com/KellerJordan/modded-nanogpt/pull/102 by @vagrawal
 2. Updated distributed_data_generator() to align to bos token for training data. Specifically: Added a helper function in the distributed data loader that returns the next {world_size} starting points, one for each gpu, such that points are spaced at least {local_batch_size} distance from each other, all start with a bos_token, keep same order, and skip the minimum number of tokens. Justification is right now a nontrivial number of samples start mid-sample, learning from mid-sample context is more challenging, and not having a bos_token in the intra-document context window may degrade attention sink behavior. Validation data kept consistent with prior records.
 3. As a follow-on from 2: Reduced number of iterations from 1770 to 1750, increased cooldown frac from 0.4 to 0.45, and decreased minimum lr schedule factor from 0.1 to 0.05.
@@ -23,3 +25,9 @@ print('acc:',torch.std_mean(torch.tensor(accs)))
 print('time:',torch.std_mean(torch.tensor(times)))
 # time: (tensor(0.0682), tensor(173.3594))
 ```
+
+## Retiming on 07/13/25
+
+The record was retimed using torch==2.9.0.dev20250713+cu126, yielding 171743ms. This will be the official time for the record.
+Note that this should not change the ML, so that the runs conducted in the older torch version still stand in terms of acquiring p-value on loss < 3.28.
+Also note that the retiming was with a refactored version of the code.
