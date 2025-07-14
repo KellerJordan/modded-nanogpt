@@ -101,7 +101,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 22 | 2.990 minutes | [Faster gradient all-reduce](https://x.com/KonstantinWille/status/1927137223238909969) | 05/24/25 | [log](records/052425_FasterReduce/23f40b75-06fb-4c3f-87a8-743524769a35.txt) | @KonstantinWilleke, @alexrgilbert, @adricarda, @tuttyfrutyee, @vdlad; The Enigma project
 23 | 2.979 minutes | Overlap computation and gradient communication | 05/25/25 | [log](records/052525_EvenFasterReduce/6ae86d05-5cb2-4e40-a512-63246fd08e45.txt) | @ryanyang0
 24 | 2.966 minutes | Replace gradient all_reduce with reduce_scatter | 05/30/25 | [log](records/053025_noallreduce/8054c239-3a18-499e-b0c8-dbd27cb4b3ab.txt) | @vagrawal
-25 | 2.896 minutes | Upgrade torch to 2.9.0.dev20250713+cu126 | 07/13/25 | [log](records/071325_UpgradeTorch190/692f80e0-5e64-4819-97d4-0dc83b7106b9.txt ) | @kellerjordan0 (well really the PyTorch team)
+25 | 2.896 minutes | Upgrade torch to 2.9.0.dev20250713+cu126 | 07/13/25 | [log](records/071325_UpgradeTorch190/692f80e0-5e64-4819-97d4-0dc83b7106b9.txt ) | @kellerjordan0 on behalf of the PyTorch team
 
 ## Rules
 
