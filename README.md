@@ -102,7 +102,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 23 | 2.979 minutes | [Overlap computation and gradient communication](https://x.com/kellerjordan0/status/1927460573098262616) | 05/25/25 | [log](records/052525_EvenFasterReduce/6ae86d05-5cb2-4e40-a512-63246fd08e45.txt) | @ryanyang0
 24 | 2.966 minutes | Replace gradient all_reduce with reduce_scatter | 05/30/25 | [log](records/053025_noallreduce/8054c239-3a18-499e-b0c8-dbd27cb4b3ab.txt) | @vagrawal
 25 | 2.896 minutes | Upgrade PyTorch to 2.9.0.dev20250713+cu126 | 07/13/25 | [log](records/071325_UpgradeTorch190/692f80e0-5e64-4819-97d4-0dc83b7106b9.txt ) | @kellerjordan0 on behalf of PyTorch team
-26 | 2.863 minutes | Align training batch starts with EoS, increase cooldown frac .4 -> .45 | 07/13/25 | [log](records/071225_BosAlign/c1fd8a38-bb9f-45c4-8af0-d37f70c993f3.txt) | @ClassicLarry
+26 | 2.863 minutes | Align training batch starts with EoS, increase cooldown frac to .45 | 07/13/25 | [log](records/071225_BosAlign/c1fd8a38-bb9f-45c4-8af0-d37f70c993f3.txt) | @ClassicLarry
 
 ## Rules
 
