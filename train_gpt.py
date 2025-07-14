@@ -13,13 +13,12 @@ from pathlib import Path
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
-from torch import Tensor, nn, autocast
+from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-#import wandb
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -148,44 +147,45 @@ class Muon(torch.optim.Optimizer):
     Warning: This optimizer should not be used for the embedding layer, the final fully connected layer,
     or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
     """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, rank=0, world_size=1):
-        self.rank = rank
-        self.world_size = world_size
+    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
-
         params = list(params)
         sizes = {p.shape for p in params}
-
         # create one buffer per unique parameter-size
         param_groups = []
         for size in sizes:
             group_params = [p for p in params if p.shape == size]
-            param_groups.append(dict(params=group_params,))
+            param_groups.append(dict(params=group_params))
         super().__init__(param_groups, defaults)
 
     @torch.no_grad()
     def step(self):
-        futures: list[torch.Future] = []
+        # Efficient systems-wise implementation of step developed by @YouJiacheng,
+        # @KonstantinWilleke, @alexrgilbert, @adricarda, @tuttyfrutyee, @vdlad,
+        # @ryanyang0, and @vagrawal.
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
         reduce_scatter_futures: list[torch.Future] = []
+        all_reduce_futures: list[torch.Future] = []
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             grad = torch.empty_like(params[-1])
-            grad_pad = [param.grad for param in params] + [torch.zeros_like(params[-1])] * self.world_size
-            for base_i in range(0, len(params), self.world_size):
-                if base_i + self.rank < len(params):
-                    grad = params[base_i + self.rank].grad
+            grad_pad = [param.grad for param in params] + [torch.zeros_like(params[-1])] * world_size
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    grad = params[base_i + rank].grad
                 # This gives strange dynamo warnings
-                reduce_scatter_futures.append(dist.reduce_scatter(grad, grad_pad[base_i:base_i + self.world_size], op=dist.ReduceOp.AVG, async_op=True).get_future())
+                reduce_scatter_futures.append(dist.reduce_scatter(grad, grad_pad[base_i:base_i + world_size], op=dist.ReduceOp.AVG, async_op=True).get_future())
 
         idx = 0
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
-            params_pad = params + [torch.empty_like(params[-1])] * self.world_size
+            params_pad = params + [torch.empty_like(params[-1])] * world_size
             momentum = group["momentum"]
-            for base_i in range(0, len(params), self.world_size):
+            for base_i in range(0, len(params), world_size):
                 reduce_scatter_futures[idx].wait()
-                if base_i + self.rank < len(params):
-                    p = params[base_i + self.rank]
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
                     grad = p.grad
                     eff_lr = group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5 * getattr(p, "lr_mul", 1.0)
                     eff_weight_decay = group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)
@@ -199,39 +199,36 @@ class Muon(torch.optim.Optimizer):
                     v = zeropower_via_newtonschulz5(grad.bfloat16(), 5)
                     p.add_(other=v, alpha=-eff_lr)
                 idx += 1
-                futures.append(dist.all_gather(params_pad[base_i:base_i + self.world_size], params_pad[base_i + self.rank], async_op=True).get_future())
-        # TODO: Check if commenting it is dangerous
-        torch.futures.collect_all(futures).wait()
+                all_reduce_futures.append(dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank], async_op=True).get_future())
+        torch.futures.collect_all(all_reduce_futures).wait()
 
 class DistAdam(torch.optim.Optimizer):
-    def __init__(self, params, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01, rank: int = 0, world_size: int = 1):
+    def __init__(self, params, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         params = list(params)
         sizes = {p.shape for p in params}
-        self.rank = rank
-        self.world_size = world_size
-
         # create one buffer per unique parameter-size
         param_groups = []
         for size in sizes:
             group_params = [p for p in params if p.shape == size]
-            param_groups.append(dict(
-                params=group_params,
-            ))
+            param_groups.append(dict(params=group_params))
         super().__init__(param_groups, defaults)
+        # DistributedAdam implementation by @vagrawal
 
     @torch.compile
     @torch.no_grad()
     def step(self):
-        futures: list[torch.Future] = []
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
         reduce_scatter_futures: list[torch.Future] = []
+        all_reduce_futures: list[torch.Future] = []
         grad_slices = []
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             grad = torch.empty_like(params[-1])
             for base_i in range(len(params)):
                 grad = params[base_i].grad
-                rank_size = grad.shape[0] // self.world_size
+                rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
                 reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
                 grad_slices.append(grad_slice)
@@ -245,7 +242,7 @@ class DistAdam(torch.optim.Optimizer):
             for base in range(len(params)):
                 reduce_scatter_futures[idx].wait()
                 p = params[base]
-                rank_size = p.shape[0] // self.world_size
+                rank_size = p.shape[0] // world_size
                 p_slice = p[rank * rank_size:(rank + 1) * rank_size]
                 lr = group['lr'] * getattr(p, "lr_mul", 1.0)
                 state = self.state[p]
@@ -255,12 +252,10 @@ class DistAdam(torch.optim.Optimizer):
                     state['step'] = torch.tensor(0, dtype=torch.int64, device=p.device)
                     state['exp_avg'] = torch.zeros_like(p_slice)
                     state['exp_avg_sq'] = torch.zeros_like(p_slice)
-
                 exp_avg = state['exp_avg']
                 exp_avg_sq = state['exp_avg_sq']
                 state['step'] += 1
                 t = state['step']
-
                 # weight decay
                 if wd != 0:
                     eff_weight_decay = lr * wd * getattr(p, "wd_mul", 1.0)
@@ -268,20 +263,17 @@ class DistAdam(torch.optim.Optimizer):
                 # update running averages
                 exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
-
                 # bias corrections
                 bias1 = 1 - beta1 ** t
                 bias2 = 1 - beta2 ** t
-
                 # compute step
                 denom = exp_avg_sq.sqrt().add_(eps)
                 step_size = lr * (torch.sqrt(bias2) / bias1)
                 update = exp_avg.div(denom).mul_(step_size)
                 p_slice.add_(other=update, alpha=-1.0)
                 idx += 1
-                futures.append(dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future())
-        # TODO: Check if commenting it is dangerous
-        torch.futures.collect_all(futures).wait()
+                all_reduce_futures.append(dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future())
+        torch.futures.collect_all(all_reduce_futures).wait()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -400,30 +392,31 @@ def next_multiple_of_n(v: float | int, *, n: int):
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
         super().__init__()
+        vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
-        for param in self.embed.parameters():
-            param.lr_mul = 75.
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        for embeds in self.value_embeds:
-            for param in self.value_embeds.parameters():
-                param.lr_mul = 75.
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
-        self.lm_head.weight.lr_mul = 27.5
+        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
         self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
-        pad = (-num_layers * 5) % world_size
+        pad = (-num_layers * 5) % dist.get_world_size()
         self.scalars = nn.Parameter(torch.cat([
             torch.ones(num_layers), # skip_weights
             *[torch.tensor([1.0, 0.0]) for _ in range(num_layers)], # block lambdas
             *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)], # SA lambdas
             torch.ones(pad),
         ]))
+        # set learning rates
+        for param in self.embed.parameters():
+            param.lr_mul = 75.
+        for param in self.value_embeds.parameters():
+            param.lr_mul = 75.
+        self.lm_head.weight.lr_mul = 27.5
         self.scalars.lr_mul = 5.0
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
@@ -432,7 +425,6 @@ class GPT(nn.Module):
 
         def document_causal(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
-            #return causal_mask
             document_mask = docs[q_idx] == docs[kv_idx]
             return causal_mask & document_mask
 
@@ -518,7 +510,9 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, rank : int, world_size : int):
+def distributed_data_generator(filename_pattern: str, batch_size: int):
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
@@ -542,29 +536,26 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    train_seq_len = 48*1024 # FlexAttention sequence length
+    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
     num_iterations = 1770 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    # implementation
-    seq_len = 48*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     save_checkpoint = False
 args = Hyperparameters()
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
+assert world_size == 8 # this code is designed for 8xH100
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
-
-#if master_process:
-#    wandb.init(project="modded-nanogpt-tiny", name=f"run-{os.path.basename(__file__)}", save_code=True)
 
 # begin logging
 logfile = None
@@ -573,7 +564,7 @@ if master_process:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     print(logfile)
-def print0(s, console=True):
+def print0(s, console=False):
     if master_process:
         with open(logfile, "a") as f:
             if console:
@@ -589,11 +580,10 @@ print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.ve
 def nvidia_smi():
     import subprocess  # avoid top level import
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
-if master_process:
-    print0(nvidia_smi())
+print0(nvidia_smi())
 print0("="*100)
 
-model: nn.Module = GPT(vocab_size=next_multiple_of_n(50257, n=128), num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -609,38 +599,24 @@ head_params = [model.lm_head.weight]
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-
-optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, rank=rank, world_size=world_size)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, weight_decay=0.0)
+optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
+optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0)
 optimizers = [optimizer1, optimizer2]
-
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
-for n, p in model.named_parameters():
-    wd_mul = getattr(p, "wd_mul", 1.0)
-    lr_mul = getattr(p, "lr_mul", 1.0)
-
-    print0(f"{n}: {p.shape} {p.dtype} {wd_mul} {lr_mul}")
-
-# Count parameters
-total_params = sum(p.numel() for p in model.parameters())
-embedding_params = sum(p.numel() for n, p in model.named_parameters() if "embed" in n)
-non_embedding_params = total_params - embedding_params
-
-print0(f"")
-print0(f"Model parameters:")
-print0(f"  Total parameters: {total_params:,}")
-print0(f"  Embedding parameters: {embedding_params:,}")
-print0(f"  Non-embedding parameters: {non_embedding_params:,}")
-
 # learning rate schedule: stable then decay
 def get_lr(step: int):
     x = step / args.num_iterations # progress in training
-    assert 0 <= x <= 1
-    w = min((1 - x) / args.cooldown_frac, 1.0) # 1 -> 0
-    return w * 1.0 + (1 - w) * 0.1
+    assert 0 <= x < 1
+    if x < 1 - args.cooldown_frac:
+        return 1.0
+    else:
+        w = (1 - x) / args.cooldown_frac
+        return w * 1.0 + (1 - w) * 0.1
+
+# attention window size schedule: linearly increase
 @lru_cache(1)
 def get_window_size_blocks_helper(window_size: int):
     return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -654,38 +630,31 @@ def get_window_size_blocks(step: int):
 
 model: nn.Module = torch.compile(model, dynamic=False)
 
+########################################
+#            Warmup kernels            #
+########################################
+
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.seq_len, rank, world_size)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(1)).backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
-
-torch.cuda.synchronize()
-dist.barrier()
-with torch.profiler.profile() as prof:
-    for _ in range(warmup_steps):
-        inputs, targets = next(train_loader)
-        model(inputs, targets, get_window_size_blocks(1)).backward()
-        for opt in optimizers:
-            opt.step()
-    model.zero_grad(set_to_none=True)
-    torch.cuda.synchronize()
-    dist.barrier()
-os.makedirs("traces", exist_ok=True)
-prof.export_chrome_trace(f"traces/trace_{rank}.json")
-
-model.load_state_dict(initial_state['model'])
-for opt, opt_state in zip(optimizers, initial_state['optimizers']):
+model.load_state_dict(initial_state["model"])
+for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
 del train_loader, initial_state
 
-train_loader = distributed_data_generator(args.train_files, world_size * args.seq_len, rank, world_size)
+########################################
+#        Training and validation       #
+########################################
+
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -694,6 +663,7 @@ t0 = time.perf_counter()
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
+
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         # stop the clock
@@ -703,7 +673,7 @@ for step in range(train_steps + 1):
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
+        val_loader = distributed_data_generator(args.val_files, val_batch_size)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
@@ -712,8 +682,6 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        #if master_process:
-        #    wandb.log({"val/loss": val_loss}, step=step)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
@@ -735,10 +703,10 @@ for step in range(train_steps + 1):
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * get_lr(step)
-    frac = min(step / 300, 1)
     for group in optimizer2.param_groups:
+        frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-    # step the optimizers and schedulers
+    # step the optimizers
     for opt in optimizers:
         opt.step()
     # null the gradients
