@@ -285,16 +285,19 @@ class GPT(nn.Module):
         for i, block in enumerate(self.blocks):
             x = block(x, ve[i], x0, block_masks[i])
         x = norm(x)
+        x = x.flatten(end_dim=1)
 
         if self.training:
             logits = self.lm_head(x).float()
-            loss = F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq)
+            logits = 15 * logits * torch.rsqrt(logits.square() + 225)
+            loss = F.cross_entropy(logits, target_seq)
             return loss
         else:
             loss = 0
             for i in range(4):
-                logits = self.lm_head(x.flatten(end_dim=1).chunk(4)[i]).float()
-                loss += F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq.chunk(4)[i]) / 4
+                logits = self.lm_head(x.chunk(4)[i]).float()
+                logits = 15 * logits * torch.rsqrt(logits.square() + 225)
+                loss += F.cross_entropy(logits, target_seq.chunk(4)[i]) / 4
             return loss
 
 # -----------------------------------------------------------------------------
