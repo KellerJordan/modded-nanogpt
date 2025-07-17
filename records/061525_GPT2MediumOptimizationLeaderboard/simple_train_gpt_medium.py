@@ -334,7 +334,6 @@ class Hyperparameters:
     save_checkpoint = False
 args = Hyperparameters()
 
-run_id = int(os.environ.get("RUN_ID", 0))
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
@@ -348,9 +347,8 @@ master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 # begin logging
 if master_process:
-    run_id_full = f"{run_id:03d}_{uuid.uuid4()}"
     os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{run_id_full}.txt"
+    logfile = f"logs/{uuid.uuid4()}.txt"
     print(logfile)
 def print0(s, console=False):
     if master_process:
