@@ -150,9 +150,9 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 
 ### Important note about records 22-25
 
-Thanks to the statistical testing of [@agrawal](https://www.github.com/agrawal) (the holder of the 24th record), we know that record #23 and #24 actually attain a mean loss of 3.281, slightly above the 3.28 target.
-Complete adherence to the speedrun rules would therefore technically prevent these records from being accepted.
-However, I will be leaving them in place, for the following reason: (a) this difference in loss is most likely my own fault, and (b) it is most likely easily addressable.
+Thanks to the statistical testing of [@agrawal](https://www.github.com/agrawal) (holder of the 24th record), we have learned that records 23, 24, and in all likelihood 22 and 25, actually attain a mean loss of 3.281, which is slightly above the 3.28 target.
+Therefore if we were to completely adhere to the speedrun rules, we would have to deny that these are valid records.
+However, I will be leaving them in place, for the following reasons: (a) This difference in loss is most likely my own fault, and (b) it is most likely easily addressable.
 
 To explain: Records #22, #23, and #24 each change only the systems/implementation of the speedrun.
 Therefore the requirement to do statistical testing to confirm they hit the target was waived, since in theory they should have hit it automatically since they didn't touch the ML.
