@@ -398,10 +398,7 @@ adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_param
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
 optimizer2 = Muon(hidden_matrix_params, lr=0.025, weight_decay=0.01)
-optimizers: list[torch.optim.Optimizer] = [optimizer1, optimizer2]
-def opt_params(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
-    return [p for group in opt.param_groups for p in group["params"]]
-opt2params = {opt: opt_params(opt) for opt in optimizers}
+optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
@@ -500,10 +497,8 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(step)).backward()
-    opt2futures = {
-        opt: [dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future() for p in params]
-        for opt, params in opt2params.items()
-    }
+    for p in model.parameters():
+        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
@@ -513,7 +508,6 @@ for step in range(train_steps + 1):
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers
     for opt in optimizers:
-        torch.futures.collect_all(opt2futures[opt]).wait()
         opt.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
