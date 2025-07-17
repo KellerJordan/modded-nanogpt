@@ -154,7 +154,7 @@ Thanks to the statistical testing of [@agrawal](https://www.github.com/agrawal) 
 Therefore if we were to completely adhere to the speedrun rules, we would have to deny that these are valid records.
 However, we have decided to leave them in place as valid, because of the following two reasons: (a) the extra loss is most likely my (@kellerjordan0) own fault rather than that of the records, and (b) it is most likely easily addressable.
 
-Here's what happened: Records #22, #23, and #24 each change only the systems/implementation of the speedrun.
+Here's what happened: Records #22 to #25 each change only the systems/implementation of the speedrun.
 Therefore, the requirement to do statistical testing to confirm they hit the target was waived, since in theory they should have hit it automatically, by virtue of the fact that they didn't touch the ML (i.e., they didn't change the architecture, learning rate, etc.).
 
 So if these records shouldn't have changed the ML, what explains the regression in val loss?
