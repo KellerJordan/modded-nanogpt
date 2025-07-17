@@ -152,14 +152,14 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 
 Thanks to the statistical testing of [@agrawal](https://www.github.com/agrawal) (holder of the 24th record), we have learned that records 23, 24, and in all likelihood 22 and 25, actually attain a mean loss of 3.281, which is slightly above the 3.28 target.
 Therefore if we were to completely adhere to the speedrun rules, we would have to deny that these are valid records.
-However, we have decided to leave them in place as valid, because of the following two reasons: (a) the extra loss is most likely my own fault rather than that of the records, and (b) it is most likely easily addressable.
+However, we have decided to leave them in place as valid, because of the following two reasons: (a) the extra loss is most likely my (@kellerjordan0) own fault rather than that of the records, and (b) it is most likely easily addressable.
 
 Here's what happened: Records #22, #23, and #24 each change only the systems/implementation of the speedrun.
 Therefore, the requirement to do statistical testing to confirm they hit the target was waived, since in theory they should have hit it automatically, by virtue of the fact that they didn't touch the ML (i.e., they didn't change the architecture, learning rate, etc.).
 
 So if these records shouldn't have changed the ML, what explains the regression in val loss?
 We think that most likely, the answer is that this regression was indeed not introduced by any of these records. Instead, it was
-probably caused by my (@kellerjordan0) own non-record in which I retimed record #21 with newest torch,
+probably caused by my own non-record in which I retimed record #21 with newest torch,
 because in this non-record I also changed the constants used to cast the lm_head to fp8.
 I thought that this change should cause a (small) strict improvement, but apparently that was not the case.
 
