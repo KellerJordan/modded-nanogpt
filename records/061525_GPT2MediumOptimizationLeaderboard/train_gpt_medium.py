@@ -213,9 +213,6 @@ class GPT(nn.Module):
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head_w = nn.Parameter(torch.zeros(next_multiple_of_n(vocab_size, n=128), model_dim))
-        # Add learnable skip connection weights for decoder layers
-        assert num_layers % 2 == 0
-        self.skip_weights = nn.Parameter(torch.ones(num_layers)) # skip_weights
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
