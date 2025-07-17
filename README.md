@@ -152,17 +152,20 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 
 Thanks to the statistical testing of [@agrawal](https://www.github.com/agrawal) (holder of the 24th record), we have learned that records 23, 24, and in all likelihood 22 and 25, actually attain a mean loss of 3.281, which is slightly above the 3.28 target.
 Therefore if we were to completely adhere to the speedrun rules, we would have to deny that these are valid records.
-However, I will be leaving them in place, for the following reasons: (a) This difference in loss is most likely my own fault, and (b) it is most likely easily addressable.
+However, I will be leaving them in place, because of the following two reasons: (a) this difference in loss is most likely my own fault, and (b) it is most likely easily addressable.
 
-To explain: Records #22, #23, and #24 each change only the systems/implementation of the speedrun.
-Therefore the requirement to do statistical testing to confirm they hit the target was waived, since in theory they should have hit it automatically since they didn't touch the ML.
-So what explains the failure to hit the target?
-Most likely the regression was indeed not introduced by any of these records, but was instead introduced by my non-record in which I retimed record #21 with newest torch,
-in which I also changed the fp8 head casting constants. I thought that the change to these constants should be a strict improvement, but apparently that wasn't the case.
+Here's what happened: Records #22, #23, and #24 each change only the systems/implementation of the speedrun.
+Therefore, the requirement to do statistical testing to confirm they hit the target was waived, since in theory they should have hit it automatically, by virtue of the fact that they didn't touch the ML.
 
-Therefore, most likely each of records #22-24 could be easily made fully valid by simply reverting the change I made to those constants. So I'm going to leave them up as accepted records.
+So if these records shouldn't have changed the ML, what explains the regression?
+The answer is that we think that most likely, it was indeed not introduced by any of these records. Instead, the regression of 0.002 val loss was
+probably caused by my (@kellerjordan0) own non-record in which I retimed record #21 with newest torch,
+because in this non-record I also changed the constants used to cast the lm_head to fp8.
+I thought that the change I made should be a (small) strict improvement, but apparently that was not the case.
 
-Another nice thing is that fortunately record #26 brought the speedrun back into the green in terms of <3.28 loss, so (with high p-value) it should be in a good state now.
+Therefore, it is probable that each of records #22-24 could be easily made fully valid by simply reverting the change I had made to those constants. So I'm going to leave them up as accepted records.
+
+For future records, fortunately record #26 brought the speedrun back into the green in terms of <3.28 loss, so (with high p-value) it should be in a good state now.
 
 ---
 
