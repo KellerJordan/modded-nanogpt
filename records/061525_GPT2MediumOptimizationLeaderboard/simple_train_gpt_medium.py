@@ -118,6 +118,17 @@ def init_linear(w: Tensor):
     bound = (3 ** 0.5) * std
     return w.uniform_(-bound, bound)
 
+class Linear(nn.Linear):
+    def __init__(self, in_features, out_features, init_zero=True):
+        super().__init__(in_features, out_features)
+        if init_zero:
+            self.weight.data.zero_()
+        else:
+            init_linear(self.weight.data)
+    
+    def forward(self, x):
+        return F.linear(x, self.weight.bfloat16())
+
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
         super().__init__()
@@ -145,8 +156,8 @@ class CausalSelfAttention(nn.Module):
         hdim = num_heads * head_dim
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
-        self.qkvo_w = nn.Parameter(init_linear(torch.empty(4, hdim, dim)))
-        self.qkvo_w.detach()[3].zero_() # out zero init suggested by @Grad62304977
+        self.c_qkv = Linear(dim, hdim)
+        self.c_o = Linear(hdim, dim, init_zero=True) # out zero init suggested by @Grad62304977
         self.rotary = Rotary(head_dim, max_seq_len)
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
@@ -156,7 +167,7 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q, k, v = F.linear(x, self.qkvo_w[:3].flatten(end_dim=1).bfloat16()).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k, v = self.c_qkv(x).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         v = norm(v)
@@ -166,20 +177,20 @@ class CausalSelfAttention(nn.Module):
             v = self.lambdas[0] * v
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = F.linear(y, self.qkvo_w[3].bfloat16())
+        y = self.c_o(y)
         return y
 
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         hdim = 4 * dim
-        self.fc_w = nn.Parameter(init_linear(torch.empty(hdim, dim)))
-        self.proj_w = nn.Parameter(torch.zeros(dim, hdim))
+        self.c_fc = Linear(dim, hdim)
+        self.c_proj = Linear(hdim, dim, init_zero=True)
 
     def forward(self, x: Tensor):
-        x = F.linear(x, self.fc_w.bfloat16())
+        x = self.c_fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = F.linear(x, self.proj_w.bfloat16())
+        x = self.c_proj(x)
         return x
 
 class Block(nn.Module):
@@ -212,7 +223,7 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head_w = nn.Parameter(torch.zeros(next_multiple_of_n(vocab_size, n=128), model_dim))
+        self.lm_head = Linear(next_multiple_of_n(vocab_size, n=128), model_dim, init_zero=True)
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
@@ -273,13 +284,13 @@ class GPT(nn.Module):
         x = norm(x)
 
         if self.training:
-            logits = F.linear(x.flatten(end_dim=1), self.lm_head_w.bfloat16()).float()
+            logits = self.lm_head(x).float()
             loss = F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq)
             return loss
         else:
             loss = 0
             for i in range(4):
-                logits = F.linear(x.flatten(end_dim=1).chunk(4)[i], self.lm_head_w.bfloat16()).float()
+                logits = self.lm_head(x.flatten(end_dim=1).chunk(4)[i]).float()
                 loss += F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq.chunk(4)[i]) / 4
             return loss
 
