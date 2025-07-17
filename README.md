@@ -150,17 +150,19 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 
 ### Important note about records 22-25
 
-Thanks to the statistical testing of [@agrawal](https://www.github.com/agrawal) (who is the holder of the 24th record), we know that record #23 and #24 actually attain a mean loss of 3.281, which is slightly above the cutoff of 3.28.
-Technically, for complete adherence to the speedrun rules, this should invalidate the records.
-However, I will be leaving the records in place, because of the fact that this difference in loss is most likely (a) my own fault and (b) easily addressable.
-To explain: Records #22, #23, and #24 each change only the systems/implementation of the speedrun, without touching the ML (i.e., they don't touch the architecture, learning rate, etc.).
-Therefore, in theory they should not affect the mean loss at all, and as a result, the requirement to do statistical testing was waived for records #22 and #23.
-In fact, most likely the deltas of these records relative to the `train_gpt.py` that was in the repo at the time of their development indeed didn't change the loss!
-Instead, the fault most likely lies with a change I made to `train_gpt.py` during the retiming of record #21 with new torch. Specifically, I changed the constants used for the fp8
-casting of the lm_head.
-Therefore, most likely each of those records could be easily made fully valid by simply reverting those constants back to before I changed them.
-Therefore, they can all be accepted as legit records.
-Also, fortunately record #26 brought the speedrun back into the green in terms of <3.28 loss, so (with high p-value) it should be in a good state now.
+Thanks to the statistical testing of [@agrawal](https://www.github.com/agrawal) (the holder of the 24th record), we know that record #23 and #24 actually attain a mean loss of 3.281, slightly above the 3.28 target.
+Complete adherence to the speedrun rules would therefore technically prevent these records from being accepted.
+However, I will be leaving them in place, for the following reason: (a) this difference in loss is most likely my own fault, and (b) it is most likely easily addressable.
+
+To explain: Records #22, #23, and #24 each change only the systems/implementation of the speedrun.
+Therefore the requirement to do statistical testing to confirm they hit the target was waived, since in theory they should have hit it automatically since they didn't touch the ML.
+So what explains the failure to hit the target?
+Most likely the regression was indeed not introduced by any of these records, but was instead introduced by my non-record in which I retimed record #21 with newest torch,
+in which I also changed the fp8 head casting constants. I thought that the change to these constants should be a strict improvement, but apparently that wasn't the case.
+
+Therefore, most likely each of records #22-24 could be easily made fully valid by simply reverting the change I made to those constants. So I'm going to leave them up as accepted records.
+
+Another nice thing is that fortunately record #26 brought the speedrun back into the green in terms of <3.28 loss, so (with high p-value) it should be in a good state now.
 
 ---
 
