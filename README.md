@@ -155,7 +155,7 @@ Therefore if we were to completely adhere to the speedrun rules, we would have t
 However, I will be leaving them in place, because of the following two reasons: (a) the extra loss is most likely my own fault rather than that of the records, and (b) it is most likely easily addressable.
 
 Here's what happened: Records #22, #23, and #24 each change only the systems/implementation of the speedrun.
-Therefore, the requirement to do statistical testing to confirm they hit the target was waived, since in theory they should have hit it automatically, by virtue of the fact that they didn't touch the ML (i.e., they left the architecture, optimizer etc. untouched).
+Therefore, the requirement to do statistical testing to confirm they hit the target was waived, since in theory they should have hit it automatically, by virtue of the fact that they didn't touch the ML (i.e., they didn't change the architecture, learning rate, etc.).
 
 So if these records shouldn't have changed the ML, what explains the regression?
 The answer is that we think that most likely, it was indeed not introduced by any of these records. Instead, the regression of 0.002 val loss was
