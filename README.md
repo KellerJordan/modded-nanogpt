@@ -154,7 +154,7 @@ Based on [@agrawal](https://www.github.com/agrawal)'s testing, it seems that the
 This wasn't caught initially because these records include pure systems/implementation changes, so in theory shouldn't change the loss.
 And indeed, that seems most likely to be true - the change which increased the loss by 0.002 seems most likely to be during my own retiming of record #21 with latest torch,
 in which I also modified the constants used to cast the lm head to fp8 (in a way that I thought should be theoretically strictly better but this seems to possibly not be the case).
-Therefore each of these techically-slightly-invalid records could be easily transformed into a fully valid record, by just reverting my own mistaken changes to the lm_head fp8 casting constants.
+Therefore it is most likely that each of these techically-slightly-invalid records could be easily transformed into a fully valid record, by just reverting my own mistaken changes to the lm_head fp8 casting constants.
 
 ---
 
