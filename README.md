@@ -163,7 +163,7 @@ probably caused by my own non-record in which I retimed record #21 with newest t
 because in this non-record I also changed the constants used to cast the lm_head to fp8.
 I thought that this change should cause only a (small) strict improvement, but apparently that was not the case.
 
-Therefore, it is probable that each of records #22-24 could be easily made fully valid by simply reverting the change I made to those constants.
+Therefore, it is probable that each of records #22-25 could be easily made fully valid by simply reverting the change I made to those constants.
 Therefore they shall be upheld as valid records.
 
 For the future, fortunately record #26 brought the speedrun back into the green in terms of <3.28 loss, so (with high p-value) it should be in a good state now.
