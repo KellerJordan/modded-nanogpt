@@ -119,7 +119,7 @@ def init_linear(w: Tensor):
     return w.uniform_(-bound, bound)
 
 class Linear(nn.Linear):
-    def __init__(self, in_features, out_features, init_zero=True):
+    def __init__(self, in_features, out_features, init_zero=False):
         super().__init__(in_features, out_features, bias=False)
         if init_zero:
             self.weight.data.zero_()
