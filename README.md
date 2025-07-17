@@ -161,7 +161,7 @@ So if these records shouldn't have changed the ML, what explains the regression 
 We think that most likely, the answer is that this regression was indeed not introduced by any of these records. Instead, it was
 probably caused by my own non-record in which I retimed record #21 with newest torch,
 because in this non-record I also changed the constants used to cast the lm_head to fp8.
-I thought that this change should cause a (small) strict improvement, but apparently that was not the case.
+I thought that this change should cause only a (small) strict improvement, but apparently that was not the case.
 
 Therefore, it is probable that each of records #22-24 could be easily made fully valid by simply reverting the change I made to those constants.
 Therefore they shall be upheld as valid records.
