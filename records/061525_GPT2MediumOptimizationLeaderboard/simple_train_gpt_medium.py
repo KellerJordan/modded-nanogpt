@@ -156,7 +156,9 @@ class CausalSelfAttention(nn.Module):
         hdim = num_heads * head_dim
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
-        self.c_qkv = Linear(dim, hdim)
+        self.c_q = Linear(dim, hdim)
+        self.c_k = Linear(dim, hdim)
+        self.c_v = Linear(dim, hdim)
         self.c_o = Linear(hdim, dim, init_zero=True) # out zero init suggested by @Grad62304977
         self.rotary = Rotary(head_dim, max_seq_len)
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
@@ -167,7 +169,9 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q, k, v = self.c_qkv(x).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q = self.c_q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.c_k(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.c_v(x).view(B, T, self.num_heads, self.head_dim)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         v = norm(v)
@@ -202,8 +206,7 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        if self.attn is not None:
-            x = x + self.attn(x, ve, block_mask)
+        x = x + self.attn(x, ve, block_mask)
         x = x + self.mlp(norm(x))
         return x
 
