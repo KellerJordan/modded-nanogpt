@@ -226,7 +226,7 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = Linear(next_multiple_of_n(vocab_size, n=128), model_dim, init_zero=True)
+        self.lm_head = Linear(model_dim, next_multiple_of_n(vocab_size, n=128), init_zero=True)
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
