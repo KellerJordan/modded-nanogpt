@@ -120,7 +120,7 @@ def init_linear(w: Tensor):
 
 class Linear(nn.Linear):
     def __init__(self, in_features, out_features, init_zero=True):
-        super().__init__(in_features, out_features)
+        super().__init__(in_features, out_features, bias=False)
         if init_zero:
             self.weight.data.zero_()
         else:
