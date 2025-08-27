@@ -298,6 +298,23 @@ compared to Shampoo.
 
 ---
 
+## HellaSwag evaluation
+
+After creating a checkpoint by running `./run.sh` (need to first set `save_checkpoint=True` inside `train_gpt.py`), the performance of this checkpoint on the HellaSwag validation set (10042 tasks) can be calculated by running
+
+```bash
+pip install -r data/requirements.txt
+torchrun --standalone --nproc_per_node=8 data/hellaswag.py --checkpoint=logs/628218e5-c830-41a4-8664-57944595b0b6/state_step001750.pt
+```
+
+Most of the time spent by the script `data/hellaswag.py` is used to load the model and compile it if there is no compiled model in the PyTorch cache.
+
+The actual evaluation takes ~3 seconds on 8 x H100 GPUs. The script packs the 10042 HellaSwag tasks into 16 sequences (if val_seq_len is ~260k). Then, each of the 8 GPUs evaluates 2 sequences by using 1 forward pass per sequence.
+
+The HellaSwag accuracy of a checkpoint produced on August 27, 2025 was 0.292472. The checkpoint was produced using 1750 steps with a runtime of ~2.86 minutes on 8 x H100s and ~3.28 validation loss.
+
+---
+
 ## References
 
 1. [Guilherme Penedo et al. "The fineweb datasets: Decanting the web for the finest text data at scale." arXiv preprint arXiv:2406.17557 (2024).](https://arxiv.org/abs/2406.17557)
