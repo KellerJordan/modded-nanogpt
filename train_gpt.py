@@ -16,11 +16,13 @@ torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
-# use of FlexAttention contributed by @KoszarskyB
-from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+import numpy as np
 import triton
 import triton.language as tl
+from flash_attn_interface import flash_attn_func
+import torch._dynamo as dynamo
+dynamo.config.recompile_limit = 64
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -598,10 +600,9 @@ class CausalSelfAttention(nn.Module):
         self.attn_gate = CastedLinear(self.attn_gate_dim, num_heads)
         self.attn_gate.weight.detach().zero_()
 
-    def forward(self, x: Tensor, ve: Tensor | None, lambdas: Tensor, block_mask: BlockMask):
+    def forward(self, x: Tensor, ve: Tensor | None, lambdas: Tensor, bm_size: int):
         B, T = x.size(0), x.size(1) # batch size, sequence length
-        assert B == 1, "Must use batch size = 1 for FlexAttention"
-        
+
         q, k, v = F.linear(x, self.qkvo_w[:3].flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
@@ -609,7 +610,8 @@ class CausalSelfAttention(nn.Module):
             v = lambdas[0] * v + lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = lambdas[0] * v
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=0.12).transpose(1, 2)
+
+        y = flash_attn_func(q, k, v, softmax_scale=self.attn_scale, window_size=(bm_size, 0)) # use flash_attn over flex_attn @varunneal
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_dim])).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
@@ -643,10 +645,10 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
         self.mlp = MLP(dim)
 
-    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor, block_mask: BlockMask):
+    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor, bm_size: int):
         x = lambdas[0] * x + lambdas[1] * x0
         if self.attn is not None:
-            x = x + self.attn(norm(x), ve, sa_lambdas, block_mask)
+            x = x + self.attn(norm(x), ve, sa_lambdas, bm_size)
         x = x + self.mlp(norm(x))
         return x
 
@@ -687,59 +689,20 @@ class GPT(nn.Module):
         self.lm_head.weight.lr_mul = 1.0
         self.scalars.lr_mul = 5.0
 
-    def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
-        BLOCK_SIZE = 128
-        docs = (input_seq == 50256).cumsum(0)
 
-        def document_causal(b, h, q_idx, kv_idx):
-            causal_mask = q_idx >= kv_idx
-            document_mask = docs[q_idx] == docs[kv_idx]
-            return causal_mask & document_mask
-
-        def dense_to_ordered(dense_blockmask: Tensor):
-            num_blocks = dense_blockmask.sum(dim=-1, dtype=torch.int32)
-            indices = dense_blockmask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
-            return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
-
-        # manual block mask creation by @YouJiacheng
-        assert len(input_seq) % BLOCK_SIZE == 0
-        NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
-        block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
-        causal_blockmask_any = block_idx[:, None] >= block_idx
-        causal_blockmask_all = block_idx[:, None] > block_idx
-        docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
-        docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
-        document_blockmask_any = (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low)
-        document_blockmask_all = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
-        blockmask_any = causal_blockmask_any & document_blockmask_any
-        blockmask_all = causal_blockmask_all & document_blockmask_all
-        partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(blockmask_any & ~blockmask_all)
-        full_kv_num_blocks, full_kv_indices = dense_to_ordered(blockmask_all)
-        def build_bm(window_size_blocks: Tensor) -> BlockMask:
-            return BlockMask.from_kv_blocks(
-                torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(window_size_blocks - full_kv_num_blocks, 1)),
-                partial_kv_indices,
-                torch.clamp_max(full_kv_num_blocks, window_size_blocks - 1),
-                full_kv_indices,
-                BLOCK_SIZE=BLOCK_SIZE,
-                mask_mod=document_causal,
-            )
-        # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
-        return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
-
-    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
-        assert input_seq.ndim == 1
+    def forward(self, input_seq: Tensor, target_seq: Tensor, ws_long: int, ws_short: int):
+        assert input_seq.ndim == 2
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
         ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == len(self.blocks)
 
-        long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
-        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
-        assert len(block_masks) == len(self.blocks)
+        long_bm, short_bm = ws_long * args.bandwidth, ws_short * args.bandwidth
+        bm_sizes = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+        assert len(bm_sizes) == len(self.blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x = x0 = norm(self.embed(input_seq)) # use of norm here by @Grad62304977
 
         # U-net design by @brendanh0gan
         skip_connections = []
@@ -752,7 +715,7 @@ class GPT(nn.Module):
         for i in range(len(self.blocks)):
             if i >= n:
                 x = x + skip_weights[i - n] * skip_connections.pop()
-            x = self.blocks[i](x, ve[i], x0, lambdas[i], sa_lambdas[i], block_masks[i])
+            x = self.blocks[i](x, ve[i], x0, lambdas[i], sa_lambdas[i], bm_sizes[i])
             if i < n:
                 skip_connections.append(x)
 
@@ -760,7 +723,8 @@ class GPT(nn.Module):
         logits = self.lm_head(x).float()
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / 7.5)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction="sum" if self.training else "mean")
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq.view(-1),
+                               reduction="sum" if self.training else "mean")
         return loss
 
 # -----------------------------------------------------------------------------
@@ -778,46 +742,104 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-# find world_size starting indicies, such that each begins with token 50256 and local_batches don't overlap by @classiclarryd
-def find_batch_starts(tokens: Tensor, pos: int, seq_len: int, token_window: int):
-    boundary_mask = tokens[pos : pos + token_window] == 50256
-    boundary_positions = torch.nonzero(boundary_mask, as_tuple=False).squeeze(-1) + pos
-    start = boundary_positions[0].item()
-    starts = []
-    for i in range(1, len(boundary_positions)):
-        end = boundary_positions[i].item() 
-        if end - start >= seq_len:
-            starts.append(start) # append start once end pos is confirmed
-            if len(starts) == dist.get_world_size():
-                return starts, end - pos
-            start = end
-    assert False # increase token_window if necessary
+class EOSBatchFinder:
+    # Helper for getting sequences that start at the beginning of documents by @varunneal based on work by @classiclarryd
+    def __init__(self, tokens: Tensor, world_size: int = 1, eos_id: int = 50256):
+        # Precompute EOS positions once per shard
+        self.eos_idx = (tokens == eos_id).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        self.i = 0      # pointer into eos_idx (start EOS for next step)
+        self.pos = 0    # logical stream position within this shard
+        self.world_size = world_size
+    def seek(self, pos: int):
+        # Set pointer to the first EOS >= pos
+        self.i = np.searchsorted(self.eos_idx, pos)
+        if self.i >= len(self.eos_idx):
+            raise StopIteration("Seek past last EOS.")
+        self.pos = pos
+    def next_batch(self, batch_size_local: int, seq_len: int):
+        n = len(self.eos_idx)
+        if self.i >= n:
+            raise StopIteration("No more EOS in this shard.")
+        starts = [[] for _ in range(self.world_size)]
+        idx = self.i
+        cur = self.eos_idx[idx]  # EOS that ends the "previous" document; next doc starts at cur+1
+        for r in range(self.world_size):
+            for _ in range(batch_size_local):
+                start = cur + 1
+                target = start + seq_len                      # need seq_len tokens before next EOS
+                j = np.searchsorted(self.eos_idx, target)
+                if j >= n:
+                    raise StopIteration("Insufficient EOS ahead; hit tail of shard.")
+                starts[r].append(start)
+                idx = j
+                cur = self.eos_idx[idx]                  # next seq must also start at a new doc
+        advance = self.eos_idx[idx] - self.pos           # move stream to the last end
+        self.pos += advance
+        self.i = idx
+        return starts, advance
 
-def distributed_data_generator(filename_pattern: str, seq_len: int, grad_accum_steps: int, align_to_bos: bool):
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    batch_size = seq_len * world_size
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len: int, align_to_bos: bool = True):
+    # align_to_bos: each sequence begins with Beginning of Sequence token and sequences don't overlap
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    assert batch_size % world_size == 0, "Batch size must be divisible by world size"
+
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
-    file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
+    if not files:
+        raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
+
+    file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
     tokens, pos = _load_data_shard(next(file_iter)), 0
+
+    finder = EOSBatchFinder(tokens, world_size=world_size) if align_to_bos else None
+    if align_to_bos: finder.seek(pos)
+
     while True:
-        token_window = grad_accum_steps * (2 * batch_size if align_to_bos else batch_size) # provide buffer to handle samples up to length seq_len
-        if pos + token_window + 1 >= len(tokens):
-            tokens = _load_data_shard(next(file_iter))
-            pos = 0
-        for _ in range(grad_accum_steps):
-            if align_to_bos:
-                batch_starts, tokens_consumed = find_batch_starts(tokens, pos, seq_len, token_window)
-                start_idx = batch_starts[rank]
-            else:
-                tokens_consumed = batch_size
-                start_idx = pos + rank * seq_len
-            buf = tokens[start_idx:][:seq_len + 1]
-            inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
-            targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
-            pos += tokens_consumed
-            token_window -= tokens_consumed
-            yield inputs, targets
+        batch_size_local = batch_size // world_size
+        num_tokens_global = batch_size * seq_len
+
+        if not align_to_bos and pos + num_tokens_global + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+
+        if align_to_bos:
+            try:
+                batch_starts, batch_span = finder.next_batch(batch_size_local, seq_len)
+                start_idxs = batch_starts[rank]
+            except StopIteration:
+                # This shard is exhausted, load the next one in the next loop iteration.
+                tokens, pos = _load_data_shard(next(file_iter)), 0
+                finder = EOSBatchFinder(tokens, world_size=world_size)
+                continue
+
+            bufs = [tokens[s: s + seq_len + 1] for s in start_idxs]
+            buf = torch.stack(bufs, dim=0)
+            _inputs = buf[:, :-1]
+            _targets = buf[:, 1:]
+        else:
+            batch_span = num_tokens_global
+            start_pos_local = pos + rank * (batch_size_local * seq_len)
+            end_pos_local = start_pos_local + (batch_size_local * seq_len)
+
+            buf = tokens[start_pos_local: end_pos_local + 1]
+
+            _inputs = buf[:-1].view(batch_size_local, seq_len)
+            _targets = buf[1:].view(batch_size_local, seq_len)
+
+        new_params = yield (
+            _inputs.to(device="cuda", dtype=torch.int32, non_blocking=True),
+            _targets.to(device="cuda", dtype=torch.int64, non_blocking=True)
+        )
+
+        pos += batch_span
+
+        if new_params is not None:
+            # makes it possible for generator to recieve new (batch_size, seq_len) via .send()
+            new_batch_size, new_seq_len = new_params
+            assert new_batch_size % world_size == 0, "New batch size must be divisible by world size"
+            batch_size = new_batch_size
+            seq_len = new_seq_len
+
 
 # -----------------------------------------------------------------------------
 # int main
@@ -825,18 +847,23 @@ def distributed_data_generator(filename_pattern: str, seq_len: int, grad_accum_s
 @dataclass
 class Hyperparameters:
     # data
-    train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
-    val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
-    val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 48*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
+    train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
+    val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
+    val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    train_seq_len: int = 1024 * 2
+    train_batch_size: int = 24 * 8
+    val_seq_len: int = 4 * 64 * 1024 # Validation will be done with batch size = world_size.
     # optimization
-    num_iterations = 1695 # number of iterations to run
-    cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
+    num_iterations: int = 1695 # number of iterations to run
+    cooldown_frac: int = 0.45 # fraction of training spent cooling down the learning rate
     # evaluation and logging
-    run_id = uuid.uuid4()
-    val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    save_checkpoint = False
+    run_id: str = str(uuid.uuid4())
+    val_loss_every: int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    save_checkpoint: bool = False
+    # attention masking
+    bandwidth: int = 128
+    ws_schedule: tuple = (3, 7, 11)
+
 args = Hyperparameters()
 
 data_path = os.environ.get("DATA_PATH", ".")
@@ -876,13 +903,20 @@ print0("="*100)
 print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0(f"Running Triton version {triton.__version__}")
+
 def nvidia_smi():
     import subprocess  # avoid top level import
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
 print0("="*100)
 
-model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+model: nn.Module = GPT(
+    vocab_size=50257,
+    num_layers=12,
+    num_heads=6,
+    model_dim=768,
+    max_seq_len=max(args.train_seq_len, args.val_seq_len)
+).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -906,26 +940,15 @@ for opt in optimizers:
         group["initial_lr"] = group["lr"]
 
 # learning rate schedule: stable then decay
-def get_lr(step: int):
-    x = step / args.num_iterations # progress in training
+def get_lr_and_ws(step: int):
+    x = step / (1 + args.num_iterations) # progress in training
     assert 0 <= x < 1
-    if x < 1 - args.cooldown_frac:
-        return 1.0
-    else:
+    lr = 1.0
+    if x >= 1 - args.cooldown_frac:
         w = (1 - x) / args.cooldown_frac
-        return w * 1.0 + (1 - w) * 0.1
-
-# attention window size schedule: linearly increase
-@lru_cache(1)
-def get_window_size_blocks_helper(window_size: int):
-    return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-def get_window_size_blocks(step: int):
-    x = step / args.num_iterations # progress in training
-    assert 0 <= x <= 1
-    # Linearly increase the block-wise sliding window size over training 128 -> 1792
-    # increase by @fernbear.bsky.social; block-wise by @YouJiacheng
-    window_size = next_multiple_of_n(1728 * x, n=128)
-    return get_window_size_blocks_helper(window_size)
+        lr = w * 1.0 + (1 - w) * 0.1
+    ws_idx = int(len(args.ws_schedule) * x)
+    return lr, args.ws_schedule[ws_idx]
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
@@ -934,13 +957,14 @@ model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 ########################################
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
-warmup_steps = 10
+warmup_steps = 60
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, args.train_seq_len, grad_accum_steps, align_to_bos=True)
-for _ in range(warmup_steps):
+train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_seq_len)
+for step in range(warmup_steps):
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(1)).backward()
+    ws = args.ws_schedule[step % len(args.ws_schedule)]  # each window size is a new graph, need to warm up eachZ
+    model(inputs, targets, ws, ws // 2).backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
@@ -953,7 +977,7 @@ del train_loader, initial_state
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(args.train_files, args.train_seq_len, grad_accum_steps, align_to_bos=True)
+train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_seq_len)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -962,6 +986,7 @@ t0 = time.perf_counter()
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
+    lr, ws = get_lr_and_ws(step)
 
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
@@ -969,15 +994,14 @@ for step in range(train_steps + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        val_batch_size = world_size * args.val_seq_len
-        assert args.val_tokens % val_batch_size == 0
-        val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, args.val_seq_len, grad_accum_steps, align_to_bos=False)
+        assert args.val_tokens % (world_size * args.val_seq_len) == 0
+        val_steps = args.val_tokens // (world_size * args.val_seq_len)
+        val_loader = distributed_data_generator(args.val_files, world_size, args.val_seq_len, align_to_bos=False)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets = next(val_loader)
-                val_loss += model(inputs, targets, get_window_size_blocks(step))
+                val_loss += model(inputs, targets, ws, ws // 2)
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -998,11 +1022,11 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     for _ in range(grad_accum_steps):
         inputs, targets = next(train_loader)
-        model(inputs, targets, get_window_size_blocks(step)).backward()
+        model(inputs, targets, ws, ws // 2).backward()
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
+            group["lr"] = group["initial_lr"] * lr
     for group in optimizer2.param_groups:
         frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
