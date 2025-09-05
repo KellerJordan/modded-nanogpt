@@ -38,8 +38,8 @@ To run the current record, run the following commands.
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install -r requirements.txt
 pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade
-# downloads only the first 800M training tokens to save time
-python data/cached_fineweb10B.py 8
+# downloads only the first 900M training tokens to save time
+python data/cached_fineweb10B.py 9
 ./run.sh
 ```
 

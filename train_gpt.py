@@ -644,19 +644,22 @@ class MLP(nn.Module):
         x = F.linear(x, self.c_proj.type_as(x))
         return x
 
+
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        self.mlp = MLP(dim)
+        SKIPPED_MLP_BLOCKS = [0, 12] # skip MLP blocks for first and last layers by @EmelyanenkoK
+        self.mlp = None if layer_idx in SKIPPED_MLP_BLOCKS else MLP(dim)
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor,
                 seqlens: Tensor, bm_size: int):
         x = lambdas[0] * x + lambdas[1] * x0
         if self.attn is not None:
             x = x + self.attn(norm(x), ve, sa_lambdas, seqlens, bm_size)
-        x = x + self.mlp(norm(x))
+        if self.mlp is not None:
+            x = x + self.mlp(norm(x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -865,7 +868,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_iterations: int = 1670 # number of iterations to run
+    num_iterations: int = 1705 # number of iterations to run
     cooldown_frac: int = 0.45 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     run_id: str = str(uuid.uuid4())
