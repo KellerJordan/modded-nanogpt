@@ -650,7 +650,7 @@ class Block(nn.Module):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        SKIPPED_MLP_BLOCKS = [0, 12] # skip MLP blocks for first and last layers by @EmelyanenkoK
+        SKIPPED_MLP_BLOCKS = [0] # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = None if layer_idx in SKIPPED_MLP_BLOCKS else MLP(dim)
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor,
