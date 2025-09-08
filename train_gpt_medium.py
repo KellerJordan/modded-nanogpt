@@ -56,11 +56,13 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     return X
 
 @torch.compile
-def update(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Tensor, grad: Tensor, momentum: Tensor, eff_lr: Tensor, eff_weight_decay: Tensor):
+def update(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Tensor, smoothed_update_buffer: Tensor, grad: Tensor, momentum: Tensor, update_smoothing: Tensor, eff_lr: Tensor, eff_weight_decay: Tensor):
     assert acc_bf16_view_u16.dtype == mantissa.dtype == torch.uint16
     grad = grad.float()
     momentum_buffer.copy_(momentum * momentum_buffer + (1 - momentum) * grad)
     v = zeropower_via_newtonschulz5(momentum * momentum_buffer + (1 - momentum) * grad)
+    smoothed_update_buffer.copy_(update_smoothing * smoothed_update_buffer + (1 - update_smoothing) * v)
+    v = update_smoothing * smoothed_update_buffer + (1-update_smoothing) * v
 
     acc_m_u32 = (acc_bf16_view_u16.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
     acc_m_u32.view(torch.float32).mul_(1 - eff_weight_decay)
@@ -82,10 +84,10 @@ class Muon(torch.optim.Optimizer):
     Warning: This optimizer should not be used for the embedding layer, the final fully connected layer,
     or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
     """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, rank=0, world_size=1):
+    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, update_smoothing=0.0, rank=0, world_size=1):
         self.rank = rank
         self.world_size = world_size
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, update_smoothing=update_smoothing)
         super().__init__(params, defaults)
         assert all(p.dtype == torch.bfloat16 for group in self.param_groups for p in group["params"])
 
@@ -96,17 +98,23 @@ class Muon(torch.optim.Optimizer):
             params: list[Tensor] = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * self.world_size
             momentum = torch._as_tensor_fullprec(group["momentum"])
+            update_smoothing = torch._as_tensor_fullprec(group["update_smoothing"])
             for base_i in range(len(params))[::self.world_size]:
                 if base_i + self.rank < len(params):
                     p = params[base_i + self.rank]
+                    # if "step_count" not in self.state:
+                    #     self.state["step_count"] = torch._as_tensor_fullprec(0.0)
+                    # step_count = self.state["step_count"]
+                    # step_count.add_(1)
                     state = self.state[p]
                     if len(state) == 0:
                         state["mantissa"] = torch.zeros_like(p, dtype=torch.uint16)
                         state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
+                        state["smoothed_update_buffer"] = torch.zeros_like(p, dtype=torch.bfloat16)
                     update(
-                        p.view(torch.uint16), state["mantissa"], state["momentum_buffer"],
-                        p.grad, momentum,
-                        eff_lr=torch._as_tensor_fullprec(group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5),
+                        p.view(torch.uint16), state["mantissa"], state["momentum_buffer"], state["smoothed_update_buffer"],
+                        p.grad, momentum, update_smoothing,
+                        eff_lr=torch._as_tensor_fullprec((group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5)), # /(1-update_smoothing**step_count)),
                         eff_weight_decay=torch._as_tensor_fullprec(group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)),
                     )
                 futures.append(dist.all_gather(params_pad[base_i:base_i + self.world_size], params_pad[base_i + self.rank], async_op=True).get_future())
@@ -362,8 +370,9 @@ class Hyperparameters:
     train_seq_len = 64*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 5690 # number of iterations to run
+    num_iterations = 5610 # number of iterations to run
     cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
+    final_lr_scale = 0.01
     # architecture
     vocab_size = 50257
     # evaluation and logging
@@ -440,7 +449,7 @@ adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_param
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
+optimizer2 = Muon(hidden_matrix_params, lr=0.03, momentum=0.95, update_smoothing=0.5, rank=rank, world_size=world_size)
 optimizers: list[torch.optim.Optimizer] = [optimizer1, optimizer2]
 def opt_params(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
     return [p for group in opt.param_groups for p in group["params"]]
@@ -456,7 +465,7 @@ def get_lr(step: int):
     if x < 1 - args.cooldown_frac:
         return 1.0
     else:
-        return (1 - x) / args.cooldown_frac
+        return (1 - x) / args.cooldown_frac * (1-args.final_lr_scale) + args.final_lr_scale
 
 # attention window size schedule: linearly increase
 @lru_cache(1)
@@ -555,6 +564,9 @@ for step in range(train_steps + 1):
     for group in optimizer2.param_groups:
         frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+
+        smoothing_frac=min(step / 3000, 1)
+        group["update_smoothing"] = (1 - smoothing_frac) * 0.5 + smoothing_frac * 0.2
     # step the optimizers
     for opt in optimizers:
         torch.futures.collect_all(opt2futures[opt]).wait()
