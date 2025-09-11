@@ -11,6 +11,7 @@ from functools import lru_cache, partial # Added partial for hook registration
 from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
 import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import Tensor, nn
@@ -544,10 +545,34 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
             batch_span = batch_size
             start_idx = pos + rank * local_batch_size
         buf = tokens[start_idx:][:local_batch_size + 1]
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
+        inputs = buf[:-1]
+        targets = buf[1:]
         pos += batch_span
         yield inputs, targets
+
+class PrefetchLoader:
+    def __init__(self, generator):
+        self.gen = generator
+        self.stream = torch.cuda.Stream()
+        self.next_inputs = None
+        self.next_targets = None
+        self._preload()
+
+    def _preload(self):
+        inputs_cpu, targets_cpu = next(self.gen)
+        with torch.cuda.stream(self.stream):
+            self.next_inputs = inputs_cpu.to(device="cuda", dtype=torch.int32, non_blocking=True)
+            self.next_targets = targets_cpu.to(device="cuda", dtype=torch.int64, non_blocking=True)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        torch.cuda.current_stream().wait_stream(self.stream)
+        inputs = self.next_inputs
+        targets = self.next_targets
+        self._preload()
+        return inputs, targets
 
 # -----------------------------------------------------------------------------
 # int main
@@ -639,7 +664,7 @@ def get_lr(step: int):
         return w * 1.0 + (1 - w) * 0.1
 
 # attention window size schedule: linearly increase
-@lru_cache(1)
+@lru_cache(None)
 def get_window_size_blocks_helper(window_size: int):
     return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 def get_window_size_blocks(step: int):
@@ -660,7 +685,7 @@ model: nn.Module = torch.compile(model, dynamic=False)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+train_loader = PrefetchLoader(distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True))
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(1)).backward()
@@ -676,7 +701,7 @@ del train_loader, initial_state
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+train_loader = PrefetchLoader(distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True))
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -695,7 +720,7 @@ for step in range(train_steps + 1):
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_bos=False)
+        val_loader = PrefetchLoader(distributed_data_generator(args.val_files, val_batch_size, align_to_bos=False))
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
