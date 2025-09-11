@@ -15,7 +15,7 @@ def forward(self, input_seq, ...):
 
     for i in range(len(self.blocks)):
         ...
-        x = self.blocks(x, x0, lambdas, ...)
+        x = self.blocks[i](x, x0, lambdas, ...)
         ...
 
 # Block
@@ -39,7 +39,7 @@ def forward(self, input_seq, ...):
 
     for i in range(len(self.blocks)):
         ...
-        x = self.blocks(x, x00, x01, lambdas, ...)
+        x = self.blocks[i](x, x00, x01, lambdas, ...)
         ...
 
 # Block
