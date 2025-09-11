@@ -19,7 +19,7 @@ self.rotary_sin = nn.Buffer(theta.sin(), persistent=False)
 
 Based on empirical testing, the 0.1 constant in 0.1*log(curr/prev)+1 formula from YaRN is updated to 0.2.
 The constant attn_scale of 0.12 is updated to a starting value of 0.1, such that the distribution over training has a similar mean, ranging between 0.1 and 0.14.
-
+<img width="1333" height="388" alt="image" src="https://github.com/user-attachments/assets/1171ad00-084a-4e50-8d05-ef7c7730d7d6" />
 
 ```
 # scale attention factor f in attn=softmax(f*qk) logarithmically with window size
@@ -30,7 +30,8 @@ attn_scales = list(accumulate([0.1] + scale_factors, lambda acc, factor: acc * f
 self.attn_scales = dict(zip(windows, attn_scales))
 ```
 
-YaRN has a straighforward implementation, shown below. alpha and beta are left at the default constants of 1 and 32, based on the original YaRN paper which was tuned for Llama.
+YaRN has a straighforward implementation, shown below. alpha and beta are left at the default constants of 1 and 32, based on the original YaRN paper which was tuned for Llama. The frequency update incurred by YaRN is most notable from ws 3->7 and dimensions 5 to 10.
+<img width="1355" height="368" alt="image" src="https://github.com/user-attachments/assets/371b91a4-0ab7-4cbe-8c82-0f5f964f4022" />
 ```
 def apply_yarn(self, old_window: int, new_window: int, alpha: int=1, beta: int=32):
     rotations = args.block_size * old_window * self.angular_freq / (2 * torch.pi)
@@ -42,10 +43,11 @@ def apply_yarn(self, old_window: int, new_window: int, alpha: int=1, beta: int=3
     self.rotary_cos.copy_(theta.cos())
     self.rotary_sin.copy_(theta.sin())
 ```
-The frequency update incurred by YaRN is most notable from ws 3->7 and dimensions 5 to 10.
+
 
 
 Arg ws_validate enables the model to be validated at a longer attention window than training. This arg is set to 13, which differs from the final training window size of 11.
+<img width="951" height="517" alt="image" src="https://github.com/user-attachments/assets/f84dcc4b-b711-40d1-8309-120663994b80" />
 
 ```
 def get_ws(step: int):
@@ -60,6 +62,7 @@ def get_ws(step: int):
 Attention args are batched to improve readablility. cooldown_frac is increased from 0.45 to 0.5 to compliment the reduction from 1705 to 1670 steps, following the heuristic of a fixed number of cooldown steps. Dropping below 1695 steps has a secondary benefit of eliminating the 9th file read, saving roughly 200ms.
 
 Without YaRN, there is a substantial spike in validation loss when the attention window is abrubtly increased from 3 to 7.
+<img width="875" height="480" alt="image" src="https://github.com/user-attachments/assets/4c4a8dc5-3294-41a3-a152-57068314dd63" />
 
 Extending the final validation window out shows roughly a 0.0015 improvement in loss for 11->13. Interestingly, odd increments perform substantially better. @varunneal has noted that "One thing to note is that floor division (ws_short = ws_long // 2) has different behavior for odd vs short window sizes. I generally found odd window sizes performed surprisingly better." The attention schedule follows (long/short) (3/1) -> (7/3) -> (11/5). It may be that the short attention window performs better when it is under 50% of the long window, or it may be that the model learns to fit the long/short ratio, and performs poorly when this ratio is substantially altered, or there may be a completely different explanation.
 
@@ -67,7 +70,8 @@ Ablations were ran to measure the impact of each change:
 * new_record
 * no_attn_scale. Keep constant attn scale of 0.12.
 * no_freq_scale. Keep constant rotary freq based on 1024^(0..1).
-* prior_record. Updated steps from 1705 to 1670.
+* prior_record. Prior record with updated steps from 1705 to 1670 and cooldown frac to 0.5.
+<img width="867" height="577" alt="image" src="https://github.com/user-attachments/assets/1ccd04f6-c118-4200-9d99-5b4697ba7061" />
 
 
 Future Considerations:
