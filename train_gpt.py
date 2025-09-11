@@ -908,7 +908,7 @@ class Hyperparameters:
     num_iterations: int = 1670 # number of iterations to run
     cooldown_frac: int = 0.5 # fraction of training spent cooling down the learning rate
     # evaluation and logging
-    run_id: str = f"yarn/{uuid.uuid4()}"
+    run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # attention masking
