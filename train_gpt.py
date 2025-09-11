@@ -1,34 +1,38 @@
 import os
 import sys
+
 with open(sys.argv[0]) as f:
-    code = f.read() # read the code of this file ASAP, for logging
-import uuid
-import time
+    code = f.read()  # read the code of this file ASAP, for logging
 import copy
 import glob
 import math
-
+import time
+import uuid
 from dataclasses import dataclass
-from functools import lru_cache
 from itertools import accumulate
 from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
-torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
-from torch import Tensor, nn
-import torch.nn.functional as F
+
+torch.empty(
+    1, device="cuda", requires_grad=True
+).backward()  # prevents a bug on some systems
+import torch._dynamo as dynamo
 import torch.distributed as dist
-#torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-import numpy as np
+import torch.nn.functional as F
+
+# torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 import triton
 import triton.language as tl
 from flash_attn_interface import flash_attn_varlen_func
-import torch._dynamo as dynamo
+from torch import Tensor, nn
+
 dynamo.config.recompile_limit = 64
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
+
 
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
@@ -422,42 +426,189 @@ class Muon(torch.optim.Optimizer):
         # @ryanyang0, and @vagrawal.
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-        reduce_scatter_futures: list[torch.Future] = []
-        all_gather_futures: list[torch.Future] = []
+        group_infos = []
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
-            grad = torch.empty_like(params[-1])
-            grad_pad = [param.grad for param in params] + [torch.zeros_like(params[-1])] * world_size
-            for base_i in range(0, len(params), world_size):
-                if base_i + rank < len(params):
-                    grad = params[base_i + rank].grad
-                # This gives strange dynamo warnings
-                reduce_scatter_futures.append(dist.reduce_scatter(grad, grad_pad[base_i:base_i + world_size], op=dist.ReduceOp.AVG, async_op=True).get_future())
+            if not params:
+                continue
 
-        idx = 0
-        for group in self.param_groups:
-            params: list[Tensor] = group["params"]
-            params_pad = params + [torch.empty_like(params[-1])] * world_size
-            momentum = group["momentum"]
-            for base_i in range(0, len(params), world_size):
-                reduce_scatter_futures[idx].wait()
-                if base_i + rank < len(params):
-                    p = params[base_i + rank]
-                    grad = p.grad
-                    eff_lr = group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5 * getattr(p, "lr_mul", 1.0)
-                    eff_weight_decay = group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state["momentum_buffer"] = torch.zeros_like(grad)
-                    momentum_buffer = state["momentum_buffer"]
-                    p.mul_(1 - eff_weight_decay)
-                    momentum_buffer.lerp_(grad, 1 - momentum)
-                    grad = grad.lerp_(momentum_buffer, momentum)
-                    v = newton_schulz_triton(grad)
-                    p.add_(other=v, alpha=-eff_lr)
-                idx += 1
-                all_gather_futures.append(dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank], async_op=True).get_future())
-        torch.futures.collect_all(all_gather_futures).wait()
+            num_params = len(params)
+            padded_num_params = (
+                (num_params + world_size - 1) // world_size * world_size
+            )
+
+            grads_to_stack = [p.grad for p in params]
+            if padded_num_params > num_params:
+                padding_grad = torch.zeros_like(params[0].grad)
+                grads_to_stack.extend(
+                    [padding_grad] * (padded_num_params - num_params)
+                )
+
+            stacked_grads = torch.stack(grads_to_stack)
+
+            chunk_size = padded_num_params // world_size
+            grad_chunk = torch.empty(
+                (chunk_size, *params[0].grad.shape),
+                dtype=stacked_grads.dtype,
+                device=stacked_grads.device,
+            )
+
+            reduce_future = dist.reduce_scatter_tensor(
+                grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True
+            ).get_future()
+
+            group_infos.append(
+                {
+                    "params": params,
+                    "grad_chunk": grad_chunk,
+                    "reduce_future": reduce_future,
+                    "chunk_size": chunk_size,
+                    "padded_num_params": padded_num_params,
+                }
+            )
+
+        all_gather_infos = []
+        # Second pass: wait for gradients, compute updates for the local shard of parameters,
+        # and launch all async all_gather operations.
+        for group, info in zip(self.param_groups, group_infos):
+            info["reduce_future"].wait()
+
+            params = info["params"]
+            grad_chunk = info["grad_chunk"]
+            chunk_size = info["chunk_size"]
+            start_idx = rank * chunk_size
+
+            # Determine effective LR and WD once per group, assuming constant for same-shaped params.
+            # This helps in vectorizing operations later.
+            p_example = params[0]  # All params in a group have the same shape.
+            eff_lr_val = (
+                group["lr"]
+                * max(1, p_example.size(-2) / p_example.size(-1)) ** 0.5
+                * getattr(p_example, "lr_mul", 1.0)
+            )
+            eff_weight_decay_val = (
+                group["lr"]
+                * group["weight_decay"]
+                * getattr(p_example, "wd_mul", 1.0)
+            )
+
+            # Determine effective LR and WD once per group, assuming constant for same-shaped params.
+            eff_lr_val = (
+                group["lr"]
+                * max(1, params[0].size(-2) / params[0].size(-1)) ** 0.5
+                * getattr(params[0], "lr_mul", 1.0)
+            )
+            eff_weight_decay_val = (
+                group["lr"]
+                * group["weight_decay"]
+                * getattr(params[0], "wd_mul", 1.0)
+            )
+
+            # Prepare a contiguous buffer for the updated parameters for this rank's chunk.
+            # This buffer will serve as the input_tensor for dist.all_gather_into_tensor.
+            updated_param_chunk = torch.empty(
+                (chunk_size, *params[0].shape),
+                dtype=params[0].dtype,
+                device=params[0].device,
+            )
+
+            # List to collect update_grad tensors for batched zeropower computation.
+            update_grads_for_zeropower = []
+
+            # Process each parameter in this rank's chunk.
+            for i in range(chunk_size):
+                param_idx = start_idx + i
+
+                if param_idx >= len(params):
+                    # For padding: Fill the corresponding part of the updated_param_chunk with zeros.
+                    # These padded entries will not be used by other ranks in the all_gather, but
+                    # initializing them prevents uninitialized memory access issues.
+                    updated_param_chunk[i].zero_()
+                    # Also append a zero tensor for zeropower input if it must be padded.
+                    update_grads_for_zeropower.append(
+                        torch.zeros_like(params[0].grad)
+                    )
+                    continue
+                p = params[param_idx]
+                grad = grad_chunk[
+                    i
+                ]  # This gradient corresponds to the current parameter p.
+                state = self.state[p]
+
+                # Initialize momentum buffer if not present
+                if not state:
+                    state["momentum_buffer"] = torch.zeros_like(grad)
+
+                momentum_buffer = state["momentum_buffer"]
+
+                # Apply momentum update directly to the persistent momentum buffer in-place.
+                momentum_buffer.lerp_(grad, 1 - group["momentum"])
+
+                # Compute the actual `update_grad` for zeropower. This creates a new tensor.
+                update_grad = grad.lerp(momentum_buffer, group["momentum"])
+                update_grads_for_zeropower.append(update_grad)
+
+                # Copy the current parameter value into the temporary buffer.
+                updated_param_chunk[i].copy_(p)
+
+                # Apply weight decay directly to the buffer.
+                updated_param_chunk[i].mul_(1 - eff_weight_decay_val)
+
+            # Stack the individual `update_grad` tensors for efficient batched zeropower computation.
+            batched_update_grads = torch.stack(update_grads_for_zeropower)
+
+            # Compute zeropower for the entire chunk in a single, batched call.
+
+            original_shape = batched_update_grads.shape
+            if batched_update_grads.ndim > 3:
+                assert batched_update_grads.ndim == 4
+                batch = original_shape[0] * original_shape[1]
+                # Flatten all but the first two dims after batch
+                d1 = original_shape[2]
+                d2 = original_shape[3]
+                batched = batched_update_grads.view(batch, d1, d2)
+                v_chunk = newton_schulz_triton(batched)
+                v_chunk = v_chunk.view(original_shape)
+            else:
+                v_chunk = newton_schulz_triton(batched_update_grads)
+
+            # Add the computed zeropower update to the parameters in the buffer.
+            # This loop applies the zeropower output (v_chunk) to the `updated_param_chunk` buffer.
+            for i in range(chunk_size):
+                param_idx = start_idx + i
+                if param_idx >= len(params):  # Skip padded entries again.
+                    continue
+
+                # Add the computed zeropower update to the parameter in the buffer.
+                updated_param_chunk[i].add_(v_chunk[i], alpha=-eff_lr_val)
+
+            stacked_params = torch.empty(
+                (info["padded_num_params"], *params[0].shape),
+                dtype=params[0].dtype,
+                device=params[0].device,
+            )
+            gather_future = dist.all_gather_into_tensor(
+                stacked_params, updated_param_chunk, async_op=True
+            ).get_future()
+
+            all_gather_infos.append(
+                {
+                    "gather_future": gather_future,
+                    "stacked_params": stacked_params,
+                    "orig_params": params,
+                }
+            )
+
+        # Final pass: wait for all_gather to complete and copy results back into original parameter tensors.
+        for info in all_gather_infos:
+            info["gather_future"].wait()
+            stacked_params = info["stacked_params"]
+            orig_params = info["orig_params"]
+
+            unstacked_params = torch.unbind(stacked_params)
+            for i, p in enumerate(orig_params):
+                p.copy_(unstacked_params[i], non_blocking=True)
+
 
 class DistAdam(torch.optim.Optimizer):
     def __init__(self, params, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01):
@@ -505,13 +656,23 @@ class DistAdam(torch.optim.Optimizer):
                 g_slice = grad_slices[idx]
                 # State init
                 if not state:
-                    state['step'] = torch.tensor(0, dtype=torch.int64, device=p.device)
-                    state['exp_avg'] = torch.zeros_like(p_slice)
-                    state['exp_avg_sq'] = torch.zeros_like(p_slice)
-                exp_avg = state['exp_avg']
-                exp_avg_sq = state['exp_avg_sq']
-                state['step'] += 1
-                t = state['step']
+                    state["step"] = torch.tensor(
+                        0, dtype=torch.int64, device=p.device
+                    )
+                    state["exp_avg"] = torch.zeros(
+                        p_slice.shape,
+                        dtype=torch.bfloat16,
+                        device=p_slice.device,
+                    )
+                    state["exp_avg_sq"] = torch.zeros(
+                        p_slice.shape,
+                        dtype=torch.bfloat16,
+                        device=p_slice.device,
+                    )
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
+                state["step"] += 1
+                t = state["step"]
                 # weight decay
                 if wd != 0:
                     eff_weight_decay = lr * wd * getattr(p, "wd_mul", 1.0)
@@ -559,13 +720,18 @@ class CastedLinear(nn.Linear):
         else:
             return F.linear(x, self.weight.type_as(x))
 
+
 def rotary(x_BTHD: Tensor, cos: Tensor, sin: Tensor):
     assert cos.size(0) >= x_BTHD.size(-3)
-    cos, sin = cos[None, :x_BTHD.size(-3), None, :], sin[None, :x_BTHD.size(-3), None, :]
-    x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+    cos, sin = (
+        cos[None, : x_BTHD.size(-3), None, :],
+        sin[None, : x_BTHD.size(-3), None, :],
+    )
+    x1, x2 = x_BTHD.chunk(2, dim=-1)
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
-    return torch.cat((y1, y2), 3).type_as(x_BTHD)
+    return torch.cat((y1, y2), 3)
+
 
 @dataclass
 class AttnArgs:
@@ -684,12 +850,21 @@ class GPT(nn.Module):
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
         pad = (-num_layers * 5) % dist.get_world_size()
-        self.scalars = nn.Parameter(torch.cat([
-            torch.ones(num_layers), # skip_weights
-            *[torch.tensor([1.0, 0.0]) for _ in range(num_layers)], # block lambdas
-            *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)], # SA lambdas
-            torch.ones(pad),
-        ]))
+        self.scalars = nn.Parameter(
+            torch.cat(
+                [
+                    -1.5
+                    * torch.ones(num_layers),  # skip_weights -> σ(-1.5) ≈ 0.18
+                    *[
+                        torch.tensor([1.0, 0.0]) for _ in range(num_layers)
+                    ],  # block lambdas
+                    *[
+                        torch.tensor([0.5, 0.5]) for _ in range(num_layers)
+                    ],  # SA lambdas
+                    torch.ones(pad),
+                ]
+            )
+        )
         self.max_seq_len = max_seq_len
         self.setup_yarn(head_dim)
         # set learning rates
@@ -707,8 +882,12 @@ class GPT(nn.Module):
         angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(head_dim//4)])
         t = torch.arange(self.max_seq_len, dtype=torch.float32)
         theta = torch.outer(t, angular_freq)
-        self.rotary_cos = nn.Buffer(theta.cos(), persistent=False)
-        self.rotary_sin = nn.Buffer(theta.sin(), persistent=False)
+        self.rotary_cos = nn.Buffer(
+            theta.cos().to(torch.bfloat16), persistent=False
+        )
+        self.rotary_sin = nn.Buffer(
+            theta.sin().to(torch.bfloat16), persistent=False
+        )
         self.angular_freq = angular_freq
 
         # scale attention factor f in attn=softmax(f*qk) logarithmically with window size @classiclarryd
@@ -740,7 +919,9 @@ class GPT(nn.Module):
         bm_sizes = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
         assert len(bm_sizes) == len(self.blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x = x0 = norm(self.embed(input_seq)[None]).to(
+            torch.bfloat16
+        )  # use of norm here by @Grad62304977
 
         # U-net design by @brendanh0gan
         skip_connections = []
@@ -761,7 +942,8 @@ class GPT(nn.Module):
                 attn_scale=self.attn_scales[ws]
             )
             if i >= n:
-                x = x + skip_weights[i - n] * skip_connections.pop()
+                gate = torch.sigmoid(skip_weights[i - n])  # in (0, 1)
+                x = x + gate * skip_connections.pop()
             x = self.blocks[i](x, x0, lambdas[i], attn_args)
             if i < n:
                 skip_connections.append(x)
@@ -872,7 +1054,6 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             cum_lengths = torch.nonzero(_inputs == BOS_ID)[:, 0]
             pos += num_tokens
 
-
         _cum_lengths = torch.full((max_num_docs,), num_tokens_local)
         _cum_lengths[0] = 0
         _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths
@@ -971,7 +1152,7 @@ model: nn.Module = GPT(
     max_seq_len=max(args.train_batch_size, args.val_batch_size) // (grad_accum_steps * world_size)
 ).cuda()
 for m in model.modules():
-    if isinstance(m, nn.Embedding):
+    if isinstance(m, (nn.Embedding, nn.Linear)):
         m.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
@@ -985,7 +1166,13 @@ head_params = [model.lm_head.weight]
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
+optimizer1 = DistAdam(
+    scalar_params + head_params + embed_params,
+    lr=0.008,
+    betas=(0.8, 0.95),
+    eps=1e-8,
+    weight_decay=0.0,
+)
 optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
