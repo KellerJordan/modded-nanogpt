@@ -6,6 +6,7 @@ with open(sys.argv[0]) as f:
 import copy
 import glob
 import math
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -720,6 +721,40 @@ class CastedLinear(nn.Linear):
         else:
             return F.linear(x, self.weight.type_as(x))
 
+# yarn implementation @classiclarryd
+class Yarn(nn.Module):
+    def __init__(self, head_dim, max_seq_len):
+        super().__init__()
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.reset()
+        
+    def reset(self):
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=self.head_dim//4, dtype=torch.float32, device=device)
+        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(self.head_dim//4)])
+        t = torch.arange(self.max_seq_len, dtype=torch.float32, device=device)
+        theta = torch.outer(t, angular_freq)
+        self.cos = nn.Buffer(
+            theta.cos().to(torch.bfloat16), persistent=False
+        )
+        self.sin = nn.Buffer(
+            theta.sin().to(torch.bfloat16), persistent=False
+        )
+        self.angular_freq = angular_freq
+        # start with 0.1, inspired by 0.12 from @leloykun and learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
+        self.attn_scale = 0.1
+
+    def apply(self, old_window: int, new_window: int, alpha: int=1, beta: int=32):
+        rotations = args.block_size * old_window * self.angular_freq / (2 * torch.pi)
+        scaling_factor = old_window / new_window
+        interpolation_weight = torch.clamp((rotations - alpha) / (beta - alpha), 0, 1)
+        self.angular_freq *= scaling_factor + interpolation_weight * (1 - scaling_factor)
+        t = torch.arange(self.max_seq_len, dtype=torch.float32, device=self.angular_freq.device)
+        theta = torch.outer(t, self.angular_freq)
+        self.cos.copy_(theta.cos())
+        self.sin.copy_(theta.sin())
+        self.attn_scale *= 0.2 * math.log(new_window / old_window) + 1
 
 def rotary(x_BTHD: Tensor, cos: Tensor, sin: Tensor):
     assert cos.size(0) >= x_BTHD.size(-3)
@@ -732,15 +767,14 @@ def rotary(x_BTHD: Tensor, cos: Tensor, sin: Tensor):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat((y1, y2), 3)
 
-
 @dataclass
 class AttnArgs:
     ve: torch.Tensor
     sa_lambdas: torch.Tensor
     seqlens: torch.Tensor
     bm_size: int
-    rotary_cos: torch.Tensor
-    rotary_sin: torch.Tensor
+    cos: torch.Tensor
+    sin: torch.Tensor
     attn_scale: float
 
 class CausalSelfAttention(nn.Module):
@@ -768,13 +802,13 @@ class CausalSelfAttention(nn.Module):
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
         # unpack attention args
-        rotary_cos, rotary_sin = attn_args.rotary_cos, attn_args.rotary_sin
+        cos, sin = attn_args.cos, attn_args.sin
         ve, sa_lambdas = attn_args.ve, attn_args.sa_lambdas
         seqlens, attn_scale, bm_size = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size
 
         q, k, v = F.linear(x, self.qkvo_w[:3].flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
-        q, k = rotary(q, rotary_cos, rotary_sin), rotary(k, rotary_cos, rotary_sin)
+        q, k = rotary(q, cos, sin), rotary(k, cos, sin)
         if ve is not None:
             v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view_as(v) # @ KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
@@ -842,6 +876,7 @@ class GPT(nn.Module):
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
         self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i) for i in range(num_layers)])
+        self.yarn = Yarn(head_dim, max_seq_len)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
@@ -865,8 +900,6 @@ class GPT(nn.Module):
                 ]
             )
         )
-        self.max_seq_len = max_seq_len
-        self.setup_yarn(head_dim)
         # set learning rates
         for param in self.embed.parameters():
             param.lr_mul = 75.
@@ -875,39 +908,7 @@ class GPT(nn.Module):
         self.lm_head.weight.lr_mul = 1.0
         self.scalars.lr_mul = 5.0
 
-    def setup_yarn(self, head_dim: int):
-        # store single copy of rotary tensors
-        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=head_dim//4, dtype=torch.float32)
-        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(head_dim//4)])
-        t = torch.arange(self.max_seq_len, dtype=torch.float32)
-        theta = torch.outer(t, angular_freq)
-        self.rotary_cos = nn.Buffer(
-            theta.cos().to(torch.bfloat16), persistent=False
-        )
-        self.rotary_sin = nn.Buffer(
-            theta.sin().to(torch.bfloat16), persistent=False
-        )
-        self.angular_freq = angular_freq
-
-        # scale attention factor f in attn=softmax(f*qk) logarithmically with window size @classiclarryd
-        windows = list(dict.fromkeys(list(args.ws_schedule) + [args.ws_validate]))
-        scale_factors = [0.2 * math.log(curr / prev) + 1 for prev, curr in zip(windows[:-1], windows[1:])]
-        # start with 0.1, inspired by 0.12 from @leloykun and learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-        attn_scales = list(accumulate([0.1] + scale_factors, lambda acc, factor: acc * factor))
-        self.attn_scales = dict(zip(windows, attn_scales))
-
-    def apply_yarn(self, old_window: int, new_window: int, alpha: int=1, beta: int=32):
-        rotations = args.block_size * old_window * self.angular_freq / (2 * torch.pi)
-        scaling_factor = old_window / new_window
-        interpolation_weight = torch.clamp((rotations - alpha) / (beta - alpha), 0, 1)
-        self.angular_freq *= scaling_factor + interpolation_weight * (1 - scaling_factor)
-        t = torch.arange(self.max_seq_len, dtype=torch.float32, device=self.angular_freq.device)
-        theta = torch.outer(t, self.angular_freq)
-        self.rotary_cos.copy_(theta.cos())
-        self.rotary_sin.copy_(theta.sin())
-
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws: int):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws: int, ws_final_layer: int):
         assert input_seq.ndim == 1
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
@@ -916,12 +917,11 @@ class GPT(nn.Module):
         assert len(ve) == len(self.blocks)
 
         long_bm, short_bm = ws * args.block_size, (ws // 2) * args.block_size
-        bm_sizes = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+        final_bm = ws_final_layer * args.block_size
+        bm_sizes = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, final_bm]
         assert len(bm_sizes) == len(self.blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]).to(
-            torch.bfloat16
-        )  # use of norm here by @Grad62304977
+        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
 
         # U-net design by @brendanh0gan
         skip_connections = []
@@ -937,9 +937,9 @@ class GPT(nn.Module):
                 sa_lambdas=sa_lambdas[i],
                 seqlens=seqlens,
                 bm_size=bm_sizes[i],
-                rotary_cos=self.rotary_cos,
-                rotary_sin=self.rotary_sin,
-                attn_scale=self.attn_scales[ws]
+                cos=self.yarn.cos,
+                sin=self.yarn.sin,
+                attn_scale=self.yarn.attn_scale
             )
             if i >= n:
                 gate = torch.sigmoid(skip_weights[i - n])  # in (0, 1)
@@ -974,14 +974,45 @@ BOS_ID = 50256
 
 class BOSFinder:
     # Helper for getting sequences that start at the beginning of documents by @varunneal based on work by @classiclarryd
-    def __init__(self, tokens: Tensor, world_size: int = 1):
+    def __init__(self, tokens: Tensor, world_size: int = 1, quickload=False):
         # Precompute BOS positions once per shard
+        self.tokens=tokens
         self.size = tokens.numel()
-        self.bos_idx = (tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        self.quickload = quickload
+        if quickload:
+            # only scan first 4 million tokens, then kickoff async thread to scan rest
+            self.bos_idx = (tokens[:4_000_000] == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+            self.thread = None
+            self.ready = threading.Event()
+            self.start()
+        else:
+            #t0 = time.perf_counter()
+            self.bos_idx = (tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+            #t1 = time.perf_counter()
+            #print(f'{t1-t0} slowload')
         self.i = 0
         self.world_size = world_size
+        self.batch_iter = 0
+
+    def _load(self):
+        self.bos_idx_async = (self.tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        self.ready.set()
+    
+    def start(self):
+        self.ready.clear()
+        self.thread = threading.Thread(target=self._load)
+        self.thread.start()
+    
+    def get(self):
+        if self.thread:
+            self.ready.wait()
+            self.thread.join()
+        self.bos_idx = self.bos_idx_async
 
     def next_batch(self, num_tokens_local: int, max_seq_len: int):
+        # if quickload was used, repoint to the full dataset after 5 batches
+        if self.quickload and self.batch_iter==5:
+            self.get()
         n = len(self.bos_idx)
         starts = [[] for _ in range(self.world_size)]
         ends = [[] for _ in range(self.world_size)]
@@ -1003,8 +1034,32 @@ class BOSFinder:
 
             assert cur_len == num_tokens_local + 1
         self.i = idx
-
+        self.batch_iter+=1
         return starts, ends
+
+class DataPreloader:
+    def __init__(self, file_iter, world_size):
+        self.file_iter = file_iter
+        self.world_size = world_size
+        self.thread = None
+        self.data = None
+        self.ready = threading.Event()
+    
+    def _load(self):
+        tokens = _load_data_shard(next(self.file_iter))
+        self.data = (tokens, BOSFinder(tokens, self.world_size))
+        self.ready.set()
+    
+    def start(self):
+        self.ready.clear()
+        self.thread = threading.Thread(target=self._load)
+        self.thread.start()
+    
+    def get(self):
+        if self.thread:
+            self.ready.wait()
+            self.thread.join()
+        return self.data
 
 def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
@@ -1019,8 +1074,14 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 
     file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
     tokens = _load_data_shard(next(file_iter))
-    finder = BOSFinder(tokens, world_size=world_size) if align_to_bos else None
-    pos = 0  # for unaligned case
+    if align_to_bos:
+      #loading in a whole shard will be slow...
+      #BosFinder tracks its self.i index. I can kickoff with a smaller set. then have the 
+      finder = BOSFinder(tokens, world_size=world_size, quickload=True)
+      preloader = DataPreloader(file_iter, world_size)
+      preloader.start()
+    else:
+      pos = 0  # for unaligned case
 
     while True:
         num_tokens_local = num_tokens // world_size
@@ -1032,8 +1093,10 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
                 start_idxs, end_idxs = torch.tensor(seq_starts[rank]), torch.tensor(seq_ends[rank])
             except StopIteration:
                 # This shard is exhausted, load the next one in the next loop iteration.
-                tokens = _load_data_shard(next(file_iter))
-                finder = BOSFinder(tokens, world_size=world_size)
+                #tokens = _load_data_shard(next(file_iter))
+                #finder = BOSFinder(tokens, world_size=world_size)
+                tokens, finder = preloader.get()
+                preloader.start()
                 continue
 
             buf = torch.cat([tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
@@ -1054,6 +1117,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             cum_lengths = torch.nonzero(_inputs == BOS_ID)[:, 0]
             pos += num_tokens
 
+
         _cum_lengths = torch.full((max_num_docs,), num_tokens_local)
         _cum_lengths[0] = 0
         _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths
@@ -1070,7 +1134,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             assert new_num_tokens % (world_size * grad_accum_steps) == 0, "Num tokens must be divisible by world size"
             num_tokens = new_num_tokens
             max_seq_len = new_max_seq_len
-            grad_accum_steps = new_grad_accum_steps 
+            grad_accum_steps = new_grad_accum_steps
 
 
 # -----------------------------------------------------------------------------
@@ -1086,7 +1150,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_iterations: int = 1670 # number of iterations to run
+    num_iterations: int = 1660 # number of iterations to run
     cooldown_frac: int = 0.5 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1096,6 +1160,7 @@ class Hyperparameters:
     block_size: int = 128
     ws_schedule: tuple = (3, 7, 11)
     ws_validate: int = 13 # increase final validation ws @classiclarryd
+    ws_validate_final_layer: int = 20 # final layer shows no degradation with context length
 
 args = Hyperparameters()
 
@@ -1191,11 +1256,11 @@ def get_lr(step: int):
 
 def get_ws(step: int):
     if step == args.num_iterations:
-        return args.ws_validate
+        return args.ws_validate, args.ws_validate_final_layer
     x = step / (1 + args.num_iterations)
     assert 0 <= x < 1
     ws_idx = int(len(args.ws_schedule) * x)
-    return args.ws_schedule[ws_idx]
+    return args.ws_schedule[ws_idx], args.ws_schedule[ws_idx]
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
@@ -1208,13 +1273,21 @@ warmup_steps = 30
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+ws=args.ws_schedule[0]
 for step in range(warmup_steps):
     inputs, targets, cum_seqlens = next(train_loader)
-    ws = args.ws_schedule[step % len(args.ws_schedule)]  # each window size is a new graph, need to warm up each
-    model(inputs, targets, cum_seqlens, ws).backward()
+    new_ws = args.ws_schedule[step % len(args.ws_schedule)]  # each window size is a new graph, need to warm up each with YaRN params
+    if new_ws > ws:
+        model.yarn.apply(ws, new_ws)
+        ws = new_ws
+    elif new_ws<ws:
+        model.yarn.reset()
+        ws = new_ws
+    model(inputs, targets, cum_seqlens, ws, ws).backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
+model.yarn.reset()
 model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
@@ -1231,12 +1304,12 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
-ws = get_ws(0)
+ws, ws_final_layer = get_ws(0)
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
-    new_ws = get_ws(step)
+    new_ws, ws_final_layer = get_ws(step)
     if new_ws != ws:
-        model.apply_yarn(ws, new_ws)
+        model.yarn.apply(ws, new_ws)
         ws=new_ws
 
     # --------------- VALIDATION SECTION -----------------
@@ -1252,7 +1325,7 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, ws)
+                val_loss += model(inputs, targets, cum_seqlens, ws, ws_final_layer)
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -1273,7 +1346,7 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     for _ in range(grad_accum_steps):
         inputs, targets, cum_seqlens = next(train_loader)
-        model(inputs, targets, cum_seqlens, ws).backward()
+        model(inputs, targets, cum_seqlens, ws, ws_final_layer).backward()
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
