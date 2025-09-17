@@ -1,4 +1,4 @@
-## New WR 153.9s: Apply threading to preload data and extend final layer attention window for validation
+## New WR 153.9s: Asynchronously fetch and index data batches, extend final layer attention window for validation
 
 This PR builds on all recent WR improvements including PR #125 by @bernard24. This one adds:
 

@@ -974,7 +974,7 @@ BOS_ID = 50256
 
 class BOSFinder:
     # Helper for getting sequences that start at the beginning of documents by @varunneal based on work by @classiclarryd
-    def __init__(self, tokens: Tensor, world_size: int = 1, quickload=False):
+    def __init__(self, tokens: Tensor, world_size: int = 1, quickload: bool = False):
         # Precompute BOS positions once per shard
         self.tokens=tokens
         self.size = tokens.numel()
@@ -986,10 +986,7 @@ class BOSFinder:
             self.ready = threading.Event()
             self.start()
         else:
-            #t0 = time.perf_counter()
             self.bos_idx = (tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
-            #t1 = time.perf_counter()
-            #print(f'{t1-t0} slowload')
         self.i = 0
         self.world_size = world_size
         self.batch_iter = 0
@@ -1038,7 +1035,8 @@ class BOSFinder:
         return starts, ends
 
 class DataPreloader:
-    def __init__(self, file_iter, world_size):
+    # Helper for asynchronously loading next shard and indexing bos tokens
+    def __init__(self, file_iter, world_size: int = 1):
         self.file_iter = file_iter
         self.world_size = world_size
         self.thread = None
@@ -1075,13 +1073,11 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
     file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
     tokens = _load_data_shard(next(file_iter))
     if align_to_bos:
-      #loading in a whole shard will be slow...
-      #BosFinder tracks its self.i index. I can kickoff with a smaller set. then have the 
-      finder = BOSFinder(tokens, world_size=world_size, quickload=True)
-      preloader = DataPreloader(file_iter, world_size)
-      preloader.start()
+        finder = BOSFinder(tokens, world_size=world_size, quickload=True)
+        preloader = DataPreloader(file_iter, world_size)
+        preloader.start()
     else:
-      pos = 0  # for unaligned case
+        pos = 0  # for unaligned case
 
     while True:
         num_tokens_local = num_tokens // world_size
@@ -1093,8 +1089,6 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
                 start_idxs, end_idxs = torch.tensor(seq_starts[rank]), torch.tensor(seq_ends[rank])
             except StopIteration:
                 # This shard is exhausted, load the next one in the next loop iteration.
-                #tokens = _load_data_shard(next(file_iter))
-                #finder = BOSFinder(tokens, world_size=world_size)
                 tokens, finder = preloader.get()
                 preloader.start()
                 continue
