@@ -872,6 +872,8 @@ class GPT(nn.Module):
         super().__init__()
         vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
+        self.smear_gate = CastedLinear(12, 1)
+        self.smear_gate.weight.detach().zero_()
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
@@ -884,7 +886,7 @@ class GPT(nn.Module):
         self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
-        pad = (-num_layers * 5) % dist.get_world_size()
+        pad = (-num_layers * 6) % dist.get_world_size()
         self.scalars = nn.Parameter(
             torch.cat(
                 [
@@ -896,6 +898,7 @@ class GPT(nn.Module):
                     *[
                         torch.tensor([0.5, 0.5]) for _ in range(num_layers)
                     ],  # SA lambdas
+                    torch.zeros(num_layers), #extra zeros params for smear_lambda
                     torch.ones(pad),
                 ]
             )
@@ -921,7 +924,13 @@ class GPT(nn.Module):
         bm_sizes = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, final_bm]
         assert len(bm_sizes) == len(self.blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x = self.embed(input_seq)
+
+        # smear token embed forward 1 position @classiclarryd
+        smear_lambda = self.scalars[5 * len(self.blocks)]
+        smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
+        x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
+        x = x0 = norm(x[None])
 
         # U-net design by @brendanh0gan
         skip_connections = []
@@ -1144,7 +1153,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_iterations: int = 1660 # number of iterations to run
+    num_iterations: int = 1645 # number of iterations to run
     cooldown_frac: int = 0.5 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1221,6 +1230,7 @@ hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim 
 embed_params = [p for n, p in model.named_parameters() if "embed" in n]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
+smear_gate_params = [p for n, p in model.named_parameters() if "smear" in n]
 
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
@@ -1232,7 +1242,7 @@ optimizer1 = DistAdam(
     eps=1e-8,
     weight_decay=0.0,
 )
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0)
+optimizer2 = Muon(hidden_matrix_params+smear_gate_params, lr=0.05, momentum=0.95, weight_decay=0.0)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
