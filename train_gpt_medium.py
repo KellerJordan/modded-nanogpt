@@ -143,8 +143,10 @@ def update(
     acc_bf16_view_u16: Tensor,
     mantissa: Tensor,
     momentum_buffer: Tensor,
+    update_smoothing_buffer: Tensor,
     grad: Tensor,
     momentum: Tensor,
+    update_smoothing: Tensor,
     eff_lr: Tensor,
     eff_weight_decay: Tensor,
 ):
@@ -152,6 +154,9 @@ def update(
     grad = grad.float()
     momentum_buffer.copy_(momentum * momentum_buffer + (1 - momentum) * grad)
     v = zeropower_via_newtonschulz5(momentum * momentum_buffer + (1 - momentum) * grad)
+
+    update_smoothing_buffer.copy_(update_smoothing * update_smoothing_buffer + (1 - update_smoothing) * v)
+    v = update_smoothing_buffer
 
     acc_m_u32 = (acc_bf16_view_u16.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
     acc_m_u32.view(torch.float32).mul_(1 - eff_weight_decay)
@@ -176,11 +181,11 @@ class Muon(torch.optim.Optimizer):
     """
 
     def __init__(
-        self, params, lr=0.02, weight_decay=0.01, momentum=0.95, rank=0, world_size=1
+        self, params, lr=0.02, weight_decay=0.01, momentum=0.95, update_smoothing=0.0, rank=0, world_size=1
     ):
         self.rank = rank
         self.world_size = world_size
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, update_smoothing=update_smoothing)
         super().__init__(params, defaults)
         assert all(
             p.dtype == torch.bfloat16
@@ -195,6 +200,7 @@ class Muon(torch.optim.Optimizer):
             params: list[Tensor] = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * self.world_size
             momentum = torch._as_tensor_fullprec(group["momentum"])
+            update_smoothing = torch._as_tensor_fullprec(group["update_smoothing"])
             for base_i in range(len(params))[:: self.world_size]:
                 if base_i + self.rank < len(params):
                     p = params[base_i + self.rank]
@@ -204,12 +210,17 @@ class Muon(torch.optim.Optimizer):
                         state["momentum_buffer"] = torch.zeros_like(
                             p, dtype=torch.float32
                         )
+                        state["update_smoothing_buffer"] = torch.zeros_like(
+                            p, dtype=torch.bfloat16
+                        )
                     update(
                         p.view(torch.uint16),
                         state["mantissa"],
                         state["momentum_buffer"],
+                        state["update_smoothing_buffer"],
                         p.grad,
                         momentum,
+                        update_smoothing,
                         eff_lr=torch._as_tensor_fullprec(
                             group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5
                         ),
@@ -614,8 +625,9 @@ class Hyperparameters:
     train_seq_len = 64 * 1024  # FlexAttention sequence length
     val_seq_len = 4 * 64 * 1024  # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 5640  # number of iterations to run
+    num_iterations = 5580  # number of iterations to run
     cooldown_frac = 0.7  # fraction of training spent cooling down the learning rate
+    final_lr_scale = 0.01
     # architecture
     vocab_size = 50257
     # evaluation and logging
@@ -752,7 +764,7 @@ inner_optimizers = [
     )
 ]
 inner_hidden_optim = Muon(
-    hidden_matrix_params, lr=0.027, momentum=0.95, rank=rank, world_size=world_size
+    hidden_matrix_params, lr=0.03, momentum=0.95, update_smoothing=0.2, rank=rank, world_size=world_size
 )
 inner_optimizers += [inner_hidden_optim]
 outer_optim = Snoo(model, lr=0.68, momentum=0.37, k=28)
@@ -776,8 +788,7 @@ def get_lr(step: int):
     if x < 1 - args.cooldown_frac:
         return 1.0
     else:
-        return (1 - x) / args.cooldown_frac
-
+        return (1 - x) / args.cooldown_frac * (1 - args.final_lr_scale) + args.final_lr_scale
 
 # attention window size schedule: linearly increase
 @lru_cache(1)
@@ -903,6 +914,7 @@ for step in range(train_steps + 1):
     for group in inner_hidden_optim.param_groups:
         frac = min(step / 300, 1)  # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+
     # step the optimizers
     for opt in inner_optimizers:
         torch.futures.collect_all(opt2futures[opt]).wait()
