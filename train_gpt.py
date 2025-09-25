@@ -433,24 +433,35 @@ class Muon(torch.optim.Optimizer):
     """
     def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, custom_sizing=True):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
-        if custom_sizing:
+        # custom sizing requires 8 GPUs
+        if custom_sizing and dist.get_world_size()==8:
             param_groups = self.generate_custom_param_groups(params)
         else:
             param_groups = self.generate_standard_param_groups(params)
         super().__init__(param_groups, defaults)
 
     def generate_standard_param_groups(self, params):
+        """
+        Use this method if running on less than 8 GPU or experimenting with additional attn or mlp modules.
+        Creates one param group per size, while giving attn its own param group for resize op.
+        """
         params = list(params)
-        sizes = {p.shape for p in params}
-        # create one buffer per unique parameter-size
         param_groups = []
+        attn_subset = [p for p in params if p.module == 'attn']
+        non_attn_subset = [p for p in params if p.module != 'attn']
+        param_groups.append(dict(params=attn_subset))
+
+        sizes = {p.shape for p in non_attn_subset}
         for size in sizes:
-            group_params = [p for p in params if p.shape == size]
+            group_params = [p for p in non_attn_subset if p.shape == size]
             param_groups.append(dict(params=group_params))
+        return param_groups
     
     def generate_custom_param_groups(self, params):
-        # implementation requires that a single GPU does not receive both attn 
-        # and mlp params when a param group is split across GPUs
+        """
+        Implementation requires that a single GPU does not receive both attn 
+        and mlp params when a param group is split across GPUs.
+        """
         module_ranks = {
             'smear_gate': 1, # 1 param
             'attn_gate': 2, # 10 params
@@ -600,6 +611,8 @@ class Muon(torch.optim.Optimizer):
             # Reshape attn params from [hdim, dim*4] to [4,hdim,dim] to apply NS indepedently to Q,K,V,O
             module_idx = start_idx if start_idx<len(params) else 0
             if getattr(params[module_idx],'module','none')=='attn':
+                for p in params[module_idx:module_idx+chunk_size]:
+                    assert getattr(params[module_idx],'module','none')=='attn'
                 batch = 4 * original_shape[0]
                 d1 = original_shape[1] 
                 d2 = original_shape[2] // 4
