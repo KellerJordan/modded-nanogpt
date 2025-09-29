@@ -818,8 +818,6 @@ class Yarn(nn.Module):
         self.sin.copy_(theta.sin())
         self.attn_scale *= 0.2 * math.log(new_window / old_window) + 1
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
-
 def rotary(x_BTHD: Tensor, cos: Tensor, sin: Tensor):
     assert cos.size(0) >= x_BTHD.size(-3)
     cos, sin = (
@@ -840,6 +838,8 @@ class AttnArgs:
     cos: torch.Tensor
     sin: torch.Tensor
     attn_scale: float
+
+flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int):
@@ -1034,10 +1034,15 @@ class GPT(nn.Module):
                 skip_connections.append(x)
 
         x = norm(x)
-        logits = self.lm_head(x).float()
+        logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / 7.5)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction="sum" if self.training else "mean")
+        logits_for_loss = logits.float() if not self.training else logits
+        loss = F.cross_entropy(
+            logits_for_loss.view(-1, logits_for_loss.size(-1)),
+            target_seq,
+            reduction="sum" if self.training else "mean",
+        )
         return loss
 
 # -----------------------------------------------------------------------------
@@ -1229,7 +1234,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_iterations: int = 1640 # number of iterations to run
+    num_iterations: int = 1630 # number of iterations to run
     iteration_extension = 40 # number of iterations to continue training at final cooldown and window size
     cooldown_frac: int = 0.5 # fraction of training spent cooling down the learning rate
     # evaluation and logging
@@ -1319,7 +1324,7 @@ optimizer1 = DistAdam(
     eps=1e-8,
     weight_decay=0.0,
 )
-optimizer2 = Muon(hidden_matrix_params + gate_params, lr=0.05, momentum=0.95, weight_decay=0.0)
+optimizer2 = Muon(hidden_matrix_params + gate_params, lr=0.06, momentum=0.95, weight_decay=0.0)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
