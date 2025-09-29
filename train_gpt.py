@@ -26,7 +26,7 @@ import torch.nn.functional as F
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 import triton
 import triton.language as tl
-from flash_attn_interface import flash_attn_varlen_func
+from kernels import get_kernel
 from torch import Tensor, nn
 
 dynamo.config.recompile_limit = 64
@@ -166,7 +166,7 @@ def _pid_to_block(
     key=["M", "K", "a_stride_r", "a_stride_c", "c_stride_r", "c_stride_c"],
 )
 @triton.jit
-def ns_line_1_kernel(
+def XXT_kernel(
     A_ptr, C_ptr,
     M, K,
     a_stride_b, a_stride_r, a_stride_c,
@@ -224,7 +224,7 @@ def ns_line_1_kernel(
     c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
     tl.store(c_ptrs_t, output.T, mask=c_mask_t)
 
-def ns_line_1(A: torch.Tensor, out: torch.Tensor):
+def XXT(A: torch.Tensor, out: torch.Tensor):
     """
     Launch Triton kernel to compute C = A @ A.T
     """
@@ -240,7 +240,7 @@ def ns_line_1(A: torch.Tensor, out: torch.Tensor):
     grid = lambda meta: (
         batch_size * triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(M, meta["BLOCK_SIZE_N"]),
     )
-    ns_line_1_kernel[grid](
+    XXT_kernel[grid](
         A_ptr=A,
         C_ptr=out,
         M=M,
@@ -259,7 +259,7 @@ def ns_line_1(A: torch.Tensor, out: torch.Tensor):
     key=["M", "a_stride_r", "a_stride_c", "c_stride_r", "c_stride_c"],
 )
 @triton.jit
-def ns_line_2_kernel(
+def ba_plus_cAA_kernel(
     A_ptr, C_ptr,
     M,
     a_stride_b, a_stride_r, a_stride_c,
@@ -271,8 +271,8 @@ def ns_line_2_kernel(
     GROUP_SIZE_M: tl.constexpr,
     LOWER_UPPER: tl.constexpr,
 ):
-    # This is mostly duplicated from ns_line_1_kernel, but also loads and adds a block of A
-    # Performance is slightly slower than ns_line_1_kernel, so we use two separate kernels
+    # This is mostly duplicated from XXT_kernel, but also loads and adds a block of A
+    # Performance is slightly slower than XXT_kernel, so we use two separate kernels
     pid = tl.program_id(axis=0)
     batch_idx, m_idx, n_idx = _pid_to_block(
         pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
@@ -331,7 +331,7 @@ def ns_line_2_kernel(
     c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
     tl.store(c_ptrs_t, output.T, mask=c_mask_t)
 
-def ns_line_2(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
+def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
     """
     Launch Triton kernel to compute C = alpha * A @ A.T + beta * A
     """
@@ -348,7 +348,7 @@ def ns_line_2(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
     grid = lambda meta: (
         batch_size * triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(M, meta["BLOCK_SIZE_N"]),
     )
-    ns_line_2_kernel[grid](
+    ba_plus_cAA_kernel[grid](
         A_ptr=A,
         C_ptr=out,
         M=M,
@@ -363,15 +363,28 @@ def ns_line_2(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
     )
     return out
 
+# Computed for num_iters=5, safety_factor=2e-2, cushion=2
+coeffs_list = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
+]
+
 @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
-def newton_schulz_triton(G: torch.Tensor):
-    a, b, c = (3.4445, -4.7750, 2.0315)
+def polar_express(G: torch.Tensor):
+    """
+    Polar Express Sign Method: https://arxiv.org/pdf/2505.16932
+    by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
+    Code adapted from https://github.com/NoahAmsel/PolarExpress/tree/main by @varunneal.
+    """
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
         X = X.mT
 
     # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
 
     # Allocate buffers
     X = X.contiguous()
@@ -379,13 +392,13 @@ def newton_schulz_triton(G: torch.Tensor):
     B = torch.empty_like(A)
     C = torch.empty_like(X)
 
-    ns_line_3 = torch.baddbmm if X.ndim > 2 else torch.addmm
+    aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
 
-    # Perform the NS iterations
-    for _ in range(5):
-        ns_line_1(X, out=A)  # A = X @ X.mT
-        ns_line_2(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
-        ns_line_3(X, B, X, beta=a, out=C)  # C = a * X + B @ X
+    # Perform the iterations
+    for a, b, c in coeffs_list:
+        XXT(X, out=A)  # A = X @ X.mT
+        ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
+        aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
         X, C = C, X  # Swap references to avoid unnecessary copies
 
     if G.size(-2) > G.size(-1):
@@ -617,10 +630,10 @@ class Muon(torch.optim.Optimizer):
                 d1 = original_shape[1] 
                 d2 = original_shape[2] // 4
                 batched = batched_update_grads.view(batch, d1, d2)
-                v_chunk = newton_schulz_triton(batched)
+                v_chunk = polar_express(batched)
                 v_chunk = v_chunk.view(original_shape)
             else:
-                v_chunk = newton_schulz_triton(batched_update_grads)
+                v_chunk = polar_express(batched_update_grads)
 
             # Add the computed zeropower update to the parameters in the buffer.
             # This loop applies the zeropower output (v_chunk) to the `updated_param_chunk` buffer.
@@ -805,6 +818,8 @@ class Yarn(nn.Module):
         self.sin.copy_(theta.sin())
         self.attn_scale *= 0.2 * math.log(new_window / old_window) + 1
 
+flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+
 def rotary(x_BTHD: Tensor, cos: Tensor, sin: Tensor):
     assert cos.size(0) >= x_BTHD.size(-3)
     cos, sin = (
@@ -873,7 +888,7 @@ class CausalSelfAttention(nn.Module):
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens, max_seqlen_q=max_len, max_seqlen_k=max_len,
+        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens, max_seqlen_q=max_len, max_seqlen_k=max_len,
                                    causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
