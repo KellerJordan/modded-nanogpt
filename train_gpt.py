@@ -1230,16 +1230,17 @@ class Hyperparameters:
     train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_batch_size: int = 2048 * 24 * 8
+    train_batch_size: int = 2048 * 16 * 8
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_iterations: int = 1630 # number of iterations to run
-    iteration_extension = 40 # number of iterations to continue training at final cooldown and window size
-    cooldown_frac: int = 0.5 # fraction of training spent cooling down the learning rate
+    num_iterations: int = 2380  # number of iterations to run
+    iteration_extension = 40  # number of iterations to continue training at final cooldown and window size
+    cooldown_frac: int = 0.4  # fraction of training spent cooling down the learning rate
+    momentum_cd_steps = 50  # number of iterations for muon momentum cooldown
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
-    val_loss_every: int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # attention masking
     block_size: int = 128
@@ -1320,7 +1321,7 @@ gate_params = [p for n, p in model.named_parameters() if "gate" in n]
 optimizer1 = DistAdam(
     scalar_params + head_params + embed_params,
     lr=0.008,
-    betas=(0.8, 0.95),
+    betas=(0.7, 0.95),
     eps=1e-8,
     weight_decay=0.0,
 )
@@ -1347,6 +1348,30 @@ def get_ws(step: int):
     assert 0 <= x < 1
     ws_idx = int(len(args.ws_schedule) * x)
     return args.ws_schedule[ws_idx]//2, args.ws_schedule[ws_idx]
+
+def update_optimizer_params(step, optimizer1, optimizer2):
+    # Update lr
+    for group in optimizer1.param_groups:
+        group["lr"] = group["initial_lr"] * get_lr(step)
+    for group in optimizer2.param_groups:
+        group["lr"] = group["initial_lr"] * get_lr(step)
+
+    # Warmup phase: gradually increase momentum from 0.85 to 0.95
+    if step < 300:
+        frac = step / 300
+        momentum = 0.85 + frac * (0.95 - 0.85)
+        for group in optimizer2.param_groups:
+            group["momentum"] = momentum
+
+    # Cooldown phase: gradually decrease momentum
+    momentum_cd_start = args.num_iterations + args.iteration_extension - args.momentum_cd_steps
+    if step > momentum_cd_start:
+        frac = (step - momentum_cd_start) / args.momentum_cd_steps  # More explicit denominator
+
+        # Decay momentum from 0.95 to 0.85
+        momentum = 0.95 - frac * (0.95 - 0.85)
+        for group in optimizer2.param_groups:
+            group["momentum"] = momentum
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
@@ -1435,18 +1460,17 @@ for step in range(train_steps + 1):
     for _ in range(grad_accum_steps):
         inputs, targets, cum_seqlens = next(train_loader)
         model(inputs, targets, cum_seqlens, ws_short, ws_long).backward()
-    # set optimization hyperparameters
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
-    for group in optimizer2.param_groups:
-        frac = min(step / 300, 1) # momentum warmup for muon
-        group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-    # step the optimizers
-    for opt in optimizers:
-        opt.step()
-    # null the gradients
-    model.zero_grad(set_to_none=True)
+    update_optimizer_params(step, optimizer1, optimizer2)
+    # only step Adam every other step
+    if step%2==0:
+        optimizer2.step()
+        optimizer2.zero_grad(set_to_none=True)
+    else:
+        for opt in optimizers:
+            opt.step()
+        # null the gradients
+        model.zero_grad(set_to_none=True)
+        
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
