@@ -961,7 +961,7 @@ class GPT(nn.Module):
         self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
-        pad = (-num_layers * 6) % dist.get_world_size()
+        pad = (-num_layers * 5 - 2) % dist.get_world_size()
         self.scalars = nn.Parameter(
             torch.cat(
                 [
@@ -973,7 +973,8 @@ class GPT(nn.Module):
                     *[
                         torch.tensor([0.5, 0.5]) for _ in range(num_layers)
                     ],  # SA lambdas
-                    torch.zeros(num_layers), #extra zeros params for smear_lambda
+                    torch.zeros(1), # smear_lambda
+                    0.5*torch.ones(1), # backout_lambda
                     torch.ones(pad),
                 ]
             )
@@ -1012,9 +1013,11 @@ class GPT(nn.Module):
         skip_weights = self.scalars[:(len(self.blocks) // 2)]
         lambdas = self.scalars[1 * len(self.blocks): 3 * len(self.blocks)].view(-1, 2)
         sa_lambdas = self.scalars[3 * len(self.blocks): 5 * len(self.blocks)].view(-1, 2)
+        backout_lambda = self.scalars[5 * len(self.blocks)+1]
 
         n = len(self.blocks) // 2
 
+        x_backout = None
         # skip layer zero
         for i in range(1,len(self.blocks)):
             attn_args = AttnArgs(
@@ -1032,7 +1035,11 @@ class GPT(nn.Module):
             x = self.blocks[i](x, x0, lambdas[i], attn_args)
             if i < n:
                 skip_connections.append(x)
+            if i==8:
+                x_backout=x
 
+        # back out contributions from first 8 layers that are only required for downstream context and not direct prediction
+        x -= backout_lambda*x_backout
         x = norm(x)
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
@@ -1234,9 +1241,9 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_iterations: int = 2380  # number of iterations to run
+    num_iterations: int = 2290  # number of iterations to run
     iteration_extension = 40  # number of iterations to continue training at final cooldown and window size
-    cooldown_frac: int = 0.4  # fraction of training spent cooling down the learning rate
+    cooldown_frac: int = 0.45  # fraction of training spent cooling down the learning rate
     momentum_cd_steps = 50  # number of iterations for muon momentum cooldown
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1321,7 +1328,7 @@ gate_params = [p for n, p in model.named_parameters() if "gate" in n]
 optimizer1 = DistAdam(
     scalar_params + head_params + embed_params,
     lr=0.008,
-    betas=(0.7, 0.95),
+    betas=(0.65, 0.95),
     eps=1e-8,
     weight_decay=0.0,
 )
@@ -1366,7 +1373,7 @@ def update_optimizer_params(step, optimizer1, optimizer2):
     # Cooldown phase: gradually decrease momentum
     momentum_cd_start = args.num_iterations + args.iteration_extension - args.momentum_cd_steps
     if step > momentum_cd_start:
-        frac = (step - momentum_cd_start) / args.momentum_cd_steps  # More explicit denominator
+        frac = (step - momentum_cd_start) / args.momentum_cd_steps
 
         # Decay momentum from 0.95 to 0.85
         momentum = 0.95 - frac * (0.95 - 0.85)
