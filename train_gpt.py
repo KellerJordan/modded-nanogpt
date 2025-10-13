@@ -133,22 +133,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
         X = X.mT
     return X
 
-class Muon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
+class NorMuon(torch.optim.Optimizer):
 
-    https://kellerjordan.github.io/posts/muon/
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Warning: This optimizer should not be used for the embedding layer, the final fully connected layer,
-    or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
-    """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
+    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, beta2=0.95):
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2)
         params = list(params)
         sizes = {p.shape for p in params}
         # create one buffer per unique parameter-size
@@ -174,6 +162,8 @@ class Muon(torch.optim.Optimizer):
             for base_i in range(0, len(params), world_size):
                 if base_i + rank < len(params):
                     grad = params[base_i + rank].grad
+                else:
+                    grad = torch.zeros_like(grad)
                 # This gives strange dynamo warnings
                 reduce_scatter_futures.append(dist.reduce_scatter(grad, grad_pad[base_i:base_i + world_size], op=dist.ReduceOp.AVG, async_op=True).get_future())
 
@@ -182,6 +172,7 @@ class Muon(torch.optim.Optimizer):
             params: list[Tensor] = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * world_size
             momentum = group["momentum"]
+            beta2 = group["beta2"]
             for base_i in range(0, len(params), world_size):
                 reduce_scatter_futures[idx].wait()
                 if base_i + rank < len(params):
@@ -192,11 +183,22 @@ class Muon(torch.optim.Optimizer):
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum_buffer"] = torch.zeros_like(grad)
+                        state["second_momentum_buffer"] = torch.zeros_like(grad[..., 0:1]) if p.size(-2) >= p.size(-1) else torch.zeros_like(grad[0:1, ...])
                     momentum_buffer = state["momentum_buffer"]
+                    second_momentum_buffer = state["second_momentum_buffer"]
                     p.mul_(1 - eff_weight_decay)
                     momentum_buffer.lerp_(grad, 1 - momentum)
                     grad = grad.lerp_(momentum_buffer, momentum)
-                    v = zeropower_via_newtonschulz5(grad.bfloat16(), 5)
+                    v = zeropower_via_newtonschulz5(grad.bfloat16(), 5).float()
+                    ###################################
+                    vnorm = v.norm(dim=(-2,-1), keepdim=True)
+                    v_mean = torch.mean(v * v, dim=-1, keepdim=True) if p.size(-2) >= p.size(-1) else torch.mean(v * v, dim=-2, keepdim=True)
+                    second_momentum_buffer.lerp_(v_mean, 1 - beta2)
+                    step_size = 1 / second_momentum_buffer.sqrt().clamp_min(1e-10)
+                    v.mul_(step_size)
+                    vnorm_new = v.norm(dim=(-2,-1), keepdim=True)
+                    v.mul_(vnorm / (vnorm_new.clamp_min(1e-10)))
+                    ####################################
                     p.add_(other=v, alpha=-eff_lr)
                 idx += 1
                 all_reduce_futures.append(dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank], async_op=True).get_future())
@@ -561,7 +563,7 @@ class Hyperparameters:
     train_seq_len = 48*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 1750 # number of iterations to run
+    num_iterations = 1700 # number of iterations to run
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -622,7 +624,7 @@ head_params = [model.lm_head.weight]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0)
+optimizer2 = NorMuon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0, beta2=0.95)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
