@@ -5,7 +5,7 @@ This repository hosts the *NanoGPT speedrun*, in which we (collaboratively|compe
 The target (3.28 validation loss on FineWeb) follows Andrej Karpathy's [GPT-2 replication in llm.c, which attains that loss after running for 45 minutes](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 The speedrun code also descends from llm.c's [PyTorch trainer](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py), which itself descends from NanoGPT, hence the name of the repo.
 Thanks to the efforts of many contributors, this repo now contains a training algorithm which attains the target performance in:
-* 3 minutes on 8xH100 (the llm.c GPT-2 replication needed 45)
+* 2 minutes and 20 seconds on 8xH100 (the llm.c GPT-2 replication needed 45)
 * 0.73B tokens (the llm.c GPT-2 replication needed 10B)
 
 This improvement in training speed has been brought about by the following techniques:
@@ -15,7 +15,13 @@ This improvement in training speed has been brought about by the following techn
 * Initialization of projection and classification layers to zero (muP-like)
 * Skip connections from embedding to every block as well as between blocks in U-net pattern
 * Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
-* FlexAttention with long-short sliding window attention pattern (inspired by Gemma 2) and window size warmup
+* Flash Attention 3 with long-short sliding window attention pattern (inspired by Gemma 2) and window size warmup with YaRN
+* Align training batch starts with EoS and set a max document length
+* Accumulate gradients for 2 steps for embedding and lm_head before updating parameters
+* Enable model to back out contributions from first 8 layers before prediction
+* Polar Express implementation in Muon
+* Smear module to enable 1 token look back
+* Sparse attention gate
 
 As well as many systems optimizations.
 
@@ -26,7 +32,9 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@YouJiacheng](https://x.com/YouJiacheng); [@jadenj3o](https://x.com/jadenj3o);
 [@KonstantinWilleke](https://github.com/KonstantinWilleke), [@alexrgilbert](https://github.com/alexrgilbert), [@adricarda](https://github.com/adricarda),
 [@tuttyfrutyee](https://github.com/tuttyfrutyee), [@vdlad](https://github.com/vdlad); 
-[@ryanyang0](https://x.com/ryanyang0)
+[@ryanyang0](https://x.com/ryanyang0), [@vagrawal](https://github.com/vagrawal), [@classiclarryd](https://x.com/classiclarryd), 
+[@byronxu99](https://github.com/byronxu99), [@varunneal](https://x.com/varunneal), [@EmelyanenkoK](https://github.com/EmelyanenkoK), 
+[@bernard24](https://github.com/bernard24)/https://www.hiverge.ai/, [@GusarichOnX](https://x.com/GusarichOnX)
 
 
 ---
@@ -43,7 +51,7 @@ python data/cached_fineweb10B.py 9
 ./run.sh
 ```
 
-**Note: torch.compile will add around 5 minutes of latency the first time you run the code.**
+**Note: torch.compile will add around 7 minutes of latency the first time you run the code.**
 
 ## Alternative: Running with Docker (recommended for precise timing)
 
@@ -102,7 +110,21 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 23 | 2.979 minutes | [Overlap computation and gradient communication](https://x.com/kellerjordan0/status/1927460573098262616) | 05/25/25 | [log](records/052525_EvenFasterReduce/6ae86d05-5cb2-4e40-a512-63246fd08e45.txt) | @ryanyang0
 24 | 2.966 minutes | Replace gradient all_reduce with reduce_scatter | 05/30/25 | [log](records/053025_noallreduce/8054c239-3a18-499e-b0c8-dbd27cb4b3ab.txt) | @vagrawal
 25 | 2.896 minutes | Upgrade PyTorch to 2.9.0.dev20250713+cu126 | 07/13/25 | [log](records/071325_UpgradeTorch190/692f80e0-5e64-4819-97d4-0dc83b7106b9.txt ) | @kellerjordan0
-26 | 2.863 minutes | Align training batch starts with EoS, increase cooldown frac to .45 | 07/13/25 | [log](records/071225_BosAlign/c1fd8a38-bb9f-45c4-8af0-d37f70c993f3.txt) | @ClassicLarry
+26 | 2.863 minutes | Align training batch starts with EoS, increase cooldown frac to .45 | 07/13/25 | [log](records/071225_BosAlign/c1fd8a38-bb9f-45c4-8af0-d37f70c993f3.txt) | @classiclarryd
+27 | 2.817 minutes | Transpose one of the MLP matrices + add Triton kernel for symmetric matmul | 07/18/25 | [log](records/071825_TritonMuon/record.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/109) | @byronxu99
+28 | 2.812 minutes | Sparse attention gate | 08/23/25 | [log](records/082325_SparseAttnGate/020630eb-2191-4ba2-9ee4-4cdc94316943.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/117) | @classiclarryd
+29 | 2.731 minutes | Flash Attention 3, 2048 max_doc_len, update ws schedule | 09/03/25 | [log](records/090325_FA3/44fc1276-0510-4961-92c0-730c65e5feba.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/118) | @varunneal
+30 | 2.717 minutes | Drop first MLP layer | 09/05/25 | [log](records/090525_SkipMLPBlocks/07e7ae76-b7d0-4481-b149-01e7d81b5ad4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/120) | @EmelyanenkoK
+31 | 2.656 minutes | Dynamically incorporate YaRN during training and validation | 09/10/25 | [log](records/091025_Yarn/0ecdb695-510b-4c3b-b030-09861a162ce8.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/122) | @classiclarryd
+32 | 2.625 minutes | Optimize distributed training, improve skip connection gating, and enhance bfloat16 usage | 09/11/25 | [log](records/091125_VectSigmoidBFloat16/0d0d9882-c34f-4d82-b961-a17d5659c988.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/125) | @bernard24 & hiverge.ai
+33 | 2.565 minutes | Asynchronously fetch and index data batches, extend final layer attention window for validation | 09/15/25 | [log](records/091525_AsyncDataLoadAttnFinalWindow/25db37c7-2bab-4ef4-ae63-d593590ef823.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/127) | @classiclarryd
+34 | 2.547 minutes | Smear token embeddings 1 position forward | 09/18/25 | [log](records/091825_Smear/18a1e5c7-947e-479d-bc3a-a57a61a98fc9.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/130) | @classiclarryd
+35 | 2.527 minutes | Drop first attn layer, extend all long windows for validation, update schedule | 09/21/25 | [log](records/092125_DropAttn/01fc4a96-f2a0-47a1-8a6a-c7d10bac99fe.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/131) | @classiclarryd
+36 | 2.495 minutes | MuonCustomSizing, perform mlp and attn reduce scatter in shared call | 09/23/25 | [log](records/092325_MuonCustomSizing/b067b4ac-72a6-4436-a6f8-ea51c1efeef3.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/132) | @classiclarryd
+37 | 2.483 minutes | Compute cross entropy in BF16 during training | 09/27/25 | [log](records/092725_BF16CE/08c0770f-17fc-44cd-971d-734a7a28a3e3.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/133) | @GusarichOnX
+38 | 2.476 minutes | Polar Express, replacement for Newton-Schulz | 09/29/25 | [log](records/092925_PolarExpress/0e3f0af5-ad08-47a6-813d-0c709b50d422.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/134) | @varunneal
+39 | 2.447 minutes | Custom Muon batching to remove padding params | 09/30/25 | [log](records/093025_CustomBatching/40b101b1-77ea-45ea-a089-1d3a647daa22.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/136) | @classiclarryd
+40 | 2.345 minutes | Backout, misc hyperparameter tuning, optimize lambda padding | 10/04/25 | [log](records/100425_Backout/514e7581-fbd4-4338-a3e4-e556f9c958ce.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/140) | @classiclarryd
 
 ## Rules
 
