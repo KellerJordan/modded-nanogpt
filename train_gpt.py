@@ -477,7 +477,6 @@ class DistAdam(torch.optim.Optimizer):
         grad_slices = []
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
-            grad = torch.empty_like(params[-1])
             for base_i in range(len(params)):
                 grad = params[base_i].grad
                 rank_size = grad.shape[0] // world_size
@@ -594,6 +593,11 @@ class CausalSelfAttention(nn.Module):
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = 0.12
 
+        # sparse gated attention to enable context based no-op by @classiclarryd
+        self.attn_gate_dim = 12
+        self.attn_gate = CastedLinear(self.attn_gate_dim, num_heads)
+        self.attn_gate.weight.detach().zero_()
+
     def forward(self, x: Tensor, ve: Tensor | None, lambdas: Tensor, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
@@ -604,7 +608,9 @@ class CausalSelfAttention(nn.Module):
             v = lambdas[0] * v + lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = lambdas[0] * v
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=0.12).transpose(1, 2)
+        y = y.view(B, T, self.num_heads, self.head_dim)
+        y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_dim])).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, self.qkvo_w[3].type_as(y))
         return y
@@ -677,7 +683,7 @@ class GPT(nn.Module):
             param.lr_mul = 75.
         for param in self.value_embeds.parameters():
             param.lr_mul = 75.
-        self.lm_head.weight.lr_mul = 27.5
+        self.lm_head.weight.lr_mul = 1.0
         self.scalars.lr_mul = 5.0
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
@@ -752,7 +758,7 @@ class GPT(nn.Module):
         x = norm(x)
         logits = self.lm_head(x).float()
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
-        logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
+        logits = 30 * torch.sigmoid(logits / 7.5)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction="sum" if self.training else "mean")
         return loss
 
@@ -824,9 +830,10 @@ class Hyperparameters:
     train_seq_len = 48*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 1750 # number of iterations to run
+    num_iterations = 1695 # number of iterations to run
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
     # evaluation and logging
+    run_id = uuid.uuid4()
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
 args = Hyperparameters()
@@ -850,7 +857,7 @@ master_process = (rank == 0) # this process will do logging, checkpointing etc.
 # begin logging
 logfile = None
 if master_process:
-    run_id = uuid.uuid4()
+    run_id = args.run_id
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     print(logfile)
