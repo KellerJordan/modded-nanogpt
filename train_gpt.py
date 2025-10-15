@@ -364,7 +364,7 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
     return out
 
 # Computed for num_iters=5, safety_factor=2e-2, cushion=2
-coeffs_list = [
+polar_express_coeffs = [
     (8.156554524902461, -22.48329292557795, 15.878769915207462),
     (4.042929935166739, -2.808917465908714, 0.5000178451051316),
     (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
@@ -395,7 +395,7 @@ def polar_express(G: torch.Tensor):
     aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
 
     # Perform the iterations
-    for a, b, c in coeffs_list:
+    for a, b, c in polar_express_coeffs:
         XXT(X, out=A)  # A = X @ X.mT
         ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
         aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
@@ -417,7 +417,8 @@ class Muon(torch.optim.Optimizer):
     Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
     processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
     matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
+    the advantage that it can be stably run in bfloat16 on the GPU. 
+    Note: A later PR replaced Newton-Shulz with Polar Express for the orthogonalization step
 
     Warning: This optimizer should not be used for the embedding layer, the final fully connected layer,
     or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
@@ -426,21 +427,21 @@ class Muon(torch.optim.Optimizer):
         This hyper-optimized class has faster execution time than the current impl of Adam for small params
 
     Custom distributed sizing:
-    The model stores all attn and mlp weights in the same shape, and then updates the view as
-    needed on the forward pass. This enables attn and mlp weights to be contained within the same
-    dist.reduce_scatter_tensor() call. The model architecture has been customized to enable
-    (n_attn_layers+n_mlp_layers*2)%4==0 for batching across 8 GPUs with zero padding on mlp and attn.
+    The model stores all attn and mlp weights in the same shape, and then updates the view as 
+    needed on the forward pass. This enables attn and mlp weights to be contained within the same 
+    dist.reduce_scatter_tensor() call. The model architecture has been customized to enable 
+    (n_attn_layers+n_mlp_layers*2)%8==0 for batching across 8 GPUs with zero padding on mlp and attn. 
     The scheduling is:
         1. reduce scatter smear_gate (1 param 7 padding params)
         2. reduce scatter attn_gate (10 params 6 padding params)
         3. reduce scatter attn/mlp round 1 (10 attn params 6 mlp params)
         4. reduce scatter attn/mlp round 2 (16 mlp params)
-        5. wait on step 1, then compute NS of 1 and schedule all gather
-        6. wait on step 2, then compute NS of 2 and schedule all gather
-        7. wait on step 3, then compute NS of 3 and schedule all gather
+        5. wait on step 1, then compute update of 1 and schedule all gather
+        6. wait on step 2, then compute update of 2 and schedule all gather
+        7. wait on step 3, then compute update of 3 and schedule all gather
             GPUs receive [2 ATTN, 2 ATTN, 2 ATTN, 2 ATTN, 2 ATTN, 2 MLP, 2 MLP, 2 MLP]
-            GPUs that receive params of type attn reshape before NS
-        8. wait on 4, then compute NS of 4 and schedule all gather
+            GPUs that receive params of type attn reshape before computing update
+        8. wait on 4, then compute update of 4 and schedule all gather
         9. wait for each all gather to complete and update params
     Empirically, leading with small params provides an additional 0.2s improvement.
     """
@@ -460,8 +461,8 @@ class Muon(torch.optim.Optimizer):
         """
         params = list(params)
         param_groups = []
-        attn_subset = [p for p in params if p.module == 'attn']
-        non_attn_subset = [p for p in params if p.module != 'attn']
+        attn_subset = [p for p in params if p.label == 'attn']
+        non_attn_subset = [p for p in params if p.label != 'attn']
         param_groups.append(dict(params=attn_subset))
 
         sizes = {p.shape for p in non_attn_subset}
@@ -469,20 +470,20 @@ class Muon(torch.optim.Optimizer):
             group_params = [p for p in non_attn_subset if p.shape == size]
             param_groups.append(dict(params=group_params))
         return param_groups
-
+    
     def generate_custom_param_groups(self, params):
         """
-        Implementation requires that a single GPU does not receive both attn
+        Implementation requires that a single GPU does not receive both attn 
         and mlp params when a param group is split across GPUs.
         """
-        module_ranks = {
+        label_ranks = {
             'smear_gate': 1, # 1 param
             'attn_gate': 2, # 10 params
             'attn': 3, # 10 params
             'mlp': 4, # 22 params
         }
         params = list(params)
-        params.sort(key=lambda x: module_ranks.get(x.module))
+        params.sort(key=lambda x: label_ranks.get(x.label))
         idx = 0
         group_sizes = [1,10,16,16]
         assert len(params)==sum(group_sizes)
@@ -591,11 +592,11 @@ class Muon(torch.optim.Optimizer):
                         torch.zeros_like(p_example.grad)
                     )
                     continue
-                p = params[param_idx]
+                param = params[param_idx]
                 grad = grad_chunk[
                     i
-                ]  # This gradient corresponds to the current parameter p.
-                state = self.state[p]
+                ]  # This gradient corresponds to the current parameter param.
+                state = self.state[param]
 
                 # Initialize momentum buffer if not present
                 if not state:
@@ -611,7 +612,7 @@ class Muon(torch.optim.Optimizer):
                 update_grads_for_zeropower.append(update_grad)
 
                 # Copy the current parameter value into the temporary buffer.
-                updated_param_chunk[i].copy_(p)
+                updated_param_chunk[i].copy_(param)
 
                 # Apply weight decay directly to the buffer.
                 updated_param_chunk[i].mul_(1 - eff_weight_decay_val)
@@ -621,13 +622,13 @@ class Muon(torch.optim.Optimizer):
 
             # Compute zeropower for the entire chunk in a single, batched call.
             original_shape = batched_update_grads.shape
-            # Reshape attn params from [hdim, dim*4] to [4,hdim,dim] to apply NS indepedently to Q,K,V,O
-            module_idx = start_idx if start_idx<len(params) else 0
-            if getattr(params[module_idx],'module','none')=='attn':
-                for p in params[module_idx:module_idx+chunk_size]:
-                    assert getattr(params[module_idx],'module','none')=='attn'
+            # Reshape attn params from [hdim, dim*4] to [4,hdim,dim] to apply polar_express independently to Q,K,V,O
+            param_idx = start_idx if start_idx < len(params) else 0
+            if getattr(params[param_idx], 'label', None) == 'attn':
+                for p in params[param_idx:param_idx+chunk_size]:
+                    assert getattr(params[param_idx], 'label', None)=='attn', "GPU cannot mix attn and mlp params"
                 batch = 4 * original_shape[0]
-                d1 = original_shape[1]
+                d1 = original_shape[1] 
                 d2 = original_shape[2] // 4
                 batched = batched_update_grads.view(batch, d1, d2)
                 v_chunk = polar_express(batched)
@@ -696,8 +697,8 @@ class DistAdam(torch.optim.Optimizer):
         grad_slices = []
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
-            for base_i in range(len(params)):
-                grad = params[base_i].grad
+            for param in params:
+                grad = param.grad
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
                 reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
@@ -709,18 +710,17 @@ class DistAdam(torch.optim.Optimizer):
             eps = group['eps']
             wd = group['weight_decay']
             params = group['params']
-            for base in range(len(params)):
+            for param in params:
                 reduce_scatter_futures[idx].wait()
-                p = params[base]
-                rank_size = p.shape[0] // world_size
-                p_slice = p[rank * rank_size:(rank + 1) * rank_size]
-                lr = group['lr'] * getattr(p, "lr_mul", 1.0)
-                state = self.state[p]
+                rank_size = param.shape[0] // world_size
+                p_slice = param[rank * rank_size:(rank + 1) * rank_size]
+                lr = group['lr'] * getattr(param, "lr_mul", 1.0)
+                state = self.state[param]
                 g_slice = grad_slices[idx]
                 # State init
                 if not state:
                     state["step"] = torch.tensor(
-                        0, dtype=torch.int64, device=p.device
+                        0, dtype=torch.int64, device=param.device
                     )
                     state["exp_avg"] = torch.zeros(
                         p_slice.shape,
@@ -738,7 +738,7 @@ class DistAdam(torch.optim.Optimizer):
                 t = state["step"]
                 # weight decay
                 if wd != 0:
-                    eff_weight_decay = lr * wd * getattr(p, "wd_mul", 1.0)
+                    eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
                     p_slice.mul_(1 - eff_weight_decay)
                 # update running averages
                 exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
@@ -752,7 +752,7 @@ class DistAdam(torch.optim.Optimizer):
                 update = exp_avg.div(denom).mul_(step_size)
                 p_slice.add_(other=update, alpha=-1.0)
                 idx += 1
-                all_gather_futures.append(dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future())
+                all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
         torch.futures.collect_all(all_gather_futures).wait()
 
 # -----------------------------------------------------------------------------
@@ -790,7 +790,7 @@ class Yarn(nn.Module):
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
         self.reset()
-
+        
     def reset(self):
         angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=self.head_dim//4, dtype=torch.float32, device=device)
         # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
@@ -857,7 +857,7 @@ class CausalSelfAttention(nn.Module):
         # make matrices the same shape as MLP to enable batched call in optimizer
         self.qkvo_w = nn.Parameter(torch.empty(self.hdim, self.dim*4))
         # label module to enable custom optimizer sizing
-        self.qkvo_w.module='attn'
+        self.qkvo_w.label='attn'
         with torch.no_grad():
             self.qkvo_w.view(4,self.hdim, self.dim)[:3].uniform_(-bound, bound) # init QKV weights
             self.qkvo_w.view(4,self.hdim, self.dim)[3].zero_() # init output weights to zero
@@ -865,7 +865,7 @@ class CausalSelfAttention(nn.Module):
         # sparse gated attention to enable context based no-op by @classiclarryd
         self.attn_gate = CastedLinear(12, num_heads)
         # label module to enable custom optimizer sizing
-        self.attn_gate.weight.module = 'attn_gate'
+        self.attn_gate.weight.label = 'attn_gate'
         self.attn_gate.weight.detach().zero_()
 
     def forward(self, x: Tensor, attn_args: AttnArgs):
@@ -877,7 +877,7 @@ class CausalSelfAttention(nn.Module):
         ve, sa_lambdas = attn_args.ve, attn_args.sa_lambdas
         seqlens, attn_scale, bm_size = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size
 
-        q, k, v = F.linear(x, self.qkvo_w.view(4,self.hdim, self.dim)[:3].flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k, v = F.linear(x, self.qkvo_w.view(4, self.hdim, self.dim)[:3].flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = rotary(q, cos, sin), rotary(k, cos, sin)
         if ve is not None:
@@ -893,7 +893,7 @@ class CausalSelfAttention(nn.Module):
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = F.linear(y, self.qkvo_w.view(4,self.hdim, self.dim)[3].type_as(y))
+        y = F.linear(y, self.qkvo_w.view(4, self.hdim, self.dim)[3].type_as(y))
         return y
 
 class MLP(nn.Module):
@@ -904,8 +904,8 @@ class MLP(nn.Module):
         self.c_fc = nn.Parameter(torch.empty(dim, hdim))
         self.c_proj = nn.Parameter(torch.empty(dim, hdim))
         # label modules to enable custom optimizer sizing
-        self.c_fc.module='mlp'
-        self.c_proj.module='mlp'
+        self.c_fc.label='mlp'
+        self.c_proj.label='mlp'
         std = 0.5 * (dim ** -0.5)
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
         with torch.no_grad():
@@ -917,7 +917,6 @@ class MLP(nn.Module):
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = F.linear(x, self.c_proj.type_as(x))
         return x
-
 
 class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
@@ -949,7 +948,7 @@ class GPT(nn.Module):
         self.smear_gate = CastedLinear(12, 1)
         self.smear_gate.weight.detach().zero_()
         # label modules to enable custom optimizer sizing
-        self.smear_gate.weight.module = 'smear_gate'
+        self.smear_gate.weight.label = 'smear_gate'
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
@@ -993,6 +992,7 @@ class GPT(nn.Module):
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
+        # dropping first layer updates this to .12 ... 012
         ve = [None, ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == len(self.blocks)
 
@@ -1019,6 +1019,7 @@ class GPT(nn.Module):
         n = len(self.blocks) // 2
 
         x_backout = None
+        backout_layer = 8
         # skip layer zero
         for i in range(1,len(self.blocks)):
             attn_args = AttnArgs(
@@ -1030,17 +1031,18 @@ class GPT(nn.Module):
                 sin=self.yarn.sin,
                 attn_scale=self.yarn.attn_scale
             )
+            # since layer 0 is skipped, layer 11 does not have skip_connection
             if i >= n and i<11:
                 gate = torch.sigmoid(skip_weights[i - n])  # in (0, 1)
                 x = x + gate * skip_connections.pop()
             x = self.blocks[i](x, x0, lambdas[i], attn_args)
             if i < n:
                 skip_connections.append(x)
-            if i==8:
-                x_backout=x
+            if i == backout_layer:
+                x_backout = x
 
         # back out contributions from first 8 layers that are only required for downstream context and not direct prediction
-        x -= backout_lambda*x_backout
+        x -= backout_lambda * x_backout
         x = norm(x)
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
@@ -1092,12 +1094,12 @@ class BOSFinder:
     def _load(self):
         self.bos_idx_async = (self.tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
         self.ready.set()
-
+    
     def start(self):
         self.ready.clear()
         self.thread = threading.Thread(target=self._load)
         self.thread.start()
-
+    
     def get(self):
         if self.thread:
             self.ready.wait()
@@ -1140,17 +1142,17 @@ class DataPreloader:
         self.thread = None
         self.data = None
         self.ready = threading.Event()
-
+    
     def _load(self):
         tokens = _load_data_shard(next(self.file_iter))
         self.data = (tokens, BOSFinder(tokens, self.world_size))
         self.ready.set()
-
+    
     def start(self):
         self.ready.clear()
         self.thread = threading.Thread(target=self._load)
         self.thread.start()
-
+    
     def get(self):
         if self.thread:
             self.ready.wait()
@@ -1242,10 +1244,10 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_iterations: int = 2290  # number of iterations to run
-    iteration_extension = 40  # number of iterations to continue training at final cooldown and window size
-    cooldown_frac: int = 0.45  # fraction of training spent cooling down the learning rate
-    momentum_cd_steps = 50  # number of iterations for muon momentum cooldown
+    num_scheduled_iterations: int = 2290  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_iterations: int = num_scheduled_iterations + num_extension_iterations
+    cooldown_frac: int = 0.45  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
@@ -1254,7 +1256,7 @@ class Hyperparameters:
     block_size: int = 128
     ws_schedule: tuple = (3, 7, 11)
     ws_validate: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
-    ws_long_validate: int = 20 # extend long windows out even further
+    ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
 
 args = Hyperparameters()
 
@@ -1339,9 +1341,9 @@ for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
-# learning rate schedule: stable then decay
+# learning rate schedule: stable then linear decay
 def get_lr(step: int):
-    x = min(0.9999,step / args.num_iterations)
+    x = min(0.9999, step / args.num_iterations)
     assert 0 <= x < 1
     lr = 1.0
     if x >= 1 - args.cooldown_frac:
@@ -1350,36 +1352,49 @@ def get_lr(step: int):
     return lr
 
 def get_ws(step: int):
-    if step == args.num_iterations+args.iteration_extension:
-        return args.ws_validate//2, args.ws_validate
-    x = min(step / (1 + args.num_iterations),0.9999)
+    # set short window size to half of long window size
+    # on final step return specific ws for validation
+    if step == args.num_iterations:
+        return args.ws_validate // 2, args.ws_validate
+    x = min(step / (1 + args.num_scheduled_iterations), 0.9999)
     assert 0 <= x < 1
     ws_idx = int(len(args.ws_schedule) * x)
-    return args.ws_schedule[ws_idx]//2, args.ws_schedule[ws_idx]
+    return args.ws_schedule[ws_idx] // 2, args.ws_schedule[ws_idx]
 
-def update_optimizer_params(step, optimizer1, optimizer2):
-    # Update lr
-    for group in optimizer1.param_groups:
-        group["lr"] = group["initial_lr"] * get_lr(step)
-    for group in optimizer2.param_groups:
-        group["lr"] = group["initial_lr"] * get_lr(step)
+def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
+    # warmup phase: linearly increase momentum from min to max
+    # cooldown phase: linearly decrease momentum from max to min
+    momentum_cd_start = args.num_iterations - muon_cooldown_steps
+    if step < muon_warmup_steps:
+        frac = step / muon_warmup_steps
+        momentum = momentum_min + frac * (momentum_max - momentum_min)
+    elif step > momentum_cd_start:
+        frac = (step - momentum_cd_start) / muon_cooldown_steps
+        momentum = momentum_max - frac * (momentum_max - momentum_min)
+    else:
+        momentum = momentum_max
+    return momentum
 
-    # Warmup phase: gradually increase momentum from 0.85 to 0.95
-    if step < 300:
-        frac = step / 300
-        momentum = 0.85 + frac * (0.95 - 0.85)
-        for group in optimizer2.param_groups:
-            group["momentum"] = momentum
+def step_optimizers(step: int, optimizers, model):
+    # update lr
+    for optimizer in optimizers:
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * get_lr(step)
 
-    # Cooldown phase: gradually decrease momentum
-    momentum_cd_start = args.num_iterations + args.iteration_extension - args.momentum_cd_steps
-    if step > momentum_cd_start:
-        frac = (step - momentum_cd_start) / args.momentum_cd_steps
+    # set muon momentum based on step
+    momentum = get_muon_momentum(step)
+    for group in optimizers[1].param_groups:
+        group["momentum"] = momentum
 
-        # Decay momentum from 0.95 to 0.85
-        momentum = 0.95 - frac * (0.95 - 0.85)
-        for group in optimizer2.param_groups:
-            group["momentum"] = momentum
+    # on even steps, only step Muon params
+    # on odd steps, step all params
+    if step%2==0:
+        optimizers[1].step()
+        optimizers[1].zero_grad(set_to_none=True)
+    else:
+        for optimizer in optimizers:
+            optimizer.step()
+        model.zero_grad(set_to_none=True)
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
@@ -1392,21 +1407,23 @@ warmup_steps = 30
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
-ws_long = args.ws_schedule[0]
 for step in range(warmup_steps):
     inputs, targets, cum_seqlens = next(train_loader)
-    new_ws_long = args.ws_schedule[step % len(args.ws_schedule)]  # each window size is a new graph, need to warm up each with YaRN params
-    if new_ws_long > ws_long:
-        model.yarn.apply(ws_long, new_ws_long)
-        ws_long = new_ws_long
-    elif new_ws_long<ws_long:
+    # each window size is a new graph, need to warm up each with Yarn.attn_scale
+    ws_idx = step % len(args.ws_schedule)
+    if ws_idx==0:
         model.yarn.reset()
-        ws_long = new_ws_long
+        ws_long = args.ws_schedule[0]
+    else:
+        new_ws_long = args.ws_schedule[ws_idx]  
+        if new_ws_long > ws_long:
+            model.yarn.apply(ws_long, new_ws_long)
+            ws_long = new_ws_long
     model(inputs, targets, cum_seqlens, ws_long//2, ws_long).backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
-model.yarn.reset()
+model.yarn.reset() # rotary buffer is not stored in state_dict
 model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
@@ -1422,7 +1439,7 @@ training_time_ms = 0
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
-train_steps = args.num_iterations + args.iteration_extension
+train_steps = args.num_iterations
 ws_short, ws_long = get_ws(0)
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
@@ -1434,7 +1451,7 @@ for step in range(train_steps + 1):
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         if last_step:
-            ws_long = args.ws_long_validate
+            ws_long = args.ws_validate_post_yarn_ext
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
@@ -1442,7 +1459,7 @@ for step in range(train_steps + 1):
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
         val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-        val_loss = torch.zeros((), device=device, dtype=torch.float32)
+        val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens = next(val_loader)
@@ -1468,17 +1485,8 @@ for step in range(train_steps + 1):
     for _ in range(grad_accum_steps):
         inputs, targets, cum_seqlens = next(train_loader)
         model(inputs, targets, cum_seqlens, ws_short, ws_long).backward()
-    update_optimizer_params(step, optimizer1, optimizer2)
-    # only step Adam every other step
-    if step%2==0:
-        optimizer2.step()
-        optimizer2.zero_grad(set_to_none=True)
-    else:
-        for opt in optimizers:
-            opt.step()
-        # null the gradients
-        model.zero_grad(set_to_none=True)
-        
+    step_optimizers(step, optimizers, model)
+     
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
