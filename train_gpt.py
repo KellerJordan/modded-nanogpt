@@ -426,10 +426,10 @@ class Muon(torch.optim.Optimizer):
         This hyper-optimized class has faster execution time than the current impl of Adam for small params
 
     Custom distributed sizing:
-    The model stores all attn and mlp weights in the same shape, and then updates the view as 
-    needed on the forward pass. This enables attn and mlp weights to be contained within the same 
-    dist.reduce_scatter_tensor() call. The model architecture has been customized to enable 
-    (n_attn_layers+n_mlp_layers*2)%4==0 for batching across 8 GPUs with zero padding on mlp and attn. 
+    The model stores all attn and mlp weights in the same shape, and then updates the view as
+    needed on the forward pass. This enables attn and mlp weights to be contained within the same
+    dist.reduce_scatter_tensor() call. The model architecture has been customized to enable
+    (n_attn_layers+n_mlp_layers*2)%4==0 for batching across 8 GPUs with zero padding on mlp and attn.
     The scheduling is:
         1. reduce scatter smear_gate (1 param 7 padding params)
         2. reduce scatter attn_gate (10 params 6 padding params)
@@ -469,10 +469,10 @@ class Muon(torch.optim.Optimizer):
             group_params = [p for p in non_attn_subset if p.shape == size]
             param_groups.append(dict(params=group_params))
         return param_groups
-    
+
     def generate_custom_param_groups(self, params):
         """
-        Implementation requires that a single GPU does not receive both attn 
+        Implementation requires that a single GPU does not receive both attn
         and mlp params when a param group is split across GPUs.
         """
         module_ranks = {
@@ -627,7 +627,7 @@ class Muon(torch.optim.Optimizer):
                 for p in params[module_idx:module_idx+chunk_size]:
                     assert getattr(params[module_idx],'module','none')=='attn'
                 batch = 4 * original_shape[0]
-                d1 = original_shape[1] 
+                d1 = original_shape[1]
                 d2 = original_shape[2] // 4
                 batched = batched_update_grads.view(batch, d1, d2)
                 v_chunk = polar_express(batched)
@@ -790,7 +790,7 @@ class Yarn(nn.Module):
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
         self.reset()
-        
+
     def reset(self):
         angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=self.head_dim//4, dtype=torch.float32, device=device)
         # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
@@ -917,6 +917,7 @@ class MLP(nn.Module):
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = F.linear(x, self.c_proj.type_as(x))
         return x
+
 
 class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
@@ -1084,12 +1085,12 @@ class BOSFinder:
     def _load(self):
         self.bos_idx_async = (self.tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
         self.ready.set()
-    
+
     def start(self):
         self.ready.clear()
         self.thread = threading.Thread(target=self._load)
         self.thread.start()
-    
+
     def get(self):
         if self.thread:
             self.ready.wait()
@@ -1132,17 +1133,17 @@ class DataPreloader:
         self.thread = None
         self.data = None
         self.ready = threading.Event()
-    
+
     def _load(self):
         tokens = _load_data_shard(next(self.file_iter))
         self.data = (tokens, BOSFinder(tokens, self.world_size))
         self.ready.set()
-    
+
     def start(self):
         self.ready.clear()
         self.thread = threading.Thread(target=self._load)
         self.thread.start()
-    
+
     def get(self):
         if self.thread:
             self.ready.wait()
@@ -1409,7 +1410,7 @@ for step in range(train_steps + 1):
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
         val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-        val_loss = 0
+        val_loss = torch.zeros((), device=device, dtype=torch.float32)
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens = next(val_loader)
