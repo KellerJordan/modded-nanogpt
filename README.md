@@ -123,7 +123,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 36 | 2.495 minutes | MuonCustomSizing, perform mlp and attn reduce scatter in shared call | 09/23/25 | [log](records/092325_MuonCustomSizing/b067b4ac-72a6-4436-a6f8-ea51c1efeef3.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/132) | @classiclarryd
 37 | 2.483 minutes | Compute cross entropy in BF16 during training | 09/27/25 | [log](records/092725_BF16CE/08c0770f-17fc-44cd-971d-734a7a28a3e3.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/133) | @GusarichOnX
 38 | 2.476 minutes | Polar Express, replacement for Newton-Schulz | 09/29/25 | [log](records/092925_PolarExpress/0e3f0af5-ad08-47a6-813d-0c709b50d422.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/134) | @varunneal
-39 | 2.447 minutes | Custom Muon batching to remove padding params | 09/30/25 | [log](records/093025_CustomBatching/40b101b1-77ea-45ea-a089-1d3a647daa22.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/136) | @classiclarryd
+39 | 2.447 minutes | Only update Adam params every other step, reduce batch size | 09/30/25 | [log](records/093025_CustomBatching/40b101b1-77ea-45ea-a089-1d3a647daa22.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/136) | @classiclarryd
 40 | 2.345 minutes | Backout, misc hyperparameter tuning, optimize lambda padding | 10/04/25 | [log](records/100425_Backout/514e7581-fbd4-4338-a3e4-e556f9c958ce.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/140) | @classiclarryd
 
 ## Rules
