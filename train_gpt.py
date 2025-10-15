@@ -601,7 +601,6 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor, ve: Tensor | None, lambdas: Tensor, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        
         q, k, v = F.linear(x, self.qkvo_w[:3].flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
@@ -668,7 +667,7 @@ class GPT(nn.Module):
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
-        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, x_s=(model_dim**0.5)/448, w_s=2**-9, grad_s=1/448)
+        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
         self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
@@ -778,7 +777,7 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-# find world_size starting indicies, such that each begins with token 50256 and local_batches don't overlap by @classiclarryd
+# find world_size starting indicies, such that each begins with token 50256 and local_batches don't overlap
 def find_batch_starts(tokens: Tensor, pos: int, seq_len: int, token_window: int):
     boundary_mask = tokens[pos : pos + token_window] == 50256
     boundary_positions = torch.nonzero(boundary_mask, as_tuple=False).squeeze(-1) + pos
