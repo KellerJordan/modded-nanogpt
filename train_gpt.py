@@ -493,18 +493,6 @@ class Muon(torch.optim.Optimizer):
                 * getattr(p_example, "wd_mul", 1.0)
             )
 
-            # Determine effective LR and WD once per group, assuming constant for same-shaped params.
-            eff_lr_val = (
-                group["lr"]
-                * max(1, params[0].size(-2) / params[0].size(-1)) ** 0.5
-                * getattr(params[0], "lr_mul", 1.0)
-            )
-            eff_weight_decay_val = (
-                group["lr"]
-                * group["weight_decay"]
-                * getattr(params[0], "wd_mul", 1.0)
-            )
-
             # Prepare a contiguous buffer for the updated parameters for this rank's chunk.
             # This buffer will serve as the input_tensor for dist.all_gather_into_tensor.
             updated_param_chunk = torch.empty(
@@ -850,7 +838,7 @@ class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx != 7 else None
+        self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx not in [0, 7] else None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP(dim) if layer_idx != 0 else None
 
@@ -912,17 +900,17 @@ class GPT(nn.Module):
         self.lm_head.weight.lr_mul = 1.0
         self.scalars.lr_mul = 5.0
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws: int, ws_final_layer: int):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws_short: int, ws_long: int):
         assert input_seq.ndim == 1
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
+        ve = [None, ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == len(self.blocks)
 
-        long_bm, short_bm = ws * args.block_size, (ws // 2) * args.block_size
-        final_bm = ws_final_layer * args.block_size
-        bm_sizes = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, final_bm]
+        short_bm = ws_short * args.block_size
+        long_bm = ws_long * args.block_size
+        bm_sizes = [None, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, None, short_bm, short_bm, short_bm, long_bm]
         assert len(bm_sizes) == len(self.blocks)
 
         x = self.embed(input_seq)
@@ -941,7 +929,8 @@ class GPT(nn.Module):
 
         n = len(self.blocks) // 2
 
-        for i in range(len(self.blocks)):
+        # skip layer zero
+        for i in range(1,len(self.blocks)):
             attn_args = AttnArgs(
                 ve=ve[i],
                 sa_lambdas=sa_lambdas[i],
@@ -951,7 +940,7 @@ class GPT(nn.Module):
                 sin=self.yarn.sin,
                 attn_scale=self.yarn.attn_scale
             )
-            if i >= n:
+            if i >= n and i<11:
                 gate = torch.sigmoid(skip_weights[i - n])  # in (0, 1)
                 x = x + gate * skip_connections.pop()
             x = self.blocks[i](x, x0, lambdas[i], attn_args)
@@ -1154,7 +1143,8 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_iterations: int = 1645 # number of iterations to run
+    num_iterations: int = 1640 # number of iterations to run
+    iteration_extension = 40 # number of iterations to continue training at final cooldown and window size
     cooldown_frac: int = 0.5 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1163,8 +1153,8 @@ class Hyperparameters:
     # attention masking
     block_size: int = 128
     ws_schedule: tuple = (3, 7, 11)
-    ws_validate: int = 13 # increase final validation ws @classiclarryd
-    ws_validate_final_layer: int = 20 # final layer shows no degradation with context length
+    ws_validate: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
+    ws_long_validate: int = 20 # extend long windows out even further
 
 args = Hyperparameters()
 
@@ -1251,7 +1241,7 @@ for opt in optimizers:
 
 # learning rate schedule: stable then decay
 def get_lr(step: int):
-    x = step / args.num_iterations
+    x = min(0.9999,step / args.num_iterations)
     assert 0 <= x < 1
     lr = 1.0
     if x >= 1 - args.cooldown_frac:
@@ -1260,12 +1250,12 @@ def get_lr(step: int):
     return lr
 
 def get_ws(step: int):
-    if step == args.num_iterations:
-        return args.ws_validate, args.ws_validate_final_layer
-    x = step / (1 + args.num_iterations)
+    if step == args.num_iterations+args.iteration_extension:
+        return args.ws_validate//2, args.ws_validate
+    x = min(step / (1 + args.num_iterations),0.9999)
     assert 0 <= x < 1
     ws_idx = int(len(args.ws_schedule) * x)
-    return args.ws_schedule[ws_idx], args.ws_schedule[ws_idx]
+    return args.ws_schedule[ws_idx]//2, args.ws_schedule[ws_idx]
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
@@ -1278,17 +1268,17 @@ warmup_steps = 30
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
-ws=args.ws_schedule[0]
+ws_long = args.ws_schedule[0]
 for step in range(warmup_steps):
     inputs, targets, cum_seqlens = next(train_loader)
-    new_ws = args.ws_schedule[step % len(args.ws_schedule)]  # each window size is a new graph, need to warm up each with YaRN params
-    if new_ws > ws:
-        model.yarn.apply(ws, new_ws)
-        ws = new_ws
-    elif new_ws<ws:
+    new_ws_long = args.ws_schedule[step % len(args.ws_schedule)]  # each window size is a new graph, need to warm up each with YaRN params
+    if new_ws_long > ws_long:
+        model.yarn.apply(ws_long, new_ws_long)
+        ws_long = new_ws_long
+    elif new_ws_long<ws_long:
         model.yarn.reset()
-        ws = new_ws
-    model(inputs, targets, cum_seqlens, ws, ws).backward()
+        ws_long = new_ws_long
+    model(inputs, targets, cum_seqlens, ws_long//2, ws_long).backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
@@ -1308,17 +1298,19 @@ training_time_ms = 0
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
-train_steps = args.num_iterations
-ws, ws_final_layer = get_ws(0)
+train_steps = args.num_iterations + args.iteration_extension
+ws_short, ws_long = get_ws(0)
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
-    new_ws, ws_final_layer = get_ws(step)
-    if new_ws != ws:
-        model.yarn.apply(ws, new_ws)
-        ws=new_ws
+    ws_short, new_ws_long = get_ws(step)
+    if new_ws_long != ws_long:
+        model.yarn.apply(ws_long, new_ws_long)
+        ws_long=new_ws_long
 
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        if last_step:
+            ws_long = args.ws_long_validate
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
@@ -1330,7 +1322,7 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, ws, ws_final_layer)
+                val_loss += model(inputs, targets, cum_seqlens, ws_short, ws_long)
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -1351,7 +1343,7 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     for _ in range(grad_accum_steps):
         inputs, targets, cum_seqlens = next(train_loader)
-        model(inputs, targets, cum_seqlens, ws, ws_final_layer).backward()
+        model(inputs, targets, cum_seqlens, ws_short, ws_long).backward()
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
