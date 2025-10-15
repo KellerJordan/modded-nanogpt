@@ -6,8 +6,11 @@ import uuid
 import time
 import copy
 import glob
+import math
+
 from dataclasses import dataclass
 from functools import lru_cache
+from itertools import accumulate
 from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -556,27 +559,26 @@ class CastedLinear(nn.Linear):
         else:
             return F.linear(x, self.weight.type_as(x))
 
-class Rotary(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int):
-        super().__init__()
-        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
-        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
-        t = torch.arange(max_seq_len, dtype=torch.float32)
-        theta = torch.einsum("i,j -> ij", t, angular_freq)
-        self.cos = nn.Buffer(theta.cos(), persistent=False)
-        self.sin = nn.Buffer(theta.sin(), persistent=False)
+def rotary(x_BTHD: Tensor, cos: Tensor, sin: Tensor):
+    assert cos.size(0) >= x_BTHD.size(-3)
+    cos, sin = cos[None, :x_BTHD.size(-3), None, :], sin[None, :x_BTHD.size(-3), None, :]
+    x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
-    def forward(self, x_BTHD: Tensor):
-        assert self.cos.size(0) >= x_BTHD.size(-3)
-        cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
-        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
-        y1 = x1 * cos + x2 * sin
-        y2 = x1 * (-sin) + x2 * cos
-        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+@dataclass
+class AttnArgs:
+    ve: torch.Tensor
+    sa_lambdas: torch.Tensor
+    seqlens: torch.Tensor
+    bm_size: int
+    rotary_cos: torch.Tensor
+    rotary_sin: torch.Tensor
+    attn_scale: float
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128):
+    def __init__(self, dim: int, head_dim: int, num_heads: int):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -590,36 +592,35 @@ class CausalSelfAttention(nn.Module):
         with torch.no_grad():
             self.qkvo_w[:3].uniform_(-bound, bound) # init QKV weights
             self.qkvo_w[3].zero_() # init output weights to zero
-        self.rotary = Rotary(head_dim, max_seq_len)
-        # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
-        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-        self.attn_scale = 0.12
 
         # sparse gated attention to enable context based no-op by @classiclarryd
-        self.attn_gate_dim = 12
-        self.attn_gate = CastedLinear(self.attn_gate_dim, num_heads)
+        self.attn_gate = CastedLinear(12, num_heads)
         self.attn_gate.weight.detach().zero_()
 
-    def forward(self, x: Tensor, ve: Tensor | None, lambdas: Tensor, seqlens: Tensor, bm_size: int):
+    def forward(self, x: Tensor, attn_args: AttnArgs):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
+        # unpack attention args
+        rotary_cos, rotary_sin = attn_args.rotary_cos, attn_args.rotary_sin
+        ve, sa_lambdas = attn_args.ve, attn_args.sa_lambdas
+        seqlens, attn_scale, bm_size = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size
 
         q, k, v = F.linear(x, self.qkvo_w[:3].flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
-        q, k = self.rotary(q), self.rotary(k)
+        q, k = rotary(q, rotary_cos, rotary_sin), rotary(k, rotary_cos, rotary_sin)
         if ve is not None:
-            v = lambdas[0] * v + lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+            v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view_as(v) # @ KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
-            v = lambdas[0] * v
+            v = sa_lambdas[0] * v
 
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
         y = flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens, max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                   causal=True, softmax_scale=self.attn_scale, window_size=(bm_size, 0))
+                                   causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
-        y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_dim])).view(B, T, self.num_heads, 1)
+        y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, self.qkvo_w[3].type_as(y))
         return y
@@ -646,18 +647,17 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        SKIPPED_MLP_BLOCKS = [0] # skip MLP blocks for first MLP layer by @EmelyanenkoK
-        self.mlp = None if layer_idx in SKIPPED_MLP_BLOCKS else MLP(dim)
+        self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx != 7 else None
+        # skip MLP blocks for first MLP layer by @EmelyanenkoK
+        self.mlp = MLP(dim) if layer_idx != 0 else None
 
-    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor,
-                seqlens: Tensor, bm_size: int):
+    def forward(self, x: Tensor, x0: Tensor, lambdas: Tensor, attn_args: AttnArgs):
         x = lambdas[0] * x + lambdas[1] * x0
         if self.attn is not None:
-            x = x + self.attn(norm(x), ve, sa_lambdas, seqlens, bm_size)
+            x = x + self.attn(norm(x), attn_args)
         if self.mlp is not None:
             x = x + self.mlp(norm(x))
         return x
@@ -669,14 +669,14 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
         super().__init__()
         vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
@@ -691,6 +691,8 @@ class GPT(nn.Module):
             *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)], # SA lambdas
             torch.ones(pad),
         ]))
+        self.max_seq_len = max_seq_len
+        self.setup_yarn(head_dim)
         # set learning rates
         for param in self.embed.parameters():
             param.lr_mul = 75.
@@ -699,6 +701,33 @@ class GPT(nn.Module):
         self.lm_head.weight.lr_mul = 1.0
         self.scalars.lr_mul = 5.0
 
+    def setup_yarn(self, head_dim: int):
+        # store single copy of rotary tensors
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=head_dim//4, dtype=torch.float32)
+        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(head_dim//4)])
+        t = torch.arange(self.max_seq_len, dtype=torch.float32)
+        theta = torch.outer(t, angular_freq)
+        self.rotary_cos = nn.Buffer(theta.cos(), persistent=False)
+        self.rotary_sin = nn.Buffer(theta.sin(), persistent=False)
+        self.angular_freq = angular_freq
+
+        # scale attention factor f in attn=softmax(f*qk) logarithmically with window size @classiclarryd
+        windows = list(dict.fromkeys(list(args.ws_schedule) + [args.ws_validate]))
+        scale_factors = [0.2 * math.log(curr / prev) + 1 for prev, curr in zip(windows[:-1], windows[1:])]
+        # start with 0.1, inspired by 0.12 from @leloykun and learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
+        attn_scales = list(accumulate([0.1] + scale_factors, lambda acc, factor: acc * factor))
+        self.attn_scales = dict(zip(windows, attn_scales))
+
+    def apply_yarn(self, old_window: int, new_window: int, alpha: int=1, beta: int=32):
+        rotations = args.block_size * old_window * self.angular_freq / (2 * torch.pi)
+        scaling_factor = old_window / new_window
+        interpolation_weight = torch.clamp((rotations - alpha) / (beta - alpha), 0, 1)
+        self.angular_freq *= scaling_factor + interpolation_weight * (1 - scaling_factor)
+        t = torch.arange(self.max_seq_len, dtype=torch.float32, device=self.angular_freq.device)
+        theta = torch.outer(t, self.angular_freq)
+        self.rotary_cos.copy_(theta.cos())
+        self.rotary_sin.copy_(theta.sin())
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws: int):
         assert input_seq.ndim == 1
@@ -723,9 +752,18 @@ class GPT(nn.Module):
         n = len(self.blocks) // 2
 
         for i in range(len(self.blocks)):
+            attn_args = AttnArgs(
+                ve=ve[i],
+                sa_lambdas=sa_lambdas[i],
+                seqlens=seqlens,
+                bm_size=bm_sizes[i],
+                rotary_cos=self.rotary_cos,
+                rotary_sin=self.rotary_sin,
+                attn_scale=self.attn_scales[ws]
+            )
             if i >= n:
                 x = x + skip_weights[i - n] * skip_connections.pop()
-            x = self.blocks[i](x, ve[i], x0, lambdas[i], sa_lambdas[i], seqlens, bm_sizes[i])
+            x = self.blocks[i](x, x0, lambdas[i], attn_args)
             if i < n:
                 skip_connections.append(x)
 
@@ -868,15 +906,16 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_iterations: int = 1705 # number of iterations to run
-    cooldown_frac: int = 0.45 # fraction of training spent cooling down the learning rate
+    num_iterations: int = 1670 # number of iterations to run
+    cooldown_frac: int = 0.5 # fraction of training spent cooling down the learning rate
     # evaluation and logging
-    run_id: str = str(uuid.uuid4())
+    run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # attention masking
     block_size: int = 128
     ws_schedule: tuple = (3, 7, 11)
+    ws_validate: int = 13 # increase final validation ws @classiclarryd
 
 args = Hyperparameters()
 
@@ -928,6 +967,7 @@ model: nn.Module = GPT(
     vocab_size=50257,
     num_layers=12,
     num_heads=6,
+    head_dim=128,
     model_dim=768,
     max_seq_len=max(args.train_batch_size, args.val_batch_size) // (grad_accum_steps * world_size)
 ).cuda()
@@ -964,6 +1004,8 @@ def get_lr(step: int):
     return lr
 
 def get_ws(step: int):
+    if step == args.num_iterations:
+        return args.ws_validate
     x = step / (1 + args.num_iterations)
     assert 0 <= x < 1
     ws_idx = int(len(args.ws_schedule) * x)
@@ -1003,9 +1045,13 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
+ws = get_ws(0)
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
-    ws = get_ws(step)
+    new_ws = get_ws(step)
+    if new_ws != ws:
+        model.apply_yarn(ws, new_ws)
+        ws=new_ws
 
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
