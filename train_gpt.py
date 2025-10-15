@@ -408,17 +408,77 @@ class Muon(torch.optim.Optimizer):
 
     Warning: This optimizer should not be used for the embedding layer, the final fully connected layer,
     or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
+    Though empirically small 1D params perform efficiently here:
+        NS approximately performs a magnitude normalization of the grad
+        This hyper-optimized class has faster execution time than the current impl of Adam for small params
+
+    Custom distributed sizing:
+    The model stores all attn and mlp weights in the same shape, and then updates the view as 
+    needed on the forward pass. This enables attn and mlp weights to be contained within the same 
+    dist.reduce_scatter_tensor() call. The model architecture has been customized to enable 
+    (n_attn_layers+n_mlp_layers*2)%4==0 for batching across 8 GPUs with zero padding on mlp and attn. 
+    The scheduling is:
+        1. reduce scatter smear_gate (1 param 7 padding params)
+        2. reduce scatter attn_gate (10 params 6 padding params)
+        3. reduce scatter attn/mlp round 1 (10 attn params 6 mlp params)
+        4. reduce scatter attn/mlp round 2 (16 mlp params)
+        5. wait on step 1, then compute NS of 1 and schedule all gather
+        6. wait on step 2, then compute NS of 2 and schedule all gather
+        7. wait on step 3, then compute NS of 3 and schedule all gather
+            GPUs receive [2 ATTN, 2 ATTN, 2 ATTN, 2 ATTN, 2 ATTN, 2 MLP, 2 MLP, 2 MLP]
+            GPUs that receive params of type attn reshape before NS
+        8. wait on 4, then compute NS of 4 and schedule all gather
+        9. wait for each all gather to complete and update params
+    Empirically, leading with small params provides an additional 0.2s improvement.
     """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95):
+    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, custom_sizing=True):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
-        params = list(params)
-        sizes = {p.shape for p in params}
-        # create one buffer per unique parameter-size
-        param_groups = []
-        for size in sizes:
-            group_params = [p for p in params if p.shape == size]
-            param_groups.append(dict(params=group_params))
+        # custom sizing requires 8 GPUs
+        if custom_sizing and dist.get_world_size()==8:
+            param_groups = self.generate_custom_param_groups(params)
+        else:
+            param_groups = self.generate_standard_param_groups(params)
         super().__init__(param_groups, defaults)
+
+    def generate_standard_param_groups(self, params):
+        """
+        Use this method if running on less than 8 GPU or experimenting with additional attn or mlp modules.
+        Creates one param group per size, while giving attn its own param group for resize op.
+        """
+        params = list(params)
+        param_groups = []
+        attn_subset = [p for p in params if p.module == 'attn']
+        non_attn_subset = [p for p in params if p.module != 'attn']
+        param_groups.append(dict(params=attn_subset))
+
+        sizes = {p.shape for p in non_attn_subset}
+        for size in sizes:
+            group_params = [p for p in non_attn_subset if p.shape == size]
+            param_groups.append(dict(params=group_params))
+        return param_groups
+    
+    def generate_custom_param_groups(self, params):
+        """
+        Implementation requires that a single GPU does not receive both attn 
+        and mlp params when a param group is split across GPUs.
+        """
+        module_ranks = {
+            'smear_gate': 1, # 1 param
+            'attn_gate': 2, # 10 params
+            'attn': 3, # 10 params
+            'mlp': 4, # 22 params
+        }
+        params = list(params)
+        params.sort(key=lambda x: module_ranks.get(x.module))
+        idx = 0
+        group_sizes = [1,10,16,16]
+        assert len(params)==sum(group_sizes)
+        param_groups = []
+        for size in group_sizes:
+            group_params = params[idx:idx+size]
+            param_groups.append(dict(params=group_params))
+            idx += size
+        return param_groups
 
     @torch.no_grad()
     def step(self):
@@ -496,9 +556,9 @@ class Muon(torch.optim.Optimizer):
             # Prepare a contiguous buffer for the updated parameters for this rank's chunk.
             # This buffer will serve as the input_tensor for dist.all_gather_into_tensor.
             updated_param_chunk = torch.empty(
-                (chunk_size, *params[0].shape),
-                dtype=params[0].dtype,
-                device=params[0].device,
+                (chunk_size, *p_example.shape),
+                dtype=p_example.dtype,
+                device=p_example.device,
             )
 
             # List to collect update_grad tensors for batched zeropower computation.
@@ -515,7 +575,7 @@ class Muon(torch.optim.Optimizer):
                     updated_param_chunk[i].zero_()
                     # Also append a zero tensor for zeropower input if it must be padded.
                     update_grads_for_zeropower.append(
-                        torch.zeros_like(params[0].grad)
+                        torch.zeros_like(p_example.grad)
                     )
                     continue
                 p = params[param_idx]
@@ -547,14 +607,15 @@ class Muon(torch.optim.Optimizer):
             batched_update_grads = torch.stack(update_grads_for_zeropower)
 
             # Compute zeropower for the entire chunk in a single, batched call.
-
             original_shape = batched_update_grads.shape
-            if batched_update_grads.ndim > 3:
-                assert batched_update_grads.ndim == 4
-                batch = original_shape[0] * original_shape[1]
-                # Flatten all but the first two dims after batch
-                d1 = original_shape[2]
-                d2 = original_shape[3]
+            # Reshape attn params from [hdim, dim*4] to [4,hdim,dim] to apply NS indepedently to Q,K,V,O
+            module_idx = start_idx if start_idx<len(params) else 0
+            if getattr(params[module_idx],'module','none')=='attn':
+                for p in params[module_idx:module_idx+chunk_size]:
+                    assert getattr(params[module_idx],'module','none')=='attn'
+                batch = 4 * original_shape[0]
+                d1 = original_shape[1] 
+                d2 = original_shape[2] // 4
                 batched = batched_update_grads.view(batch, d1, d2)
                 v_chunk = newton_schulz_triton(batched)
                 v_chunk = v_chunk.view(original_shape)
@@ -770,19 +831,26 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
-        hdim = num_heads * head_dim
-        assert hdim == dim, "num_heads * head_dim must equal model_dim"
-        std = 0.5 * (dim ** -0.5)
+        self.dim = dim
+        self.hdim = num_heads * head_dim
+
+        assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
+        std = 0.5 * (self.dim ** -0.5)
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
-        self.qkvo_w = nn.Parameter(torch.empty(4, hdim, dim))
+        # make matrices the same shape as MLP to enable batched call in optimizer
+        self.qkvo_w = nn.Parameter(torch.empty(self.hdim, self.dim*4))
+        # label module to enable custom optimizer sizing
+        self.qkvo_w.module='attn'
         with torch.no_grad():
-            self.qkvo_w[:3].uniform_(-bound, bound) # init QKV weights
-            self.qkvo_w[3].zero_() # init output weights to zero
+            self.qkvo_w.view(4,self.hdim, self.dim)[:3].uniform_(-bound, bound) # init QKV weights
+            self.qkvo_w.view(4,self.hdim, self.dim)[3].zero_() # init output weights to zero
 
         # sparse gated attention to enable context based no-op by @classiclarryd
         self.attn_gate = CastedLinear(12, num_heads)
+        # label module to enable custom optimizer sizing
+        self.attn_gate.weight.module = 'attn_gate'
         self.attn_gate.weight.detach().zero_()
 
     def forward(self, x: Tensor, attn_args: AttnArgs):
@@ -794,7 +862,7 @@ class CausalSelfAttention(nn.Module):
         ve, sa_lambdas = attn_args.ve, attn_args.sa_lambdas
         seqlens, attn_scale, bm_size = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size
 
-        q, k, v = F.linear(x, self.qkvo_w[:3].flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k, v = F.linear(x, self.qkvo_w.view(4,self.hdim, self.dim)[:3].flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = rotary(q, cos, sin), rotary(k, cos, sin)
         if ve is not None:
@@ -810,17 +878,19 @@ class CausalSelfAttention(nn.Module):
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = F.linear(y, self.qkvo_w[3].type_as(y))
+        y = F.linear(y, self.qkvo_w.view(4,self.hdim, self.dim)[3].type_as(y))
         return y
 
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         hdim = 4 * dim
-        # make both matrices have the same shape because optimizer sorts params by shape
-        # 2 matrices x 12 layers = 24 total, which is divisible by 8 GPU world size
+        # make matrices the same shape to enable batched call in optimizer
         self.c_fc = nn.Parameter(torch.empty(dim, hdim))
         self.c_proj = nn.Parameter(torch.empty(dim, hdim))
+        # label modules to enable custom optimizer sizing
+        self.c_fc.module='mlp'
+        self.c_proj.module='mlp'
         std = 0.5 * (dim ** -0.5)
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
         with torch.no_grad():
@@ -863,6 +933,8 @@ class GPT(nn.Module):
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.smear_gate = CastedLinear(12, 1)
         self.smear_gate.weight.detach().zero_()
+        # label modules to enable custom optimizer sizing
+        self.smear_gate.weight.module = 'smear_gate'
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
@@ -1217,11 +1289,11 @@ for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
 # collect the parameters to optimize
-hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n and "gate" not in n]
 embed_params = [p for n, p in model.named_parameters() if "embed" in n]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
-smear_gate_params = [p for n, p in model.named_parameters() if "smear" in n]
+gate_params = [p for n, p in model.named_parameters() if "gate" in n]
 
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
@@ -1233,7 +1305,7 @@ optimizer1 = DistAdam(
     eps=1e-8,
     weight_decay=0.0,
 )
-optimizer2 = Muon(hidden_matrix_params+smear_gate_params, lr=0.05, momentum=0.95, weight_decay=0.0)
+optimizer2 = Muon(hidden_matrix_params + gate_params, lr=0.05, momentum=0.95, weight_decay=0.0)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
