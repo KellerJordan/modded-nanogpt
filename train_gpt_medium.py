@@ -390,7 +390,7 @@ import torch._inductor.codecache # noqa: E402
 import torch._inductor.graph # noqa: E402
 def _patched_trace_structured(name, metadata_fn, **kwargs):
     if name == "inductor_output_code":
-        print0(f"inductor_output_code: {metadata_fn().get("filename", "Unknown")}")
+        print0(f"inductor_output_code: {metadata_fn().get('filename', 'Unknown')}")
     trace_structured(name, metadata_fn, **kwargs)
 torch._inductor.codecache.trace_structured = _patched_trace_structured
 torch._inductor.graph.trace_structured = _patched_trace_structured
