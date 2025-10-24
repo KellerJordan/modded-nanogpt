@@ -405,10 +405,11 @@ def polar_express(G: torch.Tensor):
         X = X.mT
     return X
 
-# -----------------------------------------------------------------------------
-# Muon optimizer
 
-class Muon(torch.optim.Optimizer):
+# -----------------------------------------------------------------------------
+# NorMuon optimizer
+
+class NorMuon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
 
@@ -445,8 +446,8 @@ class Muon(torch.optim.Optimizer):
         9. wait for each all gather to complete and update params
     Empirically, leading with small params provides an additional 0.2s improvement.
     """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, custom_sizing=True):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
+    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, custom_sizing=True, beta2=0.95):
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2)
         # custom sizing requires 8 GPUs
         if custom_sizing and dist.get_world_size()==8:
             param_groups = self.generate_custom_param_groups(params)
@@ -591,6 +592,8 @@ class Muon(torch.optim.Optimizer):
                     update_grads_for_zeropower.append(
                         torch.zeros_like(p_example.grad)
                     )
+                    if i==0:
+                        second_momentum_buffer = torch.zeros((chunk_size, *p_example.shape[:-1], 1), dtype=torch.float32, device=p_example.device) if p_example.size(-2) >= p_example.size(-1) else torch.zeros((chunk_size, *p_example.shape[:-3], 1, p_example.shape[-1]), device=p_example.device, dtype=torch.float32)
                     continue
                 param = params[param_idx]
                 grad = grad_chunk[
@@ -601,8 +604,12 @@ class Muon(torch.optim.Optimizer):
                 # Initialize momentum buffer if not present
                 if not state:
                     state["momentum_buffer"] = torch.zeros_like(grad)
+                    if i==0:
+                        state["second_momentum_buffer"] = torch.zeros((chunk_size, *grad.shape[:-1], 1), dtype=torch.float32, device=grad.device) if param.size(-2) >= param.size(-1) else torch.zeros((chunk_size, *grad.shape[:-3], 1, grad.shape[-1]), dtype=torch.float32, device=grad.device)
 
                 momentum_buffer = state["momentum_buffer"]
+                if i==0:
+                    second_momentum_buffer = state["second_momentum_buffer"]
 
                 # Apply momentum update directly to the persistent momentum buffer in-place.
                 momentum_buffer.lerp_(grad, 1 - group["momentum"])
@@ -635,6 +642,17 @@ class Muon(torch.optim.Optimizer):
                 v_chunk = v_chunk.view(original_shape)
             else:
                 v_chunk = polar_express(batched_update_grads)
+            
+
+            vnorm = v_chunk.norm(dim=(-2,-1), keepdim=True)
+            v_mean = torch.mean(v_chunk * v_chunk, dim=-1, keepdim=True) if v_chunk.size(-2) >= v_chunk.size(-1) else torch.mean(v_chunk * v_chunk, dim=-2, keepdim=True)
+            second_momentum_buffer.lerp_(v_mean.float(), 1 - group["beta2"])
+            step_size = 1 / second_momentum_buffer.sqrt().clamp_min(1e-10)
+            v_chunk.mul_(step_size)
+            vnorm_new = v_chunk.norm(dim=(-2,-1), keepdim=True)
+            v_chunk.mul_(vnorm / (vnorm_new.clamp_min(1e-10)))
+
+
 
             # Add the computed zeropower update to the parameters in the buffer.
             # This loop applies the zeropower output (v_chunk) to the `updated_param_chunk` buffer.
@@ -1244,7 +1262,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 2290  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 2275  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: int = 0.45  # fraction of num_scheduled_iterations spent cooling down the learning rate
@@ -1335,7 +1353,7 @@ optimizer1 = DistAdam(
     eps=1e-8,
     weight_decay=0.0,
 )
-optimizer2 = Muon(hidden_matrix_params + gate_params, lr=0.06, momentum=0.95, weight_decay=0.0)
+optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.06, momentum=0.95, weight_decay=0.0, beta2=0.95)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
