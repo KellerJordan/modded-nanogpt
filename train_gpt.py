@@ -378,7 +378,6 @@ def polar_express(G: torch.Tensor):
     """
     Polar Express Sign Method: https://arxiv.org/pdf/2505.16932
     by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
-    Code adapted from https://github.com/NoahAmsel/PolarExpress/tree/main by @varunneal.
     """
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
@@ -409,7 +408,7 @@ def polar_express(G: torch.Tensor):
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
-class Muon(torch.optim.Optimizer):
+class NorMuon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
 
@@ -419,15 +418,16 @@ class Muon(torch.optim.Optimizer):
     processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
     matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
     the advantage that it can be stably run in bfloat16 on the GPU.
-    Note: A later PR replaced Newton-Shulz with Polar Express for the orthogonalization step
 
     Warning: This optimizer should not be used for the embedding layer, the final fully connected layer,
     or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
-    Though empirically small 1D params perform efficiently here:
-        NS approximately performs a magnitude normalization of the grad
-        This hyper-optimized class has faster execution time than the current impl of Adam for small params
 
-    Custom distributed sizing:
+    Differences from standard Muon:
+    - Newton-Shulz is replaced with Polar Express for the orthogonalization step
+    - NorMuon adds a low-rank variance estimator similar to Adafactor.
+    - small 1D parameters handled here instead of in Adam
+    - Cautious weight decay, a gated version of decoupled weight decay
+    - Custom distributed sizing:
     The model stores all attn and mlp weights in the same shape, and then updates the view as
     needed on the forward pass. This enables attn and mlp weights to be contained within the same
     dist.reduce_scatter_tensor() call. The model architecture has been customized to enable
@@ -446,7 +446,7 @@ class Muon(torch.optim.Optimizer):
         9. wait for each all gather to complete and update params
     Empirically, leading with small params provides an additional 0.2s improvement.
     """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, eps=1e-8, beta2=0.95, custom_sizing=True):
+    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, beta2=0.95, custom_sizing=True):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2)
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         # custom sizing requires 8 GPUs
@@ -483,7 +483,7 @@ class Muon(torch.optim.Optimizer):
         Implementation requires that a single GPU does not receive both attn
         and mlp params when a param group is split across GPUs.
         """
-        module_group_order = ['smear_gate', 'attn_gate', 'attn', 'mlp_up', 'mlp_down']
+        module_group_order = ['smear_gate', 'attn_gate', 'attn', 'mlp']
         params_list = list(params)
         params_list.sort(key=lambda x: module_group_order.index(x.label))
 
@@ -584,14 +584,11 @@ class Muon(torch.optim.Optimizer):
 
             # Determine LR and WR
             eff_lr = group["lr"] * group["param_lr"]
-            eff_wd = group["weight_decay"] * group["param_wd"]
+            eff_wd = group["lr"] * group["weight_decay"] * group["param_wd"]
 
             # Compute zeropower for the entire chunk in a single, batched call.
             if num_params == 0:
                 v_chunk = updated_grads
-            elif params[module_idx].label == "smear_gate":
-                # dividing by magnitude is equivalent of SVN for 1d tensors
-                v_chunk = updated_grads / (updated_grads.norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10))
             else:
                 v_chunk = polar_express(updated_grads)
 
@@ -608,10 +605,12 @@ class Muon(torch.optim.Optimizer):
 
             updated_params = torch.empty_like(grad_chunk)
             param_chunk = torch.stack(params[module_idx:module_idx + num_params]) if num_params > 0 else torch.zeros_like(v_chunk)
-            # Apply weight decay directly to the buffer.
-            param_chunk.mul_(1 - eff_wd)
 
-            param_chunk.add_(-eff_lr * v_chunk)
+            # "Cautious" weight decay (https://arxiv.org/abs/2510.12402)
+            mask = (v_chunk * param_chunk) >= 0
+            v_chunk.addcmul_(param_chunk, (eff_wd * mask).to(ref_param.dtype))
+
+            param_chunk.addcmul_(v_chunk, -eff_lr)
 
             updated_params[:num_params].copy_(param_chunk)
             if num_params < chunk_size:
@@ -868,8 +867,8 @@ class MLP(nn.Module):
         self.c_fc = nn.Parameter(torch.empty(dim, hdim))
         self.c_proj = nn.Parameter(torch.empty(dim, hdim))
         # label modules to enable custom optimizer sizing
-        self.c_fc.label = 'mlp_up'
-        self.c_proj.label = 'mlp_down'
+        self.c_fc.label = 'mlp'
+        self.c_proj.label = 'mlp'
         # corrective factor to account for transpose
         self.c_fc.lr_mul = 2.
 
@@ -1209,16 +1208,18 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_iterations: int = 2285
-    lr_schedule = (0.5, 0.98)    # breakpoints for 3-part schedule: (flat, linear decay, flat)
-    lr_min = 0.1
+    num_scheduled_iterations: int = 2205  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_iterations: int = num_scheduled_iterations + num_extension_iterations
+    cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # attention masking
     block_size: int = 128
-    ws_schedule: tuple = (3, 5, 7, 9, 11, 13)
+    ws_schedule: tuple = (3, 7, 11)
+    ws_final: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
 
 args = Hyperparameters()
@@ -1298,30 +1299,29 @@ optimizer1 = DistAdam(
     eps=1e-8,
     weight_decay=0.0,
 )
-optimizer2 = Muon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=0.0)
+optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
+# learning rate schedule: flat, then linear decay, then flat
 def get_lr(step: int):
-    assert step < args.num_iterations
-    # Three part schedule: flat, linear decrease, flat
-    lr_schedule = args.lr_schedule
-    x = step / args.num_iterations
-
-    if x < lr_schedule[0]:
-        return 1.0
-    elif x < lr_schedule[1]:
-        progress = (x - lr_schedule[0]) / (lr_schedule[1] - lr_schedule[0])
-        lr = 1.0 - (1.0 - args.lr_min) * progress
-    else:
-        lr = args.lr_min
+    x = min(0.9999, step / args.num_scheduled_iterations)
+    assert 0 <= x < 1
+    lr = 1.0
+    if x >= 1 - args.cooldown_frac:
+        w = (1 - x) / args.cooldown_frac
+        lr = w * 1.0 + (1 - w) * 0.1
     return lr
 
 def get_ws(step: int):
-    assert step <= args.num_iterations
-    x = step / (args.num_iterations + 1)
+    # set short window size to half of long window size
+    # Higher ws on "extension" steps
+    if step >= args.num_scheduled_iterations:
+        return args.ws_final // 2, args.ws_final
+    x = step / args.num_scheduled_iterations
+    assert 0 <= x < 1
     ws_idx = int(len(args.ws_schedule) * x)
     return args.ws_schedule[ws_idx] // 2, args.ws_schedule[ws_idx]
 
@@ -1371,25 +1371,26 @@ warmup_steps = 30
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+ws_schedule = list(args.ws_schedule) + [args.ws_final]
+ws_long = ws_schedule[0]
 for step in range(warmup_steps):
     inputs, targets, cum_seqlens = next(train_loader)
     # each window size is a new graph, need to warm up each with Yarn.attn_scale
-    ws_idx = step % len(args.ws_schedule)
+    ws_idx = step % len(ws_schedule)
     if ws_idx==0:
         model.yarn.reset()
-        ws_long = args.ws_schedule[0]
+        ws_long = ws_schedule[0]
     else:
-        new_ws_long = args.ws_schedule[ws_idx]
-        if new_ws_long > ws_long:
-            model.yarn.apply(ws_long, new_ws_long)
-            ws_long = new_ws_long
+        new_ws_long = ws_schedule[ws_idx]
+        model.yarn.apply(ws_long, new_ws_long)
+        ws_long = new_ws_long
     model(inputs, targets, cum_seqlens, ws_long//2, ws_long).backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
 model.yarn.reset() # rotary buffer is not stored in state_dict
 model.load_state_dict(initial_state["model"])
-optimizer2.reset()  #  momentum buffer not in state dict
+optimizer2.reset() # muon momentum buffers not in state dict
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
 del train_loader, initial_state
@@ -1447,11 +1448,9 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    loss = 0
     for _ in range(grad_accum_steps):
         inputs, targets, cum_seqlens = next(train_loader)
-        loss += model(inputs, targets, cum_seqlens, ws_short, ws_long) / grad_accum_steps
-    loss.backward()
+        (model(inputs, targets, cum_seqlens, ws_short, ws_long) / grad_accum_steps).backward()
     step_optimizers(step, optimizers, model)
 
     # logging
