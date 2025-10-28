@@ -52,7 +52,7 @@ I vectorized several loops inside the Muon `step`, which slightly decreases step
 
 In the previous Muon step, the `eff_lr_val` was scaling the learning rate on the attention parameters by `1/2`, since they were treated as `[dim, 4 * dim]`-shaped parameters.  However, in practice, they are square parameters, so we should not do this. Moving the attention reshape in the step corrects this issue.
 
-Similarly, the MLP up-projection is also scaled down. Following the theory that effective learning rate is proportional to $\sqrt{\text{output_dim}}$ I have increased `lr_mul` on the MLP up-projection to `2.0`. I have removed the logic that requires all parameters in the same group the share the same learning rate and weight decay.
+Similarly, the MLP up-projection is also scaled down. Following the theory that effective learning rate is proportional to `sqrt(output_dim)`, I have increased `lr_mul` on the MLP up-projection to `2.0`. I have removed the logic that requires all parameters in the same group the share the same learning rate and weight decay.
 
 Both of these changes meant that our previous Muon learning rate was ~twice as high as it should be, so I've decreased it to `0.03`. I have not further tuned this value.
 
