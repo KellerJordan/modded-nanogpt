@@ -705,13 +705,12 @@ class DistAdam(torch.optim.Optimizer):
         super().__init__(param_groups, defaults)
         # DistributedAdam implementation by @vagrawal
 
+        self._reduce_scatter_hooks = []
+        self._reduce_scatter_futures: list[torch.Future] = []
+        self._grad_slices = []
         self.register_backward_hooks()
 
     def register_backward_hooks(self):
-        self._reduce_scatter_hooks = []
-        self._reduce_scatter_futures = []
-        self._grad_slices = []
-
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             for param in params:
@@ -746,7 +745,11 @@ class DistAdam(torch.optim.Optimizer):
             for group in self.param_groups:
                 params: list[Tensor] = group["params"]
                 for param in params:
-                    self._sync_gradient(param)
+                    grad = param.grad
+                    rank_size = grad.shape[0] // world_size
+                    grad_slice = torch.empty_like(grad[:rank_size])
+                    self._reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
+                    self._grad_slices.append(grad_slice)
 
         idx = 0
         for group in self.param_groups:
