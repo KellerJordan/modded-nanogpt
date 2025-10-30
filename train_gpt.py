@@ -705,22 +705,52 @@ class DistAdam(torch.optim.Optimizer):
         super().__init__(param_groups, defaults)
         # DistributedAdam implementation by @vagrawal
 
+        self.register_backward_hooks()
+
+    def register_backward_hooks(self):
+        self._reduce_scatter_hooks = []
+        self._reduce_scatter_futures = []
+        self._grad_slices = []
+
+        for group in self.param_groups:
+            params: list[Tensor] = group["params"]
+            for param in params:
+                if param.requires_grad:
+                    hook = param.register_post_accumulate_grad_hook(self._sync_gradient)
+                    self._reduce_scatter_hooks.append(hook)
+
     @torch.compile
     @torch.no_grad()
-    def step(self):
+    def _sync_gradient(self):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-        reduce_scatter_futures: list[torch.Future] = []
-        all_gather_futures: list[torch.Future] = []
-        grad_slices = []
+        # reduce_scatter_futures: list[torch.Future] = []
+        # grad_slices = []
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             for param in params:
                 grad = param.grad
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
-                reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
-                grad_slices.append(grad_slice)
+                self._reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
+                self._grad_slices.append(grad_slice)
+
+    @torch.compile
+    @torch.no_grad()
+    def step(self):
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        # reduce_scatter_futures: list[torch.Future] = []
+        all_gather_futures: list[torch.Future] = []
+        # grad_slices = self._grad_slices
+        # for group in self.param_groups:
+        #     params: list[Tensor] = group["params"]
+        #     for param in params:
+        #         grad = param.grad
+        #         rank_size = grad.shape[0] // world_size
+        #         grad_slice = torch.empty_like(grad[:rank_size])
+        #         reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
+        #         grad_slices.append(grad_slice)
 
         idx = 0
         for group in self.param_groups:
@@ -729,12 +759,12 @@ class DistAdam(torch.optim.Optimizer):
             wd = group['weight_decay']
             params = group['params']
             for param in params:
-                reduce_scatter_futures[idx].wait()
+                self._reduce_scatter_futures[idx].wait()
                 rank_size = param.shape[0] // world_size
                 p_slice = param[rank * rank_size:(rank + 1) * rank_size]
                 lr = group['lr'] * getattr(param, "lr_mul", 1.0)
                 state = self.state[param]
-                g_slice = grad_slices[idx]
+                g_slice = self._grad_slices[idx]
                 # State init
                 if not state:
                     state["step"] = torch.tensor(
@@ -771,6 +801,8 @@ class DistAdam(torch.optim.Optimizer):
                 p_slice.add_(other=update, alpha=-1.0)
                 idx += 1
                 all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
+        self._reduce_scatter_futures = []
+        self._grad_slices = []
         torch.futures.collect_all(all_gather_futures).wait()
 
 # -----------------------------------------------------------------------------
