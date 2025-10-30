@@ -742,7 +742,7 @@ class DistAdam(torch.optim.Optimizer):
         world_size = dist.get_world_size()
         # reduce_scatter_futures: list[torch.Future] = []
         all_gather_futures: list[torch.Future] = []
-        if not self._reduce_scatter_futures:
+        if len(self._reduce_scatter_futures) == 0:
         # grad_slices = self._grad_slices
             for group in self.param_groups:
                 params: list[Tensor] = group["params"]
