@@ -747,7 +747,8 @@ class DistAdam(torch.optim.Optimizer):
             for group in self.param_groups:
                 params: list[Tensor] = group["params"]
                 for param in params:
-                    self._sync_gradient(param)
+                    if param.requires_grad:
+                        self._sync_gradient(param)
 
         idx = 0
         for group in self.param_groups:
