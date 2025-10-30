@@ -721,19 +721,19 @@ class DistAdam(torch.optim.Optimizer):
 
     @torch.compile
     @torch.no_grad()
-    def _sync_gradient(self):
+    def _sync_gradient(self, param):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         # reduce_scatter_futures: list[torch.Future] = []
         # grad_slices = []
-        for group in self.param_groups:
-            params: list[Tensor] = group["params"]
-            for param in params:
-                grad = param.grad
-                rank_size = grad.shape[0] // world_size
-                grad_slice = torch.empty_like(grad[:rank_size])
-                self._reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
-                self._grad_slices.append(grad_slice)
+        # for group in self.param_groups:
+        #     params: list[Tensor] = group["params"]
+        #     for param in params:
+        grad = param.grad
+        rank_size = grad.shape[0] // world_size
+        grad_slice = torch.empty_like(grad[:rank_size])
+        self._reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
+        self._grad_slices.append(grad_slice)
 
     @torch.compile
     @torch.no_grad()
