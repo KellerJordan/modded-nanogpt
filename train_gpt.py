@@ -715,9 +715,8 @@ class DistAdam(torch.optim.Optimizer):
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             for param in params:
-                if param.requires_grad:
-                    hook = param.register_post_accumulate_grad_hook(self._sync_gradient)
-                    self._reduce_scatter_hooks.append(hook)
+                hook = param.register_post_accumulate_grad_hook(self._sync_gradient)
+                self._reduce_scatter_hooks.append(hook)
 
     @torch.compile
     @torch.no_grad()
@@ -747,8 +746,7 @@ class DistAdam(torch.optim.Optimizer):
             for group in self.param_groups:
                 params: list[Tensor] = group["params"]
                 for param in params:
-                    if param.requires_grad:
-                        self._sync_gradient(param)
+                    self._sync_gradient(param)
 
         idx = 0
         for group in self.param_groups:
