@@ -57,6 +57,8 @@ Similarly we iterate through param_groups in reverse because the first group wil
 
 ## Profiler Trace Analysis
 
+The tracefiles are checked in and can be explored using the [perfetto trace viewer](https://ui.perfetto.dev)
+
 ### Current Implementation
 
 To start, here is the profiler trace for the current implementation. We can see that the first reduce-scatter operation begins at the start of the `DistAdam` step.
