@@ -1,6 +1,6 @@
 # Adam Gradient Sync in Backward Hooks
 
-This PR improves the overall training time and avg training step time by moving the `DistAdam` reduce-gradient collectives for each model parameter out of the `step` method and into a backward hook. The `step` method is then modified to iterate through the param groups and parameters in reverse order to benefit from this change by stepping parameters in later layers first. The parameters of later layers will have their backward hooks called sooner, which will have their gradient syncs triggered earlier and completed sooner.
+This PR improves the overall training time and avg training step time by moving the `DistAdam` gradient sync reduce-scatter collectives for each model parameter out of the `step` method and into a backward hook. The `step` method is then modified to iterate through the param groups and parameters in reverse order to benefit from this change by stepping parameters in later layers first. The parameters of later layers will have their backward hooks called sooner, which should result in their gradient syncs being triggered earlier and completed sooner.
 
 
 ## Timing and Validation
