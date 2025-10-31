@@ -418,7 +418,7 @@ class NorMuon(torch.optim.Optimizer):
     Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
     processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
     matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU. 
+    the advantage that it can be stably run in bfloat16 on the GPU.
     Note: A later PR replaced Newton-Shulz with Polar Express for the orthogonalization step
 
     Warning: This optimizer should not be used for the embedding layer, the final fully connected layer,
@@ -428,10 +428,10 @@ class NorMuon(torch.optim.Optimizer):
         This hyper-optimized class has faster execution time than the current impl of Adam for small params
 
     Custom distributed sizing:
-    The model stores all attn and mlp weights in the same shape, and then updates the view as 
-    needed on the forward pass. This enables attn and mlp weights to be contained within the same 
-    dist.reduce_scatter_tensor() call. The model architecture has been customized to enable 
-    (n_attn_layers+n_mlp_layers*2)%8==0 for batching across 8 GPUs with zero padding on mlp and attn. 
+    The model stores all attn and mlp weights in the same shape, and then updates the view as
+    needed on the forward pass. This enables attn and mlp weights to be contained within the same
+    dist.reduce_scatter_tensor() call. The model architecture has been customized to enable
+    (n_attn_layers+n_mlp_layers*2)%8==0 for batching across 8 GPUs with zero padding on mlp and attn.
     The scheduling is:
         1. reduce scatter smear_gate (1 param 7 padding params)
         2. reduce scatter attn_gate (10 params 6 padding params)
@@ -471,10 +471,10 @@ class NorMuon(torch.optim.Optimizer):
             group_params = [p for p in non_attn_subset if p.shape == size]
             param_groups.append(dict(params=group_params))
         return param_groups
-    
+
     def generate_custom_param_groups(self, params):
         """
-        Implementation requires that a single GPU does not receive both attn 
+        Implementation requires that a single GPU does not receive both attn
         and mlp params when a param group is split across GPUs.
         """
         label_ranks = {
@@ -635,14 +635,14 @@ class NorMuon(torch.optim.Optimizer):
                 for p in params[param_idx:param_idx+chunk_size]:
                     assert getattr(params[param_idx], 'label', None)=='attn', "GPU cannot mix attn and mlp params"
                 batch = 4 * original_shape[0]
-                d1 = original_shape[1] 
+                d1 = original_shape[1]
                 d2 = original_shape[2] // 4
                 batched = batched_update_grads.view(batch, d1, d2)
                 v_chunk = polar_express(batched)
                 v_chunk = v_chunk.view(original_shape)
             else:
                 v_chunk = polar_express(batched_update_grads)
-            
+
 
             vnorm = v_chunk.norm(dim=(-2,-1), keepdim=True)
             v_mean = torch.mean(v_chunk * v_chunk, dim=-1, keepdim=True) if v_chunk.size(-2) >= v_chunk.size(-1) else torch.mean(v_chunk * v_chunk, dim=-2, keepdim=True)
@@ -703,12 +703,12 @@ class DistAdam(torch.optim.Optimizer):
             group_params = [p for p in params if p.shape == size]
             param_groups.append(dict(params=group_params))
         super().__init__(param_groups, defaults)
-        # DistributedAdam implementation by @vagrawal
+        # DistributedAdam implementation by @vagrawal, @akash5474
+
+        self.should_sync = False
 
         self._reduce_scatter_hooks = []
-        self._reduce_scatter_futures: list[torch.Future] = []
-        self._grad_slices = []
-        self._param_order = []
+        self._reduce_scatter_futures = {}
         self.register_backward_hooks()
 
     def register_backward_hooks(self):
@@ -721,43 +721,38 @@ class DistAdam(torch.optim.Optimizer):
     @torch.compile
     @torch.no_grad()
     def _sync_gradient(self, param):
-        rank = dist.get_rank()
+        if not self.should_sync:
+            return
+
         world_size = dist.get_world_size()
-        # reduce_scatter_futures: list[torch.Future] = []
-        # grad_slices = []
-        # for group in self.param_groups:
-        #     params: list[Tensor] = group["params"]
-        #     for param in params:
         grad = param.grad
         rank_size = grad.shape[0] // world_size
         grad_slice = torch.empty_like(grad[:rank_size])
-        self._reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
-        self._grad_slices.append(grad_slice)
-        self._param_order.append(id(param))
+        self._reduce_scatter_futures[param] = (dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future(), grad_slice)
 
     @torch.compile
     @torch.no_grad()
     def step(self):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-        # reduce_scatter_futures: list[torch.Future] = []
         all_gather_futures: list[torch.Future] = []
-        # grad_slices = self._grad_slices
 
-        # idx = 0
         for group in reversed(self.param_groups):
             beta1, beta2 = group['betas']
             eps = group['eps']
             wd = group['weight_decay']
-            params = group['params']
-            for param in reversed(params):
-                idx = self._param_order.index(id(param))
-                self._reduce_scatter_futures[idx].wait()
+
+            for param in reversed(group['params']):
+                if param not in self._reduce_scatter_futures:
+                    continue
+
+                fut, g_slice = self._reduce_scatter_futures[param]
+                fut.wait()
+
                 rank_size = param.shape[0] // world_size
                 p_slice = param[rank * rank_size:(rank + 1) * rank_size]
                 lr = group['lr'] * getattr(param, "lr_mul", 1.0)
                 state = self.state[param]
-                g_slice = self._grad_slices[idx]
                 # State init
                 if not state:
                     state["step"] = torch.tensor(
@@ -792,11 +787,10 @@ class DistAdam(torch.optim.Optimizer):
                 step_size = lr * (torch.sqrt(bias2) / bias1)
                 update = exp_avg.div(denom).mul_(step_size)
                 p_slice.add_(other=update, alpha=-1.0)
-                idx += 1
+
                 all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
-        self._reduce_scatter_futures = []
-        self._grad_slices = []
-        self._param_order = []
+
+        self._reduce_scatter_futures.clear()
         torch.futures.collect_all(all_gather_futures).wait()
 
 # -----------------------------------------------------------------------------
@@ -834,7 +828,7 @@ class Yarn(nn.Module):
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
         self.reset()
-        
+
     def reset(self):
         angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=self.head_dim//4, dtype=torch.float32, device=device)
         # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
@@ -1138,12 +1132,12 @@ class BOSFinder:
     def _load(self):
         self.bos_idx_async = (self.tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
         self.ready.set()
-    
+
     def start(self):
         self.ready.clear()
         self.thread = threading.Thread(target=self._load)
         self.thread.start()
-    
+
     def get(self):
         if self.thread:
             self.ready.wait()
@@ -1186,17 +1180,17 @@ class DataPreloader:
         self.thread = None
         self.data = None
         self.ready = threading.Event()
-    
+
     def _load(self):
         tokens = _load_data_shard(next(self.file_iter))
         self.data = (tokens, BOSFinder(tokens, self.world_size))
         self.ready.set()
-    
+
     def start(self):
         self.ready.clear()
         self.thread = threading.Thread(target=self._load)
         self.thread.start()
-    
+
     def get(self):
         if self.thread:
             self.ready.wait()
@@ -1439,6 +1433,8 @@ def step_optimizers(step: int, optimizers, model):
         for optimizer in optimizers:
             optimizer.step()
         model.zero_grad(set_to_none=True)
+        # disable sync in the next training step for the adam optimizer
+        optimizers[0].should_sync = False
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
@@ -1459,7 +1455,7 @@ for step in range(warmup_steps):
         model.yarn.reset()
         ws_long = args.ws_schedule[0]
     else:
-        new_ws_long = args.ws_schedule[ws_idx]  
+        new_ws_long = args.ws_schedule[ws_idx]
         if new_ws_long > ws_long:
             model.yarn.apply(ws_long, new_ws_long)
             ws_long = new_ws_long
@@ -1526,11 +1522,15 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    for _ in range(grad_accum_steps):
+    for idx in range(grad_accum_steps):
+        # enable gradient sync for the DistAdam optimizer on the last iteration before we step it
+        if idx == grad_accum_steps - 1 and step % 2 == 1:
+            optimizers[0].should_sync = True
+
         inputs, targets, cum_seqlens = next(train_loader)
         model(inputs, targets, cum_seqlens, ws_short, ws_long).backward()
     step_optimizers(step, optimizers, model)
-     
+
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
