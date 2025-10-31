@@ -59,10 +59,14 @@ Similarly we iterate through param_groups in reverse because the first group wil
 
 ### Current Implementation
 
-To start lets look at the profiler trace for the current implementation, we can see that the first reduce-scatter operation begins at the start of the `DistAdam` step.
+To start, here is the profiler trace for the current implementation. We can see that the first reduce-scatter operation begins at the start of the `DistAdam` step.
+
+#### First Reduce-Scatter
 ![](profiler-trace-current-first-rs.png)
+#### Overview
 ![](profiler-trace-current-overview.png)
 
+#### Overlap
 Looking at the GPU streams, we can see that the initial reduce-scatter does not overlap with the main GPU stream.
 ![](profiler-trace-current-comm-overlap.png)
 
@@ -70,8 +74,11 @@ Looking at the GPU streams, we can see that the initial reduce-scatter does not 
 
 Similarly in the new implementation we can see that the first reduce-scatter is launched by the first hook.
 
+#### First Reduce-Scatter
 ![](profiler-trace-hook-first-rs.png)
+#### Overview
 ![](profiler-trace-hook-overview.png)
 
+#### Overlap
 This time we can see that the reduce-scatter overlaps with the computation on the main GPU stream.
 ![](profiler-trace-hook-comm-overlap.png)
