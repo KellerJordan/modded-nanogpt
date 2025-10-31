@@ -1,11 +1,11 @@
-# Adam Gradient Reduce Scatter in Backward Hooks
+# Adam Gradient Sync in Backward Hooks
 
-This record improves the overall training time and avg training step time by moving the `DistAdam` reduce-gradient collectives for each model parameter out of the `step` method and into a backward hook to allow. The `step` method is then modified to iterate through the param groups and parameters in reverse order to benefit from this by stepping parameters in later layers first. The parameters of later layers will have their backward hooks called sooner, which will have their gradient syncs triggered earlier and completed sooner.
+This record improves the overall training time and avg training step time by moving the `DistAdam` reduce-gradient collectives for each model parameter out of the `step` method and into a backward hook to allow. The `step` method is then modified to iterate through the param groups and parameters in reverse order to benefit from this change by stepping parameters in later layers first. The parameters of later layers will have their backward hooks called sooner, which will have their gradient syncs triggered earlier and completed sooner.
 
 
 ## Timing and Validation
 
-This record improves the final training time by ~0.7 seconds
+This PR improves the final training time by ~0.7 seconds
 
 This PR:
 
@@ -26,7 +26,7 @@ print("time:", torch.std_mean(torch.tensor(times)))
 # time: (std=0.0760, mean=140.8131)
 ```
 
-Previous PR (timed on same machine):
+Previous PR timed on same machine:
 
 ```
 import scipy.stats
@@ -41,14 +41,14 @@ print("time:", torch.std_mean(torch.tensor(times)))
 ## Changes
 
 
-### (1) Reduce Scatter in `DistAdam` Backward Hook
+### Reduce Scatter in `DistAdam` Backward Hook
 
 Even though the collective operations are async, they all occur at the end of each training step. The previous implementation looped through each parameter in order, launched the reduce-scatter operation, and then immediately waited for it to complete.
 
 In this PR I moved the reduce-scatter operation launch out of the `step` method and into a backward hook, registered using `register_post_accumulate_grad_hook` to ensure the gradients are ready. Since the backwards hooks will first be executed for later model layers, their reduce-scatters will start and complete first.
 
 
-### (2) Step params and param groups in reverse order
+### Step params and param groups in reverse order
 
 To take advantage of this, I modified the `step` method of `DistAdam` to iterate through the param_groups and parameters in reverse order. In our init function we define param groups to group by the parameter tensor's shape. The parameters of later layers are at the end of the parameters lists and since their reduce-scatters are launched earlier, we iterate and wait on the reduce-scatter futures earlier in our `step` method's loop.
 
