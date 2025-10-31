@@ -63,7 +63,7 @@ To start lets look at the profiler trace for the current implementation, we can 
 ![](profiler-trace-current-first-rs.png)
 ![](profiler-trace-current-overview.png)
 
-Looking at the GPU streams, we can see that there is no overlap of the reduce-scatter on the comm stream with the main stream.
+Looking at the GPU streams, we can see that the initial reduce-scatter does not overlap with the main GPU stream.
 ![](profiler-trace-current-comm-overlap.png)
 
 ### Hook Implementation
