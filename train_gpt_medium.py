@@ -416,7 +416,8 @@ class GPT(nn.Module):
                     *[
                         torch.tensor([0.5, 0.5]) for _ in range(num_layers)
                     ],  # SA lambdas
-                    torch.tensor([1.0, 0.0]),  # skip-to-head lambdas
+                    torch.zeros(1),  # Smear-MTP lambda
+                    torch.tensor([1.0, 0.0]),  # backout lambdas
                 ]
             )
         )
@@ -542,6 +543,12 @@ class GPT(nn.Module):
 
         skip_lambdas = self.scalars[-2:]
         x = norm(x) * skip_lambdas[0] + norm(skip_connections[11]) * skip_lambdas[1]
+        # Smear-MTP by snimu
+        x = torch.cat(
+            [x[:, :1], x[:, 1:] + self.scalars[-3] * x[:, :-1]],
+            dim=1,
+        )
+
         if self.training:
             logits: Tensor = F.linear(
                 x.flatten(end_dim=1), self.lm_head_w.bfloat16()
@@ -626,7 +633,7 @@ class Hyperparameters:
     train_seq_len = 64 * 1024  # FlexAttention sequence length
     val_seq_len = 4 * 64 * 1024  # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 5550  # number of iterations to run
+    num_iterations = 5535  # number of iterations to run
     cooldown_frac = 0.7  # fraction of training spent cooling down the learning rate
     final_lr_scale = 0.01
     # architecture
