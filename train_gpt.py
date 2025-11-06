@@ -405,8 +405,9 @@ def polar_express(G: torch.Tensor):
         X = X.mT
     return X
 
+
 # -----------------------------------------------------------------------------
-# Muon optimizer
+# NorMuon optimizer
 
 class NorMuon(torch.optim.Optimizer):
     """
