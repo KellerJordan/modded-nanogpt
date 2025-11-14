@@ -405,9 +405,8 @@ def polar_express(G: torch.Tensor):
         X = X.mT
     return X
 
-
 # -----------------------------------------------------------------------------
-# NorMuon optimizer
+# Muon optimizer
 
 class NorMuon(torch.optim.Optimizer):
     """
@@ -426,7 +425,8 @@ class NorMuon(torch.optim.Optimizer):
     Differences from standard Muon:
     - Newton-Shulz is replaced with Polar Express for the orthogonalization step
     - NorMuon adds a low-rank variance estimator similar to Adafactor.
-    - small 1D parameters handled via magnitude normalization of the grad (faster execution than Adam)
+    - small 1D parameters handled here instead of in Adam
+    - Cautious weight decay, a gated version of decoupled weight decay
     - Custom distributed sizing:
     The model stores all attn and mlp weights in the same shape, and then updates the view as
     needed on the forward pass. This enables attn and mlp weights to be contained within the same
@@ -584,7 +584,7 @@ class NorMuon(torch.optim.Optimizer):
 
             # Determine LR and WR
             eff_lr = group["lr"] * group["param_lr"]
-            eff_wd = group["weight_decay"] * group["param_wd"]
+            eff_wd = group["lr"] * group["weight_decay"] * group["param_wd"]
 
             # Compute zeropower for the entire chunk in a single, batched call.
             if num_params == 0:
@@ -605,10 +605,12 @@ class NorMuon(torch.optim.Optimizer):
 
             updated_params = torch.empty_like(grad_chunk)
             param_chunk = torch.stack(params[module_idx:module_idx + num_params]) if num_params > 0 else torch.zeros_like(v_chunk)
-            # Apply weight decay directly to the buffer.
-            param_chunk.mul_(1 - eff_wd)
 
-            param_chunk.add_(-eff_lr * v_chunk)
+            # "Cautious" weight decay (https://arxiv.org/abs/2510.12402)
+            mask = (v_chunk * param_chunk) >= 0
+            v_chunk.addcmul_(param_chunk, (eff_wd * mask).to(ref_param.dtype))
+
+            param_chunk.addcmul_(v_chunk, -eff_lr)
 
             updated_params[:num_params].copy_(param_chunk)
             if num_params < chunk_size:
@@ -1206,7 +1208,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 2245  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 2205  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
@@ -1297,7 +1299,7 @@ optimizer1 = DistAdam(
     eps=1e-8,
     weight_decay=0.0,
 )
-optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=0.0)
+optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
@@ -1448,7 +1450,7 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     for _ in range(grad_accum_steps):
         inputs, targets, cum_seqlens = next(train_loader)
-        model(inputs, targets, cum_seqlens, ws_short, ws_long).backward()
+        (model(inputs, targets, cum_seqlens, ws_short, ws_long) / grad_accum_steps).backward()
     step_optimizers(step, optimizers, model)
 
     # logging
