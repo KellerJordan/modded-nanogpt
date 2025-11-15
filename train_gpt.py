@@ -696,7 +696,6 @@ class DistAdam(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self):
         rank = dist.get_rank()
-        world_size = dist.get_world_size()
         all_gather_futures: list[torch.Future] = []
 
         for group in reversed(self.param_groups):
@@ -714,7 +713,6 @@ class DistAdam(torch.optim.Optimizer):
                 p_slice = param[rank * rank_size:(rank + 1) * rank_size]
                 lr = group['lr'] * getattr(param, "lr_mul", 1.0)
                 state = self.state[param]
-                g_slice = grad_slices[idx]
 
                 exp_avg = state["exp_avg"]
                 exp_avg_sq = state["exp_avg_sq"]
