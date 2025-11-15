@@ -663,37 +663,56 @@ class DistAdam(torch.optim.Optimizer):
             exp_avg = torch.zeros_like(p[:chunk_size], dtype=torch.bfloat16, device=p[0].device)
             exp_avg_sq = torch.zeros_like(exp_avg)
             self.state[p] = dict(step=0, exp_avg=exp_avg, exp_avg_sq=exp_avg_sq)
-        # DistributedAdam implementation by @vagrawal
+        # DistributedAdam implementation by @vagrawal, @akash5474
+
+        self.should_sync = False
+
+        self._reduce_scatter_hooks = []
+        self._reduce_scatter_futures = {}
+        self.register_backward_hooks()
+
+    def register_backward_hooks(self):
+        for group in self.param_groups:
+            params: list[Tensor] = group["params"]
+            for param in params:
+                hook = param.register_post_accumulate_grad_hook(self._sync_gradient)
+                self._reduce_scatter_hooks.append(hook)
+
+    @torch.compile
+    @torch.no_grad()
+    def _sync_gradient(self, param):
+        if not self.should_sync:
+            return
+
+        grad = param.grad
+        rank_size = grad.shape[0] // self.world_size
+        grad_slice = torch.empty_like(grad[:rank_size])
+        self._reduce_scatter_futures[param] = (
+            dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future(),
+            grad_slice
+        )
 
     @torch.compile
     @torch.no_grad()
     def step(self):
         rank = dist.get_rank()
-        reduce_scatter_futures: list[torch.Future] = []
         all_gather_futures: list[torch.Future] = []
-        grad_slices = []
-        for group in self.param_groups:
-            params: list[Tensor] = group["params"]
-            for param in params:
-                grad = param.grad
-                rank_size = grad.shape[0] // self.world_size
-                grad_slice = torch.empty_like(grad[:rank_size])
-                reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
-                grad_slices.append(grad_slice)
 
-        idx = 0
-        for group in self.param_groups:
+        for group in reversed(self.param_groups):
             beta1, beta2 = group['betas']
             eps = group['eps']
             wd = group['weight_decay']
-            params = group['params']
-            for param in params:
-                reduce_scatter_futures[idx].wait()
+            for param in reversed(group['params']):
+                if param not in self._reduce_scatter_futures:
+                    continue
+
+                fut, g_slice = self._reduce_scatter_futures[param]
+                fut.wait()
+
                 rank_size = param.shape[0] // self.world_size
                 p_slice = param[rank * rank_size:(rank + 1) * rank_size]
                 lr = group['lr'] * getattr(param, "lr_mul", 1.0)
                 state = self.state[param]
-                g_slice = grad_slices[idx]
 
                 exp_avg = state["exp_avg"]
                 exp_avg_sq = state["exp_avg_sq"]
@@ -714,8 +733,10 @@ class DistAdam(torch.optim.Optimizer):
                 step_size = lr * (bias2 ** 0.5 / bias1)
                 update = exp_avg.div(denom).mul_(step_size)
                 p_slice.add_(other=update, alpha=-1.0)
-                idx += 1
+
                 all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
+
+        self._reduce_scatter_futures.clear()
         torch.futures.collect_all(all_gather_futures).wait()
 
 # -----------------------------------------------------------------------------
@@ -1359,6 +1380,8 @@ def step_optimizers(step: int, optimizers, model):
         for optimizer in optimizers:
             optimizer.step()
         model.zero_grad(set_to_none=True)
+        # disable sync in the next training step for the adam optimizer
+        optimizers[0].should_sync = False
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
@@ -1448,7 +1471,11 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    for _ in range(grad_accum_steps):
+    for idx in range(grad_accum_steps):
+        # enable gradient sync for the DistAdam optimizer on the last iteration before we step it
+        if idx == grad_accum_steps - 1 and step % 2 == 1:
+            optimizers[0].should_sync = True
+
         inputs, targets, cum_seqlens = next(train_loader)
         (model(inputs, targets, cum_seqlens, ws_short, ws_long) / grad_accum_steps).backward()
     step_optimizers(step, optimizers, model)
