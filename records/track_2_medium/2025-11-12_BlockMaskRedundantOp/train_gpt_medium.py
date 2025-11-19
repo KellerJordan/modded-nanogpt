@@ -251,7 +251,9 @@ class GPT(nn.Module):
         causal_blockmask_all = block_idx[:, None] > block_idx
         docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
         docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
+        # document_blockmask_any = (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low)
         document_blockmask_all = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
+        # blockmask_any = causal_blockmask_any & document_blockmask_any
         blockmask_any = causal_blockmask_any & (docs_low[:, None] <= docs_high)
         blockmask_all = causal_blockmask_all & document_blockmask_all
         partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(blockmask_any & ~blockmask_all)
