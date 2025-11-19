@@ -953,8 +953,9 @@ class GPT(nn.Module):
                     -1.5
                     * torch.ones(num_layers),  # skip_weights -> σ(-1.5) ≈ 0.18
                     *[
-                        torch.tensor([1.0, 0.0]) for _ in range(num_layers)
-                    ],  # block lambdas
+                        torch.tensor([1.1, 0.0]) for _ in range(num_layers) 
+                    ],  # block lambdas. 1.1 init such that layer i weight is i^(num_layers-i). 
+                        # ~3x higher weight to layer 1 compared to 12 at init.
                     *[
                         torch.tensor([0.5, 0.5]) for _ in range(num_layers)
                     ],  # SA lambdas
@@ -999,9 +1000,11 @@ class GPT(nn.Module):
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
-        # U-net design by @brendanh0gan
+        # create skip connection from layer 4 (long attn window) to layer 7 (no attn op)
         skip_connections = []
         n = len(self.blocks) // 2
+        skip_in = [4]
+        skip_out = [7]
 
         x_backout = None
         backout_layer = 8
@@ -1017,11 +1020,11 @@ class GPT(nn.Module):
                 attn_scale=self.yarn.attn_scale
             )
             # since layer 0 is skipped, layer 11 does not have skip_connection
-            if i >= n and i<11:
+            if i in skip_out:
                 gate = torch.sigmoid(skip_weights[i - n])  # in (0, 1)
                 x = x + gate * skip_connections.pop()
             x = self.blocks[i](x, x0, lambdas[i], attn_args)
-            if i < n:
+            if i in skip_in:
                 skip_connections.append(x)
             if i == backout_layer:
                 x_backout = x
@@ -1229,7 +1232,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 2205  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 2185  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
