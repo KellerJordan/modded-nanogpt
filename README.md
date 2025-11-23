@@ -5,7 +5,7 @@ This repository hosts the *NanoGPT speedrun*, in which we (collaboratively|compe
 The target (3.28 validation loss on FineWeb) follows Andrej Karpathy's [GPT-2 replication in llm.c, which attains that loss after running for 45 minutes](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 The speedrun code also descends from llm.c's [PyTorch trainer](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py), which itself descends from NanoGPT, hence the name of the repo.
 Thanks to the efforts of many contributors, this repo now contains a training algorithm which attains the target performance in:
-* 2 minutes and 20 seconds on 8xH100 (the llm.c GPT-2 replication needed 45)
+* 2 minutes and 14 seconds on 8xH100 (the llm.c GPT-2 replication needed 45)
 * 0.73B tokens (the llm.c GPT-2 replication needed 10B)
 
 This improvement in training speed has been brought about by the following techniques:
@@ -13,7 +13,7 @@ This improvement in training speed has been brought about by the following techn
 * The Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[repo](https://github.com/KellerJordan/Muon)]
 * Untie head from embedding, use FP8 matmul for head, and softcap logits (the latter following Gemma 2)
 * Initialization of projection and classification layers to zero (muP-like)
-* Skip connections from embedding to every block as well as between blocks in U-net pattern
+* Skip connections from embedding to every block as well as from block 4 to 7
 * Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
 * Flash Attention 3 with long-short sliding window attention pattern (inspired by Gemma 2) and window size warmup with YaRN
 * Align training batch starts with EoS and set a max document length
@@ -22,6 +22,9 @@ This improvement in training speed has been brought about by the following techn
 * Polar Express implementation in Muon
 * Smear module to enable 1 token look back
 * Sparse attention gate
+* NormMuon
+* Cautious Weight Decay w/ schedule tied to LR
+* Exponential Decay of Residual Stream
 
 As well as many systems optimizations.
 
@@ -130,7 +133,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 42 | 2.313 minutes | Update NorMuon LR, Step Logic  | 10/27/25 | [log](records/track_1_short/2025-10-27_FixMuonLR/14afd380-d3d9-48d7-ad23-4c13cb96754b.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/146) | @varunneal
 43 | 2.284 minutes | Cautious Weight Decay w/ Schedule  | 11/10/25 | [log](records/track_1_short/2025-11-10_CautiousWD/1aac0132-a891-4ed9-b358-0fd2abd1b019.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/154) | @varunneal
 44 | 2.269 minutes | Backward Hooks on Adam, [Profiling 101](https://blog.underfit.ai/profiling-101-nanogpt)  | 11/16/25 | [log](records/track_1_short/2025-10-31_AdamSyncGradientHook/0c17cdfd-772c-4906-8d11-141b370599a0.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/149) | @akash5474
-
+45 | 2.248 minutes | Refine Skip Arch, update exponential decay init| 11/18/25 | [log](records/track_1_short/2025-11-18_RefineSkip/00f4e1e6-0044-4a08-b88a-3b7ec0624081.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/159) | @classiclarryd
 ## Rules
 
 The only rules are that new records must:
