@@ -230,8 +230,9 @@ class Hyperparameters:
     do_model_warmup = False
     metrics_log_every = 25
     router_layer_peak_frac = 0.475
-    router_temp_boost = -0.05 #0.2
-    router_lb_boost = -0.1 #0.5
+    router_temp_boost = 0.0 #-0.05 #0.2
+    router_lb_boost = 0.0 #-0.1 #0.5
+    end_boost_step = 1500
 
 args = Hyperparameters()
 
@@ -435,6 +436,7 @@ model: nn.Module = GPT(
     router_layer_peak_frac=args.router_layer_peak_frac,
     router_temp_boost=args.router_temp_boost,
     router_lb_boost=args.router_lb_boost,
+    end_boost_step=args.end_boost_step,
     use_router_adapters=args.use_router_adapters,
     expert_activation_schedule=args.expert_activation_schedule,
     router_freeze_frac=args.router_freeze_frac,

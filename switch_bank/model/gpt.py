@@ -45,7 +45,7 @@ class GPT(nn.Module):
                  router_temp_init: float, router_temp_final: float, router_temp_power: float,
                  router_temp_anchor_delta_steps: int | None, router_temp_anchor_ratio: float | None,
                  router_logit_cap_initial: float, router_logit_cap_final: float, router_logit_cap_delta_steps: int,
-                 router_layer_peak_frac: float, router_temp_boost: float, router_lb_boost: float,
+                 router_layer_peak_frac: float, router_temp_boost: float, router_lb_boost: float, end_boost_step: int,
                  use_router_adapters: bool, expert_activation_schedule: tuple[tuple[int, int], ...],
                  router_freeze_frac: float, router_freeze_adapters: bool,
                  ema_relax_schedule_fwd: tuple[tuple[float, float, float], ...],
@@ -77,6 +77,7 @@ class GPT(nn.Module):
                   router_layer_peak_frac, router_temp_boost, router_lb_boost)
             for i in range(num_layers)
         ])
+        self.end_boost_step = end_boost_step
         self.tie_lm_head = bool(tie_lm_head)
         self.untie_lm_head_after = int(untie_lm_head_after)
         needs_lm_head = (not self.tie_lm_head) or (self.untie_lm_head_after >= 0)
@@ -413,6 +414,7 @@ class GPT(nn.Module):
                         ema_limits_fwd=ema_limits_fwd,
                         ema_limits_rev=ema_limits_rev,
                         freeze_ema_alpha_rev=freeze_ema_alpha_rev,
+                        end_boost=step >= self.end_boost_step,
                     )
                 y = y.detach()
                 aux = aux.detach()
@@ -427,6 +429,7 @@ class GPT(nn.Module):
                     ema_limits_fwd=ema_limits_fwd,
                     ema_limits_rev=ema_limits_rev,
                     freeze_ema_alpha_rev=freeze_ema_alpha_rev,
+                    end_boost=step >= self.end_boost_step,
                 )
             x = y
             aux_loss = aux_loss + aux
