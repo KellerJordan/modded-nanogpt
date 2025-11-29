@@ -219,7 +219,7 @@ class Hyperparameters:
     router_enable_forward_ema = False
     router_enable_reverse_ema = True
     # evaluation and logging
-    val_loss_every = 500 #300 #125  # 0 for only at end
+    val_loss_every = 250 #125  # 0 for only at end
     save_checkpoint = False
     use_wandb = True
     wandb_project = "switch-bank-mini"
