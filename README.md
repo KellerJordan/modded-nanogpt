@@ -37,7 +37,7 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@tuttyfrutyee](https://github.com/tuttyfrutyee), [@vdlad](https://github.com/vdlad); 
 [@ryanyang0](https://x.com/ryanyang0), [@vagrawal](https://github.com/vagrawal), [@classiclarryd](https://x.com/classiclarryd), 
 [@byronxu99](https://github.com/byronxu99), [@varunneal](https://x.com/varunneal), [@EmelyanenkoK](https://github.com/EmelyanenkoK), 
-[@bernard24](https://github.com/bernard24)/https://www.hiverge.ai/, [@GusarichOnX](https://x.com/GusarichOnX), [@li_zichong](https://x.com/li_zichong),
+[@bernard24](https://github.com/bernard24)/https://www.hiverge.ai/, [@Gusarich](https://x.com/Gusarich), [@li_zichong](https://x.com/li_zichong),
 [@akash5474](https://github.com/akash5474)
 
 
