@@ -176,12 +176,12 @@ class Hyperparameters:
     # Parameter freezing
     router_freeze_frac = 0.50
     router_freeze_adapters = True
-    ema_relax_schedule: tuple[tuple[float, float, float], ...] = ((0.37, 0.5, 0.9),)  # (tuple of) tuple of: steps %, ema alpha min, ema alpha max.
-    ema_relax_schedule_rev: tuple[tuple[float, float, float], ...] = ((0.37, 0.75, 0.9),)
-    ema_router_prefreeze_frac = 0.45
-    ema_router_prefreeze_frac_rev = 0.45
-    ema_lr_reduce_start_frac = 0.37
-    ema_lr_reduce_start_frac_rev = 0.37
+    ema_relax_schedule: tuple[tuple[float, float, float], ...] = () #((0.37, 0.5, 0.9),)  # (tuple of) tuple of: steps %, ema alpha min, ema alpha max.
+    ema_relax_schedule_rev: tuple[tuple[float, float, float], ...] = () #((0.37, 0.75, 0.9),)
+    ema_router_prefreeze_frac = 1.0 #0.45
+    ema_router_prefreeze_frac_rev = 1.0 #0.45
+    ema_lr_reduce_start_frac = 1.0 #0.37
+    ema_lr_reduce_start_frac_rev = 1.0 #0.37
     ema_window_size_fwd = 128 #-1  # <=0 means full sequence
     ema_block_size_fwd = 128
     ema_window_size_rev = 384
@@ -195,15 +195,15 @@ class Hyperparameters:
     # -----------------
     # Router/EMA schedules
     ema_alpha_init = 0.80
-    ema_alpha_min = 0.6
-    ema_alpha_max = 0.85
-    ema_freeze_frac = 0.12  # *Initial* freeze. Only matters if > 2nd expert activating.
-    ema_alpha_init_rev = 0.85 #0.855
-    ema_alpha_min_rev = 0.8 #0.735
-    ema_alpha_max_rev = 0.9
-    ema_freeze_frac_rev = 0.12  # *Initial* freeze. Only matters if > 2nd expert activating.
-    router_temp_init = 1.9 #2.0
-    router_temp_final = 0.575 #0.70
+    ema_alpha_min = 0.80
+    ema_alpha_max = 0.80
+    ema_freeze_frac = 0.0  # *Initial* freeze. Only matters if > 2nd expert activating.
+    ema_alpha_init_rev = 0.875
+    ema_alpha_min_rev = 0.875
+    ema_alpha_max_rev = 0.875
+    ema_freeze_frac_rev = 0.0  # *Initial* freeze. Only matters if > 2nd expert activating.
+    router_temp_init = 1.9
+    router_temp_final = 0.575
     router_temp_power = 1.5  # fallback if anchor disabled
     router_temp_anchor_delta_steps = 320  # steps after 2nd expert activation to hit anchor ratio
     router_temp_anchor_ratio = 0.49  # temp curve hits this ratio at anchor delta
