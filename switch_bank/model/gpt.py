@@ -39,10 +39,7 @@ class GPT(nn.Module):
                  skip_attn_layers: set[int], E: int, h: int, lb_coeff: float, ent_coeff: float, expert_entropy_coeff: float, k: int,
                  num_value_embeds: int,
                  tie_lm_head: bool, untie_lm_head_after: int,
-                 ema_alpha_init: float, ema_alpha_min: float, ema_alpha_max: float,
-                 ema_alpha_init_rev: float, ema_alpha_min_rev: float, ema_alpha_max_rev: float,
-                 ema_freeze_frac: float, ema_freeze_frac_rev: float,
-                 ema_router_prefreeze_frac: float, ema_router_prefreeze_frac_rev: float,
+                 ema_alpha_fwd: float, ema_alpha_rev: float,
                  router_temp_init: float, router_temp_final: float, router_temp_power: float,
                  router_temp_anchor_delta_steps: int | None, router_temp_anchor_ratio: float | None,
                  router_logit_cap_initial: float, router_logit_cap_final: float, router_logit_cap_delta_steps: int,
@@ -50,8 +47,6 @@ class GPT(nn.Module):
                  decay_boost_start_delta_steps: int, decay_boost_end_delta_steps: int, boost_preramp_steps: int, boost_floor_frac: float,
                  use_router_adapters: bool, expert_activation_schedule: tuple[tuple[int, int], ...],
                  router_freeze_frac: float, router_freeze_adapters: bool,
-                 ema_relax_schedule_fwd: tuple[tuple[float, float, float], ...],
-                 ema_relax_schedule_rev: tuple[tuple[float, float, float], ...],
                  ema_block_size_fwd: int, ema_block_size_rev: int,
                  ema_window_size_fwd: int, ema_window_size_rev: int,
                  ema_layer_stride: int,
@@ -100,9 +95,6 @@ class GPT(nn.Module):
             *[torch.tensor([1.0, 0.0]) for _ in range(num_layers)],
             *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)],
         ]))
-
-        self.ema_freeze_frac = float(ema_freeze_frac)
-        self.ema_freeze_frac_rev = float(ema_freeze_frac_rev)
         self.router_temp_init = float(router_temp_init)
         self.router_temp_final = float(router_temp_final)
         self.router_temp_power = float(router_temp_power)
@@ -117,36 +109,8 @@ class GPT(nn.Module):
         self.router_freeze_frac = float(router_freeze_frac)
         self.router_freeze_adapters = bool(router_freeze_adapters)
         self.shared_ffn_freeze_frac = float(shared_ffn_freeze_frac)
-        ema_prefreeze_fwd = float(ema_router_prefreeze_frac)
-        if ema_prefreeze_fwd < 0:
-            ema_prefreeze_fwd = max(self.router_freeze_frac - 0.01, 0.0)
-        ema_prefreeze_fwd = min(max(ema_prefreeze_fwd, 0.0), self.router_freeze_frac)
-        self.ema_router_prefreeze_frac_fwd = ema_prefreeze_fwd
-        ema_prefreeze_rev = float(ema_router_prefreeze_frac_rev)
-        if ema_prefreeze_rev < 0:
-            ema_prefreeze_rev = max(self.router_freeze_frac - 0.01, 0.0)
-        ema_prefreeze_rev = min(max(ema_prefreeze_rev, 0.0), self.router_freeze_frac)
-        self.ema_router_prefreeze_frac_rev = ema_prefreeze_rev
         self._router_frozen_logged = False
         self._ffn_frozen_logged = False
-        ema_schedule_fwd: list[tuple[float, float, float]] = []
-        for entry in ema_relax_schedule_fwd:
-            frac, min_a, max_a = entry
-            frac_f = float(frac)
-            if frac_f < 0:
-                continue
-            ema_schedule_fwd.append((frac_f, float(min_a), float(max_a)))
-        ema_schedule_fwd.sort(key=lambda x: x[0])
-        ema_schedule_rev: list[tuple[float, float, float]] = []
-        for entry in ema_relax_schedule_rev:
-            frac, min_a, max_a = entry
-            frac_f = float(frac)
-            if frac_f < 0:
-                continue
-            ema_schedule_rev.append((frac_f, float(min_a), float(max_a)))
-        ema_schedule_rev.sort(key=lambda x: x[0])
-        self.ema_relax_schedule_fwd = tuple(ema_schedule_fwd)
-        self.ema_relax_schedule_rev = tuple(ema_schedule_rev)
 
         assert router_block_pos_bins in (4, 8, 16), "router_block_pos_bins must be 4, 8, or 16"
         self.router_block_pos_bins = int(router_block_pos_bins)
@@ -188,8 +152,7 @@ class GPT(nn.Module):
             d=model_dim, h=h, E=E, L=num_layers, flags_dim=flags_dim,
             lb_coeff=lb_coeff, ent_coeff=ent_coeff, expert_entropy_coeff=expert_entropy_coeff, k=k,
             use_adapters=use_router_adapters,
-            ema_alpha_init=ema_alpha_init, ema_alpha_min=ema_alpha_min, ema_alpha_max=ema_alpha_max,
-            ema_alpha_init_rev=ema_alpha_init_rev, ema_alpha_min_rev=ema_alpha_min_rev, ema_alpha_max_rev=ema_alpha_max_rev,
+            ema_alpha_fwd=ema_alpha_fwd, ema_alpha_rev=ema_alpha_rev,
             use_forward_ema=self.enable_forward_ema, use_reverse_ema=self.enable_reverse_ema,
             ema_block_size_fwd=ema_block_size_fwd, ema_block_size_rev=ema_block_size_rev,
             ema_window_size_fwd=ema_window_size_fwd, ema_window_size_rev=ema_window_size_rev,
@@ -228,19 +191,8 @@ class GPT(nn.Module):
 
     def _ema_limits_for_progress(self, progress: float, reverse: bool = False) -> tuple[float, float]:
         if reverse:
-            min_a = float(self.bank.ema_alpha_min_rev)
-            max_a = float(self.bank.ema_alpha_max_rev)
-            schedule = self.ema_relax_schedule_rev
-        else:
-            min_a = float(self.bank.ema_alpha_min_fwd)
-            max_a = float(self.bank.ema_alpha_max_fwd)
-            schedule = self.ema_relax_schedule_fwd
-        for frac, new_min, new_max in schedule:
-            if progress >= frac:
-                min_a, max_a = float(new_min), float(new_max)
-            else:
-                break
-        return (min_a, max_a)
+            return (float(self.bank.ema_alpha_min_rev), float(self.bank.ema_alpha_max_rev))
+        return (float(self.bank.ema_alpha_min_fwd), float(self.bank.ema_alpha_max_fwd))
 
     @torch._dynamo.disable
     def _active_expert_mask(self, step: int, device: torch.device) -> torch.Tensor | None:
@@ -368,8 +320,8 @@ class GPT(nn.Module):
         T_cur = self.compute_router_temp(step, total_steps)
         logit_cap = self.compute_logit_cap(step)
         decay_scale = self._boost_decay_scale(step)
-        freeze_ema_alpha_fwd = (progress < self.ema_freeze_frac) or (progress >= self.ema_router_prefreeze_frac_fwd) or freeze_router_params
-        freeze_ema_alpha_rev = (progress < self.ema_freeze_frac_rev) or (progress >= self.ema_router_prefreeze_frac_rev) or freeze_router_params
+        freeze_ema_alpha_fwd = True
+        freeze_ema_alpha_rev = True
         use_gumbel_now = (self.router_use_gumbel and (progress < self.router_gumbel_frac))
 
         ve_tables = [value_embed(input_seq) for value_embed in self.value_embeds]

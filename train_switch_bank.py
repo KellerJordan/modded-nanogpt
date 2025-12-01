@@ -77,13 +77,9 @@ def log_param_counts(model: nn.Module):
             attn_layers += 1
     attn_total = _num_params(attn_params)
 
-    # FFN bank: experts + routers (incl. EMA alpha vector)
+    # FFN bank: experts + routers
     bank_expert_params = list(model.bank.W1) + list(model.bank.W2)
     bank_router_params = list(model.bank.router_w) + list(model.bank.router_b)
-    if model.bank.ema_alpha is not None:
-        bank_router_params.append(model.bank.ema_alpha)
-    if getattr(model.bank, "ema_alpha_rev", None) is not None:
-        bank_router_params.append(model.bank.ema_alpha_rev)
     bank_expert_total = _num_params(bank_expert_params)
     bank_router_total = _num_params(bank_router_params)
     bank_total = bank_expert_total + bank_router_total
@@ -113,7 +109,7 @@ def log_param_counts(model: nn.Module):
     print0(f"  attention stack ({attn_layers} of {args.num_layers} layers run attention): {_fmt(attn_total)}", console=True)
     print0(f"  FFN bank total:      {_fmt(bank_total)}", console=True)
     print0(f"    ├─ experts W1/W2:  {_fmt(bank_expert_total)}", console=True)
-    print0(f"    └─ routers+EMA:    {_fmt(bank_router_total)}", console=True)
+    print0(f"    └─ routers:        {_fmt(bank_router_total)}", console=True)
     print0(f"  embeddings (tok + {model.num_value_embeds}× value): {_fmt(embeds_total)}", console=True)
     print0(f"    └─ token embed:    {_fmt(tok_embed_total)}", console=True)
     print0(f"    └─ value embeds:   {_fmt(ve_total)}", console=True)
@@ -171,37 +167,29 @@ class Hyperparameters:
     router_entropy_coeff = 0.0 #1e-3  # Applies to: router load entropy - importance entropy
     expert_entropy_coeff = 0.0  # Applies to: router load entropy only
 
-    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (375, 2))
     use_router_adapters = True
-    # Parameter freezing
-    router_freeze_frac = 0.50
-    router_freeze_adapters = True
-    ema_relax_schedule: tuple[tuple[float, float, float], ...] = () #((0.37, 0.5, 0.9),)  # (tuple of) tuple of: steps %, ema alpha min, ema alpha max.
-    ema_relax_schedule_rev: tuple[tuple[float, float, float], ...] = () #((0.37, 0.75, 0.9),)
-    ema_router_prefreeze_frac = 1.0 #0.45
-    ema_router_prefreeze_frac_rev = 1.0 #0.45
-    ema_lr_reduce_start_frac = 1.0 #0.37
-    ema_lr_reduce_start_frac_rev = 1.0 #0.37
-    ema_window_size_fwd = 128 #-1  # <=0 means full sequence
+    router_block_pos_bins = 8  # 4 / 8 / 16
+    first_doc_tokens_N = 64
+    router_enable_forward_ema = False
+    router_enable_reverse_ema = True
+    ema_alpha_fwd = 0.80
+    ema_alpha_rev = 0.875
+    ema_window_size_fwd = 128  # -1  # <=0 means full sequence
     ema_block_size_fwd = 128
     ema_window_size_rev = 384
     ema_block_size_rev = 384
-    router_ema_layer_stride = 1 #4 seems faster/perf but less stable?  # How often to calculate fresh EMAs (which are then used by the next N-1 layers)
+    router_ema_layer_stride = 1  # 4 seems faster/perf but less stable?  # How often to calculate fresh EMAs (which are then used by the next N-1 layers)
+    # Parameter freezing
+    router_freeze_frac = 0.50
+    router_freeze_adapters = True
     router_lr_reduce_start_frac = -1.0
     shared_ffn_freeze_frac = 1.0
     shared_ffn_lr_reduce_start_frac = -1.0
     # skip-attention layers (short-SWA) — exactly two
     skip_attn_layers = (7, )
     # -----------------
-    # Router/EMA schedules
-    ema_alpha_init = 0.80
-    ema_alpha_min = 0.80
-    ema_alpha_max = 0.80
-    ema_freeze_frac = 0.0  # *Initial* freeze. Only matters if > 2nd expert activating.
-    ema_alpha_init_rev = 0.875
-    ema_alpha_min_rev = 0.875
-    ema_alpha_max_rev = 0.875
-    ema_freeze_frac_rev = 0.0  # *Initial* freeze. Only matters if > 2nd expert activating.
+    # Router schedules
+    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (375, 2))
     router_temp_init = 1.9
     router_temp_final = 0.575
     router_temp_power = 1.5  # fallback if anchor disabled
@@ -213,11 +201,14 @@ class Hyperparameters:
     # Optional Gumbel exploration (off by default)
     router_use_gumbel = False #True
     router_gumbel_frac = 0.16
-    # Router flags
-    router_block_pos_bins = 8         # 4 / 8 / 16
-    first_doc_tokens_N = 64
-    router_enable_forward_ema = False
-    router_enable_reverse_ema = True
+    # Layerwise router temp & lb boosts.
+    router_layer_peak_frac = 0.475
+    router_temp_boost = 0.2
+    router_lb_boost = 0.5
+    decay_boost_start_delta_steps = 0  # 650
+    decay_boost_end_delta_steps = 0  # 800
+    boost_preramp_steps = 0  # 50
+    boost_floor_frac = 1.0  # 0.5
     # evaluation and logging
     val_loss_every = 250 #125  # 0 for only at end
     save_checkpoint = False
@@ -229,14 +220,6 @@ class Hyperparameters:
     enable_extra_wandb_logging = True
     do_model_warmup = False
     metrics_log_every = 25
-    # Layerwise router temp & lb boosts.
-    router_layer_peak_frac = 0.475
-    router_temp_boost = 0.2
-    router_lb_boost = 0.5
-    decay_boost_start_delta_steps = 0 #650
-    decay_boost_end_delta_steps = 0 #800
-    boost_preramp_steps = 0 #50
-    boost_floor_frac = 1.0 #0.5
 
 args = Hyperparameters()
 
@@ -419,16 +402,8 @@ model: nn.Module = GPT(
     num_value_embeds=args.num_value_embeds,
     tie_lm_head=args.tie_lm_head,
     untie_lm_head_after=untie_lm_head_after,
-    ema_alpha_init=args.ema_alpha_init,
-    ema_alpha_min=args.ema_alpha_min,
-    ema_alpha_max=args.ema_alpha_max,
-    ema_alpha_init_rev=args.ema_alpha_init_rev,
-    ema_alpha_min_rev=args.ema_alpha_min_rev,
-    ema_alpha_max_rev=args.ema_alpha_max_rev,
-    ema_freeze_frac=args.ema_freeze_frac,
-    ema_freeze_frac_rev=args.ema_freeze_frac_rev,
-    ema_router_prefreeze_frac=args.ema_router_prefreeze_frac,
-    ema_router_prefreeze_frac_rev=args.ema_router_prefreeze_frac_rev,
+    ema_alpha_fwd=args.ema_alpha_fwd,
+    ema_alpha_rev=args.ema_alpha_rev,
     router_temp_init=args.router_temp_init,
     router_temp_final=args.router_temp_final,
     router_temp_power=args.router_temp_power,
@@ -448,8 +423,6 @@ model: nn.Module = GPT(
     expert_activation_schedule=args.expert_activation_schedule,
     router_freeze_frac=args.router_freeze_frac,
     router_freeze_adapters=args.router_freeze_adapters,
-    ema_relax_schedule_fwd=args.ema_relax_schedule,
-    ema_relax_schedule_rev=args.ema_relax_schedule_rev,
     ema_block_size_fwd=args.ema_block_size_fwd,
     ema_block_size_rev=args.ema_block_size_rev,
     ema_window_size_fwd=args.ema_window_size_fwd,
@@ -475,21 +448,8 @@ for param in model.parameters():
 
 log_param_counts(model)
 
-def sanitize_router_params():
-    with torch.no_grad():
-        if model.bank.ema_alpha is not None:
-            model.bank.ema_alpha.data.nan_to_num_(nan=float(args.ema_alpha_init),
-                                                  posinf=args.ema_alpha_max,
-                                                  neginf=args.ema_alpha_min)
-            model.bank.ema_alpha.data.clamp_(args.ema_alpha_min, args.ema_alpha_max)
-        if getattr(model.bank, "ema_alpha_rev", None) is not None:
-            model.bank.ema_alpha_rev.data.nan_to_num_(nan=float(args.ema_alpha_init_rev),
-                                                      posinf=args.ema_alpha_max_rev,
-                                                      neginf=args.ema_alpha_min_rev)
-            model.bank.ema_alpha_rev.data.clamp_(args.ema_alpha_min_rev, args.ema_alpha_max_rev)
-
 # collect the parameters to optimize
-# ### FFNBANK MOD: include bank expert matrices in Muon; routers/alphas in AdamW with scalars+embeds.
+# ### FFNBANK MOD: include bank expert matrices in Muon; routers in AdamW with scalars+embeds.
 def is_2d(p: nn.Parameter) -> bool:
     return p.ndim >= 2
 
@@ -507,15 +467,9 @@ if model.bank.use_adapters:
     adapter_params.extend([model.bank.adapter_scale, model.bank.adapter_bias])
 scalar_params = [model.scalars]
 router_params = list(model.bank.router_w) + list(model.bank.router_b)
-ema_alpha_fwd_params: list[nn.Parameter] = []
-ema_alpha_rev_params: list[nn.Parameter] = []
-if model.bank.ema_alpha is not None:
-    ema_alpha_fwd_params.append(model.bank.ema_alpha)
-if getattr(model.bank, "ema_alpha_rev", None) is not None:
-    ema_alpha_rev_params.append(model.bank.ema_alpha_rev)
 
 # sanity / completeness checks
-params_collections = [hidden_matrix_params, embed_params, head_params, adapter_params, scalar_params, router_params, ema_alpha_fwd_params, ema_alpha_rev_params]
+params_collections = [hidden_matrix_params, embed_params, head_params, adapter_params, scalar_params, router_params]
 optimized_parameters_set = {p for params in params_collections for p in params}
 assert optimized_parameters_set == {*model.parameters()}
 assert len(optimized_parameters_set) == sum(len(lst) for lst in params_collections)
@@ -530,10 +484,6 @@ if adapter_params:
     adam_param_groups.append(dict(params=adapter_params, lr=args.lr_adapter, component="adapter"))
 if head_params:
     adam_param_groups.append(dict(params=head_params, lr=args.lr_head, component="head"))
-if ema_alpha_fwd_params:
-    adam_param_groups.append(dict(params=ema_alpha_fwd_params, lr=args.lr_router, component="ema_alpha"))
-if ema_alpha_rev_params:
-    adam_param_groups.append(dict(params=ema_alpha_rev_params, lr=args.lr_router, component="ema_alpha_rev"))
 optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
 muon_param_groups = []
 if attn_2d_params:

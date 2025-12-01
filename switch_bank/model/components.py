@@ -78,8 +78,7 @@ class SharedFFNBank(nn.Module):
     def __init__(self, d: int, h: int, E: int, L: int, flags_dim: int,
                  lb_coeff: float = 1e-3, ent_coeff: float = 0.0, expert_entropy_coeff: float = 0.0, k: int = 1,
                  use_adapters: bool = False,
-                 ema_alpha_init: float = 0.80, ema_alpha_min: float = 0.50, ema_alpha_max: float = 0.95,
-                 ema_alpha_init_rev: float | None = None, ema_alpha_min_rev: float | None = None, ema_alpha_max_rev: float | None = None,
+                 ema_alpha_fwd: float = 0.80, ema_alpha_rev: float | None = None,
                  use_forward_ema: bool = True, use_reverse_ema: bool = False,
                  ema_block_size_fwd: int = 128, ema_block_size_rev: int = 128,
                  ema_window_size_fwd: int = -1, ema_window_size_rev: int = 128,
@@ -92,10 +91,12 @@ class SharedFFNBank(nn.Module):
         self.ent_coeff = ent_coeff
         self.expert_entropy_coeff = expert_entropy_coeff
         self.k = int(k)
-        self.ema_alpha_min_fwd = float(ema_alpha_min)
-        self.ema_alpha_max_fwd = float(ema_alpha_max)
-        self.ema_alpha_min_rev = float(ema_alpha_min_rev if ema_alpha_min_rev is not None else ema_alpha_min)
-        self.ema_alpha_max_rev = float(ema_alpha_max_rev if ema_alpha_max_rev is not None else ema_alpha_max)
+        alpha_fwd_val = float(ema_alpha_fwd)
+        alpha_rev_val = float(ema_alpha_rev if ema_alpha_rev is not None else ema_alpha_fwd)
+        self.ema_alpha_min_fwd = alpha_fwd_val
+        self.ema_alpha_max_fwd = alpha_fwd_val
+        self.ema_alpha_min_rev = alpha_rev_val
+        self.ema_alpha_max_rev = alpha_rev_val
         self.use_adapters = bool(use_adapters)
         self.use_forward_ema = bool(use_forward_ema)
         self.use_reverse_ema = bool(use_reverse_ema)
@@ -125,9 +126,16 @@ class SharedFFNBank(nn.Module):
         in_dim = feat_multiplier * d + flags_dim
         self.router_w = nn.ParameterList([nn.Parameter(init_linear(torch.empty(E, in_dim)).bfloat16()) for _ in range(L)])
         self.router_b = nn.ParameterList([nn.Parameter(torch.zeros(E).bfloat16()) for _ in range(L)])
-        self.ema_alpha = nn.Parameter(torch.full((L,), float(ema_alpha_init), dtype=torch.bfloat16)) if self.use_forward_ema else None
-        init_rev = float(ema_alpha_init_rev) if ema_alpha_init_rev is not None else float(ema_alpha_init)
-        self.ema_alpha_rev = nn.Parameter(torch.full((L,), init_rev, dtype=torch.bfloat16)) if self.use_reverse_ema else None
+        if self.use_forward_ema:
+            alpha_fwd = torch.full((L,), alpha_fwd_val, dtype=torch.bfloat16)
+            self.register_buffer("ema_alpha", alpha_fwd)
+        else:
+            self.ema_alpha = None
+        if self.use_reverse_ema:
+            alpha_rev = torch.full((L,), alpha_rev_val, dtype=torch.bfloat16)
+            self.register_buffer("ema_alpha_rev", alpha_rev)
+        else:
+            self.ema_alpha_rev = None
         self._router_metrics_buffer: list[dict[str, float] | None] | None = None
 
     @torch.no_grad()

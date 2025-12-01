@@ -70,20 +70,6 @@ def get_logit_cap(args, step: int):
     return start * math.exp(math.log(end / start) * shaped)
 
 
-def sanitize_router_params(model, args):
-    with torch.no_grad():
-        if model.bank.ema_alpha is not None:
-            model.bank.ema_alpha.data.nan_to_num_(nan=float(args.ema_alpha_init),
-                                                  posinf=args.ema_alpha_max,
-                                                  neginf=args.ema_alpha_min)
-            model.bank.ema_alpha.data.clamp_(args.ema_alpha_min, args.ema_alpha_max)
-        if getattr(model.bank, "ema_alpha_rev", None) is not None:
-            model.bank.ema_alpha_rev.data.nan_to_num_(nan=float(args.ema_alpha_init_rev),
-                                                      posinf=args.ema_alpha_max_rev,
-                                                      neginf=args.ema_alpha_min_rev)
-            model.bank.ema_alpha_rev.data.clamp_(args.ema_alpha_min_rev, args.ema_alpha_max_rev)
-
-
 def run_training(
     args,
     model: nn.Module,
@@ -109,7 +95,6 @@ def run_training(
     dist.barrier()
     t0 = time.perf_counter()
     train_steps = args.num_iterations
-    ema_unfreeze_logged = False
     gumbel_off_logged = False
     logit_cap_decay_logged = False
     lm_head_untie_step = untie_lm_head_after
@@ -122,10 +107,6 @@ def run_training(
         last_step = (step == train_steps)
         window_blocks = get_window_size_blocks(args, step)
         progress = step / max(train_steps, 1)
-        if not ema_unfreeze_logged and progress >= args.ema_freeze_frac:
-            if args.enable_extra_logging:
-                print0(f"EMA alphas unfrozen at step {step}", console=True)
-            ema_unfreeze_logged = True
         if args.router_use_gumbel and not gumbel_off_logged and progress >= args.router_gumbel_frac:
             if args.enable_extra_logging:
                 print0(f"Gumbel router noise disabled at step {step}", console=True)
@@ -310,8 +291,6 @@ def run_training(
         progress = step / max(args.num_iterations, 1)
         router_lr_mult = rampdown_multiplier(progress, args.router_lr_reduce_start_frac, model.router_freeze_frac)
         adapter_lr_mult = router_lr_mult if args.router_freeze_adapters else 1.0
-        ema_lr_mult = rampdown_multiplier(progress, args.ema_lr_reduce_start_frac, model.ema_router_prefreeze_frac_fwd)
-        ema_lr_mult_rev = rampdown_multiplier(progress, args.ema_lr_reduce_start_frac_rev, model.ema_router_prefreeze_frac_rev)
         ffn_lr_mult = rampdown_multiplier(progress, args.shared_ffn_lr_reduce_start_frac, model.shared_ffn_freeze_frac)
         for opt in optimizers:
             for group in opt.param_groups:
@@ -322,10 +301,6 @@ def run_training(
                     mult = router_lr_mult
                 elif component == "adapter":
                     mult = adapter_lr_mult
-                elif component == "ema_alpha":
-                    mult = ema_lr_mult
-                elif component == "ema_alpha_rev":
-                    mult = ema_lr_mult_rev
                 elif component == "shared_ffn":
                     mult = ffn_lr_mult
                 group["lr"] = base_lr * mult
@@ -336,7 +311,6 @@ def run_training(
             torch.futures.collect_all(opt2futures[opt]).wait()
             opt.step()
         model.zero_grad(set_to_none=True)
-        sanitize_router_params(model, args)
         if args.enable_extra_logging and router_layer_avg:
             metric_keys = ["imp_cv2", "load_cv2", "usage_frac", "topk_prob_mean"]
             if args.router_enable_forward_ema:
