@@ -229,10 +229,14 @@ class Hyperparameters:
     enable_extra_wandb_logging = True
     do_model_warmup = False
     metrics_log_every = 25
+    # Layerwise router temp & lb boosts.
     router_layer_peak_frac = 0.475
-    router_temp_boost = 0.0 #-0.05 #0.2
-    router_lb_boost = 0.0 #-0.1 #0.5
-    end_boost_step = 1500
+    router_temp_boost = 0.2
+    router_lb_boost = 0.5
+    decay_boost_start_delta_steps = 0 #650
+    decay_boost_end_delta_steps = 0 #800
+    boost_preramp_steps = 0 #50
+    boost_floor_frac = 1.0 #0.5
 
 args = Hyperparameters()
 
@@ -436,7 +440,10 @@ model: nn.Module = GPT(
     router_layer_peak_frac=args.router_layer_peak_frac,
     router_temp_boost=args.router_temp_boost,
     router_lb_boost=args.router_lb_boost,
-    end_boost_step=args.end_boost_step,
+    decay_boost_start_delta_steps=args.decay_boost_start_delta_steps,
+    decay_boost_end_delta_steps=args.decay_boost_end_delta_steps,
+    boost_preramp_steps=args.boost_preramp_steps,
+    boost_floor_frac=args.boost_floor_frac,
     use_router_adapters=args.use_router_adapters,
     expert_activation_schedule=args.expert_activation_schedule,
     router_freeze_frac=args.router_freeze_frac,

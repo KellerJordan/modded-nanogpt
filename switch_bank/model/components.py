@@ -511,7 +511,7 @@ class Block(nn.Module):
                 freeze_router_params: bool, freeze_adapter_params: bool,
                 ema_limits_fwd: tuple[float, float] | None,
                 ema_limits_rev: tuple[float, float] | None,
-                freeze_ema_alpha_rev: bool, end_boost: bool) -> tuple[Tensor, Tensor]:
+                freeze_ema_alpha_rev: bool, decay_scale: float) -> tuple[Tensor, Tensor]:
         if self.total_layers is None:
             self.total_layers = getattr(bank, "L", layer_idx + 1)
         layer_frac = layer_idx / max(self.total_layers - 1, 1)
@@ -522,8 +522,9 @@ class Block(nn.Module):
         dist = abs(layer_frac - peak)
         denom = peak if layer_frac <= peak else max(1.0 - peak, 1e-6)
         shape = max(0.0, 1.0 - dist / denom)
-        temp_multiplier = 1.0 if end_boost else 1.0 + self.temp_boost * shape
-        lb_multiplier = 1.0 if end_boost else 1.0 + self.lb_boost * shape
+        decay_scale = float(decay_scale)
+        temp_multiplier = 1.0 + decay_scale * self.temp_boost * shape
+        lb_multiplier = 1.0 + decay_scale * self.lb_boost * shape
         y, aux = bank(
             norm(x),
             layer_idx,

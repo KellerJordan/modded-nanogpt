@@ -1,4 +1,5 @@
 import math
+import os
 from functools import lru_cache
 
 import torch
@@ -45,7 +46,8 @@ class GPT(nn.Module):
                  router_temp_init: float, router_temp_final: float, router_temp_power: float,
                  router_temp_anchor_delta_steps: int | None, router_temp_anchor_ratio: float | None,
                  router_logit_cap_initial: float, router_logit_cap_final: float, router_logit_cap_delta_steps: int,
-                 router_layer_peak_frac: float, router_temp_boost: float, router_lb_boost: float, end_boost_step: int,
+                 router_layer_peak_frac: float, router_temp_boost: float, router_lb_boost: float,
+                 decay_boost_start_delta_steps: int, decay_boost_end_delta_steps: int, boost_preramp_steps: int, boost_floor_frac: float,
                  use_router_adapters: bool, expert_activation_schedule: tuple[tuple[int, int], ...],
                  router_freeze_frac: float, router_freeze_adapters: bool,
                  ema_relax_schedule_fwd: tuple[tuple[float, float, float], ...],
@@ -77,7 +79,12 @@ class GPT(nn.Module):
                   router_layer_peak_frac, router_temp_boost, router_lb_boost)
             for i in range(num_layers)
         ])
-        self.end_boost_step = end_boost_step
+        self.router_temp_boost = float(router_temp_boost)
+        self.router_lb_boost = float(router_lb_boost)
+        self.decay_boost_start_delta_steps = int(decay_boost_start_delta_steps)
+        self.decay_boost_end_delta_steps = int(decay_boost_end_delta_steps)
+        self.boost_preramp_steps = int(boost_preramp_steps)
+        self.boost_floor_frac = float(boost_floor_frac)
         self.tie_lm_head = bool(tie_lm_head)
         self.untie_lm_head_after = int(untie_lm_head_after)
         needs_lm_head = (not self.tie_lm_head) or (self.untie_lm_head_after >= 0)
@@ -172,6 +179,8 @@ class GPT(nn.Module):
             if last_count < self.num_experts:
                 self.expert_activation_schedule.append((last_step, self.num_experts))
         self._expert_schedule_requires_mask = mask_needed
+        self._full_activation_step = self._compute_full_activation_step()
+        self._full_activation_step = self._compute_full_activation_step()
 
         flags_dim = 3 + self.router_block_pos_bins
 
@@ -358,6 +367,7 @@ class GPT(nn.Module):
             self._ffn_frozen_logged = True
         T_cur = self.compute_router_temp(step, total_steps)
         logit_cap = self.compute_logit_cap(step)
+        decay_scale = self._boost_decay_scale(step)
         freeze_ema_alpha_fwd = (progress < self.ema_freeze_frac) or (progress >= self.ema_router_prefreeze_frac_fwd) or freeze_router_params
         freeze_ema_alpha_rev = (progress < self.ema_freeze_frac_rev) or (progress >= self.ema_router_prefreeze_frac_rev) or freeze_router_params
         use_gumbel_now = (self.router_use_gumbel and (progress < self.router_gumbel_frac))
@@ -414,7 +424,7 @@ class GPT(nn.Module):
                         ema_limits_fwd=ema_limits_fwd,
                         ema_limits_rev=ema_limits_rev,
                         freeze_ema_alpha_rev=freeze_ema_alpha_rev,
-                        end_boost=step >= self.end_boost_step,
+                        decay_scale=decay_scale,
                     )
                 y = y.detach()
                 aux = aux.detach()
@@ -429,7 +439,7 @@ class GPT(nn.Module):
                     ema_limits_fwd=ema_limits_fwd,
                     ema_limits_rev=ema_limits_rev,
                     freeze_ema_alpha_rev=freeze_ema_alpha_rev,
-                    end_boost=step >= self.end_boost_step,
+                    decay_scale=decay_scale,
                 )
             x = y
             aux_loss = aux_loss + aux
@@ -441,7 +451,8 @@ class GPT(nn.Module):
             logits: Tensor = F.linear(x.flatten(end_dim=1), self._lm_head_weight()).float()
             loss_main = F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq)
             self.latest_loss_components = (loss_main.detach(), aux_loss.detach())
-            return loss_main + aux_loss
+            total = loss_main + aux_loss
+            return total
 
         loss = 0
         for i in range(4):
@@ -461,3 +472,57 @@ class GPT(nn.Module):
         if self.lm_head is None or self._head_tied_runtime:
             return self.embed.weight.bfloat16()
         return self.lm_head.bfloat16()
+
+    def _compute_full_activation_step(self) -> int:
+        step_full = 0
+        for step_v, count in self.expert_activation_schedule:
+            if count >= self.num_experts:
+                step_full = int(step_v)
+                break
+        return max(0, step_full)
+
+    def _latest_activation(self, step: int) -> tuple[int, int]:
+        last_step = 0
+        last_count = 0
+        for stage_step, count in self.expert_activation_schedule:
+            if step >= stage_step:
+                last_step = int(stage_step)
+                last_count = int(count)
+            else:
+                break
+        return last_step, last_count
+
+    def _boost_decay_scale(self, step: int) -> float:
+        # Identify last activation at or before this step, and the next one (if any)
+        last_step = 0
+        next_step = None
+        last_count = 0
+        for stage_step, count in self.expert_activation_schedule:
+            if stage_step <= step:
+                last_step = int(stage_step)
+                last_count = int(count)
+            elif next_step is None:
+                next_step = int(stage_step)
+                break
+
+        # Pre-ramp to full before the next activation, if configured
+        if next_step is not None and next_step - self.boost_preramp_steps <= step < next_step:
+            return 1.0
+
+        # If we haven't reached a multi-expert activation yet, anchor decay to the upcoming one
+        anchor_step = last_step
+        if last_count < 2 and next_step is not None:
+            anchor_step = next_step
+
+        start = anchor_step + self.decay_boost_start_delta_steps
+        end = anchor_step + self.decay_boost_end_delta_steps
+        if end < start:
+            end = start
+
+        if step < start:
+            return 1.0
+        if step >= end:
+            return self.boost_floor_frac
+        span = max(end - start, 1)
+        frac = 1.0 - (step - start) / span
+        return self.boost_floor_frac + (1.0 - self.boost_floor_frac) * min(max(frac, 0.0), 1.0)

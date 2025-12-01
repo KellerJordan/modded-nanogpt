@@ -1,6 +1,7 @@
 import copy
 import math
 import time
+import os
 from functools import lru_cache
 from collections import defaultdict
 
@@ -19,7 +20,6 @@ from switch_bank.data import (
 )
 from switch_bank.model.gpt import _compute_router_temp, _second_expert_step
 from switch_bank.model.components import CausalSelfAttention
-
 
 def get_lr(args, step: int):
     x = step / args.num_iterations
