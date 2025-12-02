@@ -44,7 +44,6 @@ class GPT(nn.Module):
                  router_temp_anchor_delta_steps: int | None, router_temp_anchor_ratio: float | None,
                  router_logit_cap_initial: float, router_logit_cap_final: float, router_logit_cap_delta_steps: int,
                  router_layer_peak_frac: float, router_temp_boost: float, router_lb_boost: float,
-                 decay_boost_start_delta_steps: int, decay_boost_end_delta_steps: int, boost_preramp_steps: int, boost_floor_frac: float,
                  use_router_adapters: bool, expert_activation_schedule: tuple[tuple[int, int], ...],
                  router_freeze_frac: float, router_freeze_adapters: bool,
                  ema_block_size_fwd: int, ema_block_size_rev: int,
@@ -76,10 +75,6 @@ class GPT(nn.Module):
         ])
         self.router_temp_boost = float(router_temp_boost)
         self.router_lb_boost = float(router_lb_boost)
-        self.decay_boost_start_delta_steps = int(decay_boost_start_delta_steps)
-        self.decay_boost_end_delta_steps = int(decay_boost_end_delta_steps)
-        self.boost_preramp_steps = int(boost_preramp_steps)
-        self.boost_floor_frac = float(boost_floor_frac)
         self.tie_lm_head = bool(tie_lm_head)
         self.untie_lm_head_after = int(untie_lm_head_after)
         needs_lm_head = (not self.tie_lm_head) or (self.untie_lm_head_after >= 0)
@@ -319,7 +314,7 @@ class GPT(nn.Module):
             self._ffn_frozen_logged = True
         T_cur = self.compute_router_temp(step, total_steps)
         logit_cap = self.compute_logit_cap(step)
-        decay_scale = self._boost_decay_scale(step)
+        decay_scale = 1.0
         freeze_ema_alpha_fwd = True
         freeze_ema_alpha_rev = True
         use_gumbel_now = (self.router_use_gumbel and (progress < self.router_gumbel_frac))
@@ -443,38 +438,3 @@ class GPT(nn.Module):
             else:
                 break
         return last_step, last_count
-
-    def _boost_decay_scale(self, step: int) -> float:
-        # Identify last activation at or before this step, and the next one (if any)
-        last_step = 0
-        next_step = None
-        last_count = 0
-        for stage_step, count in self.expert_activation_schedule:
-            if stage_step <= step:
-                last_step = int(stage_step)
-                last_count = int(count)
-            elif next_step is None:
-                next_step = int(stage_step)
-                break
-
-        # Pre-ramp to full before the next activation, if configured
-        if next_step is not None and next_step - self.boost_preramp_steps <= step < next_step:
-            return 1.0
-
-        # If we haven't reached a multi-expert activation yet, anchor decay to the upcoming one
-        anchor_step = last_step
-        if last_count < 2 and next_step is not None:
-            anchor_step = next_step
-
-        start = anchor_step + self.decay_boost_start_delta_steps
-        end = anchor_step + self.decay_boost_end_delta_steps
-        if end < start:
-            end = start
-
-        if step < start:
-            return 1.0
-        if step >= end:
-            return self.boost_floor_frac
-        span = max(end - start, 1)
-        frac = 1.0 - (step - start) / span
-        return self.boost_floor_frac + (1.0 - self.boost_floor_frac) * min(max(frac, 0.0), 1.0)

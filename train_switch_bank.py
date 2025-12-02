@@ -173,7 +173,7 @@ class Hyperparameters:
     router_enable_forward_ema = False
     router_enable_reverse_ema = True
     ema_alpha_fwd = 0.80
-    ema_alpha_rev = 0.875
+    ema_alpha_rev = 0.85 #0.875
     ema_window_size_fwd = 128  # -1  # <=0 means full sequence
     ema_block_size_fwd = 128
     ema_window_size_rev = 384
@@ -196,19 +196,15 @@ class Hyperparameters:
     router_temp_anchor_delta_steps = 320  # steps after 2nd expert activation to hit anchor ratio
     router_temp_anchor_ratio = 0.49  # temp curve hits this ratio at anchor delta
     router_logit_cap_initial = 1.0
-    router_logit_cap_final = 25.0 #30.0
-    router_logit_cap_delta_steps = 470 # ramp length after second expert activation
+    router_logit_cap_final = 20.0 #25.0
+    router_logit_cap_delta_steps = 390 # ramp length after second expert activation
     # Optional Gumbel exploration (off by default)
     router_use_gumbel = False #True
     router_gumbel_frac = 0.16
     # Layerwise router temp & lb boosts.
-    router_layer_peak_frac = 0.475
     router_temp_boost = 0.2
     router_lb_boost = 0.5
-    decay_boost_start_delta_steps = 0  # 650
-    decay_boost_end_delta_steps = 0  # 800
-    boost_preramp_steps = 0  # 50
-    boost_floor_frac = 1.0  # 0.5
+    router_layer_peak_frac = 0.475
     # evaluation and logging
     val_loss_every = 250 #125  # 0 for only at end
     save_checkpoint = False
@@ -415,10 +411,6 @@ model: nn.Module = GPT(
     router_layer_peak_frac=args.router_layer_peak_frac,
     router_temp_boost=args.router_temp_boost,
     router_lb_boost=args.router_lb_boost,
-    decay_boost_start_delta_steps=args.decay_boost_start_delta_steps,
-    decay_boost_end_delta_steps=args.decay_boost_end_delta_steps,
-    boost_preramp_steps=args.boost_preramp_steps,
-    boost_floor_frac=args.boost_floor_frac,
     use_router_adapters=args.use_router_adapters,
     expert_activation_schedule=args.expert_activation_schedule,
     router_freeze_frac=args.router_freeze_frac,
