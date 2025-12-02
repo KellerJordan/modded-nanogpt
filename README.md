@@ -38,7 +38,7 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@ryanyang0](https://x.com/ryanyang0), [@vagrawal](https://github.com/vagrawal), [@classiclarryd](https://x.com/classiclarryd), 
 [@byronxu99](https://github.com/byronxu99), [@varunneal](https://x.com/varunneal), [@EmelyanenkoK](https://github.com/EmelyanenkoK), 
 [@bernard24](https://github.com/bernard24)/https://www.hiverge.ai/, [@Gusarich](https://x.com/Gusarich), [@li_zichong](https://x.com/li_zichong),
-[@akash5474](https://github.com/akash5474)
+[@akash5474](https://github.com/akash5474), [@snimu](https://x.com/omouamoua)
 
 
 ---
@@ -141,6 +141,7 @@ The only rules are that new records must:
 1. Not modify the train or validation data pipelines. (You can change the batch size, sequence length, attention structure etc.; just don't change the underlying streams of tokens.)
 2. Attain ≤3.28 mean val loss. (Due to inter-run variance, submissions must provide enough run logs to attain a statistical significance level of p<0.01 that their mean val loss is ≤3.28. Example code to compute p-value can be found [here](records/track_1_short/2025-01-04_SoftCap#softer-softcap). For submissions which improve speed by optimizing the systems performance, without touching the ML, this requirement is waived.)
 3. Not use any extra `torch._inductor.config` or `torch.compile` flags. (These can save a few seconds, but they can also make compilation take >30min. This rule was introduced after the 21st record.)
+4. Run faster than the prior record when baselined on the same hardware. 
 
 > Note: `torch._inductor.config.coordinate_descent_tuning` is allowed for GPT-2 Medium track (a.k.a. 2.92 track).
 
@@ -178,28 +179,6 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 
 ---
 
-### Important note about records 22-25
-
-Thanks to the statistical testing of [@agrawal](https://www.github.com/agrawal) (holder of the 24th record), we have learned that records 23, 24, and in all likelihood 22 and 25, actually attain a mean loss of 3.281, which is slightly above the 3.28 target.
-Therefore if we were to completely adhere to the speedrun rules, we would have to deny that these are valid records.
-However, we have decided to leave them in place as valid, because of the following two reasons: (a) the extra loss is most likely my (@kellerjordan0) own fault rather than that of the records, and (b) it is most likely easily addressable.
-
-Here's what happened: Records #22 to #25 each change only the systems/implementation of the speedrun.
-Therefore, the requirement to do statistical testing to confirm they hit the target was waived, since in theory they should have hit it automatically, by virtue of the fact that they didn't touch the ML (i.e., they didn't change the architecture, learning rate, etc.).
-
-So if these records shouldn't have changed the ML, what explains the regression in val loss?
-We think that most likely, the answer is that this regression was indeed not introduced by any of these records. Instead, it was
-probably caused by my own non-record in which I retimed record #21 with newest torch,
-because in this non-record I also changed the constants used to cast the lm_head to fp8.
-I thought that this change should cause only a (small) strict improvement, but apparently that was not the case.
-
-Therefore, it is probable that each of records #22-25 could be easily made fully valid by simply reverting the change I made to those constants.
-Therefore they shall be upheld as valid records.
-
-For the future, fortunately record #26 brought the speedrun back into the green in terms of <3.28 loss, so (with high p-value) it should be in a good state now.
-
----
-
 ### Notable attempts & forks
 
 **Notable runs:**
@@ -233,7 +212,7 @@ All other rules remain the same.
 6 | 25.95 minutes* | [2x MLP wd, qkv norm, all_reduce/opt.step() overlap, optimized skip pattern](https://x.com/YouJiacheng/status/1905861218138804534) | 03/25/25 | [log](records/track_2_medium/2025-03-25_ArchOptTweaks/train_gpt-20250329.txt) | @YouJiacheng
 7 | 25.29 minutes | [Remove FP8 head; ISRU logits softcap; New sharded mixed precision Muon; merge weights](https://x.com/YouJiacheng/status/1912570883878842527) | 04/16/25 | [log](records/track_2_medium/2025-04-16_Record7/223_3310d0b1-b24d-48ee-899f-d5c2a254a195.txt) | @YouJiacheng
 8 | 24.50 minutes | [Cubic sliding window size schedule, 2× max window size (24.84 minutes)](https://x.com/jadenj3o/status/1914893086276169754) [24.5min repro](https://x.com/YouJiacheng/status/1915667616913645985) | 04/22/25 | [log](records/track_2_medium/2025-04-22_Record8/075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj3o
-
+9 | 24.12 minutes | [Add two value embeddings](https://snimu.github.io/2025/10/07/modded-nanogpt-value-embeddings.html) | 08/28/25 | [log](records/track_2_medium/2025-08-28_NewValemb/036_61ef4351-7b68-4897-b440-a99221a1a629.txt), [PR](https://github.com/KellerJordan/modded-nanogpt/pull/119) | @snimu
 ---
 
 ### Q: What is the point of NanoGPT speedrunning?
