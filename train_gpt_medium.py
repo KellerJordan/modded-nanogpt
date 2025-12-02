@@ -18,7 +18,6 @@ import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 torch._inductor.config.coordinate_descent_tuning = True # we allow this flag for medium track
-torch._dynamo.config.compiled_autograd = True
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -216,7 +215,7 @@ class GPT(nn.Module):
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
-        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
+        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(5)])
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
@@ -274,7 +273,7 @@ class GPT(nn.Module):
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
+        ve = [ve[0], ve[1], ve[2], ve[3], ve[4]] + [None] * (len(self.blocks) - 10) + [ve[0], ve[1], ve[2], ve[3], ve[4]]
         assert len(ve) == len(self.blocks)
 
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
@@ -352,7 +351,7 @@ class Hyperparameters:
     train_seq_len = 64*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 5960 # number of iterations to run
+    num_iterations = 5820 # number of iterations to run
     cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
     # architecture
     vocab_size = 50257
@@ -385,15 +384,6 @@ def print0(s, console=False):
             if console:
                 print(s)
             print(s, file=f)
-from torch._logging._internal import trace_structured # noqa: E402
-import torch._inductor.codecache # noqa: E402
-import torch._inductor.graph # noqa: E402
-def _patched_trace_structured(name, metadata_fn, **kwargs):
-    if name == "inductor_output_code":
-        print0(f"inductor_output_code: {metadata_fn().get("filename", "Unknown")}")
-    trace_structured(name, metadata_fn, **kwargs)
-torch._inductor.codecache.trace_structured = _patched_trace_structured
-torch._inductor.graph.trace_structured = _patched_trace_structured
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -475,7 +465,8 @@ model: nn.Module = torch.compile(model, dynamic=False)
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 warmup_steps = 10
 initial_state = copy.deepcopy(dict(model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers]))
-for _ in range(warmup_steps):
+for warmup_step in range(warmup_steps):
+    print0(f"Warmup step {warmup_step+1}/{warmup_steps}")
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
     model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
     for param in model.parameters():
