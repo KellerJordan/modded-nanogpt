@@ -202,10 +202,10 @@ class Hyperparameters:
     router_use_gumbel = False #True
     router_gumbel_frac = 0.16
     # Layerwise router temp & lb boosts.
-    router_boost_shape = "peak"  # options: peak, valley, linear_start, linear_end
+    router_boost_shape = "linear_end"  # options: peak (default), valley, linear_start, linear_end
     router_temp_boost = 0.2
     router_lb_boost = 0.5
-    router_layer_peak_frac = 0.475  # only used for peak or valley shapes
+    router_layer_peak_frac = 0.475  # only used for peak or valley shapes. boosts are calculated continuously
     # evaluation and logging
     val_loss_every = 250 #125  # 0 for only at end
     save_final_checkpoint = False
