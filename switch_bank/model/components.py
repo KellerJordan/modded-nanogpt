@@ -503,7 +503,7 @@ class SharedFFNBank(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int, skip_attn_layers: set[int],
-                 peak_frac: float, temp_boost: float, lb_boost: float):
+                 peak_frac: float, temp_boost: float, lb_boost: float, boost_shape: str = "peak"):
         super().__init__()
         self.attn = None if layer_idx in skip_attn_layers else CausalSelfAttention(dim, num_heads, max_seq_len)
         self.layer_idx = layer_idx
@@ -511,6 +511,7 @@ class Block(nn.Module):
         self.layer_peak_frac = float(peak_frac)
         self.temp_boost = float(temp_boost)
         self.lb_boost = float(lb_boost)
+        self.boost_shape = (boost_shape or "peak").lower()
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask,
                 lambdas: Tensor, sa_lambdas: Tensor, bank: SharedFFNBank, layer_idx: int,
@@ -529,7 +530,15 @@ class Block(nn.Module):
         peak = self.layer_peak_frac
         dist = abs(layer_frac - peak)
         denom = peak if layer_frac <= peak else max(1.0 - peak, 1e-6)
-        shape = max(0.0, 1.0 - dist / denom)
+        shape_peak = max(0.0, 1.0 - dist / denom)
+        if self.boost_shape == "valley":
+            shape = 1.0 - shape_peak
+        elif self.boost_shape == "linear_start":
+            shape = max(0.0, min(1.0, 1.0 - layer_frac))
+        elif self.boost_shape == "linear_end":
+            shape = max(0.0, min(1.0, layer_frac))
+        else:
+            shape = shape_peak
         decay_scale = float(decay_scale)
         temp_multiplier = 1.0 + decay_scale * self.temp_boost * shape
         lb_multiplier = 1.0 + decay_scale * self.lb_boost * shape

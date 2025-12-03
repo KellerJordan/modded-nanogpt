@@ -43,7 +43,7 @@ class GPT(nn.Module):
                  router_temp_init: float, router_temp_final: float, router_temp_power: float,
                  router_temp_anchor_delta_steps: int | None, router_temp_anchor_ratio: float | None,
                  router_logit_cap_initial: float, router_logit_cap_final: float, router_logit_cap_delta_steps: int,
-                 router_layer_peak_frac: float, router_temp_boost: float, router_lb_boost: float,
+                 router_layer_peak_frac: float, router_temp_boost: float, router_lb_boost: float, router_boost_shape: str,
                  use_router_adapters: bool, expert_activation_schedule: tuple[tuple[int, int], ...],
                  router_freeze_frac: float, router_freeze_adapters: bool,
                  ema_block_size_fwd: int, ema_block_size_rev: int,
@@ -70,7 +70,7 @@ class GPT(nn.Module):
 
         self.blocks = nn.ModuleList([
             Block(model_dim, num_heads, max_seq_len, i, skip_attn_layers,
-                  router_layer_peak_frac, router_temp_boost, router_lb_boost)
+                  router_layer_peak_frac, router_temp_boost, router_lb_boost, boost_shape=router_boost_shape)
             for i in range(num_layers)
         ])
         self.router_temp_boost = float(router_temp_boost)

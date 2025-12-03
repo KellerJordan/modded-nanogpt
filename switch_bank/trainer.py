@@ -88,9 +88,18 @@ def run_training(
     world_size: int,
     rank: int,
     log_param_counts_fn=None,
+    start_step: int = 0,
+    checkpoint_save_step: int = -1,
 ):
     training_time_ms = 0
-    train_loader = distributed_data_generator(args.train_files, world_size * train_micro_len, rank, world_size)
+    approx_step_time_ms_resume = getattr(args, "approx_step_time_ms", None)
+    train_loader = distributed_data_generator(
+        args.train_files,
+        world_size * train_micro_len,
+        rank,
+        world_size,
+        skip_batches=start_step * args.grad_accum_steps,
+    )
     print0("Starting training.", console=True)
     dist.barrier()
     t0 = time.perf_counter()
@@ -103,7 +112,7 @@ def run_training(
     experts_pruned = False
     EXPERT_ACTIVITY_THRESHOLD = 0.015
 
-    for step in range(train_steps + 1):
+    for step in range(start_step, train_steps + 1):
         last_step = (step == train_steps)
         window_blocks = get_window_size_blocks(args, step)
         progress = step / max(train_steps, 1)
@@ -157,11 +166,11 @@ def run_training(
             t0 = time.perf_counter()
 
         if last_step:
-            if master_process and args.save_checkpoint:
-                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-                import os
+            if master_process and getattr(args, "save_final_checkpoint", getattr(args, "save_checkpoint", False)):
+                model_to_save = getattr(model, "_orig_mod", model)
+                log = dict(step=step, code=code, model=model_to_save.state_dict())
                 os.makedirs(f"logs/{run_id_full}", exist_ok=True)
-                torch.save(log, f"logs/{run_id_full}/state_step{step:06d}.pt")
+                torch.save(log, f"logs/{run_id_full}/final_model_step{step:06d}.pt")
             break
 
         model.zero_grad(set_to_none=True)
@@ -328,6 +337,12 @@ def run_training(
             f"{router_summary_str(router_step_summary, args.router_enable_forward_ema, args.router_enable_reverse_ema)}",
             console=True)
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+        if approx_step_time_ms_resume is not None:
+            approx_training_time_ms = approx_step_time_ms_resume
+            # reset base timer so subsequent steps are correct
+            training_time_ms = approx_step_time_ms_resume
+            t0 = time.perf_counter()
+            approx_step_time_ms_resume = None
         print0(
             f"step:{step + 1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / (step + 1):.2f}ms",
             console=True)
@@ -416,5 +431,24 @@ def run_training(
                 *expert_active_list,
             ]
             metrics_csv_writer.writerow(row)
+        if master_process and checkpoint_save_step >= 0 and step == checkpoint_save_step:
+            os.makedirs(f"logs/{run_id_full}", exist_ok=True)
+            model_to_save = getattr(model, "_orig_mod", model)
+            checkpoint_payload = dict(
+                step=step,
+                code=code,
+                model=model_to_save.state_dict(),
+                optimizers=[opt.state_dict() for opt in optimizers],
+                approx_step_time_ms=approx_training_time_ms,
+                meta=dict(
+                    model_dim=getattr(args, "model_dim", None),
+                    num_layers=getattr(args, "num_layers", None),
+                    num_heads=getattr(args, "num_heads", None),
+                    num_experts=getattr(args, "num_experts", None),
+                    ffn_hidden=getattr(args, "ffn_hidden", None),
+                    vocab_size=getattr(args, "vocab_size", None),
+                ),
+            )
+            torch.save(checkpoint_payload, f"logs/{run_id_full}/state_step{step:06d}.pt")
 
     return experts_pruned

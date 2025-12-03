@@ -16,7 +16,7 @@ def _load_data_shard(file: Path):
     return tokens
 
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, rank: int, world_size: int):
+def distributed_data_generator(filename_pattern: str, batch_size: int, rank: int, world_size: int, skip_batches: int = 0):
     files = sorted(Path.cwd().glob(filename_pattern))
     if not files:
         raise RuntimeError(f"No data files match pattern '{filename_pattern}' in {Path.cwd()}")
@@ -27,6 +27,17 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank: int
         tokens, pos = _load_data_shard(next(file_iter)), 0
     except StopIteration as exc:
         raise RuntimeError(f"No data files available for pattern '{filename_pattern}'") from exc
+    # fast-forward if resuming
+    while skip_batches > 0:
+        if pos + batch_size + 1 >= len(tokens):
+            try:
+                tokens, pos = _load_data_shard(next(file_iter)), 0
+            except StopIteration:
+                file_iter = iter(files)
+                tokens, pos = _load_data_shard(next(file_iter)), 0
+        pos += batch_size
+        skip_batches -= 1
+
     while True:
         if pos + batch_size + 1 >= len(tokens):
             try:

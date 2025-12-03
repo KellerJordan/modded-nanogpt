@@ -202,12 +202,15 @@ class Hyperparameters:
     router_use_gumbel = False #True
     router_gumbel_frac = 0.16
     # Layerwise router temp & lb boosts.
+    router_boost_shape = "peak"  # options: peak, valley, linear_start, linear_end
     router_temp_boost = 0.2
     router_lb_boost = 0.5
-    router_layer_peak_frac = 0.475
+    router_layer_peak_frac = 0.475  # only used for peak or valley shapes
     # evaluation and logging
     val_loss_every = 250 #125  # 0 for only at end
-    save_checkpoint = False
+    save_final_checkpoint = False
+    checkpoint_save_step: int = -1  # -1 disables mid-training save
+    resume_checkpoint: str | None = "./logs/375/state_step000375.pt"
     use_wandb = True
     wandb_project = "switch-bank-mini"
     wandb_run_name = ""
@@ -411,6 +414,7 @@ model: nn.Module = GPT(
     router_layer_peak_frac=args.router_layer_peak_frac,
     router_temp_boost=args.router_temp_boost,
     router_lb_boost=args.router_lb_boost,
+    router_boost_shape=args.router_boost_shape,
     use_router_adapters=args.use_router_adapters,
     expert_activation_schedule=args.expert_activation_schedule,
     router_freeze_frac=args.router_freeze_frac,
@@ -491,6 +495,52 @@ for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
+start_step = 0
+resume_path = args.resume_checkpoint
+if resume_path:
+    print0(f"Loading checkpoint from {resume_path}", console=True)
+    checkpoint = torch.load(resume_path, map_location="cuda")
+    model_state = checkpoint.get("model", {})
+    if all(k.startswith("_orig_mod.") for k in model_state.keys()):
+        model_state = {k.removeprefix("_orig_mod."): v for k, v in model_state.items()}
+    args.approx_step_time_ms = float(checkpoint.get("approx_step_time_ms", 0))
+    meta = checkpoint.get("meta", {}) or {}
+    meta_checks = {
+        "model_dim": args.model_dim,
+        "num_layers": args.num_layers,
+        "num_heads": args.num_heads,
+        "num_experts": args.num_experts,
+        "ffn_hidden": args.ffn_hidden,
+        "vocab_size": args.vocab_size,
+    }
+    for key, current_val in meta_checks.items():
+        saved_val = meta.get(key, current_val)
+        assert saved_val == current_val, f"Checkpoint {key}={saved_val} does not match current args ({current_val})"
+    model.load_state_dict(model_state)
+    ckpt_opts = checkpoint.get("optimizers", [])
+    assert len(ckpt_opts) == len(optimizers), "Optimizer count mismatch in checkpoint."
+    for opt, state in zip(optimizers, ckpt_opts):
+        opt.load_state_dict(state)
+        for group in opt.param_groups:
+            group.setdefault("initial_lr", group.get("lr", 0.0))
+        # ensure Muon state dtypes survive checkpoint reload
+        if isinstance(opt, Muon):
+            for p, st in opt.state.items():
+                if not st:
+                    continue
+                if "mantissa" in st and st["mantissa"].dtype != torch.uint16:
+                    st["mantissa"] = st["mantissa"].to(dtype=torch.uint16)
+                if "momentum_buffer" in st and st["momentum_buffer"].dtype != torch.float32:
+                    st["momentum_buffer"] = st["momentum_buffer"].to(dtype=torch.float32)
+    start_step = int(checkpoint.get("step", -1)) + 1
+    assert start_step >= 0, "Invalid checkpoint step."
+    assert start_step <= args.num_iterations, "Checkpoint step exceeds configured num_iterations."
+    print0(f"Resumed from checkpoint at step {start_step - 1}. Continuing from step {start_step}.", console=True)
+    dist.barrier()
+
+for param in model.parameters():
+    dist.broadcast(param.detach(), 0)
+
 print0("Compiling model...", console=True)
 model: nn.Module = torch.compile(model, dynamic=False)
 print0("Compile complete.", console=True)
@@ -508,8 +558,7 @@ if effective_train_tokens != args.train_seq_len:
         console=True)
 
 if args.do_model_warmup:
-    if args.enable_extra_logging:
-        print0("Warming up kernels...", console=True)
+    print0("Warming up kernels...", console=True)
     warmup_steps = 10
     initial_state = copy.deepcopy(dict(model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers]))
     for warm_step in range(warmup_steps):
@@ -571,6 +620,8 @@ experts_pruned = trainer.run_training(
     world_size=world_size,
     rank=rank,
     log_param_counts_fn=log_param_counts,
+    start_step=start_step,
+    checkpoint_save_step=args.checkpoint_save_step,
 )
 
 if experts_pruned and args.enable_extra_logging:
