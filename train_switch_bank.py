@@ -173,7 +173,7 @@ class Hyperparameters:
     router_enable_forward_ema = False
     router_enable_reverse_ema = True
     ema_alpha_fwd = 0.80
-    ema_alpha_rev = 0.85 #0.875
+    ema_alpha_rev = 0.85
     ema_window_size_fwd = 128  # -1  # <=0 means full sequence
     ema_block_size_fwd = 128
     ema_window_size_rev = 384
