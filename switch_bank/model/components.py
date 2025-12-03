@@ -367,8 +367,8 @@ class SharedFFNBank(nn.Module):
         load_entropy = (-(load_f + 1e-6).log().mul(load_f)).sum()
 
         lb_term = (self.lb_coeff * lb_multiplier) * (cv2(imp_f) + cv2(load_f))
-        #entropy_term = -self.ent_coeff * (load_entropy + imp_entropy)
-        entropy_term = 1/load - 1/(imp+load)
+        entropy_term = -self.ent_coeff * (load_entropy + imp_entropy)
+        #entropy_term = 1/load - 1/(imp+load)
 
         expert_entropy_term = lb_term.new_zeros(())
         if self.expert_entropy_coeff > 0:
