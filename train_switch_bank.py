@@ -39,6 +39,7 @@ from switch_bank import trainer
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
+import torch._functorch.config
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -47,6 +48,7 @@ torch._inductor.config.coordinate_descent_tuning = True # we have banned this fl
 
 # ***** SET ME TRUE FOR NVIDIA? ******
 torch._dynamo.config.compiled_autograd = False
+torch._functorch.config.donated_buffer = False
 
 
 #
@@ -202,7 +204,7 @@ class Hyperparameters:
     router_use_gumbel = False #True
     router_gumbel_frac = 0.16
     # Layerwise router temp & lb boosts.
-    router_boost_shape = "linear_end"  # options: peak (default), valley, linear_start, linear_end
+    router_boost_shape = "peak"  # options: peak (default), valley, linear_start, linear_end
     router_temp_boost = 0.2
     router_lb_boost = 0.5
     router_layer_peak_frac = 0.475  # only used for peak or valley shapes. boosts are calculated continuously
@@ -565,11 +567,21 @@ if args.do_model_warmup:
         model.zero_grad(set_to_none=True)
         for micro in range(args.grad_accum_steps):
             inputs = targets = torch.randint(0, args.vocab_size, size=(train_micro_len,), device="cuda")
-            loss = model(inputs.to(torch.int32), targets, trainer.get_window_size_blocks(args, 0), 0, args.num_iterations)
-            loss_val = float(loss.detach().item())
-            components = model.latest_loss_components
-            main_loss = float(components[0].item()) if components else float("nan")
-            aux_loss = float(components[1].item()) if components else float("nan")
+            outputs = model(inputs.to(torch.int32), targets, trainer.get_window_size_blocks(args, 0), 0, args.num_iterations)
+            if isinstance(outputs, tuple):
+                loss_main, loss_aux = outputs
+                loss_val = float((loss_main + loss_aux).detach().item())
+                main_loss = float(loss_main.detach().item())
+                aux_loss = float(loss_aux.detach().item())
+                loss_total = (loss_main + loss_aux) / args.grad_accum_steps
+                loss_total.backward()
+            else:
+                loss = outputs
+                loss_val = float(loss.detach().item())
+                components = model.latest_loss_components
+                main_loss = float(components[0].item()) if components else float("nan")
+                aux_loss = float(components[1].item()) if components else float("nan")
+                (loss / args.grad_accum_steps).backward()
             router_summary = summarize_router_metrics(model.latest_router_metrics or [])
             if args.enable_extra_logging:
                 print0(
@@ -577,7 +589,6 @@ if args.do_model_warmup:
                     f"loss={loss_val:.6f} main={main_loss:.6f} aux={aux_loss:.6f} "
                     f"{router_summary_str(router_summary, args.router_enable_forward_ema, args.router_enable_reverse_ema)}",
                     console=True)
-            (loss / args.grad_accum_steps).backward()
         opt2futures = {
             opt: [dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                   for p in params if (p.grad is not None)]

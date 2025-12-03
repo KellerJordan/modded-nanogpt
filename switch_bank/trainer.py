@@ -184,16 +184,32 @@ def run_training(
         expert_active_accum: list[torch.Tensor] = []
         for micro in range(args.grad_accum_steps):
             inputs, targets = next(train_loader)
-            loss = model(inputs, targets, window_blocks, step, args.num_iterations)
-            loss_val = float(loss.detach().item())
-            micro_losses.append(loss_val)
-            components = model.latest_loss_components
-            main_loss = float(components[0].item()) if components else float("nan")
-            aux_loss = float(components[1].item()) if components else float("nan")
-            if not math.isnan(main_loss):
-                micro_main_losses.append(main_loss)
-            if not math.isnan(aux_loss):
-                micro_aux_losses.append(aux_loss)
+            outputs = model(inputs, targets, window_blocks, step, args.num_iterations)
+            if isinstance(outputs, tuple):
+                loss_main, loss_aux = outputs
+                loss_main_v = float(loss_main.detach().item())
+                loss_aux_v = float(loss_aux.detach().item())
+                loss_val = loss_main_v + loss_aux_v
+                micro_losses.append(loss_val)
+                micro_main_losses.append(loss_main_v)
+                micro_aux_losses.append(loss_aux_v)
+                loss_total = (loss_main + loss_aux) / args.grad_accum_steps
+                loss_total.backward()
+                components = (loss_main.detach(), loss_aux.detach())
+                main_loss = loss_main_v
+                aux_loss = loss_aux_v
+            else:
+                loss = outputs
+                loss_val = float(loss.detach().item())
+                micro_losses.append(loss_val)
+                (loss / args.grad_accum_steps).backward()
+                components = model.latest_loss_components
+                main_loss = float(components[0].item()) if components else float("nan")
+                aux_loss = float(components[1].item()) if components else float("nan")
+                if not math.isnan(main_loss):
+                    micro_main_losses.append(main_loss)
+                if not math.isnan(aux_loss):
+                    micro_aux_losses.append(aux_loss)
             router_summary = summarize_router_metrics(model.latest_router_metrics or [])
             if router_summary:
                 router_metric_accum.append(router_summary)
@@ -228,7 +244,6 @@ def run_training(
                     f"loss={loss_val:.6f} main={main_loss:.6f} aux={aux_loss:.6f} "
                     f"{router_summary_str(router_summary, args.router_enable_forward_ema, args.router_enable_reverse_ema)}",
                     console=True)
-            (loss / args.grad_accum_steps).backward()
 
         avg_loss = sum(micro_losses) / max(len(micro_losses), 1)
         avg_main_loss = sum(micro_main_losses) / max(len(micro_main_losses), 1) if micro_main_losses else float("nan")
@@ -348,6 +363,12 @@ def run_training(
             console=True)
         current_logit_cap = get_logit_cap(args, step)
         current_router_temp = get_router_temp(args, step)
+        active_count_val = None
+        if expert_active is not None:
+            active_count_val = float(expert_active.mean().item() * args.num_experts)
+        if active_count_val is None or active_count_val <= 0:
+            active_count_val = float(args.num_experts)
+        active_count_val = max(active_count_val, 1.0)
         if wandb_run is not None and (step % max(args.wandb_log_every, 1) == 0):
             if args.enable_extra_wandb_logging:
                 log_data = {
@@ -364,7 +385,60 @@ def run_training(
                     "router/temperature": current_router_temp,
                     "router/max_logit": router_step_summary.get("max_logit", float("nan")),
                 }
+                # feature weight percentages
+                feat_keys_all = [k for k in router_step_summary.keys() if k.startswith("feat_w_")]
+                feat_keys = [k for k in feat_keys_all if k in ("feat_w_tok", "feat_w_ema_fwd", "feat_w_ema_rev", "feat_w_flags")]
+                if not feat_keys:
+                    feat_keys = feat_keys_all
+                feat_total = sum(router_step_summary[k] for k in feat_keys) if feat_keys else 0.0
+                if feat_total and feat_total != 0:
+                    for k in feat_keys:
+                        pct = 100.0 * router_step_summary[k] / feat_total
+                        log_data[f"router/feat_pct/{k.replace('feat_w_', '')}"] = pct
+                # normalized CV metrics
+                imp_cv2 = router_step_summary.get("imp_cv2", float("nan"))
+                load_cv2 = router_step_summary.get("load_cv2", float("nan"))
+                log_data["router/imp_cv2_norm"] = imp_cv2 / active_count_val if not math.isnan(imp_cv2) else float("nan")
+                log_data["router/load_cv2_norm"] = load_cv2 / active_count_val if not math.isnan(load_cv2) else float("nan")
+                # entropy gaps
+                expected_entropy = math.log(active_count_val) if active_count_val > 0 else float("nan")
+                load_entropy = router_step_summary.get("load_entropy", float("nan"))
+                imp_entropy = router_step_summary.get("imp_entropy", float("nan"))
+                def _entropy_gap(val):
+                    if math.isnan(val) or math.isnan(expected_entropy) or expected_entropy <= 0:
+                        return float("nan")
+                    return max(0.0, (expected_entropy - val) / expected_entropy)
+                load_entropy_gap = _entropy_gap(load_entropy)
+                imp_entropy_gap = _entropy_gap(imp_entropy)
+                log_data["router/load_entropy_gap"] = load_entropy_gap
+                log_data["router/imp_entropy_gap"] = imp_entropy_gap
+                # usage gap and health score
+                usage_frac = router_step_summary.get("usage_frac", float("nan"))
+                target_usage = min(1.0, active_count_val / max(args.num_experts, 1))
+                usage_gap = abs(usage_frac - target_usage) if not math.isnan(usage_frac) else float("nan")
+                weights = {
+                    "imp_cv2_norm": 1.0,
+                    "load_cv2_norm": 1.0,
+                    "load_entropy_gap": 0.5,
+                    "imp_entropy_gap": 0.5,
+                    "usage_gap": 0.75,
+                }
+                components_weighted = []
+                components_weighted.append(weights["imp_cv2_norm"] * log_data["router/imp_cv2_norm"] if not math.isnan(log_data["router/imp_cv2_norm"]) else float("nan"))
+                components_weighted.append(weights["load_cv2_norm"] * log_data["router/load_cv2_norm"] if not math.isnan(log_data["router/load_cv2_norm"]) else float("nan"))
+                components_weighted.append(weights["load_entropy_gap"] * load_entropy_gap if not math.isnan(load_entropy_gap) else float("nan"))
+                components_weighted.append(weights["imp_entropy_gap"] * imp_entropy_gap if not math.isnan(imp_entropy_gap) else float("nan"))
+                components_weighted.append(weights["usage_gap"] * usage_gap if not math.isnan(usage_gap) else float("nan"))
+                health_terms = [v for v in components_weighted if not math.isnan(v)]
+                if health_terms:
+                    health_penalty = sum(health_terms)
+                    log_data["router/health_score"] = 1.0 / (1.0 + health_penalty)
+                    health_penalty = health_penalty / 10.0
+                    log_data["router/health_penalty"] = health_penalty
+                # raw router stats (skip feat_w_*; percents already logged)
                 for key, value in router_step_summary.items():
+                    if key.startswith("feat_w_"):
+                        continue
                     log_data[f"router/{key}"] = value
                 for layer_idx, stats in router_layer_avg.items():
                     for key, value in stats.items():

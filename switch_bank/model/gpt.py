@@ -398,8 +398,7 @@ class GPT(nn.Module):
             logits: Tensor = F.linear(x.flatten(end_dim=1), self._lm_head_weight()).float()
             loss_main = F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq)
             self.latest_loss_components = (loss_main.detach(), aux_loss.detach())
-            total = loss_main + aux_loss
-            return total
+            return loss_main, aux_loss
 
         loss = 0
         for i in range(4):
