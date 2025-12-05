@@ -159,7 +159,14 @@ def run_training(
                 f"step:{step}/{train_steps} val_loss:{val_loss:.6f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms",
                 console=True)
             if wandb_run is not None:
-                wandb_run.log({"val/loss": float(val_loss.detach().item()), "val/step": step}, step=step)
+                wandb_run.log(
+                    {
+                        "val/loss": float(val_loss.detach().item()),
+                        "val/step": step,
+                        "perf/approx_step_time_ms": training_time_ms,
+                    },
+                    step=step,
+                )
             model.train()
             model.bank.k = prev_k
             dist.barrier()

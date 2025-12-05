@@ -135,10 +135,10 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin"
     val_files = "data/fineweb10B/fineweb_val_*.bin"
     val_tokens = 32768 * 20 #10485760
-    train_seq_len = 32768 #64*1024          # effective tokens per optimizer step per rank
+    train_seq_len = 48*1024 #32768 #64*1024          # effective tokens per optimizer step per rank
     val_seq_len = 8192 #4*64*1024
     # minibatch / gradient accumulation
-    grad_accum_steps = 8               # default=1 keeps original behavior
+    grad_accum_steps = 12 #8               # default=1 keeps original behavior
     train_micro_seq_len: int | None = None  # if None, computed as train_seq_len // grad_accum_steps
     # optimization
     num_iterations = 4123 #2980 #5960
@@ -160,7 +160,7 @@ class Hyperparameters:
     tie_lm_head = False
     untie_lm_head_frac = -1.0
     # Bank / routing
-    num_experts = 3 #2
+    num_experts = 12 #2
     ffn_hidden = 1024 #2048
     topk = 1
     topk_val: int | None = None
@@ -188,21 +188,8 @@ class Hyperparameters:
     shared_ffn_lr_reduce_start_frac = -1.0
     # skip-attention layers (short-SWA) — exactly two
     skip_attn_layers = (7, )
-    # -----------------
-    # Router schedules
-    # Was:
-    # ((0, 1), (385, 2), (740, 3), (1100, 4), (1450, 5), (1800, 6))
-    #
-    # 12E@512:
-    #    ((0, 1), (175, 2), (280, 3), (385, 4), (560, 5), (740, 6), (920, 7), (1100, 8), (1275, 9), (1450, 10), (1625, 11), (1800, 12))
-    # OR:
-    #    ((0, 1), (200, 2), (250, 3), (300, 4), (350, 5), (400, 6), (500, 7), (600, 8), (760, 9), (920, 10), (1150, 11), (1380, 12))
-    #    ~((0, 1), (200, 2), (300, 3), (425, 4), (600, 5), (700, 6), (800, 7), (900, 8), (1050, 9), (1200, 10), (1350, 11), (1500, 12))
-    #
-    # 6E@512:
-    #    ((0, 1), (200, 2), (300, 3), (400, 4), (550, 5), (700, 6))
-    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 3),) #((0, 2), (420, 3), (800, 4), (1200, 5))
-                                                               #...(500, 5), (600, 6), (700, 7), (800, 8), (900, 9))  #((0, 1), (375, 2))
+    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (200, 2), (425, 3), (650, 4), (900, 5), (1100, 6), (1300, 7), (1500, 8), (1750, 9), (2050, 10), (2375, 11), (2700, 12))
+        #((0, 1), (200, 2), (425, 3), (650, 4), (925, 5), (1200, 6), (1500, 7), (1800, 8), (2100, 9))
     # 12E@1024 whoops: ((0, 1), (200, 2), (300, 3),                     (425, 4), (600, 5), (700, 6), (800, 7), (900, 8), (1050, 9), (1200, 10), (1350, 11), (1500, 12))
     router_temp_init = 1.85 #1.9
     router_temp_final = 0.65 #0.575
@@ -210,11 +197,11 @@ class Hyperparameters:
     router_temp_anchor_delta_steps = 350 #320  # steps after 2nd expert activation to hit anchor ratio
     router_temp_anchor_ratio = 0.49  # temp curve hits this ratio at anchor delta
     router_logit_cap_initial = 1.0
-    router_logit_cap_final = 20.0 #20.0 #25.0
+    router_logit_cap_final = 20.0 #21.0 #25.0
     router_logit_cap_delta_steps = 390 # ramp length after second expert activation
     # Optional Gumbel exploration (off by default)
     router_use_gumbel = True
-    router_gumbel_frac = 0.30
+    router_gumbel_frac = 0.75 #=2969   #0.30
     # Layerwise router temp & lb boosts.
     router_boost_shape = "peak"  # options: peak (default), valley, linear_start, linear_end
     router_temp_boost = 0.2
