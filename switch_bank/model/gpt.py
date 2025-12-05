@@ -36,7 +36,7 @@ def _second_expert_step(expert_activation_schedule: tuple[tuple[int, int], ...])
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int,
-                 skip_attn_layers: set[int], E: int, h: int, lb_coeff: float, ent_coeff: float, expert_entropy_coeff: float, k: int,
+                 skip_attn_layers: set[int], E: int, h: int, lb_coeff: float, ent_coeff: float, k: int,
                  num_value_embeds: int,
                  tie_lm_head: bool, untie_lm_head_after: int,
                  ema_alpha_fwd: float, ema_alpha_rev: float,
@@ -145,7 +145,7 @@ class GPT(nn.Module):
 
         self.bank = SharedFFNBank(
             d=model_dim, h=h, E=E, L=num_layers, flags_dim=flags_dim,
-            lb_coeff=lb_coeff, ent_coeff=ent_coeff, expert_entropy_coeff=expert_entropy_coeff, k=k,
+            lb_coeff=lb_coeff, ent_coeff=ent_coeff, k=k,
             use_adapters=use_router_adapters,
             ema_alpha_fwd=ema_alpha_fwd, ema_alpha_rev=ema_alpha_rev,
             use_forward_ema=self.enable_forward_ema, use_reverse_ema=self.enable_reverse_ema,

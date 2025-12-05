@@ -263,6 +263,7 @@ def run_training(
             event_step, active_count = pending_event
             if wandb_run is not None:
                 wandb_run.log({"router/active_experts": active_count}, step=event_step)
+                wandb_run.log({"router/active_total_ffn_dim": active_count * args.ffn_hidden}, step=event_step)
             model._pending_active_count = None
         if pending_expert_prune and not experts_pruned and expert_active is not None:
             activity_tensor = expert_active.to(device=model.bank.pruned_experts.device, dtype=torch.float32).clone()
@@ -407,7 +408,7 @@ def run_training(
                 def _entropy_gap(val):
                     if math.isnan(val) or math.isnan(expected_entropy) or expected_entropy <= 0:
                         return float("nan")
-                    return max(0.0, (expected_entropy - val) / expected_entropy)
+                    return max(0.0, abs(expected_entropy - val) / expected_entropy)
                 load_entropy_gap = _entropy_gap(load_entropy)
                 imp_entropy_gap = _entropy_gap(imp_entropy)
                 log_data["router/load_entropy_gap"] = load_entropy_gap
@@ -417,11 +418,11 @@ def run_training(
                 target_usage = min(1.0, active_count_val / max(args.num_experts, 1))
                 usage_gap = abs(usage_frac - target_usage) if not math.isnan(usage_frac) else float("nan")
                 weights = {
-                    "imp_cv2_norm": 1.0,
-                    "load_cv2_norm": 1.0,
+                    "imp_cv2_norm": 0.8,
+                    "load_cv2_norm": 0.9,
                     "load_entropy_gap": 0.5,
-                    "imp_entropy_gap": 0.5,
-                    "usage_gap": 0.75,
+                    "imp_entropy_gap": 0.2,
+                    "usage_gap": 1.25,
                 }
                 components_weighted = []
                 components_weighted.append(weights["imp_cv2_norm"] * log_data["router/imp_cv2_norm"] if not math.isnan(log_data["router/imp_cv2_norm"]) else float("nan"))
@@ -433,7 +434,7 @@ def run_training(
                 if health_terms:
                     health_penalty = sum(health_terms)
                     log_data["router/health_score"] = 1.0 / (1.0 + health_penalty)
-                    health_penalty = health_penalty / 10.0
+                    health_penalty = health_penalty
                     log_data["router/health_penalty"] = health_penalty
                 # raw router stats (skip feat_w_*; percents already logged)
                 for key, value in router_step_summary.items():
@@ -451,12 +452,33 @@ def run_training(
                     for idx, value in enumerate(expert_list):
                         log_data[f"router_expert/e{idx}"] = float(value)
                 if expert_active is not None:
-                    active_list = expert_active.tolist()
-                    log_data["router_expert_active/min"] = float(min(active_list))
-                    log_data["router_expert_active/max"] = float(max(active_list))
-                    log_data["router_expert_active/mean"] = float(sum(active_list) / len(active_list))
-                    for idx, value in enumerate(active_list):
-                        log_data[f"router_expert_active/e{idx}"] = float(value)
+                    base_model = getattr(model, "_orig_mod", model)
+                    scheduled_active = getattr(base_model, "_current_base_active", None)
+                    active_count = args.num_experts
+                    if isinstance(scheduled_active, int):
+                        active_count = max(1, min(args.num_experts, scheduled_active))
+                    inferred_active = expert_active.sum().item()
+                    if inferred_active > 0:
+                        active_count = max(1, min(active_count, int(round(inferred_active))))
+                    source = expert_usage if expert_usage is not None else expert_active
+                    active_list = source.tolist()
+                    active_slice = active_list[:active_count] if active_list else []
+                    if not active_slice:
+                        active_slice = [0.0]
+                    denom = sum(active_slice)
+                    if denom > 0:
+                        active_slice = [v / denom for v in active_slice]
+                    log_data["router_expert_active/min"] = float(min(active_slice))
+                    log_data["router_expert_active/max"] = float(max(active_slice))
+                    log_data["router_expert_active/mean"] = float(sum(active_slice) / len(active_slice))
+                    per_expert = []
+                    for idx in range(args.num_experts):
+                        if idx < active_count and idx < len(active_slice):
+                            per_expert.append(float(active_slice[idx]))
+                        else:
+                            per_expert.append(0.0)
+                    for idx, value in enumerate(per_expert):
+                        log_data[f"router_expert_active/e{idx}"] = value
                 wandb_run.log(log_data, step=step)
             else:
                 wandb_run.log(

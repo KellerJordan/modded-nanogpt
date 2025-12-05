@@ -44,11 +44,11 @@ torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
-torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+#torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+torch._functorch.config.donated_buffer = False
 
 # ***** SET ME TRUE FOR NVIDIA? ******
 torch._dynamo.config.compiled_autograd = False
-torch._functorch.config.donated_buffer = False
 
 
 #
@@ -141,15 +141,15 @@ class Hyperparameters:
     grad_accum_steps = 8               # default=1 keeps original behavior
     train_micro_seq_len: int | None = None  # if None, computed as train_seq_len // grad_accum_steps
     # optimization
-    num_iterations = 2980 #1180 #5960
-    cooldown_frac = 0.7
+    num_iterations = 4123 #2980 #5960
+    cooldown_frac = 0.55 #0.5 #0.7
     lr_embed = 0.3
     lr_scalar = 0.015
     lr_head = 1/320
     lr_router = 0.095
     lr_adapter = 0.03
     lr_muon = 0.025
-    # architecture (Config A default: D=896, L=28, heads=7x128)
+    # architecture
     vocab_size = 50257
     model_dim = 896
     num_layers = 16 #original: 20 (before that:) #28
@@ -160,14 +160,13 @@ class Hyperparameters:
     tie_lm_head = False
     untie_lm_head_frac = -1.0
     # Bank / routing
-    num_experts = 2
-    ffn_hidden = 2048
+    num_experts = 3 #2
+    ffn_hidden = 1024 #2048
     topk = 1
     topk_val: int | None = None
 
-    lb_coeff = 4e-3
-    router_entropy_coeff = 0.0 #1e-3  # Applies to: router load entropy - importance entropy
-    expert_entropy_coeff = 0.0  # Applies to: router load entropy only
+    lb_coeff = 2.15e-3 #1.6e-3 #0.0 #4e-3
+    router_entropy_coeff = 2.5e-3 #1.85e-3 #2e-3  # Router entropy aux loss component coefficient
 
     use_router_adapters = True
     router_block_pos_bins = 8  # 4 / 8 / 16
@@ -180,29 +179,42 @@ class Hyperparameters:
     ema_block_size_fwd = 128
     ema_window_size_rev = 384
     ema_block_size_rev = 384
-    router_ema_layer_stride = 1  # 4 seems faster/perf but less stable?  # How often to calculate fresh EMAs (which are then used by the next N-1 layers)
+    router_ema_layer_stride = -1 #12  # 4 seems faster/perf but less stable?  # How often to calculate fresh EMAs (which are then used by the next N-1 layers).  N < 0 -> num_layers (one shared EMA calculation for all layers).
     # Parameter freezing
-    router_freeze_frac = 0.50
-    router_freeze_adapters = True
-    router_lr_reduce_start_frac = -1.0
+    router_freeze_frac = 1.0 #0.625 #0.7 #0.50
+    router_freeze_adapters = False #True
+    router_lr_reduce_start_frac = -1.0 #0.575 #0.68 #-1.0
     shared_ffn_freeze_frac = 1.0
     shared_ffn_lr_reduce_start_frac = -1.0
     # skip-attention layers (short-SWA) — exactly two
     skip_attn_layers = (7, )
     # -----------------
     # Router schedules
-    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (375, 2))
-    router_temp_init = 1.9
-    router_temp_final = 0.575
+    # Was:
+    # ((0, 1), (385, 2), (740, 3), (1100, 4), (1450, 5), (1800, 6))
+    #
+    # 12E@512:
+    #    ((0, 1), (175, 2), (280, 3), (385, 4), (560, 5), (740, 6), (920, 7), (1100, 8), (1275, 9), (1450, 10), (1625, 11), (1800, 12))
+    # OR:
+    #    ((0, 1), (200, 2), (250, 3), (300, 4), (350, 5), (400, 6), (500, 7), (600, 8), (760, 9), (920, 10), (1150, 11), (1380, 12))
+    #    ~((0, 1), (200, 2), (300, 3), (425, 4), (600, 5), (700, 6), (800, 7), (900, 8), (1050, 9), (1200, 10), (1350, 11), (1500, 12))
+    #
+    # 6E@512:
+    #    ((0, 1), (200, 2), (300, 3), (400, 4), (550, 5), (700, 6))
+    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 3),) #((0, 2), (420, 3), (800, 4), (1200, 5))
+                                                               #...(500, 5), (600, 6), (700, 7), (800, 8), (900, 9))  #((0, 1), (375, 2))
+    # 12E@1024 whoops: ((0, 1), (200, 2), (300, 3),                     (425, 4), (600, 5), (700, 6), (800, 7), (900, 8), (1050, 9), (1200, 10), (1350, 11), (1500, 12))
+    router_temp_init = 1.85 #1.9
+    router_temp_final = 0.65 #0.575
     router_temp_power = 1.5  # fallback if anchor disabled
-    router_temp_anchor_delta_steps = 320  # steps after 2nd expert activation to hit anchor ratio
+    router_temp_anchor_delta_steps = 350 #320  # steps after 2nd expert activation to hit anchor ratio
     router_temp_anchor_ratio = 0.49  # temp curve hits this ratio at anchor delta
     router_logit_cap_initial = 1.0
-    router_logit_cap_final = 20.0 #25.0
+    router_logit_cap_final = 20.0 #20.0 #25.0
     router_logit_cap_delta_steps = 390 # ramp length after second expert activation
     # Optional Gumbel exploration (off by default)
-    router_use_gumbel = False #True
-    router_gumbel_frac = 0.16
+    router_use_gumbel = True
+    router_gumbel_frac = 0.30
     # Layerwise router temp & lb boosts.
     router_boost_shape = "peak"  # options: peak (default), valley, linear_start, linear_end
     router_temp_boost = 0.2
@@ -212,9 +224,9 @@ class Hyperparameters:
     val_loss_every = 250 #125  # 0 for only at end
     save_final_checkpoint = False
     checkpoint_save_step: int = -1  # -1 disables mid-training save
-    resume_checkpoint: str | None = "./logs/375/state_step000375.pt"
+    resume_checkpoint: str | None = None #"./logs/375/state_step000375.pt"
     use_wandb = True
-    wandb_project = "switch-bank-mini"
+    wandb_project = "switch-bank-long"
     wandb_run_name = ""
     wandb_log_every = 1
     enable_extra_logging = False
@@ -223,6 +235,8 @@ class Hyperparameters:
     metrics_log_every = 25
 
 args = Hyperparameters()
+if args.router_ema_layer_stride < 0:
+    args.router_ema_layer_stride = args.num_layers
 
 def hyperparams_to_config(h: Hyperparameters) -> dict:
     cfg: dict[str, object] = {}
@@ -398,7 +412,6 @@ model: nn.Module = GPT(
     h=args.ffn_hidden,
     lb_coeff=args.lb_coeff,
     ent_coeff=args.router_entropy_coeff,
-    expert_entropy_coeff=args.expert_entropy_coeff,
     k=args.topk,
     num_value_embeds=args.num_value_embeds,
     tie_lm_head=args.tie_lm_head,

@@ -1,3 +1,4 @@
+import math
 from collections import defaultdict
 from typing import Any
 
@@ -76,7 +77,7 @@ class CausalSelfAttention(nn.Module):
 
 class SharedFFNBank(nn.Module):
     def __init__(self, d: int, h: int, E: int, L: int, flags_dim: int,
-                 lb_coeff: float = 1e-3, ent_coeff: float = 0.0, expert_entropy_coeff: float = 0.0, k: int = 1,
+                 lb_coeff: float = 1e-3, ent_coeff: float = 0.0, k: int = 1,
                  use_adapters: bool = False,
                  ema_alpha_fwd: float = 0.80, ema_alpha_rev: float | None = None,
                  use_forward_ema: bool = True, use_reverse_ema: bool = False,
@@ -89,7 +90,6 @@ class SharedFFNBank(nn.Module):
         self.flags_dim = flags_dim
         self.lb_coeff = lb_coeff
         self.ent_coeff = ent_coeff
-        self.expert_entropy_coeff = expert_entropy_coeff
         self.k = int(k)
         alpha_fwd_val = float(ema_alpha_fwd)
         alpha_rev_val = float(ema_alpha_rev if ema_alpha_rev is not None else ema_alpha_fwd)
@@ -367,14 +367,22 @@ class SharedFFNBank(nn.Module):
         load_entropy = (-(load_f + 1e-6).log().mul(load_f)).sum()
 
         lb_term = (self.lb_coeff * lb_multiplier) * (cv2(imp_f) + cv2(load_f))
-        entropy_term = -self.ent_coeff * (load_entropy + imp_entropy)
-        #entropy_term = 1/load - 1/(imp+load)
+        #entropy_term = -self.ent_coeff * (load_entropy + imp_entropy)
 
-        expert_entropy_term = lb_term.new_zeros(())
-        if self.expert_entropy_coeff > 0:
-            expert_entropy_term = self.expert_entropy_coeff * load_entropy
+        ############# Test
+        expected_entropy = math.log(regular_active_count) if regular_active_count > 0 else float("nan")
 
-        router_aux = lb_term + entropy_term + expert_entropy_term
+        def _entropy_gap(val):
+            if math.isnan(val) or math.isnan(expected_entropy) or expected_entropy <= 0:
+                return float("nan")
+            return max(0.0, abs(expected_entropy - val) / expected_entropy)
+
+        load_entropy_gap = _entropy_gap(load_entropy)
+        imp_entropy_gap = _entropy_gap(imp_entropy)
+        entropy_term = self.ent_coeff * (load_entropy_gap + imp_entropy_gap)
+        ############
+
+        router_aux = lb_term + entropy_term
 
         if single_active:
             router_aux = router_aux.new_zeros(())
