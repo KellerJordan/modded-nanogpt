@@ -160,7 +160,7 @@ class Hyperparameters:
     tie_lm_head = False
     untie_lm_head_frac = -1.0
     # Bank / routing
-    num_experts = 12 #2
+    num_experts = 10 #2
     ffn_hidden = 1024 #2048
     topk = 1
     topk_val: int | None = None
@@ -186,9 +186,11 @@ class Hyperparameters:
     router_lr_reduce_start_frac = -1.0 #0.575 #0.68 #-1.0
     shared_ffn_freeze_frac = 1.0
     shared_ffn_lr_reduce_start_frac = -1.0
+    expert_prune_threshold = 0.01
     # skip-attention layers (short-SWA) — exactly two
     skip_attn_layers = (7, )
-    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (200, 2), (425, 3), (650, 4), (900, 5), (1100, 6), (1300, 7), (1500, 8), (1750, 9), (2050, 10), (2375, 11), (2700, 12))
+    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (200, 2), (425, 3), (650, 4), (925, 5), (1150, 6), (1350, 7), (1600, 8), (1850, 9),  (2250, 10))
+        #((0, 1), (200, 2), (425, 3), (650, 4), (900, 5), (1100, 6), (1300, 7), (1500, 8), (1750, 9), (2050, 10), (2375, 11), (2700, 12))
         #((0, 1), (200, 2), (425, 3), (650, 4), (925, 5), (1200, 6), (1500, 7), (1800, 8), (2100, 9))
     # 12E@1024 whoops: ((0, 1), (200, 2), (300, 3),                     (425, 4), (600, 5), (700, 6), (800, 7), (900, 8), (1050, 9), (1200, 10), (1350, 11), (1500, 12))
     router_temp_init = 1.85 #1.9
@@ -201,7 +203,7 @@ class Hyperparameters:
     router_logit_cap_delta_steps = 390 # ramp length after second expert activation
     # Optional Gumbel exploration (off by default)
     router_use_gumbel = True
-    router_gumbel_frac = 0.75 #=2969   #0.30
+    router_gumbel_frac = 1.0 #0.75 #0.75==2969   #0.30
     # Layerwise router temp & lb boosts.
     router_boost_shape = "peak"  # options: peak (default), valley, linear_start, linear_end
     router_temp_boost = 0.2
@@ -212,6 +214,8 @@ class Hyperparameters:
     save_final_checkpoint = False
     checkpoint_save_step: int = -1  # -1 disables mid-training save
     resume_checkpoint: str | None = None #"./logs/375/state_step000375.pt"
+    prune_after_router_freeze = True
+    prune_at_final_step = True
     use_wandb = True
     wandb_project = "switch-bank-long"
     wandb_run_name = ""
@@ -633,6 +637,9 @@ experts_pruned = trainer.run_training(
     log_param_counts_fn=log_param_counts,
     start_step=start_step,
     checkpoint_save_step=args.checkpoint_save_step,
+    prune_after_router_freeze=args.prune_after_router_freeze,
+    prune_at_final_step=args.prune_at_final_step,
+    expert_prune_threshold=args.expert_prune_threshold,
 )
 
 if experts_pruned and args.enable_extra_logging:
