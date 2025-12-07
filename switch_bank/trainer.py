@@ -100,9 +100,6 @@ def run_training(
     log_param_counts_fn=None,
     start_step: int = 0,
     checkpoint_save_step: int = -1,
-    prune_after_router_freeze: bool = True,
-    prune_at_final_step: bool = True,
-    expert_prune_threshold: float = 0.015,
 ):
     training_time_ms = 0
     approx_step_time_ms_resume = getattr(args, "approx_step_time_ms", None)
@@ -121,19 +118,6 @@ def run_training(
     logit_cap_decay_logged = False
     lm_head_untie_step = untie_lm_head_after
     lm_head_untied_logged = lm_head_untie_step < 0
-    pending_expert_prune = False
-    experts_pruned = False
-    ACTIVITY_WINDOW = 25
-    MATURE_STEPS = 500
-    expert_activity_sum: torch.Tensor | None = None  # (usage-based) running sum over window
-    expert_activity_queue: list[torch.Tensor] = []   # usage vectors in window
-    last_expert_active: torch.Tensor | None = None
-    expert_usage_sum: torch.Tensor | None = None
-    expert_usage_queue: list[torch.Tensor] = []
-    last_expert_usage: torch.Tensor | None = None
-    expert_active_steps = torch.zeros(args.num_experts, dtype=torch.float32)
-    freeze_step = train_steps if args.router_freeze_frac < 0 else int(train_steps * args.router_freeze_frac)
-    freeze_accum_start = max(0, freeze_step - ACTIVITY_WINDOW)
 
     def run_validation(val_steps_multiplier: int, log_val_loss: bool, extra_log: dict | None = None, log_to_wandb: bool = True):
         nonlocal training_time_ms, t0
@@ -175,72 +159,6 @@ def run_training(
         t0 = time.perf_counter()
         return val_scalar
 
-    def _collect_activity_for_prune(activity_source: torch.Tensor | None):
-        device = model.bank.pruned_experts.device
-        latest_tensor = None
-        if activity_source is not None:
-            latest_tensor = activity_source.to(device=device, dtype=torch.float32).clone()
-            dist.all_reduce(latest_tensor, op=dist.ReduceOp.AVG)
-        running_tensor = None
-        if expert_usage_sum is not None and expert_usage_queue:
-            running_tensor = (expert_usage_sum / len(expert_usage_queue)).to(device=device, dtype=torch.float32)
-            dist.all_reduce(running_tensor, op=dist.ReduceOp.AVG)
-        basis = running_tensor if running_tensor is not None else latest_tensor
-        return basis, latest_tensor, running_tensor
-
-    def attempt_prune(activity_source: torch.Tensor | None, reason: str, log_debug: bool = False, require_mature: bool = False):
-        nonlocal pending_expert_prune, experts_pruned
-        basis, latest_tensor, running_tensor = _collect_activity_for_prune(activity_source)
-        if basis is None:
-            if log_debug and master_process:
-                print0("[prune check] skipped (no activity stats available)", console=True)
-            pending_expert_prune = False
-            return []
-        basis_cpu = basis.detach().cpu()
-        basis_list = basis_cpu.tolist()
-        steps_cpu = expert_active_steps
-        eligible_mask = torch.ones_like(basis_cpu, dtype=torch.bool)
-        if require_mature:
-            eligible_mask = steps_cpu >= MATURE_STEPS
-            basis_cpu = basis_cpu.clone()
-            basis_cpu[~eligible_mask] = 1.0
-            basis_list = basis_cpu.tolist()
-        should_log = log_debug or args.enable_extra_logging
-        if should_log and master_process:
-            for idx, val in enumerate(basis_list):
-                eligible = bool(eligible_mask[idx].item())
-                decision = eligible and (val < expert_prune_threshold)
-                step_ct = float(steps_cpu[idx].item())
-                print0(
-                    f"[prune check: {reason}] expert {idx}: activity={val:.6f} "
-                    f"steps={step_ct:.0f} eligible={'Y' if eligible else 'N'} "
-                    f"thresh={expert_prune_threshold:.6f} -> {'PRUNE' if decision else 'keep'}",
-                    console=True,
-                )
-        if require_mature and expert_activity_queue and len(expert_activity_queue) < ACTIVITY_WINDOW:
-            if log_debug and master_process:
-                print0("[prune check] skipped (not enough activity window to consider mature)", console=True)
-            pending_expert_prune = False
-            return []
-        pruned_indices = model.bank.prune_inactive_experts(basis_cpu.to(device=model.bank.pruned_experts.device), expert_prune_threshold)
-        if pruned_indices:
-            if args.enable_extra_logging or log_debug:
-                print0(
-                    f"Pruned experts (activity<{expert_prune_threshold * 100:.1f}%): {pruned_indices}",
-                    console=True,
-                )
-            if wandb_run is not None:
-                wandb_run.log({
-                    "router/pruned_expert_count": len(pruned_indices),
-                    "router/pruned_expert_ids": ",".join(str(idx) for idx in pruned_indices),
-                }, step=step)
-            experts_pruned = True
-        else:
-            if args.enable_extra_logging and not log_debug:
-                print0("Router freeze pruning skipped (no experts below threshold).", console=True)
-        pending_expert_prune = False
-        return pruned_indices
-
     for step in range(start_step, train_steps + 1):
         last_step = (step == train_steps)
         window_blocks = get_window_size_blocks(args, step)
@@ -250,8 +168,6 @@ def run_training(
             status = "enabled" if gumbel_now else "disabled"
             print0(f"Gumbel router noise {status} at step {step}", console=True)
         gumbel_prev_state = gumbel_now
-        if prune_after_router_freeze and not experts_pruned and progress >= args.router_freeze_frac:
-            pending_expert_prune = True
         current_logit_cap = get_logit_cap(args, step)
         cap_start_step = _second_expert_step(tuple(args.expert_activation_schedule))
         if not logit_cap_decay_logged and step >= cap_start_step:
@@ -268,33 +184,7 @@ def run_training(
 
         if last_step or (step > 0 and args.val_loss_every > 0 and step % args.val_loss_every == 0):
             val_steps_multiplier = 7 if last_step else 1
-            if last_step and prune_at_final_step:
-                val_before = run_validation(val_steps_multiplier, log_val_loss=False, log_to_wandb=False)
-                pruned_indices = attempt_prune(last_expert_usage, reason="final_prune", log_debug=True, require_mature=False)
-                val_after = None
-                if pruned_indices:
-                    val_after = run_validation(val_steps_multiplier, log_val_loss=False, log_to_wandb=False)
-                best_val = val_before if val_after is None else min(val_before, val_after)
-                if wandb_run is not None:
-                    log_payload = {
-                        "val/step": step,
-                        "perf/approx_step_time_ms": training_time_ms,
-                        "val/final_pre_prune": val_before,
-                        "val/loss": best_val,
-                    }
-                    if val_after is not None:
-                        log_payload["val/final_post_prune"] = val_after
-                    wandb_run.log(log_payload, step=step)
-                if master_process:
-                    if val_after is None:
-                        print0(f"Final validation (no prune run): {val_before:.6f}", console=True)
-                    else:
-                        print0(
-                            f"Final validation pre-prune: {val_before:.6f} post-prune: {val_after:.6f} chosen: {best_val:.6f}",
-                            console=True,
-                        )
-            else:
-                run_validation(val_steps_multiplier, log_val_loss=True)
+            run_validation(val_steps_multiplier, log_val_loss=True)
 
         if last_step:
             if master_process and getattr(args, "save_final_checkpoint", getattr(args, "save_checkpoint", False)):
@@ -389,26 +279,6 @@ def run_training(
             router_layer_avg[layer_idx] = {key: sums[key] / max(counts[key], 1) for key in sums}
         expert_usage = torch.stack(expert_usage_accum).mean(0) if expert_usage_accum else None
         expert_active = torch.stack(expert_active_accum).mean(0) if expert_active_accum else None
-        if expert_active is not None:
-            last_expert_active = expert_active
-        if expert_usage is not None:
-            last_expert_usage = expert_usage
-            step_activity = (expert_usage > 0).to(dtype=expert_active_steps.dtype)
-            expert_active_steps += step_activity
-            if prune_after_router_freeze:
-                allow_accum = step >= freeze_accum_start
-            else:
-                allow_accum = (train_steps - step) <= ACTIVITY_WINDOW
-            if allow_accum:
-                to_store = expert_usage.clone()
-                expert_usage_queue.append(to_store)
-                if expert_usage_sum is None:
-                    expert_usage_sum = to_store.clone()
-                else:
-                    expert_usage_sum += to_store
-                if len(expert_usage_queue) > ACTIVITY_WINDOW:
-                    oldest = expert_usage_queue.pop(0)
-                    expert_usage_sum -= oldest
         pending_event = getattr(model, "_pending_active_count", None)
         if pending_event is not None:
             event_step, active_count = pending_event
@@ -416,10 +286,6 @@ def run_training(
                 wandb_run.log({"router/active_experts": active_count}, step=event_step)
                 wandb_run.log({"router/active_total_ffn_dim": active_count * args.ffn_hidden}, step=event_step)
             model._pending_active_count = None
-        if pending_expert_prune and last_expert_usage is not None:
-            pruned_indices = attempt_prune(last_expert_usage, reason="freeze_prune", log_debug=args.enable_extra_logging, require_mature=True)
-            if pruned_indices:
-                experts_pruned = True
 
         abort_flag = False
         abort_reason = ""
@@ -682,4 +548,4 @@ def run_training(
             )
             torch.save(checkpoint_payload, f"logs/{run_id_full}/state_step{step:06d}.pt")
 
-    return experts_pruned
+    return None

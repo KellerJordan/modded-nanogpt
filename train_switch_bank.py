@@ -135,10 +135,10 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin"
     val_files = "data/fineweb10B/fineweb_val_*.bin"
     val_tokens = 32768 * 20 #10485760
-    train_seq_len = 64*1024 #32768 #64*1024          # effective tokens per optimizer step per rank
+    train_seq_len = 32*1024 #32768 #64*1024          # effective tokens per optimizer step per rank
     val_seq_len = 8192 #4*64*1024
     # minibatch / gradient accumulation
-    grad_accum_steps = 16 #8               # default=1 keeps original behavior
+    grad_accum_steps = 8 #8               # default=1 keeps original behavior
     train_micro_seq_len: int | None = None  # if None, computed as train_seq_len // grad_accum_steps
     # optimization
     num_iterations = 4123 #2980 #5960
@@ -186,10 +186,9 @@ class Hyperparameters:
     router_lr_reduce_start_frac = -1.0 #0.575 #0.68 #-1.0
     shared_ffn_freeze_frac = 1.0
     shared_ffn_lr_reduce_start_frac = -1.0
-    expert_prune_threshold = 0.01
     # skip-attention layers (short-SWA) — exactly two
     skip_attn_layers = (7, )
-    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (200, 2), (425, 3), (650, 4), (950, 5), (1250, 6), (1575, 7), (1850, 8), (2175, 9)) #((0, 1), (350, 2), (900, 3), (1500, 4), (2200, 5)) #((0, 1), (200, 2), (425, 3), (650, 4), (925, 5), (1150, 6), (1350, 7), (1600, 8), (1850, 9),  (2250, 10))
+    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (200, 2), (425, 3), (775, 4), (1175, 6), (1575, 7), (1850, 8), (2175, 9)) #((0, 1), (350, 2), (900, 3), (1500, 4), (2200, 5)) #((0, 1), (200, 2), (425, 3), (650, 4), (925, 5), (1150, 6), (1350, 7), (1600, 8), (1850, 9),  (2250, 10))
         #((0, 1), (200, 2), (425, 3), (650, 4), (900, 5), (1100, 6), (1300, 7), (1500, 8), (1750, 9), (2050, 10), (2375, 11), (2700, 12))
         #((0, 1), (200, 2), (425, 3), (650, 4), (925, 5), (1200, 6), (1500, 7), (1800, 8), (2100, 9))
     # 12E@1024 whoops: ((0, 1), (200, 2), (300, 3),                     (425, 4), (600, 5), (700, 6), (800, 7), (900, 8), (1050, 9), (1200, 10), (1350, 11), (1500, 12))
@@ -203,7 +202,7 @@ class Hyperparameters:
     router_logit_cap_delta_steps = 390 # ramp length after second expert activation
     # Optional Gumbel exploration (off by default)
     router_use_gumbel = True
-    router_gumbel_schedule: tuple[tuple[int, int], ...] =  ((200, 750), (775, 800), (1100, 2000), (2725, 2775), (2900, 2950), (3900, -1))  #((350, 450), (900, 1000), (1500, 1575), (2200, 2250), (3950, -1))   #((200, 300), (425, 525), (650, 750), (925,1025), (1150, 1250), (1350, 1400), (1600, 1650), (1850, 1900), (2250, 2300), (3950, -1))  #((200, 1250), (3950, -1))
+    router_gumbel_schedule: tuple[tuple[int, int], ...] =  ((200, 1175), (1225, 1275), (1400, 2000), (2725, 2775), (2900, 2950), (3900, -1))  #((350, 450), (900, 1000), (1500, 1575), (2200, 2250), (3950, -1))   #((200, 300), (425, 525), (650, 750), (925,1025), (1150, 1250), (1350, 1400), (1600, 1650), (1850, 1900), (2250, 2300), (3950, -1))  #((200, 1250), (3950, -1))
     # Layerwise router temp & lb boosts.
     router_boost_shape = "peak"  # options: peak (default), valley, linear_start, linear_end
     router_temp_boost = 0.2
@@ -214,8 +213,6 @@ class Hyperparameters:
     save_final_checkpoint = False
     checkpoint_save_step: int = -1  # -1 disables mid-training save
     resume_checkpoint: str | None = None #"./logs/375/state_step000375.pt"
-    prune_after_router_freeze = True
-    prune_at_final_step = True
     use_wandb = True
     wandb_project = "switch-bank-long"
     wandb_run_name = ""
@@ -617,7 +614,7 @@ if args.do_model_warmup:
 ########################################
 
 torch.cuda.reset_peak_memory_stats()
-experts_pruned = trainer.run_training(
+trainer.run_training(
     args=args,
     model=model,
     optimizers=optimizers,
@@ -637,14 +634,7 @@ experts_pruned = trainer.run_training(
     log_param_counts_fn=log_param_counts,
     start_step=start_step,
     checkpoint_save_step=args.checkpoint_save_step,
-    prune_after_router_freeze=args.prune_after_router_freeze,
-    prune_at_final_step=args.prune_at_final_step,
-    expert_prune_threshold=args.expert_prune_threshold,
 )
-
-if experts_pruned and args.enable_extra_logging:
-    print0("Reporting parameter counts after expert pruning:", console=True)
-    log_param_counts(model)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
     f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
