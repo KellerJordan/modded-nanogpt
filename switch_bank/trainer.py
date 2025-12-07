@@ -69,6 +69,16 @@ def get_logit_cap(args, step: int):
     shaped = frac ** 4.0
     return start * math.exp(math.log(end / start) * shaped)
 
+def gumbel_active(args, step: int):
+    if not args.router_use_gumbel:
+        return False
+    schedule = getattr(args, "router_gumbel_schedule", ())
+    for start, end in schedule:
+        end_eff = args.num_iterations if end < 0 else end
+        if start <= step < end_eff:
+            return True
+    return False
+
 
 def run_training(
     args,
@@ -107,7 +117,7 @@ def run_training(
     dist.barrier()
     t0 = time.perf_counter()
     train_steps = args.num_iterations
-    gumbel_off_logged = False
+    gumbel_prev_state = gumbel_active(args, start_step - 1) if start_step > 0 else gumbel_active(args, 0)
     logit_cap_decay_logged = False
     lm_head_untie_step = untie_lm_head_after
     lm_head_untied_logged = lm_head_untie_step < 0
@@ -235,10 +245,11 @@ def run_training(
         last_step = (step == train_steps)
         window_blocks = get_window_size_blocks(args, step)
         progress = step / max(train_steps, 1)
-        if args.router_use_gumbel and not gumbel_off_logged and progress >= args.router_gumbel_frac:
-            if args.enable_extra_logging:
-                print0(f"Gumbel router noise disabled at step {step}", console=True)
-            gumbel_off_logged = True
+        gumbel_now = gumbel_active(args, step)
+        if args.enable_extra_logging and gumbel_now != gumbel_prev_state:
+            status = "enabled" if gumbel_now else "disabled"
+            print0(f"Gumbel router noise {status} at step {step}", console=True)
+        gumbel_prev_state = gumbel_now
         if prune_after_router_freeze and not experts_pruned and progress >= args.router_freeze_frac:
             pending_expert_prune = True
         current_logit_cap = get_logit_cap(args, step)

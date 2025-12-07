@@ -50,7 +50,7 @@ class GPT(nn.Module):
                  ema_window_size_fwd: int, ema_window_size_rev: int,
                  ema_layer_stride: int,
                  shared_ffn_freeze_frac: float,
-                 router_use_gumbel: bool, router_gumbel_frac: float,
+                 router_use_gumbel: bool, router_gumbel_schedule: tuple[tuple[int, int], ...],
                  router_block_pos_bins: int, first_doc_tokens_N: int,
                  router_enable_forward_ema: bool, router_enable_reverse_ema: bool,
                  extra_console_logging: bool, extra_wandb_logging: bool,
@@ -99,7 +99,14 @@ class GPT(nn.Module):
         self.router_logit_cap_initial = float(router_logit_cap_initial)
         self.router_logit_cap_final = float(router_logit_cap_final)
         self.router_use_gumbel = bool(router_use_gumbel)
-        self.router_gumbel_frac = float(router_gumbel_frac)
+        schedule: list[tuple[int, int]] = []
+        for entry in router_gumbel_schedule:
+            if len(entry) < 2:
+                continue
+            start, end = entry
+            schedule.append((max(0, int(start)), int(end)))
+        schedule.sort(key=lambda x: x[0])
+        self.router_gumbel_schedule: tuple[tuple[int, int], ...] = tuple(schedule)
         self.second_expert_step_const = _second_expert_step(expert_activation_schedule)
         self.router_freeze_frac = float(router_freeze_frac)
         self.router_freeze_adapters = bool(router_freeze_adapters)
@@ -317,7 +324,13 @@ class GPT(nn.Module):
         decay_scale = 1.0
         freeze_ema_alpha_fwd = True
         freeze_ema_alpha_rev = True
-        use_gumbel_now = (self.router_use_gumbel and (progress < self.router_gumbel_frac))
+        use_gumbel_now = False
+        if self.router_use_gumbel:
+            for start, end in self.router_gumbel_schedule:
+                end_eff = total_steps if end < 0 else end
+                if start <= step < end_eff:
+                    use_gumbel_now = True
+                    break
 
         ve_tables = [value_embed(input_seq) for value_embed in self.value_embeds]
         L = len(self.blocks)

@@ -135,10 +135,10 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin"
     val_files = "data/fineweb10B/fineweb_val_*.bin"
     val_tokens = 32768 * 20 #10485760
-    train_seq_len = 48*1024 #32768 #64*1024          # effective tokens per optimizer step per rank
+    train_seq_len = 64*1024 #32768 #64*1024          # effective tokens per optimizer step per rank
     val_seq_len = 8192 #4*64*1024
     # minibatch / gradient accumulation
-    grad_accum_steps = 12 #8               # default=1 keeps original behavior
+    grad_accum_steps = 16 #8               # default=1 keeps original behavior
     train_micro_seq_len: int | None = None  # if None, computed as train_seq_len // grad_accum_steps
     # optimization
     num_iterations = 4123 #2980 #5960
@@ -160,7 +160,7 @@ class Hyperparameters:
     tie_lm_head = False
     untie_lm_head_frac = -1.0
     # Bank / routing
-    num_experts = 10 #2
+    num_experts = 9 #10 #2
     ffn_hidden = 1024 #2048
     topk = 1
     topk_val: int | None = None
@@ -189,7 +189,7 @@ class Hyperparameters:
     expert_prune_threshold = 0.01
     # skip-attention layers (short-SWA) — exactly two
     skip_attn_layers = (7, )
-    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (200, 2), (425, 3), (650, 4), (925, 5), (1150, 6), (1350, 7), (1600, 8), (1850, 9),  (2250, 10))
+    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (200, 2), (425, 3), (650, 4), (950, 5), (1250, 6), (1575, 7), (1850, 8), (2175, 9)) #((0, 1), (350, 2), (900, 3), (1500, 4), (2200, 5)) #((0, 1), (200, 2), (425, 3), (650, 4), (925, 5), (1150, 6), (1350, 7), (1600, 8), (1850, 9),  (2250, 10))
         #((0, 1), (200, 2), (425, 3), (650, 4), (900, 5), (1100, 6), (1300, 7), (1500, 8), (1750, 9), (2050, 10), (2375, 11), (2700, 12))
         #((0, 1), (200, 2), (425, 3), (650, 4), (925, 5), (1200, 6), (1500, 7), (1800, 8), (2100, 9))
     # 12E@1024 whoops: ((0, 1), (200, 2), (300, 3),                     (425, 4), (600, 5), (700, 6), (800, 7), (900, 8), (1050, 9), (1200, 10), (1350, 11), (1500, 12))
@@ -203,7 +203,7 @@ class Hyperparameters:
     router_logit_cap_delta_steps = 390 # ramp length after second expert activation
     # Optional Gumbel exploration (off by default)
     router_use_gumbel = True
-    router_gumbel_frac = 1.0 #0.75 #0.75==2969   #0.30
+    router_gumbel_schedule: tuple[tuple[int, int], ...] =  ((200, 750), (775, 800), (1100, 2000), (2725, 2775), (2900, 2950), (3900, -1))  #((350, 450), (900, 1000), (1500, 1575), (2200, 2250), (3950, -1))   #((200, 300), (425, 525), (650, 750), (925,1025), (1150, 1250), (1350, 1400), (1600, 1650), (1850, 1900), (2250, 2300), (3950, -1))  #((200, 1250), (3950, -1))
     # Layerwise router temp & lb boosts.
     router_boost_shape = "peak"  # options: peak (default), valley, linear_start, linear_end
     router_temp_boost = 0.2
@@ -432,7 +432,7 @@ model: nn.Module = GPT(
     ema_layer_stride=args.router_ema_layer_stride,
     shared_ffn_freeze_frac=args.shared_ffn_freeze_frac,
     router_use_gumbel=args.router_use_gumbel,
-    router_gumbel_frac=args.router_gumbel_frac,
+    router_gumbel_schedule=args.router_gumbel_schedule,
     router_block_pos_bins=args.router_block_pos_bins,
     first_doc_tokens_N=args.first_doc_tokens_N,
     router_enable_forward_ema=args.router_enable_forward_ema,
