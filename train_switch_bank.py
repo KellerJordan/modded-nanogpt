@@ -135,14 +135,16 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin"
     val_files = "data/fineweb10B/fineweb_val_*.bin"
     val_tokens = 32768 * 20 #10485760
-    train_seq_len = 32*1024 #32768 #64*1024          # effective tokens per optimizer step per rank
+    train_seq_len = 48*1024 #64*1024          # effective tokens per optimizer step per rank
     val_seq_len = 8192 #4*64*1024
     # minibatch / gradient accumulation
-    grad_accum_steps = 8 #8               # default=1 keeps original behavior
+    grad_accum_steps = 12 # 8 for 32k, 12 for 48k, 16 for 64k    # default=1 keeps original behavior
     train_micro_seq_len: int | None = None  # if None, computed as train_seq_len // grad_accum_steps
     # optimization
     num_iterations = 4123 #2980 #5960
-    cooldown_frac = 0.55 #0.5 #0.7
+    cooldown_frac = 0.55 #0.7
+    lr_final_mult = 0.0  # decay to this % of original lr at final iteration
+    lr_freeze_last_steps = 125  # decay toward lr_final_mult at final step, but freeze lr at num_iterations-lr_freeze_last_steps
     lr_embed = 0.3
     lr_scalar = 0.015
     lr_head = 1/320
@@ -152,7 +154,7 @@ class Hyperparameters:
     # architecture
     vocab_size = 50257
     model_dim = 896
-    num_layers = 16 #original: 20 (before that:) #28
+    num_layers = 16
     head_dim = 128
     num_heads = model_dim // head_dim #7
     # value-embeddings integer count: 0, 1, 2, or 3 supported.
@@ -160,14 +162,12 @@ class Hyperparameters:
     tie_lm_head = False
     untie_lm_head_frac = -1.0
     # Bank / routing
-    num_experts = 9 #10 #2
-    ffn_hidden = 1024 #2048
+    num_experts = 9
+    ffn_hidden = 1024
     topk = 1
     topk_val: int | None = None
-
-    lb_coeff = 2.15e-3 #1.6e-3 #0.0 #4e-3
-    router_entropy_coeff = 2.5e-3 #1.85e-3 #2e-3  # Router entropy aux loss component coefficient
-
+    lb_coeff = 2.15e-3
+    router_entropy_coeff = 2.5e-3 # Coefficient for router entropy aux loss component
     use_router_adapters = True
     router_block_pos_bins = 8  # 4 / 8 / 16
     first_doc_tokens_N = 64
@@ -179,30 +179,27 @@ class Hyperparameters:
     ema_block_size_fwd = 128
     ema_window_size_rev = 384
     ema_block_size_rev = 384
-    router_ema_layer_stride = -1 #12  # 4 seems faster/perf but less stable?  # How often to calculate fresh EMAs (which are then used by the next N-1 layers).  N < 0 -> num_layers (one shared EMA calculation for all layers).
+    router_ema_layer_stride = -1  # How often to calculate fresh EMAs (which are then used by the next N-1 layers).  N < 0 -> num_layers (one shared EMA calculation for all layers).
     # Parameter freezing
-    router_freeze_frac = 1.0 #0.625 #0.7 #0.50
-    router_freeze_adapters = False #True
-    router_lr_reduce_start_frac = -1.0 #0.575 #0.68 #-1.0
+    router_freeze_frac = 1.0
+    router_freeze_adapters = False
+    router_lr_reduce_start_frac = -1.0
     shared_ffn_freeze_frac = 1.0
     shared_ffn_lr_reduce_start_frac = -1.0
     # skip-attention layers (short-SWA) — exactly two
     skip_attn_layers = (7, )
-    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (200, 2), (425, 3), (775, 4), (1175, 6), (1575, 7), (1850, 8), (2175, 9)) #((0, 1), (350, 2), (900, 3), (1500, 4), (2200, 5)) #((0, 1), (200, 2), (425, 3), (650, 4), (925, 5), (1150, 6), (1350, 7), (1600, 8), (1850, 9),  (2250, 10))
-        #((0, 1), (200, 2), (425, 3), (650, 4), (900, 5), (1100, 6), (1300, 7), (1500, 8), (1750, 9), (2050, 10), (2375, 11), (2700, 12))
-        #((0, 1), (200, 2), (425, 3), (650, 4), (925, 5), (1200, 6), (1500, 7), (1800, 8), (2100, 9))
-    # 12E@1024 whoops: ((0, 1), (200, 2), (300, 3),                     (425, 4), (600, 5), (700, 6), (800, 7), (900, 8), (1050, 9), (1200, 10), (1350, 11), (1500, 12))
-    router_temp_init = 1.85 #1.9
-    router_temp_final = 0.65 #0.575
+    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (200, 2), (375, 3), (625, 4), (900, 5), (1175, 6), (1575, 7), (1850, 8), (2175, 9))
+    router_temp_init = 1.85
+    router_temp_final = 0.65
     router_temp_power = 1.5  # fallback if anchor disabled
-    router_temp_anchor_delta_steps = 350 #320  # steps after 2nd expert activation to hit anchor ratio
+    router_temp_anchor_delta_steps = 350  # steps after 2nd expert activation to hit anchor ratio
     router_temp_anchor_ratio = 0.49  # temp curve hits this ratio at anchor delta
     router_logit_cap_initial = 1.0
-    router_logit_cap_final = 20.0 #21.0 #25.0
+    router_logit_cap_final = 20.0
     router_logit_cap_delta_steps = 390 # ramp length after second expert activation
     # Optional Gumbel exploration (off by default)
     router_use_gumbel = True
-    router_gumbel_schedule: tuple[tuple[int, int], ...] =  ((200, 1175), (1225, 1275), (1400, 2000), (2725, 2775), (2900, 2950), (3900, -1))  #((350, 450), (900, 1000), (1500, 1575), (2200, 2250), (3950, -1))   #((200, 300), (425, 525), (650, 750), (925,1025), (1150, 1250), (1350, 1400), (1600, 1650), (1850, 1900), (2250, 2300), (3950, -1))  #((200, 1250), (3950, -1))
+    router_gumbel_schedule: tuple[tuple[int, int], ...] =  ((200, 1175), (1225, 1300), (1425, 1900), (2400, 2425), (2725, 2750), (2925, 2950), (3200, 3225), (3475, 3500), (3925, -1))  # ensure ~2500 active before end
     # Layerwise router temp & lb boosts.
     router_boost_shape = "peak"  # options: peak (default), valley, linear_start, linear_end
     router_temp_boost = 0.2

@@ -22,12 +22,17 @@ from switch_bank.model.gpt import _compute_router_temp, _second_expert_step
 from switch_bank.model.components import CausalSelfAttention
 
 def get_lr(args, step: int):
-    x = step / args.num_iterations
-    assert 0 <= x < 1
+    freeze_last = max(int(getattr(args, "lr_freeze_last_steps", 0)), 0)
+    schedule_step = min(step, max(args.num_iterations - freeze_last, 0))
+    x = schedule_step / max(args.num_iterations, 1)
+    x = min(max(x, 0.0), 1.0)
     if x < 1 - args.cooldown_frac:
         return 1.0
-    else:
-        return (1 - x) / args.cooldown_frac
+    cooldown = max(args.cooldown_frac, 1e-8)
+    t = (x - (1 - cooldown)) / cooldown
+    t = min(max(t, 0.0), 1.0)
+    final_mult = float(getattr(args, "lr_final_mult", 0.0))
+    return 1.0 - t * (1.0 - final_mult)
 
 
 @lru_cache(1)
