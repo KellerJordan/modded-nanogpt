@@ -953,8 +953,8 @@ class GPT(nn.Module):
                     -1.5
                     * torch.ones(num_layers),  # skip_weights -> σ(-1.5) ≈ 0.18
                     *[
-                        torch.tensor([1.1, 0.0]) for _ in range(num_layers) 
-                    ],  # block lambdas. 1.1 init such that layer i weight is i^(num_layers-i). 
+                        torch.tensor([1.1, 0.0]) for _ in range(num_layers)
+                    ],  # block lambdas. 1.1 init such that layer i weight is i^(num_layers-i).
                         # ~3x higher weight to layer 1 compared to 12 at init.
                     *[
                         torch.tensor([0.5, 0.5]) for _ in range(num_layers)
@@ -1106,7 +1106,7 @@ class BOSFinder:
             cur_len = 0
             while cur_len <= num_tokens_local:
                 if idx >= n:
-                    raise StopIteration(f"Insufficient BOS ahead of position {cur}; hit tail of shard.")
+                    raise StopIteration(f"Insufficient BOS ahead; hit tail of shard.")
                 cur = self.bos_idx[idx]
                 starts[r].append(cur)
                 end = min(self.bos_idx[idx + 1] if idx + 1 < n else self.size,
@@ -1212,10 +1212,9 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         if new_params is not None:
             # makes it possible for generator to receive new (num_tokens, max_seq_len, grad_accum_steps) via .send()
             new_num_tokens, new_max_seq_len, new_grad_accum_steps = new_params
-            assert new_num_tokens % (world_size * grad_accum_steps) == 0, "Num tokens must be divisible by world size"
-            num_tokens = new_num_tokens
+            assert new_num_tokens % (world_size * new_grad_accum_steps) == 0, "Num tokens must be divisible by world size"
+            num_tokens = new_num_tokens // new_grad_accum_steps
             max_seq_len = new_max_seq_len
-            grad_accum_steps = new_grad_accum_steps
 
 
 # -----------------------------------------------------------------------------
@@ -1227,14 +1226,16 @@ class Hyperparameters:
     train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_batch_size: int = 2048 * 16 * 8
+    # batch sizes
+    train_bs_schedule: tuple = (8 * 2048 * 8, 16 * 2048 * 8, 24 * 2048 * 8)
+    train_bs_extension: int = 24 * 2048 * 8
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 2185  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 2120  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
-    cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
+    cooldown_frac: float = 0.55  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
@@ -1297,7 +1298,7 @@ model: nn.Module = GPT(
     num_heads=6,
     head_dim=128,
     model_dim=768,
-    max_seq_len=max(args.train_batch_size, args.val_batch_size) // (grad_accum_steps * world_size)
+    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
@@ -1322,21 +1323,27 @@ optimizer1 = DistAdam(
     eps=1e-8,
     weight_decay=0.0,
 )
-optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
+optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
-# learning rate schedule: flat, then linear decay, then flat
+# learning rate schedule: tied to batch size schedule, with cooldown at the end.
 def get_lr(step: int):
-    x = min(0.9999, step / args.num_scheduled_iterations)
-    assert 0 <= x < 1
-    lr = 1.0
+    if step > args.num_scheduled_iterations:
+        return 0.1
+    lr_max = 1.0
+    x = step / args.num_scheduled_iterations
+    if x > 0.33:
+       lr_max = 1.51  # (16/8)**0.6
+    if x > 0.66:
+        lr_max = 1.93  # (24/8)**0.6
     if x >= 1 - args.cooldown_frac:
         w = (1 - x) / args.cooldown_frac
-        lr = w * 1.0 + (1 - w) * 0.1
-    return lr
+        lr = lr_max * w + (1 - w) * 0.1
+        return lr
+    return lr_max
 
 def get_ws(step: int):
     # set short window size to half of long window size
@@ -1347,6 +1354,15 @@ def get_ws(step: int):
     assert 0 <= x < 1
     ws_idx = int(len(args.ws_schedule) * x)
     return args.ws_schedule[ws_idx] // 2, args.ws_schedule[ws_idx]
+
+
+def get_bs(step: int):
+    if step >= args.num_scheduled_iterations:
+        return args.train_bs_extension
+    x = step / args.num_scheduled_iterations
+    bs_idx = int(len(args.train_bs_schedule) * x)
+    return args.train_bs_schedule[bs_idx]
+
 
 def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
     # warmup phase: linearly increase momentum from min to max
@@ -1392,30 +1408,33 @@ model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 ########################################
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
-warmup_steps = 30
+warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader = distributed_data_generator(args.train_files, args.train_bs_schedule[0], args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
 ws_schedule = list(args.ws_schedule) + [args.ws_final]
+bs_schedule = list(args.train_bs_schedule) + [args.train_bs_extension]
 ws_long = ws_schedule[0]
-for step in range(warmup_steps):
-    inputs, targets, cum_seqlens = next(train_loader)
-    # each window size is a new graph, need to warm up each with Yarn.attn_scale
-    ws_idx = step % len(ws_schedule)
-    if ws_idx==0:
-        model.yarn.reset()
-        ws_long = ws_schedule[0]
-    else:
-        new_ws_long = ws_schedule[ws_idx]
+model.yarn.reset()
+assert len(ws_schedule) == len(bs_schedule), "This warmup assumes len(ws_schedule) == len(bs_schedule)"
+
+for idx in range(len(ws_schedule)):
+    send_args = None
+    if idx != 0:
+        new_ws_long = ws_schedule[idx]
         model.yarn.apply(ws_long, new_ws_long)
         ws_long = new_ws_long
-    model(inputs, targets, cum_seqlens, ws_long//2, ws_long).backward()
-    for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
+        send_args = (bs_schedule[idx], args.train_max_seq_len, grad_accum_steps)
+    for step in range(warmup_steps):
+        inputs, targets, cum_seqlens = train_loader.send(send_args)
+        model(inputs, targets, cum_seqlens, ws_long//2, ws_long).backward()
+        for opt in optimizers:
+            opt.step()
+        model.zero_grad(set_to_none=True)
+
 model.yarn.reset() # rotary buffer is not stored in state_dict
-model.load_state_dict(initial_state["model"])
 optimizer2.reset() # muon momentum buffers not in state dict
+model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
 del train_loader, initial_state
@@ -1424,7 +1443,8 @@ del train_loader, initial_state
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+step_batch_size = args.train_bs_schedule[0]
+train_loader = distributed_data_generator(args.train_files, step_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -1473,12 +1493,15 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    new_step_batch_size = get_bs(step)
+    send_args = (new_step_batch_size, args.train_max_seq_len, grad_accum_steps) if new_step_batch_size != step_batch_size else None
+    step_batch_size = new_step_batch_size
     for idx in range(grad_accum_steps):
         # enable gradient sync for the DistAdam optimizer on the last iteration before we step it
         if idx == grad_accum_steps - 1 and step % 2 == 1:
             optimizers[0].should_sync = True
 
-        inputs, targets, cum_seqlens = next(train_loader)
+        inputs, targets, cum_seqlens = train_loader.send(send_args)
         (model(inputs, targets, cum_seqlens, ws_short, ws_long) / grad_accum_steps).backward()
     step_optimizers(step, optimizers, model)
 
