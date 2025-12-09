@@ -1438,6 +1438,7 @@ for idx in range(len(ws_schedule)):
             for opt in optimizers:
                 opt.step()
             model.zero_grad(set_to_none=True)
+            optimizers[0].should_sync = False
 
 model.eval()
 
