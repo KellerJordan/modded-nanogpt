@@ -1440,6 +1440,7 @@ for idx in range(len(ws_schedule)):
             model.zero_grad(set_to_none=True)
             optimizers[0].should_sync = False
 
+model.zero_grad(set_to_none=True)
 model.eval()
 
 # warm up validation too
