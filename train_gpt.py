@@ -1415,6 +1415,7 @@ train_loader = distributed_data_generator(args.train_files, args.train_bs_schedu
 ws_schedule = list(args.ws_schedule) + [args.ws_final]
 bs_schedule = list(args.train_bs_schedule) + [args.train_bs_extension]
 ws_long = ws_schedule[0]
+model.train()
 model.yarn.reset()
 assert len(ws_schedule) == len(bs_schedule), "This warmup assumes len(ws_schedule) == len(bs_schedule)"
 
@@ -1427,11 +1428,37 @@ for idx in range(len(ws_schedule)):
         send_args = (bs_schedule[idx], args.train_max_seq_len, grad_accum_steps)
     for step in range(warmup_steps):
         inputs, targets, cum_seqlens = train_loader.send(send_args)
+        if step % 2 == 1:
+            optimizers[0].should_sync = True
         model(inputs, targets, cum_seqlens, ws_long//2, ws_long).backward()
-        for opt in optimizers:
-            opt.step()
-        model.zero_grad(set_to_none=True)
+        if step % 2 == 0:
+            optimizers[1].step()
+            optimizers[1].zero_grad(set_to_none=True)
+        else:
+            for opt in optimizers:
+                opt.step()
+            model.zero_grad(set_to_none=True)
 
+model.eval()
+
+# warm up validation too
+val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+val_loss = 0
+with torch.no_grad():
+    for step in range(val_steps):
+        inputs, targets, cum_seqlens = next(val_loader)
+        ws_idx = step % len(ws_schedule)
+        if ws_idx==0:
+            model.yarn.reset()
+            ws_long = ws_schedule[0]
+        else:
+            new_ws_long = ws_schedule[ws_idx]
+            model.yarn.apply(ws_long, new_ws_long)
+            ws_long = new_ws_long
+        val_loss += model(inputs, targets, cum_seqlens, ws_long // 2, ws_long)
+
+model.train()
 model.yarn.reset() # rotary buffer is not stored in state_dict
 optimizer2.reset() # muon momentum buffers not in state dict
 model.load_state_dict(initial_state["model"])
