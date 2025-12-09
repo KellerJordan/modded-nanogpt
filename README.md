@@ -24,7 +24,8 @@ This improvement in training speed has been brought about by the following techn
 * Sparse attention gate
 * NormMuon
 * Cautious Weight Decay w/ schedule tied to LR
-* Exponential Decay of Residual Stream
+* Exponential decay of residual stream
+* Batch size schedule
 
 As well as many systems optimizations.
 
@@ -134,6 +135,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 43 | 2.284 minutes | Cautious Weight Decay w/ Schedule  | 11/10/25 | [log](records/track_1_short/2025-11-10_CautiousWD/1aac0132-a891-4ed9-b358-0fd2abd1b019.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/154) | @varunneal
 44 | 2.269 minutes | Backward Hooks on Adam, [Profiling 101](https://blog.underfit.ai/profiling-101-nanogpt)  | 11/16/25 | [log](records/track_1_short/2025-10-31_AdamSyncGradientHook/0c17cdfd-772c-4906-8d11-141b370599a0.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/149) | @akash5474
 45 | 2.248 minutes | Refine Skip Arch, update exponential decay init| 11/18/25 | [log](records/track_1_short/2025-11-18_RefineSkip/00f4e1e6-0044-4a08-b88a-3b7ec0624081.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/159) | @classiclarryd
+46 | 2.203 minutes | Batch Size Schedule | 11/29/25 | [log](records/track_1_short/2025-11-29_BatchSizeSchedule/10e8f7c6-7175-4467-bdb0-a5de25d771a6.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/163) | @varunneal
 ## Rules
 
 The only rules are that new records must:
