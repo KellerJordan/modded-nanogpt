@@ -1441,6 +1441,7 @@ for idx in range(len(ws_schedule)):
             optimizers[0].should_sync = False
 
 model.zero_grad(set_to_none=True)
+optimizers[0].should_sync = False
 model.eval()
 
 # warm up validation too
@@ -1460,6 +1461,7 @@ with torch.no_grad():
             ws_long = new_ws_long
         val_loss += model(inputs, targets, cum_seqlens, ws_long // 2, ws_long)
 
+del val_loader, val_loss
 model.train()
 model.yarn.reset() # rotary buffer is not stored in state_dict
 optimizer2.reset() # muon momentum buffers not in state dict
