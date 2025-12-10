@@ -151,6 +151,7 @@ class Hyperparameters:
     lr_router = 0.095
     lr_adapter = 0.03
     lr_muon = 0.025
+    router_grad_clip_norm = 1.0
     # architecture
     vocab_size = 50257
     model_dim = 896

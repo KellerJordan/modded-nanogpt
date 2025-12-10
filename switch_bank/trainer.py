@@ -164,6 +164,20 @@ def run_training(
         t0 = time.perf_counter()
         return val_scalar
 
+    router_clip_norm = getattr(args, "router_grad_clip_norm", None)
+    router_clip_norm = float(router_clip_norm) if router_clip_norm is not None else None
+    if router_clip_norm is not None and router_clip_norm <= 0:
+        router_clip_norm = None
+    router_params_by_opt: dict[torch.optim.Optimizer, list[nn.Parameter]] = {}
+    if router_clip_norm is not None:
+        for opt in optimizers:
+            params = []
+            for group in opt.param_groups:
+                if group.get("component") == "router":
+                    params.extend(group["params"])
+            if params:
+                router_params_by_opt[opt] = params
+
     for step in range(start_step, train_steps + 1):
         last_step = (step == train_steps)
         window_blocks = get_window_size_blocks(args, step)
@@ -340,6 +354,13 @@ def run_training(
             group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
         for opt in optimizers:
             torch.futures.collect_all(opt2futures[opt]).wait()
+            if router_clip_norm is not None and opt in router_params_by_opt:
+                total_norm = float(torch.nn.utils.clip_grad_norm_(router_params_by_opt[opt], router_clip_norm))
+                if args.enable_extra_logging and total_norm > router_clip_norm:
+                    print0(
+                        f"[router grad clip] norm={total_norm:.4f} clip={router_clip_norm:.4f}",
+                        console=True,
+                    )
             opt.step()
         model.zero_grad(set_to_none=True)
         if args.enable_extra_logging and router_layer_avg:
