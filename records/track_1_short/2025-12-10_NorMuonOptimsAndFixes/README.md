@@ -1,27 +1,14 @@
 ### NorMuon & DistAdam Optimizations and Fixes
 
-This update includes a number of algebraic and fusion optimizations to NorMuon, as well as a fix to the variance reduction step.
+This update includes a number of algebraic and fusion optimizations to NorMuon, as well as an important fix to the variance normalization step.
 
-It also addresses a synchronization issue with the DistAdam implementation, and makes its parameter ordering more explicit.
+Fixing this issue reduced validation loss, and enabled pre-multiplication of `sa_lambdas[1]` with $W^O$ as suggested in the previous record.
+
+This update also addresses a synchronization issue with the DistAdam implementation, and makes its parameter ordering more explicit.
 
 **Timings & Loss**
 
-This is primarily a GPU-optimization submission, but the fixes to NorMuon do impact the math.
 
-I did some runs at lower step counts, but the margin seems too small to achieve the required significance.
-
-Here are averages from 3 baseline runs, and five runs each of the submission (at -5 and -10 steps): 
-
-```
-              Steps       Mean Time (s)      Mean Loss  
-  Baseline    2160        133.6643           3.2773     
- This Repo    2155        132.1304           3.2792     
- This Repo    2150        132.0766           3.2798     
-```
-
-**Attention and MLP Weight Layout**
-
-Correcting the Output heads required a layout change.
 
 ### NorMuon Variance Reduction
 
