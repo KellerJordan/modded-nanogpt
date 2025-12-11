@@ -8,7 +8,11 @@ This update also addresses a synchronization issue with the DistAdam implementat
 
 **Timings & Loss**
 
-
+|                        |    Runs |   Time μ | Time σ | Time +/- | Loss μ | Loss σ | Loss +/- |      p |
+|-----------------------:|--------:|---------:|-------:|---------:|-------:|-------:|---------:|-------:|
+|        Baseline        |  4.0000 | 132.7217 | 0.1176 |   0.0000 | 3.2792 | 0.0008 |   0.0000 | 0.0632 |
+|       NorMuon-Fix      | 13.0000 | 131.4852 | 0.0680 |  -1.2365 | 3.2777 | 0.0016 |  -0.0015 | 0.0001 |
+| NorMuon-Fix + PreMul-O | 10.0000 | 131.2106 | 0.0660 |  -1.5111 | 3.2777 | 0.0020 |  -0.0015 | 0.0024 |
 
 ### NorMuon Variance Reduction
 
