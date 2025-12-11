@@ -14,6 +14,25 @@ This update also addresses a synchronization issue with the DistAdam implementat
 |       NorMuon-Fix      | 13.0000 | 131.4852 | 0.0680 |  -1.2365 | 3.2777 | 0.0016 |  -0.0015 | 0.0001 |
 | NorMuon-Fix + PreMul-O | 10.0000 | 131.2106 | 0.0660 |  -1.5111 | 3.2777 | 0.0020 |  -0.0015 | 0.0024 |
 
+```
+
+Baseline:
+  losses = [3.2796, 3.2781, 3.2798, 3.2793]
+  times  = [132.5520, 132.8170, 132.7390, 132.7790]
+  (n = 4)
+
+NorMuon and DistAdam Optimizations and Fixes:
+  losses = [3.2790, 3.2759, 3.2766, 3.2761, 3.2776, 3.2804, 3.2759, 3.2774, 3.2772, 3.2806, 3.2790, 3.2776, 3.2770]
+  times  = [131.5030, 131.6180, 131.5430, 131.4140, 131.4730, 131.4550, 131.4170, 131.5680, 131.5520, 131.4520, 131.3850, 131.4570, 131.4710]
+  (n = 13)
+
+Above + Pre-Multiply with W_O:
+  losses = [3.2758, 3.2807, 3.2776, 3.2757, 3.2793, 3.2764, 3.2795, 3.2788, 3.2785, 3.2748]
+  times  = [131.2380, 131.2910, 131.1550, 131.1570, 131.2540, 131.3040, 131.1550, 131.1300, 131.1570, 131.2650]
+  (n = 10)
+
+```
+
 ### NorMuon Variance Reduction
 
 NorMuon improves upon Muon by normalizing the update variance at the level of individual weight vectors, such as the FFN neurons and Attention head basis vectors.
