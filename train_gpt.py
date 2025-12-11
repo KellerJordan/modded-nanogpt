@@ -1,6 +1,3 @@
-import uuid
-run_id = f"NorMuon Fixes and PreMul-O - {str(uuid.uuid4())[0:5]}"
-
 import os
 import sys
 
@@ -30,7 +27,7 @@ import torch.nn.functional as F
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 import triton
 import triton.language as tl
-#from kernels import get_kernel
+from kernels import get_kernel
 from torch import Tensor, nn
 
 dynamo.config.recompile_limit = 64
@@ -425,7 +422,7 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 
 
 # -----------------------------------------------------------------------------
-# Compiled Helpers for NorMuon by @chrisjmccormick
+# Compiled helpers for NorMuon by @chrisjmccormick
 
 @torch.compile(dynamic=False, fullgraph=True)
 def cautious_wd_and_update_inplace(p, v, wd_tensor, lr_tensor):
@@ -457,7 +454,7 @@ from collections import defaultdict
 
 # -----------------------------------------------------------------------------
 # NorMuon optimizer
-# -----------------------------------------------------------------------------
+
 
 class NorMuon(torch.optim.Optimizer):
     """
@@ -898,14 +895,7 @@ class AttnArgs:
     sin: torch.Tensor
     attn_scale: float
 
-# If we're on a GH200, just use the existing flash attention installed.
-# Otherwise, if we're on an H100, we'll use the official flash attention for the speedrun.
-gpu_name = torch.cuda.get_device_properties(0).name
-if "H100" in gpu_name:  # H100
-    from kernels import get_kernel
-    flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
-else:  # GH200 or other
-    from flash_attn import flash_attn_interface
+flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int):
@@ -921,9 +911,8 @@ class CausalSelfAttention(nn.Module):
         # merged QKVO weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
         #
-        # Stacked layout stores all QKVO heads horizontally, allowing us to 
-        # correctly calculate variance for output heads in NorMuon without
-        # splitting off O. @chrisjmccormick  
+        # Stacked layout stores all QKVO heads horizontally, allowing us to correctly calculate variance
+        # for output heads in NorMuon without splitting off O. @chrisjmccormick  
         self.qkvo_w = nn.Parameter(torch.empty(self.dim * 4, self.hdim))
         # label module to enable custom optimizer sizing
         self.qkvo_w.label = 'attn'
@@ -961,7 +950,7 @@ class CausalSelfAttention(nn.Module):
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = F.linear(y, sa_lambdas[1] * self.qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O
+        y = F.linear(y, sa_lambdas[1] * self.qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
 
 class MLP(nn.Module):
