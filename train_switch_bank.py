@@ -151,7 +151,8 @@ class Hyperparameters:
     lr_router = 0.095
     lr_adapter = 0.03
     lr_muon = 0.025
-    router_grad_clip_norm = 1.0
+    router_grad_clip_norm = 0.0 #1.0
+    router_autoclip = True #False
     # architecture
     vocab_size = 50257
     model_dim = 896
@@ -168,7 +169,7 @@ class Hyperparameters:
     topk = 1
     topk_val: int | None = None
     lb_coeff = 2.15e-3
-    router_entropy_coeff = 2.5e-3 # Coefficient for router entropy aux loss component
+    router_entropy_coeff = 2.5e-3  # coefficient for router entropy aux loss component
     use_router_adapters = True
     router_block_pos_bins = 8  # 4 / 8 / 16
     first_doc_tokens_N = 64
@@ -176,7 +177,7 @@ class Hyperparameters:
     router_enable_reverse_ema = True
     ema_alpha_fwd = 0.80
     ema_alpha_rev = 0.85
-    ema_window_size_fwd = 128  # -1  # <=0 means full sequence
+    ema_window_size_fwd = 128  # <=0 means full sequence
     ema_block_size_fwd = 128
     ema_window_size_rev = 384
     ema_block_size_rev = 384

@@ -3,7 +3,7 @@ import math
 import time
 import os
 from functools import lru_cache
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import torch
 import torch.distributed as dist
@@ -164,12 +164,16 @@ def run_training(
         t0 = time.perf_counter()
         return val_scalar
 
-    router_clip_norm = getattr(args, "router_grad_clip_norm", None)
-    router_clip_norm = float(router_clip_norm) if router_clip_norm is not None else None
-    if router_clip_norm is not None and router_clip_norm <= 0:
-        router_clip_norm = None
+    router_clip_base = getattr(args, "router_grad_clip_norm", None)
+    router_clip_base = float(router_clip_base) if router_clip_base is not None else None
+    if router_clip_base is not None and router_clip_base <= 0:
+        router_clip_base = None
     router_params_by_opt: dict[torch.optim.Optimizer, list[nn.Parameter]] = {}
-    if router_clip_norm is not None:
+    router_autoclip = bool(getattr(args, "router_autoclip", False))
+    autoclip_window = 250
+    router_autoclip_state: dict[torch.optim.Optimizer, dict[str, object]] = {}
+    needs_router_clip = router_autoclip or (router_clip_base is not None)
+    if needs_router_clip:
         for opt in optimizers:
             params = []
             for group in opt.param_groups:
@@ -177,6 +181,12 @@ def run_training(
                     params.extend(group["params"])
             if params:
                 router_params_by_opt[opt] = params
+                if router_autoclip:
+                    initial_clip = router_clip_base if router_clip_base is not None else None
+                    router_autoclip_state[opt] = {
+                        "history": deque(maxlen=autoclip_window),
+                        "clip": (initial_clip if (initial_clip is not None and initial_clip > 0) else None),
+                    }
 
     for step in range(start_step, train_steps + 1):
         last_step = (step == train_steps)
@@ -354,11 +364,30 @@ def run_training(
             group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
         for opt in optimizers:
             torch.futures.collect_all(opt2futures[opt]).wait()
-            if router_clip_norm is not None and opt in router_params_by_opt:
-                total_norm = float(torch.nn.utils.clip_grad_norm_(router_params_by_opt[opt], router_clip_norm))
-                if args.enable_extra_logging and total_norm > router_clip_norm:
+            if opt in router_params_by_opt:
+                state = router_autoclip_state.get(opt)
+                clip_value = router_clip_base
+                if state is not None and state.get("clip") is not None:
+                    clip_value = float(state["clip"])
+                max_norm = clip_value if (clip_value is not None and clip_value > 0) else float("inf")
+                total_norm = float(torch.nn.utils.clip_grad_norm_(router_params_by_opt[opt], max_norm))
+                if state is not None:
+                    history: deque = state["history"]  # type: ignore[assignment]
+                    history.append(total_norm)
+                    if len(history) >= autoclip_window:
+                        hist_tensor = torch.tensor(list(history), device="cpu")
+                        new_clip = float(torch.quantile(hist_tensor, 0.10).item())
+                        new_clip = max(new_clip, 1e-6)
+                        if state.get("clip") is None or not math.isclose(state["clip"], new_clip):
+                            state["clip"] = new_clip
+                            if args.enable_extra_logging:
+                                print0(
+                                    f"[router grad clip auto] norm={total_norm:.4f} clip-> {new_clip:.4f}",
+                                    console=True,
+                                )
+                elif clip_value is not None and clip_value > 0 and args.enable_extra_logging and total_norm > clip_value:
                     print0(
-                        f"[router grad clip] norm={total_norm:.4f} clip={router_clip_norm:.4f}",
+                        f"[router grad clip] norm={total_norm:.4f} clip={clip_value:.4f}",
                         console=True,
                     )
             opt.step()
