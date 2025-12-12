@@ -1,11 +1,12 @@
 ## Overview
 - Entry point: `train_switch_bank.py` orchestrates distributed setup, logging, and environment flags. It captures source for reproducibility via the top-level `code` string and patches Torch Inductor's `trace_structured` to be metadata-tolerant while logging compiled filenames.
-- Focus of the repo: a sideways MoE GPT variant where each transformer layer routes to a shared bank of FFN experts. Non-standard optimizations include Muon for 2D matrices, FlexAttention, router feature EMAs (with clamped/strided alphas), router temperature/logit-cap schedules, optional router Gumbel noise, adapter support on routers, configurable router boost shapes, router/FFN freeze controls, and mid-training checkpoint/resume.
+- Focus of the repo: a sideways MoE GPT variant where each transformer layer routes to a shared bank of FFN experts. Non-standard optimizations include NeoMuon (Muon-compatible spectral optimizer) for 2D+ bf16 matrices, FlexAttention, router feature EMAs (with clamped/strided alphas), router temperature/logit-cap schedules, optional router Gumbel noise, adapter support on routers, configurable router boost shapes, router/FFN freeze controls, and mid-training checkpoint/resume.
 - Ignore/never touch: any `*_original*.py` or `train_gpt_*.py` files unless explicitly requested.
 
 ## Package layout (`switch_bank/`)
 - `utils.py`: numeric safety helpers (`_sanitize/_safe_softmax`) plus scheduling utilities (`next_multiple_of_n`, `rampdown_multiplier`, `compute_train_micro_len` which enforces 128-token blocks). Includes a placeholder `summarize` helper. Keep behavior identical for numeric parity.
-- `optim/muon.py`: Muon optimizer and fused `update` kernel plus Newton–Schulz `zeropower_via_newtonschulz5`. Used for attention QKV/out and shared FFN matrices; expects bf16 2D params (mantissa uint16, momentum float32 on resume).
+- `optim/muon.py`: Reference Muon optimizer and fused `update` kernel plus Newton–Schulz `zeropower_via_newtonschulz5`. Retained for parity/compat, but current training uses NeoMuon instead.
+- `optim/neomuon.py`: NeoMuon optimizer (geometry-aware hybrid on Muon). Runs AdamW for non-spectral params and Muon/NeoMuon spectral updates for 2D+ bf16 matrices. Spectral branch LR (`lr_spec`) defaults to the group's `lr` unless explicitly overridden. Optional nr/st spectral gating uses per-parameter `last_activation` side-channel, wired from model forwards via `_neomuon_last_activation` and fed to the optimizer each step when `enable_spectral_gating=True`.
 - `model/components.py`:
   - `Rotary`, `CausalSelfAttention` (FlexAttention + RMSNorm + rotary).
   - `SharedFFNBank`: shared expert W1/W2 across layers, per-layer routers with optional adapters; forward/reverse EMA features (blockwise, doc-aware reverse) cached per `ema_layer_stride` with clampable/freezeable alphas; top-k hard routing with optional Gumbel noise, active/pruned expert masks, deterministic top-1 when only one expert is live. Aux loss mixes load/importance CV² with an entropy-gap term. Metrics buffer stores load vectors, entropies, and feature-weight means; `compile_warm_all_experts` warms kernels; adapters lazily initialize; `prune_inactive_experts` zeros weights/adapters when invoked.
@@ -19,8 +20,8 @@
 ## Execution flow (high level)
 1) `train_switch_bank.py` sets up distributed env/logging, disables donated buffers/compiled autograd, patches Inductor tracing, captures module source via `code`, and inits wandb/CSV when enabled.
 2) Builds `GPT` with hyperparams (shared bank size/stride/window config, EMA settings, router/adapters, value embeds, router Gumbel/boost shape, expert activation schedule), broadcasts params, and logs parameter counts.
-3) Partitions params: AdamW for embeds/scalars/router/adapters/head; Muon for attention QKV/out and shared FFN bank matrices; stores `initial_lr` per group.
-4) Optional checkpoint resume validates meta (dims/experts/vocab), restores approx step timing, sanitizes Muon state dtypes, and recompiles the model (`torch.compile` dynamic=False). Computes block-aligned `train_micro_len` (logs adjustments).
+3) Partitions params into NeoMuon groups: non-spectral (embeds/scalars/router/adapters/head) use AdamW branch; spectral (attention QKV/out and shared FFN bank matrices) use Muon/NeoMuon spectral branch. Stores `initial_lr` per group.
+4) Optional checkpoint resume validates meta (dims/experts/vocab), restores approx step timing, sanitizes NeoMuon/Muon-compat state dtypes, and recompiles the model (`torch.compile` dynamic=False). Computes block-aligned `train_micro_len` (logs adjustments).
 5) Optional warmup (synthetic steps + `compile_warm_all_experts`) while preserving optimizer/model state, then training/validation via `trainer.run_training` (window schedule, router temp/logit-cap schedules, Gumbel gating, freeze milestones, optional mid-training checkpoint via `checkpoint_save_step`, wandb/CSV logging, resume-aware dataloader position).
 6) Shutdown: report peak memory, destroy process group, finish wandb/CSV.
 

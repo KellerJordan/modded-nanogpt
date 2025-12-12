@@ -359,9 +359,14 @@ def run_training(
                 elif component == "shared_ffn":
                     mult = ffn_lr_mult
                 group["lr"] = base_lr * mult
-        for group in optimizers[-1].param_groups:
-            frac = min(step / 300, 1)
-            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+        # Muon-style momentum warmup for spectral groups (NeoMuon compat).
+        target_muon_momentum = float(getattr(args, "neomuon_muon_momentum", 0.95))
+        frac = min(step / 300, 1)
+        warm_momentum = (1 - frac) * 0.85 + frac * target_muon_momentum
+        for opt in optimizers:
+            for group in opt.param_groups:
+                if group.get("spectral", True):
+                    group["momentum"] = warm_momentum
         for opt in optimizers:
             torch.futures.collect_all(opt2futures[opt]).wait()
             if opt in router_params_by_opt:
@@ -390,6 +395,15 @@ def run_training(
                         f"[router grad clip] norm={total_norm:.4f} clip={clip_value:.4f}",
                         console=True,
                     )
+            # Feed last activations to NeoMuon for nr/st spectral gating.
+            if hasattr(opt, "set_last_activation") and bool(getattr(opt, "enable_spectral_gating", False)):
+                for group in opt.param_groups:
+                    if not group.get("spectral", True):
+                        continue
+                    for p in group.get("params", []):
+                        act = getattr(p, "_neomuon_last_activation", None)
+                        if act is not None:
+                            opt.set_last_activation(p, act)
             opt.step()
         model.zero_grad(set_to_none=True)
         if args.enable_extra_logging and router_layer_avg:
@@ -428,14 +442,23 @@ def run_training(
         active_count_val = max(active_count_val, 1.0)
         if wandb_run is not None and (step % max(args.wandb_log_every, 1) == 0):
             if args.enable_extra_wandb_logging:
+                # Preserve historical lr keys by mapping to first non-spectral/spectral groups.
+                adamw_lr = next(
+                    (g["lr"] for g in optimizers[0].param_groups if not g.get("spectral", True)),
+                    float("nan"),
+                )
+                muon_lr = next(
+                    (g["lr"] for g in optimizers[0].param_groups if g.get("spectral", True)),
+                    float("nan"),
+                )
                 log_data = {
                     "train/loss": avg_loss,
                     "train/loss_main": avg_main_loss,
                     "train/loss_aux": avg_aux_loss,
                     "perf/approx_step_time_ms": approx_training_time_ms,
                     "train/tokens_seen": float((step + 1) * args.train_seq_len * world_size),
-                    "lr/adamw": optimizers[0].param_groups[0]["lr"],
-                    "lr/muon": optimizers[-1].param_groups[0]["lr"],
+                    "lr/adamw": adamw_lr,
+                    "lr/muon": muon_lr,
                     "train/step": step,
                     "router/logit_cap": (current_logit_cap if current_logit_cap is not None else float("nan")),
                     "router/logit_cap_enabled": float(current_logit_cap is not None),

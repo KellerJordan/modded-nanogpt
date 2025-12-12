@@ -15,7 +15,7 @@ def _read_text(path: Path) -> str:
 code_paths = [
     Path(sys.argv[0]).resolve(),
     Path("switch_bank/utils.py"),
-    Path("switch_bank/optim/muon.py"),
+    Path("switch_bank/optim/neomuon.py"),
     Path("switch_bank/model/components.py"),
     Path("switch_bank/model/gpt.py"),
     Path("switch_bank/data.py"),
@@ -31,7 +31,7 @@ import time
 import copy
 from dataclasses import dataclass
 from switch_bank.utils import compute_train_micro_len
-from switch_bank.optim.muon import Muon
+from switch_bank.optim.neomuon import NeoMuon
 from switch_bank.model.components import CausalSelfAttention
 from switch_bank.model.gpt import GPT
 from switch_bank.data import summarize_router_metrics, summarize_expert_usage, summarize_expert_activity, router_summary_str
@@ -153,6 +153,24 @@ class Hyperparameters:
     lr_muon = 0.025
     router_grad_clip_norm = 0.0 #1.0
     router_autoclip = True #False
+    # NeoMuon optimizer parameters (see switch_bank/optim/neomuon.py)
+    neomuon_betas: tuple[float, float] = (0.8, 0.95)
+    neomuon_eps: float = 1e-10
+    neomuon_weight_decay: float = 0.0
+    neomuon_muon_momentum: float = 0.95
+    neomuon_initial_adamw_steps: int = 3
+    neomuon_spec_interval: int = 4
+    neomuon_reestimate_interval: int = 35
+    neomuon_nr_st_threshold: float = 1.5
+    neomuon_blend_margin: float = 1.0
+    neomuon_ema_rho: float = 0.1
+    neomuon_soft_q: float = 0.9
+    neomuon_ns_iters: int = 4
+    neomuon_enable_spectral_gating: bool = False # (tested w/ TM)
+    neomuon_enable_initial_adamw_steps: bool = False # Try SGD?     (tested on its own)
+    neomuon_enable_normuon: bool = False # Try enabled after step 350?  (tested w/ TM)
+    neomuon_enable_turbomuon: bool = True  # logit max hitting ceil (from the start)     (tested on its own)
+    neomuon_enable_root: bool = False  # Try enabled after step 375?     (tested w/ TM)
     # architecture
     vocab_size = 50257
     model_dim = 896
@@ -164,7 +182,7 @@ class Hyperparameters:
     tie_lm_head = False
     untie_lm_head_frac = -1.0
     # Bank / routing
-    num_experts = 9
+    num_experts = 8
     ffn_hidden = 1024
     topk = 1
     topk_val: int | None = None
@@ -190,7 +208,7 @@ class Hyperparameters:
     shared_ffn_lr_reduce_start_frac = -1.0
     # skip-attention layers (short-SWA) — exactly two
     skip_attn_layers = (7, )
-    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (200, 2), (375, 3), (625, 4), (900, 5), (1175, 6), (1575, 7), (1850, 8), (2175, 9))
+    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (200, 2), (425, 3), (700, 4), (1050, 5), (1400, 6), (1675, 7), (2025, 8))  #((0, 1), (200, 2), (375, 3), (625, 4), (900, 5), (1175, 6), (1575, 7), (1850, 8), (2175, 9))
     router_temp_init = 1.85
     router_temp_final = 0.65
     router_temp_power = 1.5  # fallback if anchor disabled
@@ -201,7 +219,7 @@ class Hyperparameters:
     router_logit_cap_delta_steps = 390 # ramp length after second expert activation
     # Optional Gumbel exploration (off by default)
     router_use_gumbel = True
-    router_gumbel_schedule: tuple[tuple[int, int], ...] =  ((200, 1175), (1225, 1300), (1425, 1900), (2400, 2425), (2725, 2750), (2925, 2950), (3200, 3225), (3475, 3500), (3925, -1))  # ensure ~2500 active before end
+    router_gumbel_schedule: tuple[tuple[int, int], ...] =  ((200, 1175), (1225, 1300), (1450, 1950), (2375, 2400), (2725, 2750), (2925, 2950), (3200, 3225), (3450, 3525), (3900, -1))  # ensure ~250 active before end
     # Layerwise router temp & lb boosts.
     router_boost_shape = "peak"  # options: peak (default), valley, linear_start, linear_end
     router_temp_boost = 0.2
@@ -447,7 +465,8 @@ for param in model.parameters():
 log_param_counts(model)
 
 # collect the parameters to optimize
-# ### FFNBANK MOD: include bank expert matrices in Muon; routers in AdamW with scalars+embeds.
+# ### FFNBANK MOD: include bank expert matrices in NeoMuon spectral groups;
+# non-spectral params (routers/embeds/scalars/head/adapters) use AdamW branch.
 def is_2d(p: nn.Parameter) -> bool:
     return p.ndim >= 2
 
@@ -473,23 +492,45 @@ assert optimized_parameters_set == {*model.parameters()}
 assert len(optimized_parameters_set) == sum(len(lst) for lst in params_collections)
 
 # init the optimizer(s)
-adam_param_groups = [
-    dict(params=embed_params, lr=args.lr_embed, component="embed"),
-    dict(params=scalar_params, lr=args.lr_scalar, component="scalar"),
-    dict(params=router_params, lr=args.lr_router, component="router"),
+neomuon_param_groups: list[dict] = [
+    dict(params=embed_params, lr=args.lr_embed, component="embed", spectral=False),
+    dict(params=scalar_params, lr=args.lr_scalar, component="scalar", spectral=False),
+    dict(params=router_params, lr=args.lr_router, component="router", spectral=False),
 ]
 if adapter_params:
-    adam_param_groups.append(dict(params=adapter_params, lr=args.lr_adapter, component="adapter"))
+    neomuon_param_groups.append(dict(params=adapter_params, lr=args.lr_adapter, component="adapter", spectral=False))
 if head_params:
-    adam_param_groups.append(dict(params=head_params, lr=args.lr_head, component="head"))
-optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
-muon_param_groups = []
+    neomuon_param_groups.append(dict(params=head_params, lr=args.lr_head, component="head", spectral=False))
 if attn_2d_params:
-    muon_param_groups.append(dict(params=attn_2d_params, lr=args.lr_muon, component="attention"))
+    neomuon_param_groups.append(dict(params=attn_2d_params, lr=args.lr_muon, component="attention", spectral=True))
 if ffn_matrix_params:
-    muon_param_groups.append(dict(params=ffn_matrix_params, lr=args.lr_muon, component="shared_ffn"))
-optimizer2 = Muon(muon_param_groups, lr=args.lr_muon, momentum=0.95, rank=rank, world_size=world_size)
-optimizers: list[torch.optim.Optimizer] = [optimizer1, optimizer2]
+    neomuon_param_groups.append(dict(params=ffn_matrix_params, lr=args.lr_muon, component="shared_ffn", spectral=True))
+
+optimizer = NeoMuon(
+    neomuon_param_groups,
+    lr=args.lr_muon,  # default lr for spectral groups; overridden per-group above
+    betas=tuple(args.neomuon_betas),
+    eps=float(args.neomuon_eps),
+    weight_decay=float(args.neomuon_weight_decay),
+    muon_momentum=float(args.neomuon_muon_momentum),
+    lr_spec=None,
+    initial_adamw_steps=int(args.neomuon_initial_adamw_steps),
+    spec_interval=int(args.neomuon_spec_interval),
+    reestimate_interval=int(args.neomuon_reestimate_interval),
+    nr_st_threshold=float(args.neomuon_nr_st_threshold),
+    blend_margin=float(args.neomuon_blend_margin),
+    ema_rho=float(args.neomuon_ema_rho),
+    soft_q=float(args.neomuon_soft_q),
+    ns_iters=int(args.neomuon_ns_iters),
+    rank=rank,
+    world_size=world_size,
+    enable_spectral_gating=bool(args.neomuon_enable_spectral_gating),
+    enable_initial_adamw_steps=bool(args.neomuon_enable_initial_adamw_steps),
+    enable_normuon=bool(args.neomuon_enable_normuon),
+    enable_turbomuon=bool(args.neomuon_enable_turbomuon),
+    enable_root=bool(args.neomuon_enable_root),
+)
+optimizers: list[torch.optim.Optimizer] = [optimizer]
 def opt_params(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
     return [p for group in opt.param_groups for p in group["params"]]
 opt2params = {opt: opt_params(opt) for opt in optimizers}
@@ -525,8 +566,8 @@ if resume_path:
         opt.load_state_dict(state)
         for group in opt.param_groups:
             group.setdefault("initial_lr", group.get("lr", 0.0))
-        # ensure Muon state dtypes survive checkpoint reload
-        if isinstance(opt, Muon):
+        # ensure NeoMuon/Muon-compat state dtypes survive checkpoint reload
+        if isinstance(opt, NeoMuon):
             for p, st in opt.state.items():
                 if not st:
                     continue
