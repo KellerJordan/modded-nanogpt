@@ -550,8 +550,7 @@ class NorMuon(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self):
         # Efficient distributed step by @YouJiacheng, @KonstantinWilleke, @alexrgilbert,
-        # @adricarda, @tuttyfrutyee, @vdlad, @ryanyang0, @vagrawal, @varunneal
-        # Compiled helpers by @chrisjmccormick
+        # @adricarda, @tuttyfrutyee, @vdlad, @ryanyang0, @vagrawal, @varunneal, @chrisjmccormick
         rank = dist.get_rank()
         group_infos = []
         for group in self.param_groups:
@@ -609,7 +608,6 @@ class NorMuon(torch.optim.Optimizer):
                 for p in params[module_idx:module_idx + num_params]:
                     assert p.label == 'attn'
                 
-                # Reshape attn params from [hdim, dim*4] to [4,hdim,dim]
                 updated_grads = updated_grads.view(4 * grad_shape[0], grad_shape[1] // 4, grad_shape[2])
             
             ref_param = params[module_idx]
@@ -719,7 +717,7 @@ class DistAdam(torch.optim.Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         params = list(params)
         # Group by label, with explicit ordering for execution control.
-        # lm_head is ready earliest, so it should be processed first.
+        # lm_head is ready earliest.
         label_order = ['lm_head', 'scalars', 'value_embed', 'embed']
         params_by_label = defaultdict(list)
         for p in params:
@@ -910,11 +908,9 @@ class CausalSelfAttention(nn.Module):
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
         # merged QKVO weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
-        #
-        # Stacked layout stores all QKVO heads horizontally, allowing us to correctly calculate variance
-        # for output heads in NorMuon without splitting off O. @chrisjmccormick  
+        # Simplified layout by @chrisjmccormick
         self.qkvo_w = nn.Parameter(torch.empty(self.dim * 4, self.hdim))
-        # label module to enable custom optimizer sizing
+        # label all modules for explicit optimizer grouping
         self.qkvo_w.label = 'attn'
 
         with torch.no_grad():
@@ -923,7 +919,6 @@ class CausalSelfAttention(nn.Module):
 
         # sparse gated attention to enable context based no-op by @classiclarryd
         self.attn_gate = CastedLinear(12, num_heads)
-        # label module to enable custom optimizer sizing
         self.attn_gate.weight.label = 'attn_gate'
 
     def forward(self, x: Tensor, attn_args: AttnArgs):
@@ -960,11 +955,10 @@ class MLP(nn.Module):
         # Transposed layout to match attention weights
         self.c_fc = nn.Parameter(torch.empty(hdim, dim))
         self.c_proj = nn.Parameter(torch.empty(hdim, dim))
-        # label modules to enable custom optimizer sizing
+        # label all modules for explicit optimizer grouping
         self.c_fc.label = 'mlp'
         self.c_proj.label = 'mlp'
-        # corrective factor to account for transpose
-        self.c_proj.lr_mul = 2.
+        self.c_proj.lr_mul = 2. 
 
         std = 0.5 * (dim ** -0.5)
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
@@ -1005,17 +999,16 @@ class GPT(nn.Module):
         super().__init__()
         vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
-        # label module to enable explicit optimizer grouping
+        # label all modules for explicit optimizer grouping
         self.embed.weight.label = 'embed'
         
         self.smear_gate = CastedLinear(12, 1)
-        # label modules to enable custom optimizer sizing
         self.smear_gate.weight.label = 'smear_gate'
 
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        # label modules to enable explicit optimizer grouping
+
         for ve in self.value_embeds:
             ve.weight.label = 'value_embed'
         self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i) for i in range(num_layers)])
@@ -1024,7 +1017,6 @@ class GPT(nn.Module):
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
         self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, x_s=(model_dim**0.5)/448, w_s=2**-9, grad_s=1/448)
-        # label module to enable explicit optimizer grouping
         self.lm_head.weight.label = 'lm_head'
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
@@ -1047,7 +1039,7 @@ class GPT(nn.Module):
                 ]
             )
         )
-        # label module to enable explicit optimizer grouping
+
         self.scalars.label = 'scalars'
         # set learning rates
         for param in self.embed.parameters():
