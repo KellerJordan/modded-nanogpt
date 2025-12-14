@@ -59,6 +59,8 @@ python data/cached_fineweb10B.py 9
 
 **Note: torch.compile will add around 7 minutes of latency the first time you run the code.**
 
+Official records are timed on 8 NVIDIA H100 GPUs from https://app.primeintellect.ai/. PrimeIntellect has generously sponsored recent validation runs.
+
 ## Alternative: Running with Docker (recommended for precise timing)
 
 For cases where CUDA or NCCL versions aren't compatible with your current system setup, Docker can be a helpful alternative.
