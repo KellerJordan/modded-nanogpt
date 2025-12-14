@@ -613,7 +613,8 @@ class NorMuon(torch.optim.Optimizer):
             ref_param = params[module_idx]
             param_shape = ref_param.shape
 
-            # Corrected variance calculation for gates and attn output heads by @chrisjmccormick
+            # The below shape-based heuristic assumes that matrices have their input along the 
+            # row dimension and their output along the columns. Gates are an exception.
             is_gate = ref_param.label in ['smear_gate', 'attn_gate']
             
             if "second_momentum_buffer" not in group:                
@@ -630,6 +631,9 @@ class NorMuon(torch.optim.Optimizer):
                 lr_mults = []
                 wd_mults = []
                 for p in params:
+                    # Increase learning rate for modules with larger inputs than outputs.
+                    # This shape check also assumes rows=input, columns=output, so take care
+                    # when changing memory layouts. @chrisjmccormick
                     shape = p.shape
                     if len(shape) >= 2:
                         shape_mult = max(1.0, shape[-2] / shape[-1]) ** 0.5
@@ -654,6 +658,8 @@ class NorMuon(torch.optim.Optimizer):
             else:
                 v_chunk = polar_express(updated_grads, split_baddbmm=(ref_param.label == 'mlp'))
 
+            # Note that the head orientation in O is transposed relative to QKV, so red_dim
+            # is 'incorrect' for O. However, correcting this showed no improvement. @chrisjmccormick 
             red_dim = -1 if (is_gate or param_shape[-2] >= param_shape[-1]) else -2
             
             v_chunk = apply_normuon_variance_reduction(
