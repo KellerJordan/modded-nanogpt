@@ -1325,7 +1325,7 @@ class Hyperparameters:
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.55  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # evaluation and logging
-    run_id: str = run_id #f"{uuid.uuid4()}"
+    run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # attention masking
