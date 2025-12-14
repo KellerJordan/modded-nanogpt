@@ -1,12 +1,10 @@
 # NorMuon & DistAdam Optimizations and Fixes
 
-This update includes a number of algebraic and fusion optimizations to NorMuon, as well as an important fix to the variance normalization step.
+This update includes a number of algebraic and fusion optimizations to NorMuon, as well as a fix to the variance normalization step.
 
-Fixing this issue enabled @shenberg's suggestion from the prior record of pre-multiplication of `sa_lambdas[1]` with $W^O$, which I've included in this submission.
+It also transposes the weight matrices, such that the Attention and MLP weights now have shape (3072, 768), which had some unintended consequences--some beneficial, others neutral. 
 
-This update also addresses a synchronization issue with the DistAdam implementation, which was causing it to send out some of the Adam weights even on non-Adam steps. 
-
-Because Adam is primarily communication-bound, I've also modified DistAdam to make its parameter grouping and ordering more explicit (similar to NorMuon's approach) to make it easier to reason about and optimize.
+I was also able to incorporate @shenberg's suggestion from the prior record of pre-multiplication of `sa_lambdas[1]` with $W^O$, which I've included in this submission. 
 
 **Timings & Loss**
 
@@ -41,9 +39,9 @@ Above + Pre-Multiply with W_O:
 
 - [1. NorMuon Variance Normalization Fix](#1-normuon-variance-normalization-fix)
   - [1.1. Attention and MLP Weight Layout](#11-attention-and-mlp-weight-layout)
-  - [1.2. Confirming the Benefit](#12-confirming-the-benefit)
-  - [1.3. Should we Address $W^O$?](#13-should-we-address-wo)
-  - [1.4. Impact to Smear Gate](#14-impact-to-smear-gate)
+  - [1.2. Output Heads](#12-output-heads)
+  - [1.3. Change in Learning Rates](#13-change-in-learning-rates)
+  - [1.4. Pre-Multiplication with Output Heads](#14-pre-multiplication-with-output-heads)
 - [2. GPU & Algebraic Optimizations](#2-gpu--algebraic-optimizations)
   - [2.1. NorMuon Algebraic Optimizations](#21-normuon-algebraic-optimizations)
   - [2.2. Compiled Helpers](#22-compiled-helpers)
@@ -51,7 +49,7 @@ Above + Pre-Multiply with W_O:
   - [2.3. Polar Express Defensive Memcpy](#23-polar-express-defensive-memcpy)
   - [2.4. Combined Improvement](#24-combined-improvement)
 - [3. Communication](#3-communication)
-  - [3.1. DistAdam Synchronization](#31-distadam-synchronization)
+  - [3.1. DistAdam](#31-distadam)
   - [3.2. Parameter Group Ordering](#32-parameter-group-ordering)
   - [3.3. Type-Casting on Host](#33-type-casting-on-host)
 - [4. Future Work / Opportunities for Improvement](#4-future-work--opportunities-for-improvement)
@@ -78,9 +76,27 @@ This rule did not correctly capture the orientation for:
 
 I was able to correct the handling of the gate weights by adding a special case to the shape-checking rule.
 
+To verify that these changes had a positive effect on the model, I ran the baseline plus three variants:
+The corrected orientation for:
+1. The attention gate only.
+2. The attention and smear gates.
+3. (I'll come back to this one)
+
+Averaged over four runs, all three variants outperformed the baseline:
+
+<img src='https://lh3.googleusercontent.com/d/1kcsAdOlgQwbHcQhjt_jvBqIUk0zIMcm1' alt='Plot of final validation loss for variance fixes applied to gates and W_O' width='640' />
+
+The smear gate is unique in that, because it is only a single weight vector, there is no population to normalize over. When applied in the correct orientation, this normalization step is effectively a no-op.
+
+When applied in the other orientation, as it is currently, it normalizes each position of the smear gate weight updates independently, which constricts the weight updates to either -1 or +1. 
+
+This could explain why fixing the normalization on the smear gate had the biggest positive impact in the above plot.
+
+The third variant here was intended to include the impact of correcting the orientation of the output heads, however the change I made didn't actually change their orientation! It did impact the learning rate multipliers on the various weight matrices, however.
+
 ### 1.1. Attention and MLP Weight Layout
 
-Correcting for the output heads required a layout change to the attention weights (and therefore to the MLP weights as well, to maintain matching shapes). 
+Trying to correct the variance normalization for the output heads lead me to make a layout change to the attention weights (and therefore to the MLP weights as well, to maintain matching shapes). 
 
 Like most attention implementations, the current version stores the Output heads transposed relative to the QKV heads. Specifically, it stores QKV heads "horizontally", each with shape (128, 768), and the output heads "vertically", with shape (768, 128), to avoid a transpose operation during the output projection.
 
@@ -88,45 +104,72 @@ The "simplest" solutions require things we want to avoid:
 1. Separating $W^O$ from QKV
 2. Costly transpose operations
 
-Instead, I changed the layout such that all heads are stored horizontally, and QKVO form a vertical stack with a combined shape of (4*model_dim, model_dim).
+Instead, I changed the layout such that all heads can be stored horizontally*, and QKVO form a vertical stack with a combined shape of (4*model_dim, model_dim).
 
 This allows for efficient projections and slicing operations, and puts all basis vectors in the same orientation for NorMuon.
 
 To maintain the matching shapes of the attention and mlp weights (for efficient optimizer grouping), I also transposed the mlp weights to match.
 
-A nice conceptual benefit of the change is that the orientations are easier to reason about--all neurons, basis, and gate weights in the model are now stored horizontally.
+This results in a simpler memory layout and access pattern than the alternative, and appears to be slightly faster as well.
 
-### 1.2. Confirming the Benefit
+It did not, however, correct the output head orientation.
 
-To verify that these changes had a positive effect on the model, I ran the baseline plus three variants:
-The corrected orientation for:
-1. The attention gate only.
-2. The attention and smear gates.
-3. Both gates and the Attention Output matrix.
+### 1.2. Output Heads
 
-Averaged over four runs, all three variants outperformed the baseline:
+I had left the output projection as:
 
-<img src='https://lh3.googleusercontent.com/d/1kcsAdOlgQwbHcQhjt_jvBqIUk0zIMcm1' alt='Plot of final validation loss for variance fixes applied to gates and W_O' width='640' />
+`y = F.linear(y, sa_lambdas[1] * self.qkvo_w[self.dim * 3:].type_as(y))`
 
-Note that correcting both gates but not $W^O$ (pink) performed better than with the $W^O$ correction (light blue).
+which still results in vertical output heads.
 
-### 1.3. Should we Address $W^O$?
+The correct form would be:
 
-Here are two arguments in favor of addressing $W^O$ the above.
+`y = y @ sa_lambdas[1] * self.qkvo_w[self.dim * 3:].type_as(y))`
 
-1. It has an affect on the learning curve which could be indicative of the current implementation causing over-fitting. The curve (light blue) is higher until crossing under the baseline near the very end of training.
+On a GH200 (single H100+Arm), I ran some experiments after-the-fact with the corrected form, and found it to be very slightly slower. Loss did not change, but did have slightly lower variance over the five runs.
+
+```
+                       Runs     Time μ   Time σ  Time +/-  Loss μ  Loss σ   Loss +/-      p  
+12-11 Baseline             5 1,036.4752  0.7519    0.0000  3.2780  0.0018   0.0000      0.0322   
+Corrected Output Heads     5 1,037.0282  0.2171    0.5530  3.2779  0.0014  -0.0001      0.0138   
+```
+
+This seems to confirm @ClassicLarry's suspicion, that the variance normalization step has little significance for the Attention matrices--because they are square, they are already orthonormal from Muon. 
+
+### 1.3. Change in Learning Rates
+
+After transposing the attention and MLP matrices, I found the validation loss curve had changed significantly:
 
 <img src='https://lh3.googleusercontent.com/d/1zjeJUaiFFzbe82deptO1zljF017rZktB' alt='Plot showing the overall higher validation loss curve with the W_O fix in place' width='720' />
 
-2. It seems to have resolved the challenges @shenberg was having with applying their Pre-Multiplication technique to the $W^O$ matrix. It was inexplicably increasing validation loss. With this fix in place, however, it worked well.
+I took this as evidence that my intended change to the output heads had worked.
 
-### 1.4. Impact to Smear Gate
+In reality, I had unintentionally changed the learning rate on all of the attention and mlp matrices. 
 
-The smear gate is unique in that, because it is only a single weight vector, there is no population to normalize over. When applied in the correct orientation, this normalization step is effectively a no-op.
+Muon uses the same "tall vs. wide" heuristic used by the variance-norm step to choose whether to scale up the learning rate for a matrix weight update (specifically, it increases the learning rate on tall matrices).
 
-When applied in the other orientation, as it is currently, it normalizes each position of the smear gate weight updates independently, which constricts the weight updates to either -1 or +1. 
+Transposing everything triggered this heuristic, doubling the learning the rate. 
 
-This could explain why fixing the normalization on the smear gate had the biggest positive impact in the above plot.
+Additionally, the MLP had an existing explicit 2x learning rate multiplier on its input matrix:
+
+`self.c_fc.lr_mul = 2.`
+
+And amidst my changes I had moved this to the output matrix.
+
+Here are the combined learning rate multipliers, before and after:
+
+| Version | Attention | MLP in | MLP out |
+|---------|-----------|--------|---------|
+| 12-10   |   1.0     |  2.0   |   1.0   |
+| 12-11   |   2.0     |  2.0   |   4.0   |
+
+After seeing this, we've experimented with different settings, and they seem to have surprisingly little effect.
+
+### 1.4. Pre-Multiplication with Output Heads
+
+After reading @shenberg's submission about successfully "pre-multiplying" the value embedding coefficients with the QKV projection, but having difficulty with the Output projection, I tried incorporating this technique.
+
+It worked for me, and I assumed that correcting the output head orientation had resolved the problem, but I hadn't. So this is still a mystery.
 
 ---
 
@@ -197,7 +240,7 @@ Attn: 730us -> 560us = ~170us
  MLP: 770us -> 545us = ~225us
 ```
 
-I've also included a trace file from one of my runs (note that it doesn't include the pre-multiplication improvements in the attention layer, but does capture the improvements to the optimizers).
+In the subfolder `profiler-example-traces` you'll find traces for all 8 GPUs, along with a copy of the script used to create them.
 
 Thank you to @akash5474 for their excellent tutorial, [Profiling 101](https://blog.underfit.ai/profiling-101-nanogpt), and for providing a trace file from their run. 
 
@@ -207,21 +250,23 @@ Thank you to @akash5474 for their excellent tutorial, [Profiling 101](https://bl
 
 I also looked for ways to address the current communication-bound nature of the optimization process.
 
-### 3.1. DistAdam Synchronization
+### 3.1. DistAdam
 
-The DistAdam implementation contained a subtle issue which was resulting in Adam weights being scattered on every step, instead of only on the intended every-other step.
+Profiler traces from the previous run (Nov 29) showed a very long transfer time for the smear gate weight:
 
-This appears to have been caused by the use of the torch.compile decorator on the _sync_gradients function. Compiling this function seems to have interfered with the function of the "should_sync" variable meant to control what steps the Adam weights are scattered on.
+<img src='https://lh3.googleusercontent.com/d/1oNNIeZXD6AHlGFfiIlY2IH9qXN9IeKeu' alt='Illustration showing a Muon-only step from the previous baseline highlighting the long delay on the smear gate' width='1024' />
 
 This issue was slowing down the Muon-only steps because processing was held up by the extraneous communication. 
 
-<img src='https://lh3.googleusercontent.com/d/1A4Cj40qlyy_ksFSsAjzLPL6YMXbjs7P1' alt='Profiler trace showing unintended weight copy' width='1024' />
+I believe it may have been resolved by correcting the Adam warmup process in the Dec-10 record. 
+
+Prior to that, I managed to resolve it in my traces by disabling `torch.compile` on the _sync_gradients function. My rationale was that the compiler might be interfering somehow with the "should_sync" flag, but that was a guess.
 
 ### 3.2. Parameter Group Ordering
 
-I also modified DistAdam to have a more explicit definition of its parameter groups and their order. (The existing code relied on inferring the order from attributes like size).
+I also modified DistAdam to have a more explicit definition of its parameter groups and their order, using labels similar to NorMuon. This is a superficial change, though, because there doesn't appear to be any improvement to be gained due to it being communication bound.
 
-The motivation for this comes from observing the profiler traces, which show that the weight matrices aren't being transmitted or operated on in the most efficient order. The difficulty is that we can't control the order in which weight updates are available and the optimizer hooks are called. The best we can do is define an order to wait for them in based on our observations. 
+The motivation came from observing the profiler traces, which show that the weight matrices aren't being transmitted or operated on in the most efficient order. The difficulty is that we can't control the order in which weight updates are available and the optimizer hooks are called. The best we can do is define an order to wait for them in based on our observations. 
 
 ### 3.3. Type-Casting on Host
 
@@ -241,13 +286,7 @@ There's a significant opportunity for improvement to the communication-computati
 
 The main reason for this is that, currently, the scatter _and gather_ operations from Adam must complete before NorMuon can begin, which prevents us from overlapping more communication and compute.
 
-Optimization is still very communication bound, but we should be able to eliminate all gaps in comms. I've implemented a version of this, and the profiler trace confirms the benefits of it:
-
-<img src='https://lh3.googleusercontent.com/d/1zEufAW3Kwli3N3luo6_788PO-EIvLM3n' alt='Profiler trace of combined optimizer implementation' width='1024' />
-
-However, despite what the profiler shows, the actual step time is slow, presumably because of a graph break in the optimization code which is causing frequent recompiles. 
-
-I've included my current implementation of the merged optimizers in this commit--I'm happy to share credit with anyone who's able to help get it working. :)
+Optimization is still very communication bound, but we should be able to eliminate all gaps in comms.
 
 ### 4.2. Hyperparameters
 
@@ -285,6 +324,8 @@ Below are some bad ideas I had that might inspire better ones.
 Ignoring the strong mathematical grounding of the Muon orthogonal matrix update rule, but considering the underlying structure of the attention matrices, I wondered if making the weight updates orthogonal on a per-head level might have merits. While we generally want our attention matrices to be full rank, I wondered if enforcing it across all heads might be overly-constricting.
 
 Running polar express on a large batch of individual heads provides a significant reduction in compute, because it is only attempting to orthogonalize, e.g., 24 sets of 128 vectors instead of 4 sets of 768. But this approach had a negative impact on learning, and the speed improvement didn't seem to outweigh it.
+
+Update: @ClassicLarry commented [here](https://github.com/KellerJordan/modded-nanogpt/discussions/23?sort=new#discussioncomment-15233803) that Muon on the attention heads has been tried many times, and explained why it doesn't work. And beyond that, the experiments were invalid since $W^O$ still wasn't oriented how I thought!
 
 _Separating RoPE and NoPE_
 
