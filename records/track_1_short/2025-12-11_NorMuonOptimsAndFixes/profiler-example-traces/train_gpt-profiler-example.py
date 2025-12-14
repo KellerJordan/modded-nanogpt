@@ -1,3 +1,7 @@
+
+import uuid
+run_id = f"Baseline - 12-11 - {str(uuid.uuid4())[0:5]}"
+
 import os
 import sys
 
@@ -8,7 +12,7 @@ import glob
 import math
 import threading
 import time
-import uuid
+#import uuid
 from dataclasses import dataclass
 from collections import defaultdict
 from itertools import accumulate
@@ -550,7 +554,8 @@ class NorMuon(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self):
         # Efficient distributed step by @YouJiacheng, @KonstantinWilleke, @alexrgilbert,
-        # @adricarda, @tuttyfrutyee, @vdlad, @ryanyang0, @vagrawal, @varunneal, @chrisjmccormick
+        # @adricarda, @tuttyfrutyee, @vdlad, @ryanyang0, @vagrawal, @varunneal
+        # Compiled helpers by @chrisjmccormick
         rank = dist.get_rank()
         group_infos = []
         for group in self.param_groups:
@@ -608,13 +613,13 @@ class NorMuon(torch.optim.Optimizer):
                 for p in params[module_idx:module_idx + num_params]:
                     assert p.label == 'attn'
                 
+                # Reshape attn params from [hdim, dim*4] to [4,hdim,dim]
                 updated_grads = updated_grads.view(4 * grad_shape[0], grad_shape[1] // 4, grad_shape[2])
             
             ref_param = params[module_idx]
             param_shape = ref_param.shape
 
-            # The below shape-based heuristic assumes that matrices have their input along the 
-            # row dimension and their output along the columns. Gates are an exception.
+            # Corrected variance calculation for gates and attn output heads by @chrisjmccormick
             is_gate = ref_param.label in ['smear_gate', 'attn_gate']
             
             if "second_momentum_buffer" not in group:                
@@ -631,9 +636,6 @@ class NorMuon(torch.optim.Optimizer):
                 lr_mults = []
                 wd_mults = []
                 for p in params:
-                    # Increase learning rate for modules with larger inputs than outputs.
-                    # This shape check also assumes rows=input, columns=output, so take care
-                    # when changing memory layouts. @chrisjmccormick
                     shape = p.shape
                     if len(shape) >= 2:
                         shape_mult = max(1.0, shape[-2] / shape[-1]) ** 0.5
@@ -658,8 +660,6 @@ class NorMuon(torch.optim.Optimizer):
             else:
                 v_chunk = polar_express(updated_grads, split_baddbmm=(ref_param.label == 'mlp'))
 
-            # Note that the head orientation in O is transposed relative to QKV, so red_dim
-            # is 'incorrect' for O. However, correcting this showed no improvement. @chrisjmccormick 
             red_dim = -1 if (is_gate or param_shape[-2] >= param_shape[-1]) else -2
             
             v_chunk = apply_normuon_variance_reduction(
@@ -723,7 +723,7 @@ class DistAdam(torch.optim.Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         params = list(params)
         # Group by label, with explicit ordering for execution control.
-        # lm_head is ready earliest.
+        # lm_head is ready earliest, so it should be processed first.
         label_order = ['lm_head', 'scalars', 'value_embed', 'embed']
         params_by_label = defaultdict(list)
         for p in params:
@@ -914,9 +914,11 @@ class CausalSelfAttention(nn.Module):
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
         # merged QKVO weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
-        # Simplified layout by @chrisjmccormick
+        #
+        # Stacked layout stores all QKVO heads horizontally, allowing us to correctly calculate variance
+        # for output heads in NorMuon without splitting off O. @chrisjmccormick  
         self.qkvo_w = nn.Parameter(torch.empty(self.dim * 4, self.hdim))
-        # label all modules for explicit optimizer grouping
+        # label module to enable custom optimizer sizing
         self.qkvo_w.label = 'attn'
 
         with torch.no_grad():
@@ -925,6 +927,7 @@ class CausalSelfAttention(nn.Module):
 
         # sparse gated attention to enable context based no-op by @classiclarryd
         self.attn_gate = CastedLinear(12, num_heads)
+        # label module to enable custom optimizer sizing
         self.attn_gate.weight.label = 'attn_gate'
 
     def forward(self, x: Tensor, attn_args: AttnArgs):
@@ -961,10 +964,11 @@ class MLP(nn.Module):
         # Transposed layout to match attention weights
         self.c_fc = nn.Parameter(torch.empty(hdim, dim))
         self.c_proj = nn.Parameter(torch.empty(hdim, dim))
-        # label all modules for explicit optimizer grouping
+        # label modules to enable custom optimizer sizing
         self.c_fc.label = 'mlp'
         self.c_proj.label = 'mlp'
-        self.c_proj.lr_mul = 2. 
+        # corrective factor to account for transpose
+        self.c_proj.lr_mul = 2.
 
         std = 0.5 * (dim ** -0.5)
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
@@ -1005,16 +1009,17 @@ class GPT(nn.Module):
         super().__init__()
         vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
-        # label all modules for explicit optimizer grouping
+        # label module to enable explicit optimizer grouping
         self.embed.weight.label = 'embed'
         
         self.smear_gate = CastedLinear(12, 1)
+        # label modules to enable custom optimizer sizing
         self.smear_gate.weight.label = 'smear_gate'
 
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-
+        # label modules to enable explicit optimizer grouping
         for ve in self.value_embeds:
             ve.weight.label = 'value_embed'
         self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i) for i in range(num_layers)])
@@ -1023,6 +1028,7 @@ class GPT(nn.Module):
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
         self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, x_s=(model_dim**0.5)/448, w_s=2**-9, grad_s=1/448)
+        # label module to enable explicit optimizer grouping
         self.lm_head.weight.label = 'lm_head'
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
@@ -1045,7 +1051,7 @@ class GPT(nn.Module):
                 ]
             )
         )
-
+        # label module to enable explicit optimizer grouping
         self.scalars.label = 'scalars'
         # set learning rates
         for param in self.embed.parameters():
@@ -1575,7 +1581,38 @@ t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
 ws_short, ws_long = get_ws(0)
-for step in range(train_steps + 1):
+
+
+from torch.profiler import profile, ProfilerActivity, schedule
+
+profile_steps = 14
+
+def trace_handler(prof: torch.profiler.profile):
+    path_prefix = f"{run_id}-rank{rank}"
+    prof.export_chrome_trace(f"{path_prefix}-chrome-trace.json.gz")
+
+prof_ctx = torch.profiler.profile(
+    activities=[
+        # profile activity on the CPU and GPU
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ],
+    # Setup the profiler schedule to wait 5 steps, warmup for 5 steps,
+    # then activate for the remaining steps.
+    schedule=torch.profiler.schedule(wait=5, warmup=5, active=profile_steps - 10),
+    # This callback will be fired when the trace files are ready
+    on_trace_ready=trace_handler,
+    # Records the file and line number for the operation.
+    # Disabling this mainly to make the traces less cluttered
+    with_stack=False,
+    record_shapes=True,
+)
+
+# Enter the profiler context before the training loop
+prof_ctx.__enter__()
+
+for step in range(profile_steps):
+#for step in range(train_steps + 1):
     last_step = (step == train_steps)
     ws_short, new_ws_long = get_ws(step)
     if new_ws_long != ws_long:
@@ -1631,6 +1668,12 @@ for step in range(train_steps + 1):
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+
+    # Step the profiler at the end of each training step
+    prof_ctx.step()
+
+# After we exit our loop we exit the profiler context
+prof_ctx.__exit__(None, None, None)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
