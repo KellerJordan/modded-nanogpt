@@ -1,6 +1,6 @@
 ## New WR 128.8s: Partial Key Offset
 
-Four updates, for roughly 2.4s improvement:
+Five updates, for roughly 2.4s improvement:
 1. Implement a partial key offset for the long sliding windows
 2. Merge the `x_lambda*x + x0_lambda*x0` for layer 0 into (x_lambda+x0_lambda)*x. And clean up the code to properly represent the 11 layer model.
 3. Drop 50 steps. (60ms per step)
