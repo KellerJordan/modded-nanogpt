@@ -15,7 +15,7 @@ k[:, 1:, :, self.head_dim//4:self.head_dim//2] = k[:, :-1, :, self.head_dim//4:s
 k[:, 1:, :, self.head_dim//4+self.head_dim//2:] = k[:, :-1, :, self.head_dim//4+self.head_dim//2:]
 ```
 
-<img width="1634" height="1108" alt="image" src="https://github.com/user-attachments/assets/3afcf683-4d82-4236-82c9-0cf7520f776c" />
+<img width="3471" height="2388" alt="Picture4" src="https://github.com/user-attachments/assets/bd861f9e-4fed-47f0-b9fd-ee14f692efa9" />
 
 
 ## Timing and Validation
