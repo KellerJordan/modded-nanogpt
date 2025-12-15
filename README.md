@@ -22,7 +22,7 @@ This improvement in training speed has been brought about by the following techn
 * Polar Express implementation in Muon
 * Smear module to enable 1 token look back
 * Sparse attention gate
-* NormMuon
+* NorMuon
 * Cautious Weight Decay w/ schedule tied to LR
 * Exponential decay of residual stream
 * Batch size schedule
