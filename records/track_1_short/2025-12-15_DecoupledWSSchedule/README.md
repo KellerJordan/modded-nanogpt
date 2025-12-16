@@ -42,7 +42,7 @@ print("time:", torch.std_mean(torch.tensor(baseline_times)))
 # time: (tensor(0.6011), tensor(129.4074))
 ```
 
-This shows an improvement of $ \approx 0.51 $ seconds. Running the new training script 5 times on the previous pytorch nightly build yields an average training time of 128.775 seconds, but this reduction seems likely to be due to variance rather than an actual performance improvement.
+This shows an improvement of ~0.51 seconds. Running the new training script 5 times on the previous pytorch nightly build yields an average training time of 128.775 seconds, but this reduction seems likely to be due to variance rather than an actual performance improvement.
 
 ### Timing previous records
 
