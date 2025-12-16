@@ -447,14 +447,9 @@ def apply_normuon_variance_reduction(v_chunk, second_momentum_buffer, beta2, red
     final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
     return v_chunk.mul_(final_scale.type_as(v_chunk))
 
-import torch
-from torch import Tensor
-import torch.distributed as dist
-from collections import defaultdict
 
 # -----------------------------------------------------------------------------
 # NorMuon optimizer
-
 
 class NorMuon(torch.optim.Optimizer):
     """
@@ -472,7 +467,7 @@ class NorMuon(torch.optim.Optimizer):
 
     Differences from standard Muon:
     - Newton-Shulz is replaced with Polar Express for the orthogonalization step
-    - NorMuon adds a low-rank variance estimator similar to Adafactor.
+    - NorMuon adds a low-rank variance estimator similar to Adafactor. https://arxiv.org/pdf/2510.05491
     - small 1D parameters handled here instead of in Adam
     - Cautious weight decay, a gated version of decoupled weight decay
     - Custom distributed sizing:
@@ -898,6 +893,7 @@ class AttnArgs:
     cos: torch.Tensor
     sin: torch.Tensor
     attn_scale: float
+    key_shift: bool
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
@@ -933,14 +929,18 @@ class CausalSelfAttention(nn.Module):
         assert T % 16 == 0
         # unpack attention args
         cos, sin = attn_args.cos, attn_args.sin
-        ve, sa_lambdas = attn_args.ve, attn_args.sa_lambdas
+        ve, sa_lambdas, key_shift = attn_args.ve, attn_args.sa_lambdas, attn_args.key_shift
         seqlens, attn_scale, bm_size = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size
 
         q, k, v = F.linear(x, sa_lambdas[0] * self.qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = rotary(q, cos, sin), rotary(k, cos, sin)
+        if key_shift:
+            # shift keys forward for the stationary head dims. Enables 1-layer induction.
+            k[:, 1:, :, self.head_dim//4:self.head_dim//2] = k[:, :-1, :, self.head_dim//4:self.head_dim//2]
+            k[:, 1:, :, self.head_dim//4+self.head_dim//2:] = k[:, :-1, :, self.head_dim//4+self.head_dim//2:]
         if ve is not None:
-            v = v + ve.view_as(v) # @ KoszarskyB & @Grad62304977 (sa_lambdas[1] moved to O projection)
+            v = v + ve.view_as(v) # @ KoszarskyB & @Grad62304977
 
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
@@ -981,13 +981,12 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
         super().__init__()
-        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx not in [0, 7] else None
+        # skip attention of blocks.6 (the 7th layer) by @YouJiacheng
+        self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx != 6 else None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
-        self.mlp = MLP(dim) if layer_idx != 0 else None
+        self.mlp = MLP(dim)
 
-    def forward(self, x: Tensor, x0: Tensor, lambdas: Tensor, attn_args: AttnArgs):
-        x = lambdas[0] * x + lambdas[1] * x0
+    def forward(self, x: Tensor, attn_args: AttnArgs):
         if self.attn is not None:
             x = x + self.attn(norm(x), attn_args)
         if self.mlp is not None:
@@ -1003,6 +1002,7 @@ def next_multiple_of_n(v: float | int, *, n: int):
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
         super().__init__()
+        self.num_layers = num_layers
         vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
         # label all modules for explicit optimizer grouping
@@ -1014,7 +1014,8 @@ class GPT(nn.Module):
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-
+        for embed in self.value_embeds:
+            nn.init.zeros_(embed.weight)
         for ve in self.value_embeds:
             ve.weight.label = 'value_embed'
         self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i) for i in range(num_layers)])
@@ -1025,27 +1026,21 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, x_s=(model_dim**0.5)/448, w_s=2**-9, grad_s=1/448)
         self.lm_head.weight.label = 'lm_head'
         # Add learnable skip connection weights for decoder layers
-        assert num_layers % 2 == 0
-        pad = (-num_layers * 5 - 2) % dist.get_world_size()
+        pad = (-num_layers * 4 - 3) % dist.get_world_size()
         self.scalars = nn.Parameter(
             torch.cat(
                 [
-                    -1.5
-                    * torch.ones(num_layers),  # skip_weights -> σ(-1.5) ≈ 0.18
-                    *[
-                        torch.tensor([1.1, 0.0]) for _ in range(num_layers)
-                    ],  # block lambdas. 1.1 init such that layer i weight is i^(num_layers-i).
-                        # ~3x higher weight to layer 1 compared to 12 at init.
-                    *[
-                        torch.tensor([0.5, 1.0]) for _ in range(num_layers)
-                    ],  # SA lambdas (sa_lambdas[1] init to 1.0 since it's now pre-multiplied to O)
+                    1.1 * torch.ones(num_layers),  # resid lambdas. 1.1 init such that layer i weight is i^(num_layers-i).
+                    0 * torch.ones(num_layers),  # x0 lambdas
+                    *[torch.tensor([0.5, 1.0]) for _ in range(num_layers)],  # SA lambdas
                     torch.zeros(1), # smear_lambda
                     0.5*torch.ones(1), # backout_lambda
+                    -1.5 * torch.ones(1),  # skip_lambda -> σ(-1.5) ≈ 0.18
                     torch.ones(pad),
                 ]
             )
         )
-
+        
         self.scalars.label = 'scalars'
         # set learning rates
         for param in self.embed.parameters():
@@ -1058,41 +1053,42 @@ class GPT(nn.Module):
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws_short: int, ws_long: int):
         assert input_seq.ndim == 1
 
+        # set configs
+        skip_connections = []
+        skip_in = [3] # long attention window on layer 3
+        skip_out = [6] # no attn op on layer 6
+        x_backout = None
+        backout_layer = 7
+
+        # set lambdas
+        resid_lambdas = self.scalars[: 1 * self.num_layers]
+        x0_lambdas = self.scalars[1 * self.num_layers: 2 * self.num_layers]
+        sa_lambdas = self.scalars[2 * self.num_layers: 4 * self.num_layers].view(-1, 2)
+        smear_lambda = self.scalars[4 * self.num_layers]
+        backout_lambda = self.scalars[4 * self.num_layers+1]
+        skip_lambda = self.scalars[4 * self.num_layers+2]
+
+        # set block masks and key shift
+        short_bm = ws_short * args.block_size
+        long_bm = ws_long * args.block_size
+        bm_sizes = [short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, None, short_bm, short_bm, short_bm, long_bm]
+        assert len(bm_sizes) == self.num_layers
+        key_shift = [b==long_bm for b in bm_sizes] # apply key shift to long windows
+        
+        # start forward pass
+        x = self.embed(input_seq)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
         # dropping first layer updates this to .12 ... 012
-        ve = [None, ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
-        assert len(ve) == len(self.blocks)
-
-        short_bm = ws_short * args.block_size
-        long_bm = ws_long * args.block_size
-        bm_sizes = [None, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, None, short_bm, short_bm, short_bm, long_bm]
-        assert len(bm_sizes) == len(self.blocks)
-
-        x = self.embed(input_seq)
-
-        skip_weights = self.scalars[:(len(self.blocks) // 2)]
-        lambdas = self.scalars[1 * len(self.blocks): 3 * len(self.blocks)].view(-1, 2)
-        sa_lambdas = self.scalars[3 * len(self.blocks): 5 * len(self.blocks)].view(-1, 2)
-        smear_lambda = self.scalars[5 * len(self.blocks)]
-        backout_lambda = self.scalars[5 * len(self.blocks)+1]
-
+        ve = [ve[1], ve[2]] + [None] * (self.num_layers - 5) + [ve[0], ve[1], ve[2]]
+        assert len(ve) == self.num_layers
+        
         # smear token embed forward 1 position @classiclarryd
         smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
-        
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
-        # create skip connection from layer 4 (long attn window) to layer 7 (no attn op)
-        skip_connections = []
-        n = len(self.blocks) // 2
-        skip_in = [4]
-        skip_out = [7]
-
-        x_backout = None
-        backout_layer = 8
-        # skip layer zero
-        for i in range(1,len(self.blocks)):
+        for i in range(self.num_layers):
             attn_args = AttnArgs(
                 ve=ve[i],
                 sa_lambdas=sa_lambdas[i],
@@ -1100,18 +1096,23 @@ class GPT(nn.Module):
                 bm_size=bm_sizes[i],
                 cos=self.yarn.cos,
                 sin=self.yarn.sin,
-                attn_scale=self.yarn.attn_scale
+                attn_scale=self.yarn.attn_scale,
+                key_shift = key_shift[i]
             )
             if i in skip_out:
-                gate = torch.sigmoid(skip_weights[i - n])  # in (0, 1)
+                gate = torch.sigmoid(skip_lambda)  # in (0, 1)
                 x = x + gate * skip_connections.pop()
-            x = self.blocks[i](x, x0, lambdas[i], attn_args)
+            if i == 0:
+                x = (resid_lambdas[0] + x0_lambdas[0]) * x
+            else:
+                x = resid_lambdas[i] * x + x0_lambdas[i] * x0
+            x = self.blocks[i](x, attn_args) 
             if i in skip_in:
                 skip_connections.append(x)
             if i == backout_layer:
                 x_backout = x
 
-        # back out contributions from first 8 layers that are only required for downstream context and not direct prediction
+        # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
         x -= backout_lambda * x_backout
         x = norm(x)
         logits = self.lm_head(x)
@@ -1320,7 +1321,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 2120  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 2070  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.55  # fraction of num_scheduled_iterations spent cooling down the learning rate
@@ -1382,7 +1383,7 @@ print0("="*100)
 
 model: nn.Module = GPT(
     vocab_size=50257,
-    num_layers=12,
+    num_layers=11,
     num_heads=6,
     head_dim=128,
     model_dim=768,
@@ -1423,9 +1424,9 @@ def get_lr(step: int):
         return 0.1
     lr_max = 1.0
     x = step / args.num_scheduled_iterations
-    if x > 0.33:
+    if x > 1/3:
        lr_max = 1.51  # (16/8)**0.6
-    if x > 0.66:
+    if x > 2/3:
         lr_max = 1.93  # (24/8)**0.6
     if x >= 1 - args.cooldown_frac:
         w = (1 - x) / args.cooldown_frac
