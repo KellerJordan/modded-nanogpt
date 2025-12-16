@@ -447,14 +447,9 @@ def apply_normuon_variance_reduction(v_chunk, second_momentum_buffer, beta2, red
     final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
     return v_chunk.mul_(final_scale.type_as(v_chunk))
 
-import torch
-from torch import Tensor
-import torch.distributed as dist
-from collections import defaultdict
 
 # -----------------------------------------------------------------------------
 # NorMuon optimizer
-
 
 class NorMuon(torch.optim.Optimizer):
     """
@@ -472,7 +467,7 @@ class NorMuon(torch.optim.Optimizer):
 
     Differences from standard Muon:
     - Newton-Shulz is replaced with Polar Express for the orthogonalization step
-    - NorMuon adds a low-rank variance estimator similar to Adafactor.
+    - NorMuon adds a low-rank variance estimator similar to Adafactor. https://arxiv.org/pdf/2510.05491
     - small 1D parameters handled here instead of in Adam
     - Cautious weight decay, a gated version of decoupled weight decay
     - Custom distributed sizing:
