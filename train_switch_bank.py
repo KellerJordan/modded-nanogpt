@@ -151,8 +151,8 @@ class Hyperparameters:
     lr_router = 0.095
     lr_adapter = 0.03
     lr_muon = 0.025
-    router_grad_clip_norm = 0.0 #1.0
-    router_autoclip = True #False
+    router_grad_clip_norm = 0.0
+    router_autoclip = True
     # NeoMuon optimizer parameters (see switch_bank/optim/neomuon.py)
     neomuon_betas: tuple[float, float] = (0.8, 0.95)
     neomuon_eps: float = 1e-10
@@ -166,11 +166,11 @@ class Hyperparameters:
     neomuon_ema_rho: float = 0.1
     neomuon_soft_q: float = 0.9
     neomuon_ns_iters: int = 4
-    neomuon_enable_spectral_gating: bool = False # (tested w/ TM)
-    neomuon_enable_initial_adamw_steps: bool = False # Try SGD?     (tested on its own)
-    neomuon_enable_normuon: bool = False # Try enabled after step 350?  (tested w/ TM)
-    neomuon_enable_turbomuon: bool = True  # logit max hitting ceil (from the start)     (tested on its own)
-    neomuon_enable_root: bool = False  # Try enabled after step 375?     (tested w/ TM)
+    neomuon_enable_spectral_gating: bool = False
+    neomuon_enable_initial_adamw_steps: bool = False
+    neomuon_enable_normuon: bool = False
+    neomuon_enable_turbomuon: bool = True
+    neomuon_enable_root: bool = False
     # architecture
     vocab_size = 50257
     model_dim = 896
@@ -182,7 +182,7 @@ class Hyperparameters:
     tie_lm_head = False
     untie_lm_head_frac = -1.0
     # Bank / routing
-    num_experts = 8
+    num_experts = 9
     ffn_hidden = 1024
     topk = 1
     topk_val: int | None = None
@@ -208,7 +208,7 @@ class Hyperparameters:
     shared_ffn_lr_reduce_start_frac = -1.0
     # skip-attention layers (short-SWA) — exactly two
     skip_attn_layers = (7, )
-    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (200, 2), (425, 3), (700, 4), (1050, 5), (1400, 6), (1675, 7), (2025, 8))  #((0, 1), (200, 2), (375, 3), (625, 4), (900, 5), (1175, 6), (1575, 7), (1850, 8), (2175, 9))
+    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (200, 2), (375, 3), (625, 4), (900, 5), (1175, 6), (1575, 7), (1850, 8), (2175, 9))
     router_temp_init = 1.85
     router_temp_final = 0.65
     router_temp_power = 1.5  # fallback if anchor disabled
@@ -219,7 +219,7 @@ class Hyperparameters:
     router_logit_cap_delta_steps = 390 # ramp length after second expert activation
     # Optional Gumbel exploration (off by default)
     router_use_gumbel = True
-    router_gumbel_schedule: tuple[tuple[int, int], ...] =  ((200, 1175), (1225, 1300), (1450, 1950), (2375, 2400), (2725, 2750), (2925, 2950), (3200, 3225), (3450, 3525), (3900, -1))  # ensure ~250 active before end
+    router_gumbel_schedule: tuple[tuple[int, int], ...] =  ((200, 1175), (1225, 1300), (1425, 1900), (2400, 2425), (2725, 2750), (2925, 2950), (3200, 3225), (3475, 3500), (3925, -1))  # ensure ~250 active before end
     # Layerwise router temp & lb boosts.
     router_boost_shape = "peak"  # options: peak (default), valley, linear_start, linear_end
     router_temp_boost = 0.2
