@@ -158,19 +158,8 @@ class Hyperparameters:
     neomuon_eps: float = 1e-10
     neomuon_weight_decay: float = 0.0
     neomuon_muon_momentum: float = 0.95
-    neomuon_initial_adamw_steps: int = 3
-    neomuon_spec_interval: int = 4
-    neomuon_reestimate_interval: int = 35
-    neomuon_nr_st_threshold: float = 1.5
-    neomuon_blend_margin: float = 1.0
-    neomuon_ema_rho: float = 0.1
-    neomuon_soft_q: float = 0.9
     neomuon_ns_iters: int = 4
-    neomuon_enable_spectral_gating: bool = False
-    neomuon_enable_initial_adamw_steps: bool = False
-    neomuon_enable_normuon: bool = False
     neomuon_enable_turbomuon: bool = True
-    neomuon_enable_root: bool = False
     # architecture
     vocab_size = 50257
     model_dim = 896
@@ -514,21 +503,10 @@ optimizer = NeoMuon(
     weight_decay=float(args.neomuon_weight_decay),
     muon_momentum=float(args.neomuon_muon_momentum),
     lr_spec=None,
-    initial_adamw_steps=int(args.neomuon_initial_adamw_steps),
-    spec_interval=int(args.neomuon_spec_interval),
-    reestimate_interval=int(args.neomuon_reestimate_interval),
-    nr_st_threshold=float(args.neomuon_nr_st_threshold),
-    blend_margin=float(args.neomuon_blend_margin),
-    ema_rho=float(args.neomuon_ema_rho),
-    soft_q=float(args.neomuon_soft_q),
     ns_iters=int(args.neomuon_ns_iters),
     rank=rank,
     world_size=world_size,
-    enable_spectral_gating=bool(args.neomuon_enable_spectral_gating),
-    enable_initial_adamw_steps=bool(args.neomuon_enable_initial_adamw_steps),
-    enable_normuon=bool(args.neomuon_enable_normuon),
     enable_turbomuon=bool(args.neomuon_enable_turbomuon),
-    enable_root=bool(args.neomuon_enable_root),
 )
 optimizers: list[torch.optim.Optimizer] = [optimizer]
 def opt_params(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
