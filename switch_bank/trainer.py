@@ -359,8 +359,8 @@ def run_training(
                 elif component == "shared_ffn":
                     mult = ffn_lr_mult
                 group["lr"] = base_lr * mult
-        # Muon-style momentum warmup for spectral groups (NeoMuon compat).
-        target_muon_momentum = float(getattr(args, "neomuon_muon_momentum", 0.95))
+        # Muon-style momentum warmup for spectral groups.
+        target_muon_momentum = float(getattr(args, "muon_momentum", getattr(args, "neomuon_muon_momentum", 0.95)))
         frac = min(step / 300, 1)
         warm_momentum = (1 - frac) * 0.85 + frac * target_muon_momentum
         for opt in optimizers:
@@ -395,7 +395,7 @@ def run_training(
                         f"[router grad clip] norm={total_norm:.4f} clip={clip_value:.4f}",
                         console=True,
                     )
-            # Feed last activations to NeoMuon for nr/st spectral gating.
+            # Feed last activations to Muon for spectral gating.
             if hasattr(opt, "set_last_activation") and bool(getattr(opt, "enable_spectral_gating", False)):
                 for group in opt.param_groups:
                     if not group.get("spectral", True):

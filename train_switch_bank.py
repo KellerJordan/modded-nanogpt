@@ -15,7 +15,7 @@ def _read_text(path: Path) -> str:
 code_paths = [
     Path(sys.argv[0]).resolve(),
     Path("switch_bank/utils.py"),
-    Path("switch_bank/optim/neomuon.py"),
+    Path("switch_bank/optim/muon.py"),
     Path("switch_bank/model/components.py"),
     Path("switch_bank/model/gpt.py"),
     Path("switch_bank/data.py"),
@@ -31,7 +31,7 @@ import time
 import copy
 from dataclasses import dataclass
 from switch_bank.utils import compute_train_micro_len
-from switch_bank.optim.neomuon import NeoMuon
+from switch_bank.optim.muon import Muon
 from switch_bank.model.components import CausalSelfAttention
 from switch_bank.model.gpt import GPT
 from switch_bank.data import summarize_router_metrics, summarize_expert_usage, summarize_expert_activity, router_summary_str
@@ -153,13 +153,13 @@ class Hyperparameters:
     lr_muon = 0.025
     router_grad_clip_norm = 0.0
     router_autoclip = True
-    # NeoMuon optimizer parameters (see switch_bank/optim/neomuon.py)
-    neomuon_betas: tuple[float, float] = (0.8, 0.95)
-    neomuon_eps: float = 1e-10
-    neomuon_weight_decay: float = 0.0
-    neomuon_muon_momentum: float = 0.95
-    neomuon_ns_iters: int = 4
-    neomuon_enable_turbomuon: bool = True
+    # Muon optimizer parameters (see switch_bank/optim/muon.py)
+    muon_betas: tuple[float, float] = (0.8, 0.95)
+    muon_eps: float = 1e-10
+    muon_weight_decay: float = 0.0
+    muon_momentum: float = 0.95
+    muon_ns_iters: int = 4
+    use_turbo_muon: bool = True
     # architecture
     vocab_size = 50257
     model_dim = 896
@@ -454,7 +454,7 @@ for param in model.parameters():
 log_param_counts(model)
 
 # collect the parameters to optimize
-# ### FFNBANK MOD: include bank expert matrices in NeoMuon spectral groups;
+# ### FFNBANK MOD: include bank expert matrices in Muon spectral groups;
 # non-spectral params (routers/embeds/scalars/head/adapters) use AdamW branch.
 def is_2d(p: nn.Parameter) -> bool:
     return p.ndim >= 2
@@ -481,32 +481,32 @@ assert optimized_parameters_set == {*model.parameters()}
 assert len(optimized_parameters_set) == sum(len(lst) for lst in params_collections)
 
 # init the optimizer(s)
-neomuon_param_groups: list[dict] = [
+muon_param_groups: list[dict] = [
     dict(params=embed_params, lr=args.lr_embed, component="embed", spectral=False),
     dict(params=scalar_params, lr=args.lr_scalar, component="scalar", spectral=False),
     dict(params=router_params, lr=args.lr_router, component="router", spectral=False),
 ]
 if adapter_params:
-    neomuon_param_groups.append(dict(params=adapter_params, lr=args.lr_adapter, component="adapter", spectral=False))
+    muon_param_groups.append(dict(params=adapter_params, lr=args.lr_adapter, component="adapter", spectral=False))
 if head_params:
-    neomuon_param_groups.append(dict(params=head_params, lr=args.lr_head, component="head", spectral=False))
+    muon_param_groups.append(dict(params=head_params, lr=args.lr_head, component="head", spectral=False))
 if attn_2d_params:
-    neomuon_param_groups.append(dict(params=attn_2d_params, lr=args.lr_muon, component="attention", spectral=True))
+    muon_param_groups.append(dict(params=attn_2d_params, lr=args.lr_muon, component="attention", spectral=True))
 if ffn_matrix_params:
-    neomuon_param_groups.append(dict(params=ffn_matrix_params, lr=args.lr_muon, component="shared_ffn", spectral=True))
+    muon_param_groups.append(dict(params=ffn_matrix_params, lr=args.lr_muon, component="shared_ffn", spectral=True))
 
-optimizer = NeoMuon(
-    neomuon_param_groups,
+optimizer = Muon(
+    muon_param_groups,
     lr=args.lr_muon,  # default lr for spectral groups; overridden per-group above
-    betas=tuple(args.neomuon_betas),
-    eps=float(args.neomuon_eps),
-    weight_decay=float(args.neomuon_weight_decay),
-    muon_momentum=float(args.neomuon_muon_momentum),
+    betas=tuple(args.muon_betas),
+    eps=float(args.muon_eps),
+    weight_decay=float(args.muon_weight_decay),
+    muon_momentum=float(args.muon_momentum),
     lr_spec=None,
-    ns_iters=int(args.neomuon_ns_iters),
+    ns_iters=int(args.muon_ns_iters),
     rank=rank,
     world_size=world_size,
-    enable_turbomuon=bool(args.neomuon_enable_turbomuon),
+    enable_turbomuon=bool(args.use_turbo_muon),
 )
 optimizers: list[torch.optim.Optimizer] = [optimizer]
 def opt_params(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
@@ -544,8 +544,8 @@ if resume_path:
         opt.load_state_dict(state)
         for group in opt.param_groups:
             group.setdefault("initial_lr", group.get("lr", 0.0))
-        # ensure NeoMuon/Muon-compat state dtypes survive checkpoint reload
-        if isinstance(opt, NeoMuon):
+        # ensure Muon state dtypes survive checkpoint reload
+        if isinstance(opt, Muon):
             for p, st in opt.state.items():
                 if not st:
                     continue

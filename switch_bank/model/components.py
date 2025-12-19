@@ -54,7 +54,7 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask, lambdas: Tensor):
         B, T = x.size(0), x.size(1)
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        # Record input activations for NeoMuon spectral gating.
+        # Record input activations for Muon spectral gating.
         # This is a detached side-channel only; it does not affect numerics.
         self.qkvo_w._neomuon_last_activation = x.detach()
         q, k, v = F.linear(x, self.qkvo_w[:3].flatten(end_dim=1))\
@@ -419,7 +419,7 @@ class SharedFFNBank(nn.Module):
                     scale = scale.detach()
                     bias = bias.detach()
                 x_e = x_e * scale.to(x_e.dtype) + bias.to(x_e.dtype)
-            # Record activations for NeoMuon spectral gating.
+            # Record activations for Muon spectral gating.
             self.W1[e]._neomuon_last_activation = x_e.detach()
             h1 = F.linear(x_e, self.W1[e])
             h1 = F.relu(h1).square()

@@ -1,11 +1,9 @@
 """Optimizers for switch-bank.
 
 This package provides:
-- `Muon`: orthogonalized momentum optimizer for 2D+ bf16 matrices.
-- `NeoMuon`: geometry-aware hybrid optimizer built on Muon.
+- `Muon`: hybrid optimizer with a Muon/TurboMuon spectral branch and an AdamW branch.
 """
 
 from .muon import Muon
-from .neomuon import NeoMuon
 
-__all__ = ["Muon", "NeoMuon"]
+__all__ = ["Muon"]
