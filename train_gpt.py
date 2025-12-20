@@ -791,10 +791,6 @@ class DistAdam(torch.optim.Optimizer):
                 exp_avg_sq = state["exp_avg_sq"]
                 state["step"] += 1
                 t = state["step"]
-                # weight decay
-                if wd != 0:
-                    eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
-                    p_slice.mul_(1 - eff_weight_decay)
                 # update running averages
                 exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
@@ -805,6 +801,14 @@ class DistAdam(torch.optim.Optimizer):
                 denom = exp_avg_sq.sqrt().add_(eps)
                 step_size = lr * (bias2 ** 0.5 / bias1)
                 update = exp_avg.div(denom).mul_(step_size)
+                # weight decay
+                if wd != 0:
+                    mask = (update * p_slice) >= 0
+                    # lr as weight decay  schedule
+                    eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
+
+                    update.addcmul_(p_slice, mask, value=eff_weight_decay * lr)
+                
                 p_slice.add_(other=update, alpha=-1.0)
 
                 all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
@@ -1049,6 +1053,7 @@ class GPT(nn.Module):
             param.lr_mul = 75.
         self.lm_head.weight.lr_mul = 1.0
         self.scalars.lr_mul = 5.0
+        self.scalars.wd_mul = 0.0
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws_short: int, ws_long: int):
         assert input_seq.ndim == 1
@@ -1321,7 +1326,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 2070  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 2050  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.55  # fraction of num_scheduled_iterations spent cooling down the learning rate
@@ -1410,7 +1415,7 @@ optimizer1 = DistAdam(
     lr=0.008,
     betas=(0.65, 0.95),
     eps=1e-8,
-    weight_decay=0.0,
+    weight_decay=0.005,
 )
 optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2)
 optimizers = [optimizer1, optimizer2]
