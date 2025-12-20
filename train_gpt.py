@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from collections import defaultdict
 from itertools import accumulate
 from pathlib import Path
+import gc
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -35,7 +36,6 @@ dynamo.config.recompile_limit = 64
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
-
 
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
@@ -392,28 +392,28 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
     A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
     B = torch.empty_like(A)
     C = torch.empty_like(X)
-  
+
     # Select batched vs unbatched
     if split_baddbmm:
         BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
     else:
         aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
-    
+
     # Perform the iterations
     for a, b, c in polar_express_coeffs:
         XXT(X, out=A)  # A = X @ X.mT
         ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
-        
-        # Referencing X twice causes pytorch to make a defensive copy, 
+
+        # Referencing X twice causes pytorch to make a defensive copy,
         # resulting in a cudaMemcpyAsync in baddbmm.
-        # For large matrices (i.e., the mlp weights), it's faster to split 
+        # For large matrices (i.e., the mlp weights), it's faster to split
         # the operation into two kernels to avoid this.
         if split_baddbmm:
-            BX_matmul(B, X, out=C)  # C = B @ X  
+            BX_matmul(B, X, out=C)  # C = B @ X
             C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
         else:
             aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
-            
+
         X, C = C, X  # Swap references to avoid unnecessary copies
 
     if G.size(-2) > G.size(-1):
@@ -431,7 +431,7 @@ def cautious_wd_and_update_inplace(p, v, wd_tensor, lr_tensor):
     wd_factor = wd_tensor.to(p.dtype)
     lr_factor = lr_tensor.to(p.dtype)
     p.copy_(p - (p * mask * wd_factor * lr_factor) - (v * lr_factor))
-    
+
 
 @torch.compile(dynamic=False, fullgraph=True)
 def apply_normuon_variance_reduction(v_chunk, second_momentum_buffer, beta2, red_dim):
@@ -599,20 +599,20 @@ class NorMuon(torch.optim.Optimizer):
 
             grad_shape = updated_grads.shape
             if params[module_idx].label == 'attn':
-                
+
                 for p in params[module_idx:module_idx + num_params]:
                     assert p.label == 'attn'
-                
+
                 updated_grads = updated_grads.view(4 * grad_shape[0], grad_shape[1] // 4, grad_shape[2])
-            
+
             ref_param = params[module_idx]
             param_shape = ref_param.shape
 
-            # The below shape-based heuristic assumes that matrices have their input along the 
+            # The below shape-based heuristic assumes that matrices have their input along the
             # row dimension and their output along the columns. Gates are an exception.
             is_gate = ref_param.label in ['smear_gate', 'attn_gate']
-            
-            if "second_momentum_buffer" not in group:                
+
+            if "second_momentum_buffer" not in group:
                 if is_gate:
                     group["second_momentum_buffer"] = torch.zeros_like(updated_grads[..., :, :1])
                 else:
@@ -620,7 +620,7 @@ class NorMuon(torch.optim.Optimizer):
                         if param_shape[-2] >= param_shape[-1] else torch.zeros_like(updated_grads[..., :1, :])
                     )
             second_momentum_buffer = group["second_momentum_buffer"]
-   
+
             if "param_lr_cpu" not in group:
                 # Define multipliers for ALL params in this group (global, not per-shard)
                 lr_mults = []
@@ -654,15 +654,15 @@ class NorMuon(torch.optim.Optimizer):
                 v_chunk = polar_express(updated_grads, split_baddbmm=(ref_param.label == 'mlp'))
 
             # Note that the head orientation in O is transposed relative to QKV, so red_dim
-            # is 'incorrect' for O. However, correcting this showed no improvement. @chrisjmccormick 
+            # is 'incorrect' for O. However, correcting this showed no improvement. @chrisjmccormick
             red_dim = -1 if (is_gate or param_shape[-2] >= param_shape[-1]) else -2
-            
+
             v_chunk = apply_normuon_variance_reduction(
                 v_chunk, second_momentum_buffer, group["beta2"], red_dim
             )
 
             v_chunk = v_chunk.view(grad_shape)
-       
+
             # # "Cautious" weight decay (https://arxiv.org/abs/2510.12402)
             updated_params = torch.empty_like(grad_chunk)
             if num_params > 0:
@@ -718,8 +718,7 @@ class DistAdam(torch.optim.Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         params = list(params)
         # Group by label, with explicit ordering for execution control.
-        # lm_head is ready earliest.
-        label_order = ['lm_head', 'scalars', 'value_embed', 'embed']
+        label_order = ['lm_head', 'value_embed', 'scalars']
         params_by_label = defaultdict(list)
         for p in params:
             params_by_label[getattr(p, 'label', None)].append(p)
@@ -801,14 +800,12 @@ class DistAdam(torch.optim.Optimizer):
                 denom = exp_avg_sq.sqrt().add_(eps)
                 step_size = lr * (bias2 ** 0.5 / bias1)
                 update = exp_avg.div(denom).mul_(step_size)
-                # weight decay
-                if wd != 0:
-                    mask = (update * p_slice) >= 0
-                    # lr as weight decay  schedule
-                    eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
+                # cautious weight decay
+                mask = (update * p_slice) >= 0
+                # lr as weight decay schedule
+                eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
+                update.addcmul_(p_slice, mask, value=eff_weight_decay * lr)
 
-                    update.addcmul_(p_slice, mask, value=eff_weight_decay * lr)
-                
                 p_slice.add_(other=update, alpha=-1.0)
 
                 all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
@@ -841,6 +838,10 @@ class CastedLinear(nn.Linear):
             return out.reshape(*x.shape[:-1], -1)
         else:
             return F.linear(x, self.weight.type_as(x))
+
+
+# -----------------------------------------------------------------------------
+# PyTorch nn.Module definitions for the model
 
 # yarn implementation @classiclarryd
 class Yarn(nn.Module):
@@ -961,14 +962,14 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        hdim = 4 * dim        
+        hdim = 4 * dim
         # Transposed layout to match attention weights
         self.c_fc = nn.Parameter(torch.empty(hdim, dim))
         self.c_proj = nn.Parameter(torch.empty(hdim, dim))
         # label all modules for explicit optimizer grouping
         self.c_fc.label = 'mlp'
         self.c_proj.label = 'mlp'
-        self.c_proj.lr_mul = 2. 
+        self.c_proj.lr_mul = 2.
 
         std = 0.5 * (dim ** -0.5)
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
@@ -1008,10 +1009,7 @@ class GPT(nn.Module):
         super().__init__()
         self.num_layers = num_layers
         vocab_size = next_multiple_of_n(vocab_size, n=128)
-        self.embed = nn.Embedding(vocab_size, model_dim)
-        # label all modules for explicit optimizer grouping
-        self.embed.weight.label = 'embed'
-        
+
         self.smear_gate = CastedLinear(12, 1)
         self.smear_gate.weight.label = 'smear_gate'
 
@@ -1027,7 +1025,9 @@ class GPT(nn.Module):
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
-        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, x_s=(model_dim**0.5)/448, w_s=2**-9, grad_s=1/448)
+
+        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.5/448, grad_s=0.75/448)
+        nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
         self.lm_head.weight.label = 'lm_head'
         # Add learnable skip connection weights for decoder layers
         pad = (-num_layers * 4 - 3) % dist.get_world_size()
@@ -1044,14 +1044,11 @@ class GPT(nn.Module):
                 ]
             )
         )
-        
+
         self.scalars.label = 'scalars'
         # set learning rates
-        for param in self.embed.parameters():
-            param.lr_mul = 75.
         for param in self.value_embeds.parameters():
             param.lr_mul = 75.
-        self.lm_head.weight.lr_mul = 1.0
         self.scalars.lr_mul = 5.0
         self.scalars.wd_mul = 0.0
 
@@ -1079,15 +1076,15 @@ class GPT(nn.Module):
         bm_sizes = [short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, None, short_bm, short_bm, short_bm, long_bm]
         assert len(bm_sizes) == self.num_layers
         key_shift = [b==long_bm for b in bm_sizes] # apply key shift to long windows
-        
-        # start forward pass
-        x = self.embed(input_seq)
+
+        # weight-tied: use lm_head.weight for embedding lookup
+        x = F.embedding(input_seq, self.lm_head.weight)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
         # dropping first layer updates this to .12 ... 012
         ve = [ve[1], ve[2]] + [None] * (self.num_layers - 5) + [ve[0], ve[1], ve[2]]
         assert len(ve) == self.num_layers
-        
+
         # smear token embed forward 1 position @classiclarryd
         smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
@@ -1111,7 +1108,7 @@ class GPT(nn.Module):
                 x = (resid_lambdas[0] + x0_lambdas[0]) * x
             else:
                 x = resid_lambdas[i] * x + x0_lambdas[i] * x0
-            x = self.blocks[i](x, attn_args) 
+            x = self.blocks[i](x, attn_args)
             if i in skip_in:
                 skip_connections.append(x)
             if i == backout_layer:
@@ -1326,7 +1323,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 2050  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1995  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.55  # fraction of num_scheduled_iterations spent cooling down the learning rate
@@ -1396,7 +1393,7 @@ model: nn.Module = GPT(
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
-        m.bfloat16()
+        m.weight.data = m.weight.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
@@ -1571,7 +1568,6 @@ del train_loader, initial_state
 step_batch_size = args.train_bs_schedule[0]
 train_loader = distributed_data_generator(args.train_files, step_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
 
-import gc
 gc.collect()
 
 training_time_ms = 0
