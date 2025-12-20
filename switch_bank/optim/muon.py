@@ -84,20 +84,39 @@ def _muon_update_kernel(
     mantissa.copy_(acc_m_u32.to(torch.uint16))
 
 
-def power_iteration_smax(A: Tensor, iters: int = 2) -> Tensor:
+def power_iteration_smax(
+    A: Tensor,
+    iters: int = 2,
+    generator: Optional[torch.Generator] = None,
+    v_buf: Optional[Tensor] = None,
+) -> Tensor:
     """
     Approximate largest singular value of a (batched) 2D tensor via power iteration.
     """
     A = A.float()
     if A.ndim == 2:
         m, n = A.shape
-        v = torch.randn(n, device=A.device, dtype=A.dtype)
-        v = v / (v.norm() + 1e-8)
+        if (
+            v_buf is not None
+            and (v_buf.shape != (n,) or v_buf.device != A.device or v_buf.dtype != A.dtype)
+        ):
+            v_buf = None
+
+        if v_buf is None:
+            v = torch.randn(n, device=A.device, dtype=A.dtype, generator=generator)
+        else:
+            v = v_buf
+
+        v.div_(v.norm() + 1e-8)
         for _ in range(iters):
             u = A @ v
             u = u / (u.norm() + 1e-8)
-            v = A.mT @ u
-            v = v / (v.norm() + 1e-8)
+            v_new = A.mT @ u
+            v_new = v_new / (v_new.norm() + 1e-8)
+            if v_buf is None:
+                v = v_new
+            else:
+                v.copy_(v_new)
         sigma = (A @ v).norm()
         return sigma
 
@@ -106,13 +125,32 @@ def power_iteration_smax(A: Tensor, iters: int = 2) -> Tensor:
     lead_shape = A.shape[:-2]
     A_flat = A.reshape(-1, m, n)
     batch = A_flat.size(0)
-    v = torch.randn(batch, n, device=A.device, dtype=A.dtype)
-    v = v / (v.norm(dim=1, keepdim=True) + 1e-8)
+
+    if (
+        v_buf is not None
+        and (
+            v_buf.shape != (*lead_shape, n)
+            or v_buf.device != A.device
+            or v_buf.dtype != A.dtype
+        )
+    ):
+        v_buf = None
+
+    if v_buf is None:
+        v = torch.randn(batch, n, device=A.device, dtype=A.dtype, generator=generator)
+    else:
+        v = v_buf.reshape(batch, n)
+
+    v.div_(v.norm(dim=1, keepdim=True) + 1e-8)
     for _ in range(iters):
         u = torch.bmm(A_flat, v.unsqueeze(-1)).squeeze(-1)
         u = u / (u.norm(dim=1, keepdim=True) + 1e-8)
-        v = torch.bmm(A_flat.mT, u.unsqueeze(-1)).squeeze(-1)
-        v = v / (v.norm(dim=1, keepdim=True) + 1e-8)
+        v_new = torch.bmm(A_flat.mT, u.unsqueeze(-1)).squeeze(-1)
+        v_new = v_new / (v_new.norm(dim=1, keepdim=True) + 1e-8)
+        if v_buf is None:
+            v = v_new
+        else:
+            v.copy_(v_new)
     sigma = torch.bmm(A_flat, v.unsqueeze(-1)).squeeze(-1).norm(dim=1)
     return sigma.view(*lead_shape)
 
@@ -165,7 +203,13 @@ def _turbo_muon_polar(B: Tensor, ns_iters: int = 4) -> Tensor:
     return X
 
 
-def approx_polar(B: Tensor, backend: str = "baseline", ns_iters: int = 4) -> Tensor:
+def approx_polar(
+    B: Tensor,
+    backend: str = "baseline",
+    ns_iters: int = 4,
+    generator: Optional[torch.Generator] = None,
+    v_buf: Optional[Tensor] = None,
+) -> Tensor:
     """
     Approximate polar factor U for B ≈ U H with ||U||_op ≈ 1.
     backend:
@@ -180,7 +224,7 @@ def approx_polar(B: Tensor, backend: str = "baseline", ns_iters: int = 4) -> Ten
         raise ValueError(f"Unknown polar backend: {backend}")
 
     U = U.float()
-    sigma_max = power_iteration_smax(U, iters=1)
+    sigma_max = power_iteration_smax(U, iters=1, generator=generator, v_buf=v_buf)
     U = U / (sigma_max[..., None, None] + 1e-8)
     return U
 
@@ -190,11 +234,13 @@ def muon_like_spectral_update(
     lr_spec_base: float,
     backend: str = "baseline",
     ns_iters: int = 4,
+    generator: Optional[torch.Generator] = None,
+    v_buf: Optional[Tensor] = None,
 ) -> Tensor:
     """
     Plain Muon-style spectral update.
     """
-    U = approx_polar(B, backend=backend, ns_iters=ns_iters)
+    U = approx_polar(B, backend=backend, ns_iters=ns_iters, generator=generator, v_buf=v_buf)
     m, n = int(U.size(-2)), int(U.size(-1))
     shape_scale = math.sqrt(max(1.0, float(m) / max(1.0, float(n))))
     return -lr_spec_base * shape_scale * U
@@ -302,6 +348,9 @@ class Muon(Optimizer):
         self.ns_iters = int(ns_iters)
 
         self._step_count: int = 0
+        self._turbo_rng: Optional[torch.Generator] = None
+        self._turbo_rng_state: Optional[Tensor] = None
+        self._turbomuon_warmstart_smax: bool = False
 
         # Muon constraint: spectral parameters must be bfloat16
         for group in self.param_groups:
@@ -317,6 +366,55 @@ class Muon(Optimizer):
                             "Put non-bfloat16 or non-2D parameters into a param group "
                             "with spectral=False to use pure AdamW."
                         )
+
+    def _get_turbo_rng(self, device: torch.device) -> torch.Generator:
+        if self._turbo_rng is not None:
+            return self._turbo_rng
+
+        gen = torch.Generator(device=device)
+        base_seed = int(torch.initial_seed())
+        seed = (base_seed + 1000003 * int(self.rank)) & 0xFFFFFFFFFFFFFFFF
+        gen.manual_seed(seed)
+
+        if self._turbo_rng_state is not None:
+            state_cpu = self._turbo_rng_state.detach().to(device="cpu")
+            gen.set_state(state_cpu)
+            self._turbo_rng_state = None
+
+        self._turbo_rng = gen
+        return gen
+
+    def set_turbomuon_warmstart_smax(self, enabled: bool) -> None:
+        self._turbomuon_warmstart_smax = bool(enabled)
+
+    def state_dict(self) -> Dict[str, Any]:
+        out = super().state_dict()
+        if not out.get("param_groups"):
+            return out
+
+        turbo_state: Optional[Tensor] = None
+        if self._turbo_rng is not None:
+            turbo_state = self._turbo_rng.get_state()
+        elif self._turbo_rng_state is not None:
+            turbo_state = self._turbo_rng_state
+
+        if turbo_state is not None:
+            out["param_groups"][0]["turbo_rng_state"] = turbo_state.detach().to(device="cpu")
+
+        return out
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        turbo_state: Optional[Tensor] = None
+        try:
+            param_groups = state_dict.get("param_groups", [])
+            if param_groups:
+                turbo_state = param_groups[0].get("turbo_rng_state")
+        except Exception:
+            turbo_state = None
+
+        super().load_state_dict(state_dict)
+        self._turbo_rng = None
+        self._turbo_rng_state = turbo_state
 
     @torch.no_grad()
     def step(self, closure: Optional[Any] = None) -> Optional[Tensor]:
@@ -543,11 +641,22 @@ class Muon(Optimizer):
         M.mul_(beta1_spec).add_(g32, alpha=1.0 - beta1_spec)
         state["M"] = M
 
+        turbo_gen = self._get_turbo_rng(device=p.device)
+        v_buf = None
+        if self._turbomuon_warmstart_smax:
+            v_buf = state.get("pi_v")
+            if v_buf is None:
+                v_shape = (*p.shape[:-2], int(p.size(-1)))
+                v_buf = torch.randn(v_shape, device=p.device, dtype=torch.float32, generator=turbo_gen)
+                state["pi_v"] = v_buf
+
         spec_dir = muon_like_spectral_update(
             M,
             lr_spec_base=lr_spec,
             backend="turbo",
             ns_iters=self.ns_iters,
+            generator=turbo_gen,
+            v_buf=v_buf,
         )
 
         if weight_decay != 0.0:

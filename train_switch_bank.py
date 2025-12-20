@@ -160,6 +160,7 @@ class Hyperparameters:
     muon_momentum: float = 0.95
     muon_ns_iters: int = 4
     use_turbo_muon: bool = True
+    turbo_muon_warmstart_smax_start_frac: float = 0.725  # <0 disables; >=0 enables warm-started sigma-max (near end)
     # architecture
     vocab_size = 50257
     model_dim = 896
@@ -207,8 +208,8 @@ class Hyperparameters:
     router_logit_cap_final = 20.0
     router_logit_cap_delta_steps = 390 # ramp length after second expert activation
     # Optional Gumbel exploration (off by default)
-    router_use_gumbel = True
-    router_gumbel_schedule: tuple[tuple[int, int], ...] =  ((200, 1175), (1225, 1300), (1425, 1900), (2400, 2425), (2725, 2750), (2925, 2950), (3200, 3225), (3475, 3500), (3925, -1))  # ensure ~250 active before end
+    router_use_gumbel = True #(try comment 2725+ or 2400+ if diverges early - checkpoint around then, and if needed try only 3200+ ... can do 2400 [chkpt], then 2725 [chkpt], then 3200)
+    router_gumbel_schedule: tuple[tuple[int, int], ...] = ((200, 1175), (1225, 1300), (1425, 1900), (2400, 2425), (2725, 2750), (2925, 2950), (3200, 3225), (3425, 3500), (3925, -1))  # ensure ~250 active before end
     # Layerwise router temp & lb boosts.
     router_boost_shape = "peak"  # options: peak (default), valley, linear_start, linear_end
     router_temp_boost = 0.2
@@ -218,7 +219,7 @@ class Hyperparameters:
     val_loss_every = 250 #125  # 0 for only at end
     save_final_checkpoint = False
     checkpoint_save_step: int = -1  # -1 disables mid-training save
-    resume_checkpoint: str | None = None #"./logs/375/state_step000375.pt"
+    resume_checkpoint: str | None = None
     use_wandb = True
     wandb_project = "switch-bank-long"
     wandb_run_name = ""

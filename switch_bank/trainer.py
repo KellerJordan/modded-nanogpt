@@ -123,6 +123,12 @@ def run_training(
     logit_cap_decay_logged = False
     lm_head_untie_step = untie_lm_head_after
     lm_head_untied_logged = lm_head_untie_step < 0
+    turbo_muon_warmstart_prev: bool | None = None
+    turbo_muon_warmstart_start_step: int | None = None
+    warmstart_start_frac = float(getattr(args, "turbo_muon_warmstart_smax_start_frac", -1.0))
+    if warmstart_start_frac >= 0:
+        turbo_muon_warmstart_start_step = int(warmstart_start_frac * train_steps)
+        turbo_muon_warmstart_start_step = min(max(turbo_muon_warmstart_start_step, 0), train_steps)
 
     def run_validation(val_steps_multiplier: int, log_val_loss: bool, extra_log: dict | None = None, log_to_wandb: bool = True):
         nonlocal training_time_ms, t0
@@ -190,6 +196,14 @@ def run_training(
 
     for step in range(start_step, train_steps + 1):
         last_step = (step == train_steps)
+        turbo_muon_warmstart_now = (
+            turbo_muon_warmstart_start_step is not None and step >= turbo_muon_warmstart_start_step
+        )
+        if turbo_muon_warmstart_prev is None or turbo_muon_warmstart_now != turbo_muon_warmstart_prev:
+            for opt in optimizers:
+                if hasattr(opt, "set_turbomuon_warmstart_smax"):
+                    opt.set_turbomuon_warmstart_smax(turbo_muon_warmstart_now)
+            turbo_muon_warmstart_prev = turbo_muon_warmstart_now
         window_blocks = get_window_size_blocks(args, step)
         progress = step / max(train_steps, 1)
         gumbel_now = gumbel_active(args, step)
