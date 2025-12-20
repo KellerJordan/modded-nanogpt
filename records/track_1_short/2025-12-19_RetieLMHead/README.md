@@ -2,7 +2,7 @@ This record reties the LM Head with the first embed and tunes some of the FP8 Sc
 
 ## Timing and Validation
 
-This record has 55 fewer steps than the previous record and approximately the same step time.
+This record has 55 fewer steps than the previous record at approximately the same step time.
 
 ```
 import scipy.stats
