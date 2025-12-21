@@ -57,6 +57,7 @@ pip install torch==2.10.0.dev20251204+cu126 --index-url https://download.pytorch
 python data/cached_fineweb10B.py 9
 ./run.sh
 ```
+Add torchrun to path if ./run.sh gives error `torchrun: command not found`.
 
 **Note: torch.compile will add around 7 minutes of latency the first time you run the code.**
 
