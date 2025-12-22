@@ -11,7 +11,7 @@ Thanks to the efforts of many contributors, this repo now contains a training al
 This improvement in training speed has been brought about by the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU²
 * The Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[repo](https://github.com/KellerJordan/Muon)]
-* Untie head from embedding, use FP8 matmul for head, and softcap logits (the latter following Gemma 2)
+* Use FP8 matmul for head, and softcap logits (the latter following Gemma 2)
 * Initialization of projection and classification layers to zero (muP-like)
 * Skip connections from embedding to every block as well as from block 4 to 7
 * Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
@@ -144,7 +144,8 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 47 | 2.193 minutes | [Multiply attn lambda with weight instead of data, fix warmup](https://x.com/classiclarryd/status/1999630732814348451) | 12/10/25 | [log](records/track_1_short/2025-12-10_SALambdaOnWeights/15ef5eaf-56e1-40e1-9ddf-af010027c9dd.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/166) | @roeeshenberg
 48 | 2.170 minutes | [Speed up Muon, additional pre-multiply lambda, reshape matrices, update lr, update NorMuon axis](https://x.com/classiclarryd/status/2000272495644152317) | 12/11/25 | [log](records/track_1_short/2025-12-11_NorMuonOptimsAndFixes/82edf6be-f343-475d-b93a-47c32acf4de2.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/168) | @ChrisJMcCormick
 49 | 2.146 minutes | [Partial Key Offset](https://x.com/classiclarryd/status/2000841339299402142) | 12/14/25 | [log](records/track_1_short/2025-12-14_PartialKeyOffset/150d40bf-c20b-4568-aac9-26eb919e25fd.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/169) | @classiclarryd
-50 | 2.128 minutes | [Extend Cautious Weight Decay to Adam Parameters](https://x.com/classiclarryd/status/2002482925741486381) | 12/18/25 | [log](records/track_1_short/2025-12-18_CautiousWDAdam/1981d492-bc65-4ba9-a0fa-2b30fc5c3eba.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/172) | @roeeshenberg
+50 | 2.128 minutes | [Extend Cautious Weight Decay to Adam parameters](https://x.com/classiclarryd/status/2002482925741486381) | 12/18/25 | [log](records/track_1_short/2025-12-18_CautiousWDAdam/1981d492-bc65-4ba9-a0fa-2b30fc5c3eba.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/172) | @roeeshenberg
+51 | 2.075 minutes | Retie Embed to lm_head, retune fp8 scales | 12/19/25 | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/175) | @varunneal
 ## Rules
 
 New records must:
