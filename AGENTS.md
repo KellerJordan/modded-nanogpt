@@ -1,5 +1,8 @@
 ## Overview
 - Entry point: `train_switch_bank.py` orchestrates distributed setup, logging, and environment flags. It captures source for reproducibility via the top-level `code` string and patches Torch Inductor's `trace_structured` to be metadata-tolerant while logging compiled filenames.
+- Optuna wrapper: `optuna_router_tune.py` runs single-GPU tuning over router temp/logit-cap schedules by calling `train_switch_bank.run_training` with overrides; it reuses the compiled model across trials and early-stops after the logit-cap ramp for a validation+logit score (loss normalized to a reference step), logging per-run metrics to its own wandb project plus an overview project.
+- Backfill helper: `optuna_overview_backfill.py` can repopulate the overview wandb run from `optuna_results/trial_*.json` without duplicating logged trials.
+- Loss calibration: `loss_adjustment.py` builds `optuna_results/loss_adjustment.json` from W&B val/loss history, fitting a global floor and bucketized (A,p) curves; other Optuna helpers read this file to adjust losses.
 - Focus of the repo: a sideways MoE GPT variant where each transformer layer routes to a shared bank of FFN experts. Non-standard optimizations include Muon (hybrid AdamW + Muon/TurboMuon spectral optimizer) for 2D+ bf16 matrices, FlexAttention, router feature EMAs (with clamped/strided alphas), router temperature/logit-cap schedules, optional router Gumbel noise, adapter support on routers, configurable router boost shapes, router/FFN freeze controls, and mid-training checkpoint/resume.
 - Ignore/never touch: any `*_original*.py` or `train_gpt_*.py` files unless explicitly requested.
 
@@ -35,5 +38,6 @@
 - Preserve numeric parity: keep helper call order, defaults, and routing logic unchanged when modifying modules.
 - When logging or reproducing runs, ensure `code` aggregation and the Inductor trace patch in `train_switch_bank.py` stay aligned with module contents.
 - Hyperparameters live in `Hyperparameters` (train_switch_bank.py); adjust, and keep `compute_train_micro_len` block alignment intact.
+- `train_switch_bank.run_training` supports single-GPU execution, env JSON overrides (`SWB_OVERRIDES_JSON`/`SWITCH_BANK_OVERRIDES_JSON`), early-stop validation, and reuse-state caching for compile/warmup in wrappers.
 - Use `switch_bank/trainer.py` for any training-loop changes; keep `train_switch_bank.py` as orchestration only and respect logging gates (`enable_extra_logging`, `enable_extra_wandb_logging`).
 - When making or reverting changes that affect behavior, logging, checkpointing, or instructions, update `AGENTS.md` accordingly.

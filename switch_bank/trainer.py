@@ -85,6 +85,51 @@ def gumbel_active(args, step: int):
     return False
 
 
+def _update_logit_stats(logit_stats: dict[str, float], max_logit: float, logit_cap: float | None):
+    if logit_cap is None or logit_cap <= 0 or math.isnan(logit_cap):
+        return
+    if math.isnan(max_logit) or math.isinf(max_logit):
+        return
+    ratio = max_logit / logit_cap if logit_cap > 0 else float("nan")
+    if math.isnan(ratio) or math.isinf(ratio):
+        return
+    ratio = min(max(ratio, 0.0), 1.5)
+    logit_stats["count"] += 1.0
+    logit_stats["sum_ratio"] += ratio
+    if ratio >= 0.98:
+        logit_stats["cap_hits"] += 1.0
+    if ratio > logit_stats["max_ratio"]:
+        logit_stats["max_ratio"] = ratio
+
+
+def _finalize_logit_stats(logit_stats: dict[str, float]) -> dict[str, float]:
+    count = int(logit_stats.get("count", 0.0))
+    if count <= 0:
+        return {
+            "logit_cap_steps": 0.0,
+            "logit_cap_hit_rate": float("nan"),
+            "logit_cap_ratio_mean": float("nan"),
+            "logit_cap_ratio_max": float("nan"),
+            "logit_headroom_mean": float("nan"),
+            "logit_score": float("nan"),
+        }
+    mean_ratio = logit_stats.get("sum_ratio", 0.0) / max(count, 1)
+    cap_hit_rate = logit_stats.get("cap_hits", 0.0) / max(count, 1)
+    ratio_target = 0.85
+    ratio_score = 1.0 - abs(mean_ratio - ratio_target) / max(ratio_target, 1e-8)
+    ratio_score = min(max(ratio_score, 0.0), 1.0)
+    logit_score = 0.7 * (1.0 - cap_hit_rate) + 0.3 * ratio_score
+    logit_score = min(max(logit_score, 0.0), 1.0)
+    return {
+        "logit_cap_steps": float(count),
+        "logit_cap_hit_rate": float(cap_hit_rate),
+        "logit_cap_ratio_mean": float(mean_ratio),
+        "logit_cap_ratio_max": float(logit_stats.get("max_ratio", 0.0)),
+        "logit_headroom_mean": float(1.0 - mean_ratio),
+        "logit_score": float(logit_score),
+    }
+
+
 def run_training(
     args,
     model: nn.Module,
@@ -105,6 +150,8 @@ def run_training(
     log_param_counts_fn=None,
     start_step: int = 0,
     checkpoint_save_step: int = -1,
+    early_stop_step: int | None = None,
+    early_stop_val_multiplier: int = 1,
 ):
     training_time_ms = 0
     approx_step_time_ms_resume = getattr(args, "approx_step_time_ms", None)
@@ -119,6 +166,8 @@ def run_training(
     dist.barrier()
     t0 = time.perf_counter()
     train_steps = args.num_iterations
+    stop_step = train_steps if early_stop_step is None else min(train_steps, early_stop_step)
+    last_val_loss: float | None = None
     gumbel_prev_state = gumbel_active(args, start_step - 1) if start_step > 0 else gumbel_active(args, 0)
     logit_cap_decay_logged = False
     lm_head_untie_step = untie_lm_head_after
@@ -130,8 +179,10 @@ def run_training(
         turbo_muon_warmstart_start_step = int(warmstart_start_frac * train_steps)
         turbo_muon_warmstart_start_step = min(max(turbo_muon_warmstart_start_step, 0), train_steps)
 
+    logit_stats = {"count": 0.0, "sum_ratio": 0.0, "cap_hits": 0.0, "max_ratio": 0.0}
+
     def run_validation(val_steps_multiplier: int, log_val_loss: bool, extra_log: dict | None = None, log_to_wandb: bool = True):
-        nonlocal training_time_ms, t0
+        nonlocal training_time_ms, t0, last_val_loss
         dist.barrier()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         print0("Running validation...")
@@ -151,6 +202,7 @@ def run_training(
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_scalar = float(val_loss.detach().item())
+        last_val_loss = val_scalar
         print0(
             f"step:{step}/{train_steps} val_loss:{val_scalar:.6f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms",
             console=True)
@@ -195,7 +247,8 @@ def run_training(
                     }
 
     for step in range(start_step, train_steps + 1):
-        last_step = (step == train_steps)
+        final_step = (step == train_steps)
+        last_step = (step == stop_step)
         turbo_muon_warmstart_now = (
             turbo_muon_warmstart_start_step is not None and step >= turbo_muon_warmstart_start_step
         )
@@ -226,10 +279,22 @@ def run_training(
             lm_head_untied_logged = True
 
         if last_step or (step > 0 and args.val_loss_every > 0 and step % args.val_loss_every == 0):
-            val_steps_multiplier = 7 if last_step else 1
-            run_validation(val_steps_multiplier, log_val_loss=True)
+            if last_step and final_step:
+                val_steps_multiplier = 7
+            elif last_step:
+                val_steps_multiplier = max(int(early_stop_val_multiplier), 1)
+            else:
+                val_steps_multiplier = 1
+            extra_log = None
+            if last_step:
+                extra_log = _finalize_logit_stats(logit_stats)
+            run_validation(val_steps_multiplier, log_val_loss=True, extra_log=extra_log)
+            if last_step and not final_step:
+                result = {"val_loss": last_val_loss, "stop_step": step, "aborted": False}
+                result.update(_finalize_logit_stats(logit_stats))
+                return result
 
-        if last_step:
+        if last_step and final_step:
             if master_process and getattr(args, "save_final_checkpoint", getattr(args, "save_checkpoint", False)):
                 model_to_save = getattr(model, "_orig_mod", model)
                 log = dict(step=step, code=code, model=model_to_save.state_dict())
@@ -349,7 +414,9 @@ def run_training(
         if abort_tensor.item() > 0:
             if abort_reason and master_process:
                 print0(f"Aborting training at step {step} due to: {abort_reason}", console=True)
-            break
+            result = {"val_loss": last_val_loss, "stop_step": step, "aborted": True, "abort_reason": abort_reason}
+            result.update(_finalize_logit_stats(logit_stats))
+            return result
 
         opt2futures = {
             opt: [dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
@@ -448,6 +515,8 @@ def run_training(
             console=True)
         current_logit_cap = get_logit_cap(args, step)
         current_router_temp = get_router_temp(args, step)
+        max_logit_val = router_step_summary.get("max_logit", float("nan")) if router_step_summary else float("nan")
+        _update_logit_stats(logit_stats, max_logit_val, current_logit_cap)
         active_count_val = None
         if expert_active is not None:
             active_count_val = float(expert_active.mean().item() * args.num_experts)
@@ -640,4 +709,6 @@ def run_training(
             )
             torch.save(checkpoint_payload, f"logs/{run_id_full}/state_step{step:06d}.pt")
 
-    return None
+    result = {"val_loss": last_val_loss, "stop_step": stop_step, "aborted": False}
+    result.update(_finalize_logit_stats(logit_stats))
+    return result
