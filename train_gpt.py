@@ -1640,7 +1640,7 @@ for step in range(train_steps + 1):
                 val_loss += model(inputs, targets, cum_seqlens, ws_short, ws_long)
         val_loss /= val_steps
         del val_loader
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)               
+        dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
