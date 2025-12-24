@@ -19,7 +19,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 
 torch.empty(
-    1, device="cuda", requires_grad=True
+    1, device=f"cuda:{os.environ['LOCAL_RANK']}", requires_grad=True
 ).backward()  # prevents a bug on some systems
 import torch._dynamo as dynamo
 import torch.distributed as dist
