@@ -756,11 +756,23 @@ class DistAdam(torch.optim.Optimizer):
             )
         else:
             rank_size = grad.shape[0] // self.world_size
-            grad_slice = torch.empty_like(grad[:rank_size])
-            self._reduce_scatter_futures[param] = (
-                dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future(),
-                grad_slice
-            )
+            if grad is not None:
+                grad_slice = torch.empty_like(grad[:rank_size])
+                self._reduce_scatter_futures[param] = (
+                    dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future(),
+                    grad_slice
+                )
+
+    def copy_lm_to_embed(self):
+        # run at 2/3 of training
+        lm_head = self.param_groups[0]['params'][0]
+        embed = self.param_groups[-1]['params'][0]
+        lm_head_state = self.state[lm_head]
+        embed_state = self.state[embed]
+        embed_state['step'] = lm_head_state['step']
+        embed_state['exp_avg'] = lm_head_state['exp_avg'].clone()
+        embed_state['exp_avg_sq'] = lm_head_state['exp_avg_sq'].clone()
+        embed.data.copy_(lm_head.data)
 
     @torch.compile
     @torch.no_grad()
@@ -805,7 +817,7 @@ class DistAdam(torch.optim.Optimizer):
                 step_size = lr * (bias2 ** 0.5 / bias1)
                 update = exp_avg.div(denom).mul_(step_size)
                 # cautious weight decay
-                mask = (update * p_slice) >= 0
+                mask = (update * p_slice) > 0
                 # lr as weight decay schedule
                 eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
                 update.addcmul_(p_slice, mask, value=eff_weight_decay * lr)
@@ -916,7 +928,7 @@ class CausalSelfAttention(nn.Module):
         self.hdim = num_heads * head_dim
 
         assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
-        std = 0.5 * (self.dim ** -0.5)
+        std = self.dim ** -0.5
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
         # merged QKVO weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
@@ -1037,12 +1049,15 @@ class GPT(nn.Module):
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
         self.lm_head.weight.label = 'lm_head'
 
+        self.embed = nn.Embedding(vocab_size, model_dim)
+        self.embed.weight.label = 'embed'
+
         # x0_lambdas separated out for different optimizer treatment (no beta smoothing)
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
         self.x0_lambdas.label = 'x0_lambdas'
         self.x0_lambdas.lr_mul = 5.0
         self.x0_lambdas.wd_mul = 0.0
-        
+
         pad = (-num_layers * 3 - 3) % dist.get_world_size()  # updated: 3*num_layers instead of 4*
         self.scalars = nn.Parameter(
             torch.cat(
@@ -1064,7 +1079,9 @@ class GPT(nn.Module):
         self.scalars.lr_mul = 5.0
         self.scalars.wd_mul = 0.0
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws_short: int, ws_long: int):
+        self.split_embed = False
+
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws_short: int, ws_long: int, mtp_weights: Tensor = None):
         assert input_seq.ndim == 1
 
         # set configs
@@ -1076,7 +1093,7 @@ class GPT(nn.Module):
 
         # set lambdas
         resid_lambdas = self.scalars[: 1 * self.num_layers]
-        x0_lambdas = self.x0_lambdas  
+        x0_lambdas = self.x0_lambdas
         sa_lambdas = self.scalars[1 * self.num_layers: 3 * self.num_layers].view(-1, 2)
         smear_lambda = self.scalars[3 * self.num_layers]
         backout_lambda = self.scalars[3 * self.num_layers+1]
@@ -1089,8 +1106,11 @@ class GPT(nn.Module):
         assert len(bm_sizes) == self.num_layers
         key_shift = [b==long_bm for b in bm_sizes] # apply key shift to long windows
 
-        # weight-tied: use lm_head.weight for embedding lookup
-        x = F.embedding(input_seq, self.lm_head.weight)
+        # weight-tied: use lm_head.weight for embedding lookup (or separate embed after split)
+        if self.split_embed:
+            x = self.embed(input_seq)
+        else:
+            x = F.embedding(input_seq, self.lm_head.weight)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
         # dropping first layer updates this to .12 ... 012
@@ -1133,11 +1153,21 @@ class GPT(nn.Module):
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / 7.5)
         logits_for_loss = logits.float() if not self.training else logits
-        loss = F.cross_entropy(
-            logits_for_loss.view(-1, logits_for_loss.size(-1)),
-            target_seq,
-            reduction="sum" if self.training else "mean",
-        )
+
+        n_predict = mtp_weights.size(0) if mtp_weights is not None else 1
+        if self.training and n_predict > 1:
+            # Multi-token prediction: take loss of the weighted average of next n_predict tokens
+            logits_flat = logits_for_loss.view(-1, logits_for_loss.size(-1))
+            idx = F.pad(target_seq, (0, n_predict - 1)).unfold(0, n_predict, 1)  # [T, n_predict] of shifted targets
+            target_logits = logits_flat.gather(1, idx)
+            cross_entropy = torch.logsumexp(logits_flat, dim=-1).unsqueeze(1) - target_logits
+            for k in range(1, n_predict):  # zero out preds past end of sequence
+                cross_entropy[-k:, k] = 0
+            loss = (cross_entropy * mtp_weights).sum()
+        elif self.training:
+            loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="sum")
+        else:
+            loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
         return loss
 
 # -----------------------------------------------------------------------------
@@ -1335,11 +1365,12 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 1960  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1880  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.55  # fraction of num_scheduled_iterations spent cooling down the learning rate
     transition_steps: int = 40  # steps to pause scalar optimizer during batch size/ws transitions
+    split_embed_frac: float = 2/3  # fraction of training when embeddings split from lm_head
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
@@ -1411,7 +1442,7 @@ for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
 # collect the parameters to optimize
-adam_labels = ['lm_head', 'value_embed', 'smear_gate', 'x0_lambdas']
+adam_labels = ['lm_head', 'value_embed', 'smear_gate', 'x0_lambdas', 'embed']
 scalar_labels = ['scalars']
 muon_labels = ['attn_gate', 'attn', 'mlp']
 muon_group_sizes = [10, 16, 16]
@@ -1430,7 +1461,7 @@ adam_optimizers = [
     DistAdam(adam_params, adam_labels, lr=0.008, betas=(0.65, 0.95), eps=1e-8, weight_decay=0.005),
     DistAdam(scalar_params, scalar_labels, lr=0.008, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.005),  # higher betas for smoothing
 ]
-muon_optimizers = [NorMuon(muon_params, muon_labels, muon_group_sizes,lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2)]
+muon_optimizers = [NorMuon(muon_params, muon_labels, muon_group_sizes, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2)]
 optimizers = adam_optimizers + muon_optimizers
 for opt in optimizers:
     for group in opt.param_groups:
@@ -1443,9 +1474,9 @@ def get_lr(step: int):
     lr_max = 1.0
     x = step / args.num_scheduled_iterations
     if x > 1/3:
-       lr_max = 1.51  # (16/8)**0.6
+       lr_max = 1.52  # (16/8)**0.6
     if x > 2/3:
-        lr_max = 1.93  # (24/8)**0.6
+        lr_max = 1.73  # (24/8)**0.5
     if x >= 1 - args.cooldown_frac:
         w = (1 - x) / args.cooldown_frac
         lr = lr_max * w + (1 - w) * 0.1
@@ -1485,23 +1516,36 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
         momentum = momentum_max
     return momentum
 
+# Precompute MTP weights for all steps to avoid tensor allocation during training
+# Schedule: [1, 0.5, 0.25->0] -> [1, 0.5->0] -> [1]
+mtp_weights_schedule = []
+for s in range(args.num_iterations + 1):
+    x = s / args.num_scheduled_iterations
+    if x < 1/3:
+        w = [1.0, 0.5, 0.25 * (1 - 3*x)]
+    elif x < 2/3:
+        w = [1.0, 0.5 * (1 - (3*x - 1))]
+    else:
+        w = [1.0]
+    mtp_weights_schedule.append(torch.tensor(w, device=device))
+
 def step_optimizers(step: int, optimizers, model, start_transition: bool):
     # update lr
     for optimizer in optimizers:
         for group in optimizer.param_groups:
             group["lr"] = group["initial_lr"] * get_lr(step)
-    
+
     # Initialize transition counter if needed
     if start_transition:
         adam_optimizers[1].transition_steps = args.transition_steps
-    
+
     # Check if we are currently in a transition
     steps_remaining = getattr(adam_optimizers[1], 'transition_steps', 0)
     in_transition = steps_remaining > 0
-    
+
     if in_transition:
         adam_optimizers[1].transition_steps -= 1
-            
+
     # set muon momentum based on step
     momentum = get_muon_momentum(step)
     for opt in muon_optimizers:
@@ -1545,6 +1589,7 @@ model.train()
 model.yarn.reset()
 assert len(ws_schedule) == len(bs_schedule), "This warmup assumes len(ws_schedule) == len(bs_schedule)"
 
+base_weights = torch.tensor([1.0, 0.5, 0.25], device=device)
 for idx in range(len(ws_schedule)):
     send_args = None
     if idx != 0:
@@ -1552,11 +1597,13 @@ for idx in range(len(ws_schedule)):
         model.yarn.apply(ws_long, new_ws_long)
         ws_long = new_ws_long
         send_args = (bs_schedule[idx], args.train_max_seq_len, grad_accum_steps)
+    mtp_weights = base_weights[:max(1, 3 - idx)].clone()
+    model.split_embed = (idx >= args.split_embed_frac * len(args.ws_schedule))
     for step in range(warmup_steps):
         inputs, targets, cum_seqlens = train_loader.send(send_args)
         if step % 2 == 1:
             for opt in adam_optimizers: opt.should_sync = True
-        model(inputs, targets, cum_seqlens, ws_long//2, ws_long).backward()
+        (model(inputs, targets, cum_seqlens, ws_long//2, ws_long, mtp_weights) / grad_accum_steps).backward()
         if step % 2 == 0:
             for opt in muon_optimizers: opt.step(), opt.zero_grad(set_to_none=True)
         else:
@@ -1583,6 +1630,7 @@ with torch.no_grad():
             new_ws_long = ws_schedule[ws_idx]
             model.yarn.apply(ws_long, new_ws_long)
             ws_long = new_ws_long
+        model.split_embed = (ws_idx >= 1)
         val_loss += model(inputs, targets, cum_seqlens, ws_long // 2, ws_long)
 
 del val_loader, val_loss
@@ -1593,6 +1641,8 @@ model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
 del train_loader, initial_state
+model.split_embed = False
+
 
 
 ########################################
@@ -1610,6 +1660,7 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
+split_step = math.ceil(args.split_embed_frac * args.num_scheduled_iterations)
 ws_short, ws_long = get_ws(0)
 
 for step in range(train_steps + 1):
@@ -1620,6 +1671,8 @@ for step in range(train_steps + 1):
         model.yarn.apply(ws_long, new_ws_long)
         ws_long=new_ws_long
         is_transition = True
+    if step == split_step:
+        model.split_embed = True
 
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
@@ -1659,18 +1712,22 @@ for step in range(train_steps + 1):
     new_step_batch_size = get_bs(step)
     send_args = None
     if new_step_batch_size != step_batch_size:
-        send_args = (new_step_batch_size, args.train_max_seq_len, grad_accum_steps) 
+        send_args = (new_step_batch_size, args.train_max_seq_len, grad_accum_steps)
         is_transition = True
-            
+
     step_batch_size = new_step_batch_size
+    mtp_weights = mtp_weights_schedule[step]
     for idx in range(grad_accum_steps):
         # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
         if idx == grad_accum_steps - 1 and step % 2 == 1:
             for opt in adam_optimizers: opt.should_sync = True
         inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, ws_short, ws_long) / grad_accum_steps).backward()
+        (model(inputs, targets, cum_seqlens, ws_short, ws_long, mtp_weights) / grad_accum_steps).backward()
     step_optimizers(step, optimizers, model, is_transition)
-    
+    # copy lm_head weights/state to embed before split
+    if step == (split_step - 2) | 1:
+        adam_optimizers[0].copy_lm_to_embed()
+
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
