@@ -28,6 +28,8 @@ This improvement in training speed has been brought about by the following techn
 * Batch size schedule
 * Partial Key Offset
 * Partial model freezing during batch size and sliding window size transitions
+* Multi token prediction
+* Untie embed and lm_head at 2/3 of training
 
 As well as many systems optimizations.
 
@@ -148,6 +150,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 50 | 2.128 minutes | [Extend Cautious Weight Decay to Adam parameters](https://x.com/classiclarryd/status/2002482925741486381) | 12/18/25 | [log](records/track_1_short/2025-12-18_CautiousWDAdam/1981d492-bc65-4ba9-a0fa-2b30fc5c3eba.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/172) | @roeeshenberg
 51 | 2.075 minutes | [Retie Embed to lm_head, retune fp8 scales](https://x.com/classiclarryd/status/2003167208483209668) | 12/19/25 | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/175) | @varunneal
 52 | 2.037 minutes | Smooth scalars via beta increase, decrease smear gate lr, freeze scalars during transitions, adam all reduce  | 12/21/25 | [log](records/track_1_short/2025-12-21_SmoothedScalars/12-21-Smoothed-Scalars/0bc6e909-8ee8-4ae3-ac62-0070e151a808.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/177) | @ChrisJMcCormick
+53 | 1.988 minutes | Multi-token prediction, untie embed/lm_head at 2/3 training, lr update, tweak CWD  | 12/22/25 | [log](records/track_1_short/2025-12-22_MultiTokenPrediction/17aaf854-f338-4d0d-9767-a5db30fd7980.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/178) | @varunneal
 ## Rules
 
 New records must:
