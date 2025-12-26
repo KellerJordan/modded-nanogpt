@@ -47,7 +47,7 @@ from torch import nn
 import torch.distributed as dist
 torch._inductor.config.coordinate_descent_tuning = True   # allowed for medium track; false for rocm / single-GPU
 torch._functorch.config.donated_buffer = False
-torch._dynamo.config.compiled_autograd = True  # false for rocm / single-GPU
+torch._dynamo.config.compiled_autograd = False  # false for rocm / single-GPU
 
 
 #

@@ -70,10 +70,8 @@ class CausalSelfAttention(nn.Module):
         q = _sanitize(q)
         k = _sanitize(k)
         v = _sanitize(v)
-        # Keep flex_attention out of the Dynamo trace to avoid nested FX/Dynamo tracing.
-        with torch._dynamo.disable():
-            y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-                               block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                           block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
         y = _sanitize(y)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
         y = F.linear(y, self.qkvo_w[3])
