@@ -238,6 +238,7 @@ class Hyperparameters:
     save_final_checkpoint = True
     checkpoint_save_step: int = -1  # -1 disables mid-training save
     resume_checkpoint: str | None = None
+    log_dir: str = "records/track_2_medium/2025-12-26_SwitchBank"
     use_wandb = True
     wandb_project = "switch-bank-final-x2"
     wandb_run_name = ""
@@ -369,8 +370,9 @@ def run_training(
 
     if master_process:
         run_id_full = f"{run_id:03d}_{uuid.uuid4()}"
-        os.makedirs("logs", exist_ok=True)
-        logfile = f"logs/{run_id_full}.txt"
+        log_dir = args.log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        logfile = os.path.join(log_dir, f"{run_id_full}.txt")
         print(logfile)
     def print0(s, console=False):
         if master_process:
@@ -429,7 +431,7 @@ def run_training(
     expert_usage_headers: list[str] = []
     expert_active_headers: list[str] = []
     if master_process and run_id_full is not None and args.enable_extra_logging:
-        metrics_csv_path = f"logs/{run_id_full}_metrics.csv"
+        metrics_csv_path = os.path.join(args.log_dir, f"{run_id_full}_metrics.csv")
         metrics_csv_file = open(metrics_csv_path, "w", newline="")
         metrics_csv_writer = csv.writer(metrics_csv_file)
         expert_usage_headers = [f"expert_usage_e{i}" for i in range(args.num_experts)]

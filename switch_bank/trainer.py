@@ -154,6 +154,7 @@ def run_training(
     early_stop_val_multiplier: int = 1,
 ):
     training_time_ms = 0
+    log_dir = getattr(args, "log_dir", "logs")
     approx_step_time_ms_resume = getattr(args, "approx_step_time_ms", None)
     train_loader = distributed_data_generator(
         args.train_files,
@@ -313,8 +314,9 @@ def run_training(
             if master_process and getattr(args, "save_final_checkpoint", getattr(args, "save_checkpoint", False)):
                 model_to_save = getattr(model, "_orig_mod", model)
                 log = dict(step=step, code=code, model=model_to_save.state_dict())
-                os.makedirs(f"logs/{run_id_full}", exist_ok=True)
-                torch.save(log, f"logs/{run_id_full}/final_model_step{step:06d}.pt")
+                run_dir = os.path.join(log_dir, run_id_full)
+                os.makedirs(run_dir, exist_ok=True)
+                torch.save(log, os.path.join(run_dir, f"final_model_step{step:06d}.pt"))
             break
 
         model.zero_grad(set_to_none=True)
@@ -706,7 +708,8 @@ def run_training(
             ]
             metrics_csv_writer.writerow(row)
         if master_process and checkpoint_save_step >= 0 and step == checkpoint_save_step:
-            os.makedirs(f"logs/{run_id_full}", exist_ok=True)
+            run_dir = os.path.join(log_dir, run_id_full)
+            os.makedirs(run_dir, exist_ok=True)
             model_to_save = getattr(model, "_orig_mod", model)
             checkpoint_payload = dict(
                 step=step,
@@ -723,7 +726,7 @@ def run_training(
                     vocab_size=getattr(args, "vocab_size", None),
                 ),
             )
-            torch.save(checkpoint_payload, f"logs/{run_id_full}/state_step{step:06d}.pt")
+            torch.save(checkpoint_payload, os.path.join(run_dir, f"state_step{step:06d}.pt"))
 
     result = {"val_loss": last_val_loss, "stop_step": stop_step, "aborted": False}
     result.update(_finalize_logit_stats(logit_stats))
