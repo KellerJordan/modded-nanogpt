@@ -181,7 +181,7 @@ def run_training(
 
     logit_stats = {"count": 0.0, "sum_ratio": 0.0, "cap_hits": 0.0, "max_ratio": 0.0}
 
-    def run_validation(val_steps_multiplier: int, log_val_loss: bool, extra_log: dict | None = None, log_to_wandb: bool = True):
+    def run_validation(val_steps_multiplier: float, log_val_loss: bool, extra_log: dict | None = None, log_to_wandb: bool = True):
         nonlocal training_time_ms, t0, last_val_loss
         dist.barrier()
         training_time_ms += 1000 * (time.perf_counter() - t0)
@@ -191,7 +191,9 @@ def run_training(
         model.bank.k = int(args.topk if args.topk_val is None else max(1, min(args.topk_val, args.num_experts)))
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
-        val_steps = (args.val_tokens // val_batch_size) * val_steps_multiplier
+        base_steps = args.val_tokens // val_batch_size
+        val_steps = int(round(base_steps * float(val_steps_multiplier)))
+        val_steps = max(val_steps, 1)
         val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
         val_loss = 0
         with torch.no_grad():
@@ -282,7 +284,17 @@ def run_training(
             extra_log = None
             if last_step:
                 extra_log = _finalize_logit_stats(logit_stats)
-            run_validation(1, log_val_loss=True, extra_log=extra_log)
+            tokens_target = getattr(args, "val_tokens", None)
+            if final_step:
+                final_tokens = getattr(args, "val_tokens_final", None)
+                if final_tokens is not None:
+                    tokens_target = final_tokens
+            else:
+                intermediate_tokens = getattr(args, "val_tokens_intermediate", None)
+                if intermediate_tokens is not None:
+                    tokens_target = intermediate_tokens
+            val_steps_multiplier = float(tokens_target) / float(args.val_tokens)
+            run_validation(val_steps_multiplier, log_val_loss=True, extra_log=extra_log)
             if last_step and not final_step:
                 result = {"val_loss": last_val_loss, "stop_step": step, "aborted": False}
                 result.update(_finalize_logit_stats(logit_stats))
