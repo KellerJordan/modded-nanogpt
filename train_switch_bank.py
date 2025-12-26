@@ -145,7 +145,7 @@ class Hyperparameters:
     # data
     train_files = "data/fineweb10B/fineweb_train_*.bin"
     val_files = "data/fineweb10B/fineweb_val_*.bin"
-    val_tokens = 10485760 #32768 * 20
+    val_tokens = 10485760
     val_tokens_intermediate: int | None = 32768 * 20
     val_tokens_final: int | None = 10485760
     train_seq_len = 24*1024 #64*1024          # effective tokens per optimizer step per rank
