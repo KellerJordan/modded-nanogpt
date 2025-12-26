@@ -411,13 +411,21 @@ def print0(s, console=False):
             if console:
                 print(s)
             print(s, file=f)
-from torch._logging._internal import trace_structured # noqa: E402
+from torch._logging._internal import trace_structured as _orig_trace_structured # noqa: E402
 import torch._inductor.codecache # noqa: E402
 import torch._inductor.graph # noqa: E402
-def _patched_trace_structured(name, metadata_fn, **kwargs):
-    if name == "inductor_output_code":
-        print0(f"inductor_output_code: {metadata_fn().get("filename", "Unknown")}")
-    trace_structured(name, metadata_fn, **kwargs)
+def _patched_trace_structured(name, *args, **kwargs):
+    metadata_fn = kwargs.get("metadata_fn", None)
+    if metadata_fn is None and len(args) > 0 and callable(args[0]):
+        metadata_fn = args[0]
+    try:
+        if name == "inductor_output_code" and callable(metadata_fn):
+            md = metadata_fn()
+            filename = (md.get("filename", "Unknown") if isinstance(md, dict) else "Unknown")
+            print0(f"inductor_output_code: {filename}")
+    except Exception:
+        pass
+    return _orig_trace_structured(name, *args, **kwargs)
 torch._inductor.codecache.trace_structured = _patched_trace_structured
 torch._inductor.graph.trace_structured = _patched_trace_structured
 
