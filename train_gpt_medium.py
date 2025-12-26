@@ -5,7 +5,7 @@ with open(sys.argv[0]) as f:
 import uuid
 import time
 import copy
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -340,22 +340,6 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
         pos += batch_size
         yield inputs, targets
 
-def compute_train_micro_len(args: "Hyperparameters") -> int:
-    block = 128
-    if args.train_micro_seq_len is not None:
-        micro = int(args.train_micro_seq_len)
-    else:
-        denom = max(int(args.grad_accum_steps), 1)
-        approx = max(args.train_seq_len // denom, block)
-        approx = (approx // block) * block
-        if approx == 0:
-            approx = block
-        micro = approx
-    if micro % block != 0:
-        micro = max(block, (micro // block) * block)
-    micro = min(max(block, micro), args.train_seq_len)
-    return micro
-
 # -----------------------------------------------------------------------------
 # int main
 
@@ -366,32 +350,22 @@ class Hyperparameters:
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     train_seq_len = 64*1024 # FlexAttention sequence length
-    grad_accum_steps = 1
-    train_micro_seq_len: int | None = None
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 2000 #5960 # number of iterations to run
+    num_iterations = 5960 # number of iterations to run
     cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
     # architecture
     vocab_size = 50257
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
-    use_wandb: bool = True
-    wandb_project: str = "nanogpt-medium-1gpu"
-    wandb_run_name: str = ""
-    wandb_log_every: int = 25
 args = Hyperparameters()
 
 run_id = int(os.environ.get("RUN_ID", 0))
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == 1, "train_gpt_medium.py is intended for single-GPU runs"
-grad_accum_steps = max(1, int(args.grad_accum_steps))
-train_micro_len = compute_train_micro_len(args)
-effective_train_seq_len = train_micro_len * grad_accum_steps
-train_tokens_global = world_size * effective_train_seq_len
+assert world_size == 8 # this code is designed for 8xH100
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -432,26 +406,6 @@ def nvidia_smi():
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
 print0("="*100)
-print0(
-    f"train_micro_seq_len={train_micro_len} (block=128), "
-    f"grad_accum_steps={grad_accum_steps}, effective train_seq_len per rank={effective_train_seq_len}",
-    console=True,
-)
-print0(f"global tokens per optimizer step: {train_tokens_global}", console=True)
-
-wandb_run = None
-if args.use_wandb and os.environ.get("WANDB_DISABLED", "0").lower() not in ("1", "true", "yes") and master_process:
-    try:
-        import wandb  # type: ignore
-        wandb_run = wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name or f"{run_id:03d}",
-            config=asdict(args),
-        )
-        print0("wandb logging enabled.", console=True)
-    except Exception as err:
-        wandb_run = None
-        print0(f"wandb init failed ({err}); disabling wandb.", console=True)
 
 ########################################
 #    Construct model and optimizer     #
@@ -522,11 +476,8 @@ model: nn.Module = torch.compile(model, dynamic=False)
 warmup_steps = 10
 initial_state = copy.deepcopy(dict(model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers]))
 for _ in range(warmup_steps):
-    model.zero_grad(set_to_none=True)
-    for _ in range(grad_accum_steps):
-        inputs = targets = torch.randint(0, args.vocab_size, size=(train_micro_len,), device="cuda")
-        loss = model(inputs.to(torch.int32), targets, get_window_size_blocks(0))
-        (loss / grad_accum_steps).backward()
+    inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
+    model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     for opt in optimizers:
@@ -542,7 +493,7 @@ del initial_state
 ########################################
 
 torch.cuda.reset_peak_memory_stats()
-train_loader = distributed_data_generator(args.train_files, world_size * train_micro_len, rank, world_size)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
 training_time_ms = 0
 # start the clock
 dist.barrier()
@@ -571,8 +522,6 @@ for step in range(train_steps + 1):
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.6f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-        if wandb_run is not None:
-            wandb_run.log({"val/loss": float(val_loss.detach().item()), "val/step": step}, step=step)
         model.train()
         # start the clock again
         dist.barrier()
@@ -587,12 +536,8 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    micro_losses: list[float] = []
-    for _ in range(grad_accum_steps):
-        inputs, targets = next(train_loader)
-        loss = model(inputs, targets, get_window_size_blocks(step))
-        (loss / grad_accum_steps).backward()
-        micro_losses.append(float(loss.detach().item()))
+    inputs, targets = next(train_loader)
+    model(inputs, targets, get_window_size_blocks(step)).backward()
     opt2futures = {
         opt: [dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future() for p in params]
         for opt, params in opt2params.items()
@@ -612,25 +557,8 @@ for step in range(train_steps + 1):
     model.zero_grad(set_to_none=True)
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    avg_loss = sum(micro_losses) / max(len(micro_losses), 1)
-    print0(
-        f"step:{step+1}/{train_steps} loss:{avg_loss:.6f} "
-        f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms",
-        console=True,
-    )
-    if wandb_run is not None and (step % max(args.wandb_log_every, 1) == 0):
-        wandb_run.log(
-            {
-                "train/loss": avg_loss,
-                "train/tokens_seen": float((step + 1) * train_micro_len * world_size * grad_accum_steps),
-                "train/step": step,
-                "perf/training_time_ms": approx_training_time_ms,
-            },
-            step=step,
-        )
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
     f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
-if wandb_run is not None:
-    wandb_run.finish()
 dist.destroy_process_group()
