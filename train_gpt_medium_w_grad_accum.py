@@ -622,6 +622,7 @@ for step in range(train_steps + 1):
         wandb_run.log(
             {
                 "train/loss": avg_loss,
+                "train/loss_main": avg_loss,
                 "train/tokens_seen": float((step + 1) * train_micro_len * world_size * grad_accum_steps),
                 "train/step": step,
                 "perf/training_time_ms": approx_training_time_ms,

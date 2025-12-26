@@ -1,5 +1,6 @@
 ## Overview
 - Entry point: `train_switch_bank.py` orchestrates distributed setup, logging, and environment flags. It captures source for reproducibility via the top-level `code` string and patches Torch Inductor's `trace_structured` to be metadata-tolerant while logging compiled filenames.
+- `train_gpt_medium_w_grad_accum.py` logs training loss to W&B under `train/loss_main` for parity with switch-bank runs.
 - Optuna wrapper: `optuna_router_tune.py` runs single-GPU tuning over router temp/logit-cap schedules by calling `train_switch_bank.run_training` with overrides; it reuses the compiled model across trials and early-stops after the logit-cap ramp for a validation+logit score (loss normalized to a reference step), logging per-run metrics to its own wandb project plus an overview project.
 - Backfill helper: `optuna_overview_backfill.py` can repopulate the overview wandb run from `optuna_results/trial_*.json` without duplicating logged trials.
 - Loss calibration: `loss_adjustment.py` builds `optuna_results/loss_adjustment.json` from W&B val/loss history, fitting a global floor and bucketized (A,p) curves; other Optuna helpers read this file to adjust losses.
