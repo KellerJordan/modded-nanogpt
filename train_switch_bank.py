@@ -48,11 +48,9 @@ torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
-#torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+torch._inductor.config.coordinate_descent_tuning = True   # allowed for medium track; false for rocm / single-GPU
 torch._functorch.config.donated_buffer = False
-
-# ***** SET ME TRUE FOR NVIDIA? ******
-torch._dynamo.config.compiled_autograd = False
+torch._dynamo.config.compiled_autograd = True  # false for rocm / single-GPU
 
 
 #
