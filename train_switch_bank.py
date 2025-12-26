@@ -748,10 +748,19 @@ def run_training(
         print0("Warming up kernels...", console=True)
         warmup_steps = 10
         initial_state = copy.deepcopy(dict(model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers]))
+        warmup_loader = distributed_data_generator(
+            args.train_files,
+            world_size * train_micro_len,
+            rank,
+            world_size,
+        )
         for warm_step in range(warmup_steps):
             model.zero_grad(set_to_none=True)
             for micro in range(args.grad_accum_steps):
-                inputs = targets = torch.randint(0, args.vocab_size, size=(train_micro_len,), device="cuda")
+                if micro == 0:
+                    inputs, targets = next(warmup_loader)
+                else:
+                    inputs = targets = torch.randint(0, args.vocab_size, size=(train_micro_len,), device="cuda")
                 outputs = model(inputs.to(torch.int32), targets, trainer.get_window_size_blocks(args, 0), 0, args.num_iterations)
                 if isinstance(outputs, tuple):
                     loss_main, loss_aux = outputs
@@ -786,6 +795,14 @@ def run_training(
 
         with torch.no_grad():
             model.bank.compile_warm_all_experts(d=args.model_dim, T_warm=128)
+
+        with torch.no_grad():
+            model.eval()
+            val_inputs = torch.randint(0, args.vocab_size, size=(args.val_seq_len,), device="cuda")
+            val_targets = torch.randint(0, args.vocab_size, size=(args.val_seq_len,), device="cuda")
+            model(val_inputs.to(torch.int32), val_targets, trainer.get_window_size_blocks(args, 0), 0, args.num_iterations)
+            model.train()
+
 
         model.load_state_dict(initial_state["model"])
         for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
