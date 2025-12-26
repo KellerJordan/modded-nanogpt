@@ -224,6 +224,15 @@ def run_training(
         t0 = time.perf_counter()
         return val_scalar
 
+    if start_step == 0 and (early_stop_step is None or early_stop_step > 0):
+        step = 0
+        window_blocks = get_window_size_blocks(args, step)
+        tokens_target = getattr(args, "val_tokens_intermediate", None)
+        if tokens_target is None:
+            tokens_target = args.val_tokens
+        val_steps_multiplier = float(tokens_target) / float(args.val_tokens)
+        run_validation(val_steps_multiplier, log_val_loss=True)
+
     router_clip_base = getattr(args, "router_grad_clip_norm", None)
     router_clip_base = float(router_clip_base) if router_clip_base is not None else None
     if router_clip_base is not None and router_clip_base <= 0:
