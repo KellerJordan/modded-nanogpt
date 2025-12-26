@@ -236,12 +236,12 @@ class Hyperparameters:
     checkpoint_save_step: int = -1  # -1 disables mid-training save
     resume_checkpoint: str | None = None
     use_wandb = True
-    wandb_project = "switch-bank-final"
+    wandb_project = "switch-bank-final-x2"
     wandb_run_name = ""
     wandb_log_every = 1
     enable_extra_logging = False
     enable_extra_wandb_logging = False
-    do_model_warmup = False
+    do_model_warmup = True
     metrics_log_every = 25
 
 
