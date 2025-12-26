@@ -148,7 +148,7 @@ class Hyperparameters:
     train_seq_len = 48*1024 #64*1024          # effective tokens per optimizer step per rank
     val_seq_len = 8192 #4*64*1024
     # minibatch / gradient accumulation
-    grad_accum_steps = 4 # default=1 keeps original, multi-GPU behavior
+    grad_accum_steps = 2 # default=1 keeps original, multi-GPU behavior
     train_micro_seq_len: int | None = None  # if None, computed as train_seq_len // grad_accum_steps
     # optimization
     num_iterations = 3250 #5960
