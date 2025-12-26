@@ -18,7 +18,7 @@ import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 torch._inductor.config.coordinate_descent_tuning = True # we allow this flag for medium track; false for rocm / single-GPU
-torch._dynamo.config.compiled_autograd = False
+torch._dynamo.config.compiled_autograd = False  # torch nightly build issue??
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
