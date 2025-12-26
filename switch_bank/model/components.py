@@ -14,11 +14,6 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 
-@torch._dynamo.disable
-def _flex_attention(*args, **kwargs):
-    return flex_attention(*args, **kwargs)
-
-
 @torch.no_grad()
 def init_linear(w: Tensor):
     std = 0.5 * (w.size(-1) ** -0.5)
@@ -56,7 +51,6 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(head_dim, max_seq_len)
         self.attn_scale = 0.12
 
-    @torch._dynamo.disable
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask, lambdas: Tensor):
         B, T = x.size(0), x.size(1)
         assert B == 1, "Must use batch size = 1 for FlexAttention"
@@ -76,8 +70,10 @@ class CausalSelfAttention(nn.Module):
         q = _sanitize(q)
         k = _sanitize(k)
         v = _sanitize(v)
-        y = _flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-                            block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
+        # Keep flex_attention out of the Dynamo trace to avoid nested FX/Dynamo tracing.
+        with torch._dynamo.disable():
+            y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                               block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
         y = _sanitize(y)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
         y = F.linear(y, self.qkvo_w[3])
