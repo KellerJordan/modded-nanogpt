@@ -633,7 +633,7 @@ for step in range(train_steps + 1):
                 "train/loss_main": avg_loss,
                 "train/tokens_seen": float((step + 1) * train_micro_len * world_size * grad_accum_steps),
                 "train/step": step,
-                "perf/training_time_ms": approx_training_time_ms,
+                "perf/approx_step_time_ms": approx_training_time_ms,
             },
             step=step,
         )
