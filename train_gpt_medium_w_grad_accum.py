@@ -370,7 +370,7 @@ class Hyperparameters:
     train_micro_seq_len: int | None = None
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 2000 #5960 # number of iterations to run
+    num_iterations = 5960 # number of iterations to run
     cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
     # architecture
     vocab_size = 50257
@@ -378,9 +378,9 @@ class Hyperparameters:
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
     use_wandb: bool = True
-    wandb_project: str = "nanogpt-medium-1gpu"
+    wandb_project: str = "switch-bank-final-x2"
     wandb_run_name: str = ""
-    wandb_log_every: int = 25
+    wandb_log_every: int = 1
 args = Hyperparameters()
 
 run_id = int(os.environ.get("RUN_ID", 0))
