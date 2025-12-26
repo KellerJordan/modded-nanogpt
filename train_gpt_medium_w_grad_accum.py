@@ -378,7 +378,7 @@ class Hyperparameters:
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
     use_wandb: bool = True
-    wandb_project: str = "switch-bank-final-x2"
+    wandb_project: str = "switch-bank-final"
     wandb_run_name: str = ""
     wandb_log_every: int = 1
 args = Hyperparameters()

@@ -240,7 +240,7 @@ class Hyperparameters:
     resume_checkpoint: str | None = None
     log_dir: str = "records/track_2_medium/2025-12-26_SwitchBank"
     use_wandb = True
-    wandb_project = "switch-bank-final-x2"
+    wandb_project = "switch-bank-final"
     wandb_run_name = ""
     wandb_log_every = 1
     enable_extra_logging = False
