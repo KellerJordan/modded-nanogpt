@@ -1,5 +1,4 @@
 # ========== train_switch_bank.py ==========
-# Based on the "speedrun" baseline".
 
 import csv
 import json
@@ -31,7 +30,6 @@ def _build_code() -> str:
 
 code = _build_code()
 import uuid
-import time
 import copy
 from dataclasses import dataclass
 from switch_bank.utils import compute_train_micro_len
@@ -45,8 +43,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import torch._functorch.config
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
-from torch import Tensor, nn
-import torch.nn.functional as F
+from torch import nn
 import torch.distributed as dist
 torch._inductor.config.coordinate_descent_tuning = True   # allowed for medium track; false for rocm / single-GPU
 torch._functorch.config.donated_buffer = False
