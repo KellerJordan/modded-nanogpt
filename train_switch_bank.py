@@ -36,7 +36,8 @@ from switch_bank.utils import compute_train_micro_len
 from switch_bank.optim.muon import Muon
 from switch_bank.model.components import CausalSelfAttention
 from switch_bank.model.gpt import GPT
-from switch_bank.data import summarize_router_metrics, summarize_expert_usage, summarize_expert_activity, router_summary_str
+from switch_bank.data import summarize_router_metrics, summarize_expert_usage, summarize_expert_activity, \
+    router_summary_str, distributed_data_generator
 from switch_bank import trainer
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
