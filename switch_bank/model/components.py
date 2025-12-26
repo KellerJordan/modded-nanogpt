@@ -87,7 +87,8 @@ class SharedFFNBank(nn.Module):
                  ema_block_size_fwd: int = 128, ema_block_size_rev: int = 128,
                  ema_window_size_fwd: int = -1, ema_window_size_rev: int = 128,
                  ema_layer_stride: int = 1,
-                 extra_wandb_logging: bool = True):
+                 extra_wandb_logging: bool = True,
+                 adapter_layer_tie_map: list[int] | tuple[int, ...] | None = None):
         super().__init__()
         self.d, self.h, self.E, self.L = d, h, E, L
         self.flags_dim = flags_dim
@@ -112,6 +113,16 @@ class SharedFFNBank(nn.Module):
         assert self.ema_layer_stride <= L, "ema_layer_stride must be <= number of layers"
         self._ema_cache_fwd: dict[int, Tensor] | None = None
         self._ema_cache_rev: dict[int, Tensor] | None = None
+        if adapter_layer_tie_map is not None:
+            if len(adapter_layer_tie_map) != L:
+                raise ValueError("adapter_layer_tie_map must match number of layers")
+            tie_map = [int(idx) for idx in adapter_layer_tie_map]
+            for idx in tie_map:
+                if idx < 0 or idx >= L:
+                    raise ValueError("adapter_layer_tie_map contains out-of-range indices")
+            self.adapter_layer_tie_map = tie_map
+        else:
+            self.adapter_layer_tie_map = None
         if self.use_adapters:
             self.adapter_scale = nn.Parameter(torch.ones(L, E, d).bfloat16())
             self.adapter_bias = nn.Parameter(torch.zeros(L, E, d).bfloat16())
@@ -141,6 +152,11 @@ class SharedFFNBank(nn.Module):
             self.ema_alpha_rev = None
         self._router_metrics_buffer: list[dict[str, float] | None] | None = None
 
+    def _adapter_layer_idx(self, layer_idx: int) -> int:
+        if self.adapter_layer_tie_map is None:
+            return layer_idx
+        return int(self.adapter_layer_tie_map[layer_idx])
+
     @torch.no_grad()
     @torch._dynamo.disable
     def maybe_init_adapters(self, active_mask: torch.Tensor | None):
@@ -154,22 +170,27 @@ class SharedFFNBank(nn.Module):
             init_mask = init_mask & (~self.pruned_experts.to(device=init_mask.device))
         if not init_mask.any():
             return
+        seen_layers = set()
         for layer_idx in range(self.L):
-            init_flags = self.adapter_initialized[layer_idx]
+            adapter_layer = self._adapter_layer_idx(layer_idx)
+            if adapter_layer in seen_layers:
+                continue
+            seen_layers.add(adapter_layer)
+            init_flags = self.adapter_initialized[adapter_layer]
             to_init = init_mask & (~init_flags)
             if not to_init.any():
                 continue
             src_mask = init_mask & init_flags
             if src_mask.any():
-                scale_mean = self.adapter_scale[layer_idx, src_mask].mean(dim=0, keepdim=True)
-                bias_mean = self.adapter_bias[layer_idx, src_mask].mean(dim=0, keepdim=True)
+                scale_mean = self.adapter_scale[adapter_layer, src_mask].mean(dim=0, keepdim=True)
+                bias_mean = self.adapter_bias[adapter_layer, src_mask].mean(dim=0, keepdim=True)
             else:
                 scale_mean = None
                 bias_mean = None
             if scale_mean is not None:
-                self.adapter_scale[layer_idx, to_init] = scale_mean
-                self.adapter_bias[layer_idx, to_init] = bias_mean
-            self.adapter_initialized[layer_idx, to_init] = True
+                self.adapter_scale[adapter_layer, to_init] = scale_mean
+                self.adapter_bias[adapter_layer, to_init] = bias_mean
+            self.adapter_initialized[adapter_layer, to_init] = True
 
     @staticmethod
     def _ema_blockwise(x: Tensor, alpha: Tensor, block_size: int = 128) -> Tensor:
@@ -413,8 +434,9 @@ class SharedFFNBank(nn.Module):
                 continue
             x_e = x_norm[:, union_mask]
             if self.use_adapters:
-                scale = self.adapter_scale[layer_idx, e]
-                bias = self.adapter_bias[layer_idx, e]
+                adapter_layer = self._adapter_layer_idx(layer_idx)
+                scale = self.adapter_scale[adapter_layer, e]
+                bias = self.adapter_bias[adapter_layer, e]
                 if freeze_adapter_params:
                     scale = scale.detach()
                     bias = bias.detach()

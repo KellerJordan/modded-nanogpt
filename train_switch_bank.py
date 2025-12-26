@@ -64,6 +64,17 @@ torch._dynamo.config.compiled_autograd = False
 def _num_params(tensors_iter):
     return sum(p.numel() for p in tensors_iter)
 
+def _unique_params(params):
+    seen = set()
+    unique = []
+    for p in params:
+        pid = id(p)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        unique.append(p)
+    return unique
+
 def _fmt(n: int) -> str:
     return f"{n:,} ({n/1e6:.3f}M)"
 
@@ -81,7 +92,7 @@ def log_param_counts(model: nn.Module, args, print_fn) -> None:
         if isinstance(b.attn, CausalSelfAttention):
             attn_params.append(b.attn.qkvo_w)
             attn_layers += 1
-    attn_total = _num_params(attn_params)
+    attn_total = _num_params(_unique_params(attn_params))
 
     # FFN bank: experts + routers
     bank_expert_params = list(model.bank.W1) + list(model.bank.W2)
@@ -138,17 +149,17 @@ class Hyperparameters:
     # data
     train_files = "data/fineweb10B/fineweb_train_*.bin"
     val_files = "data/fineweb10B/fineweb_val_*.bin"
-    val_tokens = 32768 * 20 #10485760
+    val_tokens = 10485760 #32768 * 20
     train_seq_len = 48*1024 #64*1024          # effective tokens per optimizer step per rank
     val_seq_len = 8192 #4*64*1024
     # minibatch / gradient accumulation
-    grad_accum_steps = 12 # 8 for 32k, 12 for 48k, 16 for 64k    # default=1 keeps original behavior
+    grad_accum_steps = 1 # 8 for 32k, 12 for 48k, 16 for 64k    # default=1 keeps original, multi-GPU behavior
     train_micro_seq_len: int | None = None  # if None, computed as train_seq_len // grad_accum_steps
     # optimization
-    num_iterations = 4123 #2980 #5960
+    num_iterations = 3250 #5960
     cooldown_frac = 0.65  #0.7
     lr_final_mult = 0.0  # decay to this % of original lr at final iteration
-    lr_freeze_last_steps = 200 # decay toward lr_final_mult at final step, but freeze lr at num_iterations-lr_freeze_last_steps
+    lr_freeze_last_steps = 180 # decay toward lr_final_mult at final step, but freeze lr at num_iterations-lr_freeze_last_steps
     lr_embed = 0.3
     lr_scalar = 0.015
     lr_head = 1/320
@@ -168,11 +179,16 @@ class Hyperparameters:
     # architecture
     vocab_size = 50257
     model_dim = 896
-    num_layers = 16
+    num_layers = 28 #16
+    # Layer weight tying (attention + router adapters). Set to () to disable. Avoid tying layers with different attention types (short/long).
+    layer_tie_groups: tuple[tuple[int, ...], ...] = (
+        #(9, 10), (13, 14), (17, 18), (21, 22), (25, 26),  # Add 5,6 if need more. Remove from the beginning for fewer.
+        #(17, 18), (21, 22), (25, 26),
+    )
     head_dim = 128
     num_heads = model_dim // head_dim #7
     # value-embeddings integer count: 0, 1, 2, or 3 supported.
-    num_value_embeds = 2
+    num_value_embeds = 2  #3
     tie_lm_head = False
     untie_lm_head_frac = -1.0
     # Bank / routing
@@ -201,35 +217,35 @@ class Hyperparameters:
     shared_ffn_freeze_frac = 1.0
     shared_ffn_lr_reduce_start_frac = -1.0
     # skip-attention layers (short-SWA) — exactly two
-    skip_attn_layers = (7, )
+    skip_attn_layers = (11,)  # (7,)
     expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (200, 2), (375, 3), (625, 4), (900, 5), (1175, 6), (1575, 7), (1850, 8), (2175, 9))
-    router_temp_init = 1.464 #1.5
-    router_temp_final = 0.93744 #1.0
+    router_temp_init = 1.464
+    router_temp_final = 0.93744
     router_temp_power = 1.5  # fallback if anchor disabled
-    router_temp_anchor_delta_steps = 756 #800  # steps after 2nd expert activation to hit anchor ratio
+    router_temp_anchor_delta_steps = 756  # steps after 2nd expert activation to hit anchor ratio
     router_temp_anchor_ratio = 0.49  # temp curve hits this ratio at anchor delta
-    router_logit_cap_initial = 1.166 #1.1
-    router_logit_cap_final = 13.757 #13.5
-    router_logit_cap_delta_steps = 632 #650 # ramp length after second expert activation
+    router_logit_cap_initial = 1.166
+    router_logit_cap_final = 13.757
+    router_logit_cap_delta_steps = 632  # ramp length after second expert activation
     # Optional Gumbel exploration (off by default)
     router_use_gumbel = True
-    router_gumbel_schedule: tuple[tuple[int, int], ...] = ((200, 1175), (1225, 1300), (1425, 1925), (2400, 2425), (2675, 2725), (2925, 2950), (3200, 3225), (3425, 3500), (3925, -1))  # ensure ~250 active before end
+    router_gumbel_schedule: tuple[tuple[int, int], ...] = ((200, 1175), (1225, 1300), (1425, 1925), (2400, 2425), (2675, 2725), (2925, 2950), (3200, 3225), ) #(3425, 3500), (3925, -1))
     # Layerwise router temp & lb boosts.
     router_boost_shape = "peak"  # options: peak (default), valley, linear_start, linear_end
     router_temp_boost = 0.2
     router_lb_boost = 0.5
     router_layer_peak_frac = 0.475  # only used for peak or valley shapes. boosts are calculated continuously
     # evaluation and logging
-    val_loss_every = 250 #125  # 0 for only at end
-    save_final_checkpoint = False
-    checkpoint_save_step: int = 1500  # -1 disables mid-training save
+    val_loss_every = 125  # 0 for only at end
+    save_final_checkpoint = True
+    checkpoint_save_step: int = -1  # -1 disables mid-training save
     resume_checkpoint: str | None = None
     use_wandb = True
-    wandb_project = "switch-bank-long"
+    wandb_project = "switch-bank-final"
     wandb_run_name = ""
     wandb_log_every = 1
     enable_extra_logging = False
-    enable_extra_wandb_logging = True
+    enable_extra_wandb_logging = False
     do_model_warmup = False
     metrics_log_every = 25
 
@@ -504,6 +520,7 @@ def run_training(
             model_dim=args.model_dim,
             max_seq_len=max(args.train_seq_len, args.val_seq_len),
             skip_attn_layers=set(args.skip_attn_layers),
+            layer_tie_groups=tuple(args.layer_tie_groups) if args.layer_tie_groups is not None else tuple(),
             E=args.num_experts,
             h=args.ffn_hidden,
             lb_coeff=args.lb_coeff,
@@ -565,6 +582,7 @@ def run_training(
         for b in model.blocks:
             if isinstance(b.attn, CausalSelfAttention):
                 attn_2d_params.append(b.attn.qkvo_w)
+        attn_2d_params = _unique_params(attn_2d_params)
         ffn_matrix_params = [*model.bank.W1, *model.bank.W2]
         hidden_matrix_params = attn_2d_params + ffn_matrix_params
 

@@ -34,9 +34,53 @@ def _second_expert_step(expert_activation_schedule: tuple[tuple[int, int], ...])
     return 0
 
 
+def _normalize_layer_tie_groups(
+    tie_groups: tuple[tuple[int, ...], ...] | None,
+    num_layers: int,
+    skip_attn_layers: set[int],
+) -> tuple[int, ...]:
+    tie_map = list(range(num_layers))
+    if not tie_groups:
+        return tuple(tie_map)
+    if not isinstance(tie_groups, (list, tuple)):
+        raise ValueError("layer_tie_groups must be a sequence of layer index groups")
+    tie_groups = tuple(tie_groups)
+    if (
+        len(tie_groups) == 1
+        and isinstance(tie_groups[0], (list, tuple))
+        and tie_groups[0]
+        and all(isinstance(entry, (list, tuple)) for entry in tie_groups[0])
+    ):
+        tie_groups = tuple(tie_groups[0])
+    used = set()
+    for group in tie_groups:
+        if not group:
+            continue
+        group_layers = []
+        for idx in group:
+            if isinstance(idx, (list, tuple)):
+                raise ValueError("layer_tie_groups should be a sequence of layer indices; remove extra nesting")
+            idx_i = int(idx)
+            if idx_i < 0 or idx_i >= num_layers:
+                raise ValueError(f"Layer tie index {idx_i} out of range for num_layers={num_layers}")
+            if idx_i in used or idx_i in group_layers:
+                raise ValueError(f"Layer {idx_i} appears multiple times in layer_tie_groups")
+            if idx_i in skip_attn_layers:
+                raise ValueError(f"Layer tie groups cannot include skip-attn layer {idx_i}")
+            group_layers.append(idx_i)
+        if len(group_layers) < 2:
+            continue
+        base = group_layers[0]
+        for idx_i in group_layers:
+            used.add(idx_i)
+            tie_map[idx_i] = base
+    return tuple(tie_map)
+
+
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int,
-                 skip_attn_layers: set[int], E: int, h: int, lb_coeff: float, ent_coeff: float, k: int,
+                 skip_attn_layers: set[int], layer_tie_groups: tuple[tuple[int, ...], ...],
+                 E: int, h: int, lb_coeff: float, ent_coeff: float, k: int,
                  num_value_embeds: int,
                  tie_lm_head: bool, untie_lm_head_after: int,
                  ema_alpha_fwd: float, ema_alpha_rev: float,
@@ -68,11 +112,20 @@ class GPT(nn.Module):
         self.extra_console_logging = bool(extra_console_logging)
         self.extra_wandb_logging = bool(extra_wandb_logging)
 
+        self.num_layers = num_layers
+        self.layer_tie_map = _normalize_layer_tie_groups(layer_tie_groups, num_layers, skip_attn_layers)
         self.blocks = nn.ModuleList([
             Block(model_dim, num_heads, max_seq_len, i, skip_attn_layers,
                   router_layer_peak_frac, router_temp_boost, router_lb_boost, boost_shape=router_boost_shape)
             for i in range(num_layers)
         ])
+        for idx, base in enumerate(self.layer_tie_map):
+            if idx == base:
+                continue
+            base_attn = self.blocks[base].attn
+            if base_attn is None:
+                raise ValueError(f"Layer {base} has no attention but is used as a tie base")
+            self.blocks[idx].attn = base_attn
         self.router_temp_boost = float(router_temp_boost)
         self.router_lb_boost = float(router_lb_boost)
         self.tie_lm_head = bool(tie_lm_head)
@@ -83,7 +136,6 @@ class GPT(nn.Module):
         if not self.tie_lm_head:
             self._head_tied_runtime = False
 
-        self.num_layers = num_layers
         assert 1 <= ema_layer_stride <= self.num_layers, "ema_layer_stride must be between 1 and num_layers"
         self.scalars = nn.Parameter(torch.cat([
             torch.ones(num_layers),
@@ -160,6 +212,7 @@ class GPT(nn.Module):
             ema_window_size_fwd=ema_window_size_fwd, ema_window_size_rev=ema_window_size_rev,
             ema_layer_stride=ema_layer_stride,
             extra_wandb_logging=self.extra_wandb_logging,
+            adapter_layer_tie_map=self.layer_tie_map,
         )
         self.latest_router_metrics: list[dict[str, float] | None] | None = None
         self.latest_loss_components: tuple[Tensor, Tensor] | None = None

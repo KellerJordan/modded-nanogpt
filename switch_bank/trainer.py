@@ -279,16 +279,10 @@ def run_training(
             lm_head_untied_logged = True
 
         if last_step or (step > 0 and args.val_loss_every > 0 and step % args.val_loss_every == 0):
-            if last_step and final_step:
-                val_steps_multiplier = 7
-            elif last_step:
-                val_steps_multiplier = max(int(early_stop_val_multiplier), 1)
-            else:
-                val_steps_multiplier = 1
             extra_log = None
             if last_step:
                 extra_log = _finalize_logit_stats(logit_stats)
-            run_validation(val_steps_multiplier, log_val_loss=True, extra_log=extra_log)
+            run_validation(1, log_val_loss=True, extra_log=extra_log)
             if last_step and not final_step:
                 result = {"val_loss": last_val_loss, "stop_step": step, "aborted": False}
                 result.update(_finalize_logit_stats(logit_stats))
