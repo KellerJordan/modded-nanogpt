@@ -56,6 +56,7 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(head_dim, max_seq_len)
         self.attn_scale = 0.12
 
+    @torch._dynamo.disable
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask, lambdas: Tensor):
         B, T = x.size(0), x.size(1)
         assert B == 1, "Must use batch size = 1 for FlexAttention"
