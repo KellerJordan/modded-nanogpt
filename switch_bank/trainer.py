@@ -654,6 +654,7 @@ def run_training(
                         "train/loss": avg_loss,
                         "train/loss_main": avg_main_loss,
                         "train/loss_aux": avg_aux_loss,
+                        "perf/approx_step_time_ms": approx_training_time_ms,
                         "train/tokens_seen": float((step + 1) * args.train_seq_len * world_size),
                         "train/step": step,
                         "router/logit_cap": (current_logit_cap if current_logit_cap is not None else float("nan")),
