@@ -387,7 +387,7 @@ run_id = int(os.environ.get("RUN_ID", 0))
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == 1, "train_gpt_medium_w_grad_accum.py is intended for single-GPU runs"
+#assert world_size == 1, "train_gpt_medium_w_grad_accum.py is intended for single-GPU runs"
 grad_accum_steps = max(1, int(args.grad_accum_steps))
 train_micro_len = compute_train_micro_len(args)
 effective_train_seq_len = train_micro_len * grad_accum_steps
