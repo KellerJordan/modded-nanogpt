@@ -30,11 +30,11 @@ This gives independent control over attention depth vs FFN capacity, and allows 
   separately from FFN bank size.
 - There remains lots of room for optimization, particularly if unconcerned with router health.
 
-## Record facts (val loss & timing are preliminary, pending official verificaiton)
+## Record facts (val loss & timing are preliminary and based on 3 runs, pending official verification)
 - 1750 steps vs the current record's 5960.
 - 282.4M parameters vs 454.5M in `train_gpt_medium.py` (GPT-2 Medium reference ~350M).
 - 14.16 minutes vs 24.07 (largest absolute/percentage drop for small or medium track since their initial runs).
-- Mean loss 2.90 vs 2.919 previous record / 2.92 target.
+- Mean loss 2.896 vs 2.919 previous record / 2.92 target.
 
 ## Notes
 - Training/validation streams stay in order with the same FineWeb binaries as the baseline.

@@ -559,7 +559,7 @@ dist.barrier()
 t0 = time.perf_counter()
 
 def run_validation(step: int, last_step: bool) -> None:
-    nonlocal training_time_ms, t0
+    global training_time_ms, t0
     # stop the clock
     dist.barrier()
     training_time_ms += 1000 * (time.perf_counter() - t0)
