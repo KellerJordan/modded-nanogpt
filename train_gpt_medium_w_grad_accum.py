@@ -365,6 +365,8 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens_intermediate: int | None = 32768 * 20
+    val_tokens_final: int | None = 10485760
     train_seq_len = 64*1024 # FlexAttention sequence length
     grad_accum_steps = 1
     train_micro_seq_len: int | None = None
@@ -555,36 +557,56 @@ training_time_ms = 0
 # start the clock
 dist.barrier()
 t0 = time.perf_counter()
+
+def run_validation(step: int, last_step: bool) -> None:
+    nonlocal training_time_ms, t0
+    # stop the clock
+    dist.barrier()
+    training_time_ms += 1000 * (time.perf_counter() - t0)
+    model.eval()
+    val_batch_size = world_size * args.val_seq_len
+    assert args.val_tokens % val_batch_size == 0
+    base_steps = args.val_tokens // val_batch_size
+    tokens_target = args.val_tokens
+    if last_step:
+        if args.val_tokens_final is not None:
+            tokens_target = args.val_tokens_final
+    else:
+        if args.val_tokens_intermediate is not None:
+            tokens_target = args.val_tokens_intermediate
+    val_steps_multiplier = float(tokens_target) / float(args.val_tokens)
+    val_steps = int(round(base_steps * val_steps_multiplier))
+    val_steps = max(val_steps, 1)
+    val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
+    val_loss = 0
+    with torch.no_grad():
+        for _ in range(val_steps):
+            inputs, targets = next(val_loader)
+            val_loss += model(inputs, targets, get_window_size_blocks(step))
+    val_loss /= val_steps
+    del val_loader
+    dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+    print0(f"step:{step}/{train_steps} val_loss:{val_loss:.6f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+    if wandb_run is not None:
+        wandb_run.log({"val/loss": float(val_loss.detach().item()), "val/step": step}, step=step)
+    model.train()
+    # start the clock again
+    dist.barrier()
+    t0 = time.perf_counter()
+
 # begin training
 train_steps = args.num_iterations
+did_step0_val = False
+if train_steps > 0:
+    run_validation(step=0, last_step=False)
+    did_step0_val = True
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
 
     # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-        # stop the clock
-        dist.barrier()
-        training_time_ms += 1000 * (time.perf_counter() - t0)
-        model.eval()
-        val_batch_size = world_size * args.val_seq_len
-        assert args.val_tokens % val_batch_size == 0
-        val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
-        val_loss = 0
-        with torch.no_grad():
-            for _ in range(val_steps):
-                inputs, targets = next(val_loader)
-                val_loss += model(inputs, targets, get_window_size_blocks(step))
-        val_loss /= val_steps
-        del val_loader
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.6f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-        if wandb_run is not None:
-            wandb_run.log({"val/loss": float(val_loss.detach().item()), "val/step": step}, step=step)
-        model.train()
-        # start the clock again
-        dist.barrier()
-        t0 = time.perf_counter()
+    if not (did_step0_val and step == 0):
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            run_validation(step, last_step)
 
     if last_step:
         if master_process and args.save_checkpoint:
