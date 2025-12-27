@@ -216,18 +216,18 @@ class Hyperparameters:
     shared_ffn_lr_reduce_start_frac = -1.0
     # skip-attention layers (short-SWA) — exactly two
     skip_attn_layers = (11,)  # (7,)
-    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (50, 2), (94, 3), (156, 4), (225, 5), (294, 6), (394, 7), (463, 8),)     #((0, 1), (200, 2), (375, 3), (625, 4), (900, 5), (1175, 6), (1575, 7), (1850, 8),) # (2175, 9))
+    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (75, 2), (141, 3), (234, 4), (338, 5), (441, 6), (591, 7), (695, 8),)     #((0, 1), (200, 2), (375, 3), (625, 4), (900, 5), (1175, 6), (1575, 7), (1850, 8),) # (2175, 9))
     router_temp_init = 1.464
     router_temp_final = 0.93744
     router_temp_power = 1.5  # fallback if anchor disabled
-    router_temp_anchor_delta_steps = 189 #756  # steps after 2nd expert activation to hit anchor ratio
+    router_temp_anchor_delta_steps = 284 #756  # steps after 2nd expert activation to hit anchor ratio
     router_temp_anchor_ratio = 0.49  # temp curve hits this ratio at anchor delta
     router_logit_cap_initial = 1.166
     router_logit_cap_final = 13.757
-    router_logit_cap_delta_steps = 158 #632  # ramp length after second expert activation
+    router_logit_cap_delta_steps = 237 #632  # ramp length after second expert activation
     # Optional Gumbel exploration (off by default)
     router_use_gumbel = True
-    router_gumbel_schedule: tuple[tuple[int, int], ...] = ((50, 294), (306, 325), (356, 481), (600, 606), (669, 681), (731, 738), (800, 806), (856, 875), (981, 1000))       #((200, 1175), (1225, 1300), (1425, 1925),) # (2400, 2425), (2675, 2725), (2925, 2950), (3200, 3225), ) #(3425, 3500), (3925, -1))
+    router_gumbel_schedule: tuple[tuple[int, int], ...] = ((75, 441), (459, 488), (534, 722), (900, 909), (1004, 1022), (1097, 1107), (1200, 1209), (1284, 1313), (1472, 1500))       #((200, 1175), (1225, 1300), (1425, 1925),) # (2400, 2425), (2675, 2725), (2925, 2950), (3200, 3225), ) #(3425, 3500), (3925, -1))
     # Layerwise router temp & lb boosts.
     router_boost_shape = "peak"  # options: peak (default), valley, linear_start, linear_end
     router_temp_boost = 0.2
