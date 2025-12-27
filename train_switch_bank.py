@@ -157,7 +157,7 @@ class Hyperparameters:
     num_iterations = 1700 #5960
     cooldown_frac = 0.65  #0.7
     lr_final_mult = 0.0  # decay to this % of original lr at final iteration
-    lr_freeze_last_steps = 0 #125 # decay toward lr_final_mult at final step, but freeze lr at num_iterations-lr_freeze_last_steps
+    lr_freeze_last_steps = 0 # decay toward lr_final_mult at final step, but freeze lr at num_iterations-lr_freeze_last_steps
     lr_embed = 0.3
     lr_scalar = 0.015
     lr_head = 1/320
@@ -235,6 +235,7 @@ class Hyperparameters:
     router_layer_peak_frac = 0.475  # only used for peak or valley shapes. boosts are calculated continuously
     # evaluation and logging
     val_loss_every = 50  # 0 for only at end
+    early_stop_step: int | None = 1550
     save_final_checkpoint = True
     checkpoint_save_step: int = -1  # -1 disables mid-training save
     resume_checkpoint: str | None = None
@@ -327,6 +328,11 @@ def run_training(
     if args.router_ema_layer_stride < 0:
         args.router_ema_layer_stride = args.num_layers
     _set_seed(seed)
+    early_stop_is_final = False
+    if early_stop_step is None:
+        early_stop_step = getattr(args, "early_stop_step", None)
+        if early_stop_step is not None:
+            early_stop_is_final = True
 
     def hyperparams_to_config(h: Hyperparameters) -> dict:
         cfg: dict[str, object] = {}
@@ -849,6 +855,7 @@ def run_training(
         checkpoint_save_step=args.checkpoint_save_step,
         early_stop_step=early_stop_step,
         early_stop_val_multiplier=early_stop_val_multiplier,
+        early_stop_as_final=early_stop_is_final,
     )
 
     print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "

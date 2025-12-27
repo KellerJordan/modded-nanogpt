@@ -152,6 +152,7 @@ def run_training(
     checkpoint_save_step: int = -1,
     early_stop_step: int | None = None,
     early_stop_val_multiplier: int = 1,
+    early_stop_as_final: bool = False,
 ):
     training_time_ms = 0
     log_dir = getattr(args, "log_dir", "logs")
@@ -261,6 +262,7 @@ def run_training(
     for step in range(start_step, train_steps + 1):
         final_step = (step == train_steps)
         last_step = (step == stop_step)
+        finalize_now = final_step or (early_stop_as_final and last_step)
         turbo_muon_warmstart_now = (
             turbo_muon_warmstart_start_step is not None and step >= turbo_muon_warmstart_start_step
         )
@@ -295,7 +297,7 @@ def run_training(
             if last_step:
                 extra_log = _finalize_logit_stats(logit_stats)
             tokens_target = getattr(args, "val_tokens", None)
-            if final_step:
+            if finalize_now:
                 final_tokens = getattr(args, "val_tokens_final", None)
                 if final_tokens is not None:
                     tokens_target = final_tokens
@@ -305,12 +307,12 @@ def run_training(
                     tokens_target = intermediate_tokens
             val_steps_multiplier = float(tokens_target) / float(args.val_tokens)
             run_validation(val_steps_multiplier, log_val_loss=True, extra_log=extra_log)
-            if last_step and not final_step:
+            if last_step and not finalize_now:
                 result = {"val_loss": last_val_loss, "stop_step": step, "aborted": False}
                 result.update(_finalize_logit_stats(logit_stats))
                 return result
 
-        if last_step and final_step:
+        if last_step and finalize_now:
             if master_process and getattr(args, "save_final_checkpoint", getattr(args, "save_checkpoint", False)):
                 model_to_save = getattr(model, "_orig_mod", model)
                 log = dict(step=step, code=code, model=model_to_save.state_dict())
