@@ -17,8 +17,11 @@ TRAIN_TIME_RE = re.compile(r"train_time:([0-9.]+)ms")
 def _parse_log(path: Path) -> tuple[float, float] | None:
     last_loss = None
     last_time_ms = None
+    saw_complete = False
     with path.open("r", encoding="utf-8", errors="ignore") as handle:
         for line in handle:
+            if line.startswith("peak memory allocated"):
+                saw_complete = True
             if "val_loss:" not in line:
                 continue
             loss_match = VAL_LOSS_RE.search(line)
@@ -27,7 +30,7 @@ def _parse_log(path: Path) -> tuple[float, float] | None:
                 last_loss = float(loss_match.group(1))
             if time_match:
                 last_time_ms = float(time_match.group(1))
-    if last_loss is None or last_time_ms is None:
+    if not saw_complete or last_loss is None or last_time_ms is None:
         return None
     return last_loss, last_time_ms
 
