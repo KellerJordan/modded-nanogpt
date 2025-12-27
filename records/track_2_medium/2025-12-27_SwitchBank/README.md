@@ -10,8 +10,7 @@ This gives independent control over attention depth vs FFN capacity, and allows 
 - Router features include token norms plus optional forward/reverse EMA context and document-aware flags.
 - Optional router adapters (per-layer/per-expert scale/bias) with lazy init and pruning hooks.
 - Router temperature + logit-cap schedules anchored to second-expert activation.
-- Muon optimizer for 2D+ bf16 matrices; AdamW branch for non-spectral params.
-- FlexAttention long/short window attention, same data stream requirements as the baseline.
+- TurboMuon tweak.
 
 ## Routing/adapter specifics (SwitchBank)
 - Each layer computes gates into the same expert bank; outputs are scaled by gate probabilities.
@@ -19,13 +18,12 @@ This gives independent control over attention depth vs FFN capacity, and allows 
 - Routing supports temperature and logit-cap schedules, optional Gumbel exploration, and per-layer boost shapes.
 - Bank-level metrics track load/usage/entropy and a composite router health score.
 
-## Observations from ~1000 runs / ablations
+## Observations from nearly 1000 runs / ablations
+- Reverse EMA features were much more effective than forward EMA (regardless) or both (by wall time).
 - DeepSeek-style routing did not work here after extensive tuning. Best attempt was sigmoid-only routing
-  (bias/update variants were worse); it underperformed by loss vs step/time. Router health improved with sigmoid,
-  but loss did not.
-- Reverse EMA features were much more effective than forward EMA or both (by wall time).
+  (bias/update variants were worse); it still significantly underperformed by loss vs step and time. Router health did improve with sigmoid.
 - TurboMuon was slightly better by step and slightly worse by time; router health improved, so it stayed enabled.
-- Moving from 16 to 28 layers was a big win. It matched ~3.03 loss in similar wall-clock time but in fewer steps,
+- Moving from 16 to 28 layers was a big win. It matched ~3.03 loss (best value at the time) in similar wall-clock time but in fewer steps,
   and the curve was steeper. With more time it reached the target loss and below. This highlights the value of
   SwitchBank: 1.75x layers for only ~1.16x parameters (~38.9M extra), and the ability to scale attention depth
   separately from FFN bank size.
