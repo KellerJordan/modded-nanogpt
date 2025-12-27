@@ -157,7 +157,7 @@ class Hyperparameters:
     num_iterations = 2125 #5960
     cooldown_frac = 0.65  #0.7
     lr_final_mult = 0.0  # decay to this % of original lr at final iteration
-    lr_freeze_last_steps = 180 # decay toward lr_final_mult at final step, but freeze lr at num_iterations-lr_freeze_last_steps
+    lr_freeze_last_steps = 125 # decay toward lr_final_mult at final step, but freeze lr at num_iterations-lr_freeze_last_steps
     lr_embed = 0.3
     lr_scalar = 0.015
     lr_head = 1/320
