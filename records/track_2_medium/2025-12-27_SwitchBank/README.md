@@ -11,6 +11,7 @@ This gives independent control over attention depth vs FFN capacity, and allows 
 - Optional router adapters (per-layer/per-expert scale/bias) with lazy init and pruning hooks.
 - Router temperature + logit-cap schedules anchored to second-expert activation.
 - TurboMuon tweak.
+- Code is spread over multiple files: train_switch_bank.py and the switch_bank package. The former prints all of the code from both in the reproducible log.
 
 ## Routing/adapter specifics (SwitchBank)
 - Each layer computes gates into the same expert bank; outputs are scaled by gate probabilities.
