@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import csv
 import math
 import re
 from pathlib import Path
@@ -81,6 +82,21 @@ def main() -> int:
         print("p_value: nan (need at least 2 runs)")
     else:
         print(f"p_value(loss <= {TARGET_LOSS}): {p_value:.6g}")
+
+    summary_path = root / "summary.csv"
+    with summary_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["metric", "value"])
+        writer.writerow(["runs", len(losses)])
+        writer.writerow(["skipped", skipped])
+        writer.writerow(["mean_loss", f"{mean_loss:.6f}"])
+        writer.writerow(["mean_time_ms", f"{mean_time_ms:.0f}"])
+        writer.writerow(["mean_time_min", f"{mean_time_min:.6f}"])
+        if math.isnan(p_value):
+            p_value_str = "nan"
+        else:
+            p_value_str = f"{p_value:.6g}"
+        writer.writerow([f"p_value_loss_le_{TARGET_LOSS}", p_value_str])
     return 0
 
 
