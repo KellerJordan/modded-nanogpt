@@ -178,7 +178,7 @@ class Hyperparameters:
     # architecture
     vocab_size = 50257
     model_dim = 896
-    num_layers = 28 #16
+    num_layers = 28
     # Layer weight tying (attention + router adapters). Set to () to disable. Avoid tying layers with different attention types (short/long).
     layer_tie_groups: tuple[tuple[int, ...], ...] = (
         #(9, 10), (13, 14), (17, 18), (21, 22), (25, 26),  # Add 5,6 if need more. Remove from the beginning for fewer.
@@ -187,7 +187,7 @@ class Hyperparameters:
     head_dim = 128
     num_heads = model_dim // head_dim #7
     # value-embeddings integer count: 0, 1, 2, or 3 supported.
-    num_value_embeds = 2  #3
+    num_value_embeds = 2
     tie_lm_head = False
     untie_lm_head_frac = -1.0
     # Bank / routing
