@@ -155,7 +155,7 @@ class Hyperparameters:
     train_micro_seq_len: int | None = None  # if None, computed as train_seq_len // grad_accum_steps
     # optimization
     num_iterations = 1700 #5960
-    early_stop_step: int | None = 1550
+    early_stop_step: int | None = 1575
     cooldown_frac = 0.65  #0.7
     lr_final_mult = 0.0  # decay to this % of original lr at final iteration
     lr_freeze_last_steps = 0 # decay toward lr_final_mult at final step, but freeze lr at num_iterations-lr_freeze_last_steps
