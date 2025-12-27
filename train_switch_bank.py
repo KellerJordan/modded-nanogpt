@@ -148,13 +148,13 @@ class Hyperparameters:
     val_tokens = 10485760
     val_tokens_intermediate: int | None = 32768 * 20
     val_tokens_final: int | None = 10485760
-    train_seq_len = 8*1024 #64*1024          # effective tokens per optimizer step per rank
+    train_seq_len = 12*1024 #64*1024          # effective tokens per optimizer step per rank
     val_seq_len = 8192 #4*64*1024
     # minibatch / gradient accumulation
     grad_accum_steps = 1 # default=1 keeps original, multi-GPU behavior
     train_micro_seq_len: int | None = None  # if None, computed as train_seq_len // grad_accum_steps
     # optimization
-    num_iterations = 3250 #5960
+    num_iterations = 3200 #5960
     cooldown_frac = 0.65  #0.7
     lr_final_mult = 0.0  # decay to this % of original lr at final iteration
     lr_freeze_last_steps = 180 # decay toward lr_final_mult at final step, but freeze lr at num_iterations-lr_freeze_last_steps
