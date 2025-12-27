@@ -234,7 +234,7 @@ class Hyperparameters:
     router_lb_boost = 0.5
     router_layer_peak_frac = 0.475  # only used for peak or valley shapes. boosts are calculated continuously
     # evaluation and logging
-    val_loss_every = 125  # 0 for only at end
+    val_loss_every = 50  # 0 for only at end
     save_final_checkpoint = True
     checkpoint_save_step: int = -1  # -1 disables mid-training save
     resume_checkpoint: str | None = None
