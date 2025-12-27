@@ -33,8 +33,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank: int
             try:
                 tokens, pos = _load_data_shard(next(file_iter)), 0
             except StopIteration:
-                file_iter = iter(files)
-                tokens, pos = _load_data_shard(next(file_iter)), 0
+                raise RuntimeError(f"Ran out of data while skipping batches for '{filename_pattern}'")
         pos += batch_size
         skip_batches -= 1
 
@@ -43,9 +42,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank: int
             try:
                 tokens, pos = _load_data_shard(next(file_iter)), 0
             except StopIteration:
-                # restart from first file to mirror infinite stream expectation
-                file_iter = iter(files)
-                tokens, pos = _load_data_shard(next(file_iter)), 0
+                return
         buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
