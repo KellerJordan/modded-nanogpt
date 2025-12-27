@@ -155,7 +155,7 @@ class Hyperparameters:
     train_micro_seq_len: int | None = None  # if None, computed as train_seq_len // grad_accum_steps
     # optimization
     num_iterations = 1700 #5960
-    early_stop_step: int | None = 1625
+    early_stop_step: int | None = None #1625
     cooldown_frac = 0.65  #0.7
     lr_final_mult = 0.0  # decay to this % of original lr at final iteration
     lr_freeze_last_steps = 0 # decay toward lr_final_mult at final step, but freeze lr at num_iterations-lr_freeze_last_steps
@@ -237,6 +237,8 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 50  # 0 for only at end
     save_final_checkpoint = True
+    save_final_checkpoint_if_loss_below: bool = True
+    save_final_checkpoint_max_loss: float = 2.92
     checkpoint_save_step: int = -1  # -1 disables mid-training save
     resume_checkpoint: str | None = None
     log_dir: str = "records/track_2_medium/2025-12-27_SwitchBank"

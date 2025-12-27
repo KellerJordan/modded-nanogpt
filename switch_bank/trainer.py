@@ -313,7 +313,11 @@ def run_training(
                 return result
 
         if last_step and finalize_now:
-            if master_process and getattr(args, "save_final_checkpoint", getattr(args, "save_checkpoint", False)):
+            should_save = getattr(args, "save_final_checkpoint", getattr(args, "save_checkpoint", False))
+            if should_save and getattr(args, "save_final_checkpoint_if_loss_below", False):
+                max_loss = float(getattr(args, "save_final_checkpoint_max_loss", float("inf")))
+                should_save = last_val_loss is not None and math.isfinite(last_val_loss) and last_val_loss < max_loss
+            if master_process and should_save:
                 model_to_save = getattr(model, "_orig_mod", model)
                 log = dict(step=step, code=code, model=model_to_save.state_dict())
                 run_dir = os.path.join(log_dir, run_id_full)
