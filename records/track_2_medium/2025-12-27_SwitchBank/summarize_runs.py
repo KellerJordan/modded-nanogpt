@@ -42,8 +42,38 @@ def _p_value_less(values: list[float], mu: float) -> float:
     if std == 0.0:
         return 0.0 if mean < mu else 1.0
     t_stat = (mean - mu) / (std / math.sqrt(n))
-    dist = torch.distributions.StudentT(df=n - 1)
-    return float(dist.cdf(torch.tensor(t_stat)))
+    return _student_t_cdf(t_stat, n - 1)
+
+
+def _student_t_cdf(t_stat: float, df: int) -> float:
+    try:
+        import scipy.stats  # type: ignore
+    except Exception:
+        scipy = None
+    else:
+        scipy = scipy.stats
+    if scipy is not None:
+        return float(scipy.t.cdf(t_stat, df))
+    stdtr = getattr(torch.special, "stdtr", None)
+    if stdtr is not None:
+        return float(stdtr(torch.tensor(float(df)), torch.tensor(float(t_stat))).item())
+    betainc = getattr(torch.special, "betainc", None)
+    if betainc is not None:
+        t_val = float(t_stat)
+        x = df / (df + t_val * t_val)
+        a = 0.5 * df
+        b = 0.5
+        ib = betainc(torch.tensor(a, dtype=torch.float64),
+                     torch.tensor(b, dtype=torch.float64),
+                     torch.tensor(x, dtype=torch.float64))
+        ib = float(ib.item())
+        if t_val > 0:
+            return 1.0 - 0.5 * ib
+        if t_val < 0:
+            return 0.5 * ib
+        return 0.5
+    # Fallback: normal approximation if special functions are unavailable.
+    return 0.5 * (1.0 + math.erf(t_stat / math.sqrt(2.0)))
 
 
 def main() -> int:
