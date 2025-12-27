@@ -377,7 +377,7 @@ class Hyperparameters:
     # architecture
     vocab_size = 50257
     # evaluation and logging
-    val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every = 50 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
     use_wandb: bool = True
     wandb_project: str = "switch-bank-final"
