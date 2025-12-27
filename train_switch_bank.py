@@ -154,7 +154,7 @@ class Hyperparameters:
     grad_accum_steps = 1 # default=1 keeps original, multi-GPU behavior
     train_micro_seq_len: int | None = None  # if None, computed as train_seq_len // grad_accum_steps
     # optimization
-    num_iterations = 3200 #5960
+    num_iterations = 2125 #5960
     cooldown_frac = 0.65  #0.7
     lr_final_mult = 0.0  # decay to this % of original lr at final iteration
     lr_freeze_last_steps = 180 # decay toward lr_final_mult at final step, but freeze lr at num_iterations-lr_freeze_last_steps
@@ -190,7 +190,7 @@ class Hyperparameters:
     tie_lm_head = False
     untie_lm_head_frac = -1.0
     # Bank / routing
-    num_experts = 9
+    num_experts = 8 #9
     ffn_hidden = 1024
     topk = 1
     topk_val: int | None = None
@@ -216,7 +216,7 @@ class Hyperparameters:
     shared_ffn_lr_reduce_start_frac = -1.0
     # skip-attention layers (short-SWA) — exactly two
     skip_attn_layers = (11,)  # (7,)
-    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (200, 2), (375, 3), (625, 4), (900, 5), (1175, 6), (1575, 7), (1850, 8), (2175, 9))
+    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (200, 2), (375, 3), (625, 4), (900, 5), (1175, 6), (1575, 7), (1850, 8),) # (2175, 9))
     router_temp_init = 1.464
     router_temp_final = 0.93744
     router_temp_power = 1.5  # fallback if anchor disabled
@@ -227,7 +227,7 @@ class Hyperparameters:
     router_logit_cap_delta_steps = 632  # ramp length after second expert activation
     # Optional Gumbel exploration (off by default)
     router_use_gumbel = True
-    router_gumbel_schedule: tuple[tuple[int, int], ...] = ((200, 1175), (1225, 1300), (1425, 1925), (2400, 2425), (2675, 2725), (2925, 2950), (3200, 3225), ) #(3425, 3500), (3925, -1))
+    router_gumbel_schedule: tuple[tuple[int, int], ...] = ((200, 1175), (1225, 1300), (1425, 1925),) # (2400, 2425), (2675, 2725), (2925, 2950), (3200, 3225), ) #(3425, 3500), (3925, -1))
     # Layerwise router temp & lb boosts.
     router_boost_shape = "peak"  # options: peak (default), valley, linear_start, linear_end
     router_temp_boost = 0.2
