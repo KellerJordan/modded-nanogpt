@@ -1,6 +1,6 @@
 # SwitchBank (Track 2 Medium)
 
-This run uses the SwitchBank model instead of the baseline GPT-2 Medium stack. SwitchBank is a "horizontal MoE":
+This run uses the SwitchBank model instead of the baseline GPT-2 Medium stack. SwitchBank is a "horizontal MoE" architecture designed by Hailey Collet:
 each transformer layer routes tokens into a shared FFN expert bank, while the attention stack remains per-layer.
 This gives independent control over attention depth vs FFN capacity, and allows many layers to share the same expert weights.
 
