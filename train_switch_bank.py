@@ -242,12 +242,12 @@ class Hyperparameters:
     checkpoint_save_step: int = -1  # -1 disables mid-training save
     resume_checkpoint: str | None = None
     log_dir: str = "records/track_2_medium/2025-12-27_SwitchBank_reverse_ema_fix"
-    use_wandb = False
+    use_wandb = True
     wandb_project = "switch-bank-final"
     wandb_run_name = ""
     wandb_log_every = 1
-    enable_extra_logging = True
-    enable_extra_wandb_logging = False
+    enable_extra_logging = False
+    enable_extra_wandb_logging = True
     do_model_warmup = True
     metrics_log_every = 25
 
