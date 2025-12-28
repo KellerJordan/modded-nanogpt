@@ -34,7 +34,7 @@ This gives independent control over attention depth vs FFN capacity, and allows 
 ## Record facts (val loss & timing are preliminary and based on 3 runs, pending official verification)
 - 1750 steps vs the current record's 5960.
 - 282.4M parameters vs 454.5M in `train_gpt_medium.py` (GPT-2 Medium reference ~350M).
-- 13.86 minutes vs 24.07 (largest absolute/percentage drop for small or medium track since their initial runs).
+- 13.86 minutes vs 24.07 (24.37 as I tested / on this record's hardware) - the largest absolute/percentage drop for small or medium track since their initial runs.
 - Mean loss 2.896 vs 2.919 previous record / 2.92 target.
 
 ## Notes
