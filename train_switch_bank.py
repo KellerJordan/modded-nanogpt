@@ -154,7 +154,7 @@ class Hyperparameters:
     grad_accum_steps = 1 # default=1 keeps original, multi-GPU behavior
     train_micro_seq_len: int | None = None  # if None, computed as train_seq_len // grad_accum_steps
     # optimization
-    num_iterations = 2000 #1750
+    num_iterations = 3000 #1750
     early_stop_step: int | None = None
     cooldown_frac = 0.65  #0.7
     lr_final_mult = 0.0  # decay to this % of original lr at final iteration
@@ -200,8 +200,8 @@ class Hyperparameters:
     use_router_adapters = True
     router_block_pos_bins = 8  # 4 / 8 / 16
     first_doc_tokens_N = 64
-    router_enable_forward_ema = False
-    router_enable_reverse_ema = True
+    router_enable_forward_ema = True #False
+    router_enable_reverse_ema = False #True
     ema_alpha_fwd = 0.80
     ema_alpha_rev = 0.85
     ema_window_size_fwd = 128  # <=0 means full sequence
