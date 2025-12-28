@@ -242,7 +242,7 @@ class Hyperparameters:
     checkpoint_save_step: int = -1  # -1 disables mid-training save
     resume_checkpoint: str | None = None
     log_dir: str = "records/track_2_medium/2025-12-27_SwitchBank"
-    use_wandb = True
+    use_wandb = False
     wandb_project = "switch-bank-final"
     wandb_run_name = ""
     wandb_log_every = 1
