@@ -154,7 +154,7 @@ class Hyperparameters:
     grad_accum_steps = 1 # default=1 keeps original, multi-GPU behavior
     train_micro_seq_len: int | None = None  # if None, computed as train_seq_len // grad_accum_steps
     # optimization
-    num_iterations = 1750
+    num_iterations = 2000 #1750
     early_stop_step: int | None = None
     cooldown_frac = 0.65  #0.7
     lr_final_mult = 0.0  # decay to this % of original lr at final iteration
@@ -246,7 +246,7 @@ class Hyperparameters:
     wandb_project = "switch-bank-final"
     wandb_run_name = ""
     wandb_log_every = 1
-    enable_extra_logging = False
+    enable_extra_logging = True
     enable_extra_wandb_logging = False
     do_model_warmup = True
     metrics_log_every = 25
