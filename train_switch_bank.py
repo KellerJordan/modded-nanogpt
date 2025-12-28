@@ -248,7 +248,7 @@ class Hyperparameters:
     wandb_log_every = 1
     enable_extra_logging = False
     enable_extra_wandb_logging = True
-    do_model_warmup = True
+    do_model_warmup = False #True
     metrics_log_every = 25
 
 
