@@ -240,18 +240,13 @@ class SharedFFNBank(nn.Module):
             length = end - start
             limit = min(window, length)
             if limit > 0:
-                head = seg[:, :limit, :]
-                rev = torch.flip(head, dims=(1,))
-                pad = (-limit) % block_size
-                if pad:
-                    zero_pad = torch.zeros(1, pad, D, device=x.device, dtype=rev.dtype)
-                    rev = torch.cat([rev, zero_pad], dim=1)
-                ema = SharedFFNBank._ema_blockwise(rev, a, block_size=block_size)
-                ema = ema[:, :limit]
-                ema = torch.flip(ema, dims=(1,))
-                out[:, start:start + limit] = ema
+                # Avoid non-causal leakage in the doc head: zero out the reverse-EMA window.
+                out[:, start:start + limit] = 0
                 if length > limit:
-                    out[:, start + limit:end] = ema[:, -1:].expand(1, length - limit, D)
+                    # Keep a causal summary for the tail without computing full reverse EMA.
+                    last_token = seg[:, limit - 1:limit, :].float()
+                    tail_val = _sanitize((1.0 - a) * last_token)
+                    out[:, start + limit:end] = tail_val.expand(1, length - limit, D)
             else:
                 out[:, start:end] = 0
         return _sanitize(out.to(dtype=x.dtype))
@@ -281,6 +276,9 @@ class SharedFFNBank(nn.Module):
         feat_sizes: list[int] = [self.d]
         alpha_use_rev = None
         alpha_use = None
+        rev_head_frac = None
+        rev_tail_frac = None
+        rev_docs_tail_frac = None
         group_stride = max(self.ema_layer_stride, 1)
         base_layer = (layer_idx // group_stride) * group_stride
         if (not deterministic_topk) and self.use_forward_ema and self.ema_alpha is not None:
@@ -319,6 +317,27 @@ class SharedFFNBank(nn.Module):
                 ema_rev = cache_rev[base_layer]
             else:
                 doc_starts = (flags[0, :, 1].float() > 0.5)
+                if self.enable_extra_wandb_logging:
+                    if not bool(doc_starts[0]):
+                        doc_starts[0] = True
+                    doc_bounds = torch.nonzero(doc_starts, as_tuple=True)[0]
+                    if doc_bounds.numel() == 0 or doc_bounds[0].item() != 0:
+                        doc_bounds = torch.cat([doc_bounds.new_tensor([0]), doc_bounds])
+                    doc_bounds = torch.cat([doc_bounds, doc_bounds.new_tensor([x_norm.size(1)])])
+                    lengths = (doc_bounds[1:] - doc_bounds[:-1]).to(torch.float32)
+                    total = float(lengths.sum().item())
+                    if total <= 0:
+                        rev_head_frac = 0.0
+                        rev_tail_frac = 0.0
+                        rev_docs_tail_frac = 0.0
+                    else:
+                        window = float(max(self.ema_window_size_rev, 0))
+                        head = torch.clamp(lengths, max=window)
+                        tail = (lengths - head).clamp(min=0)
+                        rev_head_frac = float(head.sum().item() / total)
+                        rev_tail_frac = float(tail.sum().item() / total)
+                        docs_with_tail = float((tail > 0).sum().item())
+                        rev_docs_tail_frac = docs_with_tail / max(float(lengths.numel()), 1.0)
                 ema_rev = self._ema_reverse_since_doc_start(
                     x_norm, alpha_use_rev, doc_starts,
                     window=self.ema_window_size_rev, block_size=self.ema_block_size_rev,
@@ -471,6 +490,10 @@ class SharedFFNBank(nn.Module):
                 stats["ema_alpha_forward"] = float(alpha_use.float().item())
             if self.use_reverse_ema and self.ema_alpha_rev is not None and alpha_use_rev is not None:
                 stats["ema_alpha_reverse"] = float(alpha_use_rev.float().item())
+            if rev_head_frac is not None:
+                stats["rev_ema_head_frac"] = float(rev_head_frac)
+                stats["rev_ema_tail_frac"] = float(rev_tail_frac)
+                stats["rev_ema_docs_tail_frac"] = float(rev_docs_tail_frac)
             start_idx = 0
             for name, size in zip(feat_names, feat_sizes):
                 end_idx = start_idx + size
