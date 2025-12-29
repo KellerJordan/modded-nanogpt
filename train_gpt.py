@@ -527,8 +527,8 @@ class NorMuon(torch.optim.Optimizer):
         and mlp params when a param group is split across GPUs.
         """
         params_list = list(params)
-        module_group_order = ['attn_gate', 'attn', 'mlp']
-        group_sizes = [10, 16, 16]
+        module_group_order = ['attn_gate', 'value_embed_gate', 'attn', 'mlp']
+        group_sizes = [15, 16, 16]
         params_list.sort(key=lambda x: module_group_order.index(x.label))
 
         idx = 0
@@ -610,7 +610,7 @@ class NorMuon(torch.optim.Optimizer):
 
             # The below shape-based heuristic assumes that matrices have their input along the
             # row dimension and their output along the columns. Gates are an exception.
-            is_gate = ref_param.label in ['attn_gate']
+            is_gate = 'gate' in ref_param.label
 
             if "second_momentum_buffer" not in group:
                 if is_gate:
@@ -923,7 +923,7 @@ class AttnArgs:
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -948,6 +948,11 @@ class CausalSelfAttention(nn.Module):
         self.attn_gate = CastedLinear(12, num_heads)
         self.attn_gate.weight.label = 'attn_gate'
 
+        # only include gates on layers with value embeds used on forward pass
+        if layer_idx in [0,1,8,9,10]:
+            self.value_embed_gate = CastedLinear(12, num_heads)
+            self.value_embed_gate.weight.label = 'value_embed_gate'
+
     def forward(self, x: Tensor, attn_args: AttnArgs):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "varlen sequences requires B == 1"
@@ -965,7 +970,8 @@ class CausalSelfAttention(nn.Module):
             k[:, 1:, :, self.head_dim // 4:self.head_dim // 2] = k[:, :-1, :, self.head_dim // 4:self.head_dim // 2]
             k[:, 1:, :, 3 * self.head_dim // 4:] = k[:, :-1, :, 3 * self.head_dim // 4:]
         if ve is not None:
-            v = v + ve.view_as(v) # @ KoszarskyB & @Grad62304977
+            ve_gate_out = 2 * torch.sigmoid(self.value_embed_gate(x[..., :self.value_embed_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
+            v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
 
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
@@ -1007,7 +1013,7 @@ class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
         super().__init__()
         # skip attention of blocks.6 (the 7th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx != 6 else None
+        self.attn = CausalSelfAttention(dim, head_dim, num_heads, layer_idx) if layer_idx != 6 else None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP(dim)
 
@@ -1041,6 +1047,11 @@ class GPT(nn.Module):
         self.smear_gate.weight.lr_mul = 0.01
         self.smear_gate.weight.wd_mul = 0.0
 
+        self.skip_gate = CastedLinear(12, 1)
+        self.skip_gate.weight.label = 'skip_gate'
+        self.skip_gate.weight.lr_mul = 0.05
+        self.skip_gate.weight.wd_mul = 0.0
+
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
@@ -1054,7 +1065,7 @@ class GPT(nn.Module):
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
 
-        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.5/448, grad_s=0.75/448)
+        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=0.75/448)
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
         self.lm_head.weight.label = 'lm_head'
 
@@ -1085,6 +1096,11 @@ class GPT(nn.Module):
         # set learning rates
         for param in self.value_embeds.parameters():
             param.lr_mul = 75.
+            param.wd_mul = 5.
+        for param in self.embed.parameters():
+            param.wd_mul = 150.
+        for param in self.lm_head.parameters():
+            param.wd_mul = 150.
         self.scalars.lr_mul = 5.0
         self.scalars.wd_mul = 0.0
 
@@ -1146,8 +1162,8 @@ class GPT(nn.Module):
                 key_offset = key_offset[i]
             )
             if i in skip_out:
-                gate = torch.sigmoid(skip_lambda)  # in (0, 1)
-                x = x + gate * skip_connections.pop()
+                skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
+                x = x + skip_gate_out * skip_connections.pop()
             if i == 0:
                 x = (resid_lambdas[0] + x0_lambdas[0]) * x
             else:
@@ -1164,7 +1180,7 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
-        logits = 23 * torch.sigmoid((logits+5) / 7.5)
+        logits = 23 * torch.sigmoid((logits + 5) / 7.5)
         logits_for_loss = logits.float() if not self.training else logits
 
         n_predict = mtp_weights.size(0) if mtp_weights is not None else 1
@@ -1437,9 +1453,9 @@ class TrainingManager():
         self.mtp_weights_schedule = self._build_mtp_schedule()
         self.model = model
 
-        adam_labels = ['lm_head', 'value_embed', 'smear_gate', 'x0_lambdas', 'embed']
+        adam_labels = ['lm_head', 'value_embed', 'smear_gate', 'skip_gate', 'x0_lambdas', 'embed']
         scalar_labels = ['scalars']
-        muon_labels = ['attn_gate', 'attn', 'mlp']
+        muon_labels = ['attn_gate', 'value_embed_gate', 'attn', 'mlp']
         adam_params = [p for p in model.parameters() if getattr(p, 'label', None) in adam_labels]
         scalar_params = [p for p in model.parameters() if getattr(p, 'label', None) in scalar_labels]
         muon_params = [p for p in model.parameters() if getattr(p, 'label', None) in muon_labels]
@@ -1582,7 +1598,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 1840  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1805  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
