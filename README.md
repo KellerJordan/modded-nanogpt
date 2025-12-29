@@ -6,7 +6,7 @@ The target (3.28 validation loss on FineWeb) follows Andrej Karpathy's [GPT-2 re
 The speedrun code also descends from llm.c's [PyTorch trainer](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py), which itself descends from NanoGPT, hence the name of the repo.
 Thanks to the efforts of many contributors, this repo now contains a training algorithm which attains the target performance in:
 * 2 minutes on 8xH100 (the llm.c GPT-2 replication needed 45)
-* 0.73B tokens (the llm.c GPT-2 replication needed 10B)
+* under 500M tokens (the llm.c GPT-2 replication needed 10B)
 
 This improvement in training speed has been brought about by the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU²
@@ -30,6 +30,7 @@ This improvement in training speed has been brought about by the following techn
 * Partial model freezing during batch size and sliding window size transitions
 * Multi token prediction
 * Untie embed and lm_head at 2/3 of training
+* Additional gating on value embeddings and skip connection
 
 As well as many systems optimizations.
 
@@ -152,6 +153,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 52 | 2.037 minutes | [Smooth scalars via beta increase, decrease smear gate lr, freeze scalars during transitions, adam all reduce](https://x.com/classiclarryd/status/2003863282613190656)  | 12/21/25 | [log](records/track_1_short/2025-12-21_SmoothedScalars/12-21-Smoothed-Scalars/0bc6e909-8ee8-4ae3-ac62-0070e151a808.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/177) | @ChrisJMcCormick
 53 | 1.988 minutes | [Multi-token prediction, untie embed/lm_head at 2/3 training, lr update, tweak CWD](https://x.com/classiclarryd/status/2004248941878296580)  | 12/22/25 | [log](records/track_1_short/2025-12-22_MultiTokenPrediction/17aaf854-f338-4d0d-9767-a5db30fd7980.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/178) | @varunneal, @classiclarryd
 54 | 1.940 minutes | Asymmetric Logit Rescale  | 12/26/25 | [log](records/track_1_short/2025-12-26_LogitRescale/03e41c2d-2951-4546-a599-24cd723247fc.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/181) | @classiclarryd
+54 | 1.918 minutes | Gates on value embeds and skip connection  | 12/29/25 | [log](records/track_1_short/2025-12-29_VeSkipGates/2851d7dc-d6a5-4e74-8623-57031425db16.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/186) | @classiclarryd
 ## Rules
 
 New records must:
