@@ -154,6 +154,8 @@ def update(
     grad = grad.float()
     momentum_buffer.copy_(momentum * momentum_buffer + (1 - momentum) * grad)
     v = zeropower_via_newtonschulz5(momentum * momentum_buffer + (1 - momentum) * grad)
+    smoothed_update_buffer.copy_(update_smoothing * smoothed_update_buffer + (1 - update_smoothing) * v)
+    v = update_smoothing * smoothed_update_buffer + (1-update_smoothing) * v
 
     update_smoothing_buffer.copy_(update_smoothing * update_smoothing_buffer + (1 - update_smoothing) * v)
     v = update_smoothing_buffer
@@ -204,6 +206,10 @@ class Muon(torch.optim.Optimizer):
             for base_i in range(len(params))[:: self.world_size]:
                 if base_i + self.rank < len(params):
                     p = params[base_i + self.rank]
+                    # if "step_count" not in self.state:
+                    #     self.state["step_count"] = torch._as_tensor_fullprec(0.0)
+                    # step_count = self.state["step_count"]
+                    # step_count.add_(1)
                     state = self.state[p]
                     if len(state) == 0:
                         state["mantissa"] = torch.zeros_like(p, dtype=torch.uint16)
