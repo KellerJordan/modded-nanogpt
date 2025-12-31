@@ -573,7 +573,7 @@ def run_training(
             model._param_id_to_name = {id(p): n for n, p in model.named_parameters()}
         #id2name = model._param_id_to_name
 
-        _grad_allreducer.allreduce_grads(opt2params, bucket_cap_mb=32)
+        opt2futures = _grad_allreducer.allreduce_grads(opt2params, bucket_cap_mb=32)
 
         progress = step / max(args.num_iterations, 1)
         router_lr_mult = rampdown_multiplier(progress, args.router_lr_reduce_start_frac, model.router_freeze_frac)
