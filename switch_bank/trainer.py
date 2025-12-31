@@ -441,11 +441,31 @@ def run_training(
             result.update(_finalize_logit_stats(logit_stats))
             return result
 
-        opt2futures = {
-            opt: [dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
-                  for p in params if (p.grad is not None)]
-            for opt, params in opt2params.items()
-        }
+        # Build a stable name for each param once (same across ranks as long as the model is the same).
+        if not hasattr(model, "_param_id_to_name"):
+            model._param_id_to_name = {id(p): n for n, p in model.named_parameters()}
+        id2name = model._param_id_to_name
+
+        opt2futures = {}
+        for opt, params in opt2params.items():
+            # Deterministic ordering
+            params = sorted(params, key=lambda p: id2name.get(id(p), ""))
+
+            futures = []
+            for p in params:
+                # Skip truly frozen params (safe: consistent across ranks)
+                if not p.requires_grad:
+                    continue
+
+                # Critical: don't skip the collective just because this rank didn't use the param
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+                futures.append(
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
+                )
+
+            opt2futures[opt] = futures
 
         progress = step / max(args.num_iterations, 1)
         router_lr_mult = rampdown_multiplier(progress, args.router_lr_reduce_start_frac, model.router_freeze_frac)
