@@ -200,7 +200,7 @@ class Hyperparameters:
     use_router_adapters = True
     router_block_pos_bins = 8  # 4 / 8 / 16
     first_doc_tokens_N = 64
-    router_enable_forward_ema = True #False
+    router_enable_forward_ema = False #False
     router_enable_reverse_ema = True #True
     ema_alpha_fwd = 0.80
     ema_alpha_rev = 0.85

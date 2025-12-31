@@ -4,11 +4,14 @@ import time
 import os
 from functools import lru_cache
 from collections import defaultdict, deque
+from typing import List, Dict
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch.nn import Parameter
+from torch.optim import Optimizer
 
 from switch_bank.utils import next_multiple_of_n, rampdown_multiplier
 from switch_bank.data import (
@@ -130,6 +133,119 @@ def _finalize_logit_stats(logit_stats: dict[str, float]) -> dict[str, float]:
     }
 
 
+
+def _chunk_by_bytes(tensors: List[torch.Tensor], max_bytes: int) -> List[List[torch.Tensor]]:
+    """Chunk tensors into buckets with total size <= max_bytes.
+    Each tensor is assumed dense and on CUDA.
+    """
+    buckets: List[List[torch.Tensor]] = []
+    cur: List[torch.Tensor] = []
+    cur_bytes = 0
+
+    for t in tensors:
+        t_bytes = t.numel() * t.element_size()
+        if cur and cur_bytes + t_bytes > max_bytes:
+            buckets.append(cur)
+            cur = []
+            cur_bytes = 0
+        cur.append(t)
+        cur_bytes += t_bytes
+
+    if cur:
+        buckets.append(cur)
+    return buckets
+
+
+class GradAllReducer:
+    """Deterministic, bucketed gradient all-reduce that handles per-rank unused params.
+
+    Guarantees that all ranks execute the same collective sequence, even if some params
+    have p.grad is None on some ranks.
+
+    Notes:
+      - Uses a global-used mask to skip params unused on *all* ranks this step.
+      - Uses cached zero buffers for locally-missing grads for globally-used params.
+    """
+
+    def __init__(self, model: torch.nn.Module):
+        self._id2name = {id(p): n for n, p in model.named_parameters()}
+        self._zero_grad_cache: Dict[int, torch.Tensor] = {}
+
+    @torch.no_grad()
+    def allreduce_grads(
+        self,
+        opt2params: Dict[Optimizer, List[Parameter]],
+        *,
+        bucket_cap_mb: int = 32,
+    ) -> Dict[Optimizer, List[torch.futures.Future]]:
+        """All-reduce grads for each optimizer's param list.
+
+        Args:
+          opt2params: mapping opt -> params (Parameters may overlap across opts).
+          bucket_cap_mb: bucket size in MiB for coalesced all-reduce.
+
+        Returns:
+          opt2futures: mapping opt -> list of futures that complete when reduction is done.
+        """
+        world_size = dist.get_world_size()
+        inv_world = 1.0 / float(world_size)
+        max_bytes = int(bucket_cap_mb * 1024 * 1024)
+
+        opt2futures: Dict[Optimizer, List[torch.futures.Future]] = {}
+
+        for opt, params in opt2params.items():
+            # Deterministic order across ranks.
+            params_sorted = sorted(params, key=lambda p: self._id2name.get(id(p), ""))
+
+            # Local "has grad" flags (int32 on CUDA so NCCL can reduce it fast).
+            has_grad = torch.empty(len(params_sorted), device="cuda", dtype=torch.int32)
+            for i, p in enumerate(params_sorted):
+                has_grad[i] = 1 if (p.requires_grad and p.grad is not None) else 0
+
+            # Global-used mask: >0 means at least one rank produced a grad for that param this step.
+            dist.all_reduce(has_grad, op=dist.ReduceOp.SUM)
+
+            grads_to_reduce: List[torch.Tensor] = []
+            for i, p in enumerate(params_sorted):
+                if not p.requires_grad:
+                    continue
+                if has_grad[i].item() == 0:
+                    # Unused everywhere this step; skip entirely (preserves your old semantics).
+                    continue
+
+                if p.grad is None:
+                    # Locally unused but globally used: supply a cached zero grad buffer.
+                    pid = id(p)
+                    buf = self._zero_grad_cache.get(pid)
+                    if buf is None or buf.shape != p.shape or buf.dtype != p.dtype or buf.device != p.device:
+                        buf = torch.zeros_like(p, memory_format=torch.preserve_format)
+                        self._zero_grad_cache[pid] = buf
+                    else:
+                        buf.zero_()
+                    p.grad = buf
+
+                grads_to_reduce.append(p.grad)
+
+            # Bucketed all-reduce. Use SUM + scale (AVG isn’t always supported on all APIs).
+            futures: List[torch.futures.Future] = []
+            for bucket in _chunk_by_bytes(grads_to_reduce, max_bytes):
+                if not bucket:
+                    continue
+                work = dist.all_reduce_coalesced(bucket, op=dist.ReduceOp.SUM, async_op=True)
+                fut = work.get_future()
+
+                # Scale grads after the SUM completes (foreach is reasonably cheap).
+                def _scale_cb(f, bucket=bucket, inv_world=inv_world):
+                    torch._foreach_mul_(bucket, inv_world)
+                    return f.value()
+
+                futures.append(fut.then(_scale_cb))
+
+            opt2futures[opt] = futures
+
+        return opt2futures
+
+
 def run_training(
     args,
     model: nn.Module,
@@ -182,6 +298,8 @@ def run_training(
         turbo_muon_warmstart_start_step = min(max(turbo_muon_warmstart_start_step, 0), train_steps)
 
     logit_stats = {"count": 0.0, "sum_ratio": 0.0, "cap_hits": 0.0, "max_ratio": 0.0}
+
+    _grad_allreducer = GradAllReducer(model)
 
     def run_validation(val_steps_multiplier: float, log_val_loss: bool, extra_log: dict | None = None, log_to_wandb: bool = True):
         nonlocal training_time_ms, t0, last_val_loss
@@ -444,28 +562,9 @@ def run_training(
         # Build a stable name for each param once (same across ranks as long as the model is the same).
         if not hasattr(model, "_param_id_to_name"):
             model._param_id_to_name = {id(p): n for n, p in model.named_parameters()}
-        id2name = model._param_id_to_name
+        #id2name = model._param_id_to_name
 
-        opt2futures = {}
-        for opt, params in opt2params.items():
-            # Deterministic ordering
-            params = sorted(params, key=lambda p: id2name.get(id(p), ""))
-
-            futures = []
-            for p in params:
-                # Skip truly frozen params (safe: consistent across ranks)
-                if not p.requires_grad:
-                    continue
-
-                # Critical: don't skip the collective just because this rank didn't use the param
-                if p.grad is None:
-                    p.grad = torch.zeros_like(p, memory_format=torch.preserve_format)
-
-                futures.append(
-                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
-                )
-
-            opt2futures[opt] = futures
+        _grad_allreducer.allreduce_grads(opt2params, bucket_cap_mb=32)
 
         progress = step / max(args.num_iterations, 1)
         router_lr_mult = rampdown_multiplier(progress, args.router_lr_reduce_start_frac, model.router_freeze_frac)
