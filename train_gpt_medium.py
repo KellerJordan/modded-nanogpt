@@ -23,78 +23,7 @@ from torch import nn, Tensor
 
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-
-
-torch._inductor.config.coordinate_descent_tuning = (
-    True  # we allow this flag for medium track
-)
-# torch._dynamo.config.compiled_autograd = True
-
-
-class Snoo:
-    """
-    @DominikKallusky, @vishal9-team, @vinaysrao
-
-    Sparse Nesterov Outer Optimizer (Snoo) is a momentum-based wrapper to any optimizer that can
-    improve the stability and smoothness of the optimization process and thus the quality
-    of large language models (LLM) and other models. Snoo implicitly adds temporal regularization
-    to the parameters, thus smoothing the training trajectory and instilling a bias towards flatter
-    minima and lower parameter norms. Snoo is computationally efficient, incurring minimal overhead
-    in compute and moderate memory usage.
-    """
-
-    @torch.no_grad()
-    def __init__(self, model: nn.Module, lr: float, momentum: float, k: int) -> None:
-        self.model = model
-        self.lr = lr
-        self.momentum = momentum
-        self.k = k
-        self.current_step = 0
-        self.outer_buf = [p.clone() for p in model.parameters()]
-        self.model_params = list(self.model.parameters())
-        self.optimizer = torch.optim.SGD(
-            self.model.parameters(),
-            lr=lr,
-            momentum=momentum,
-            nesterov=True,
-            fused=True,
-        )
-
-    @torch.no_grad()
-    def step(
-        self,
-    ) -> None:
-        if self.current_step % self.k == 0:
-            for p_new, p_old in zip(self.model_params, self.outer_buf):
-                p_new.grad = p_old.data - p_new.data
-                p_new.copy_(p_old, non_blocking=True)
-
-            self.optimizer.step()
-
-            for p_new, p_old in zip(self.model_params, self.outer_buf):
-                p_old.copy_(p_new, non_blocking=True)
-        self.current_step += 1
-
-    def state_dict(self):
-        state_dict = {
-            "current_step": self.current_step,
-            "lr": self.lr,
-            "momentum": self.momentum,
-            "k": self.k,
-            "outer_buf": [p.clone() for p in self.outer_buf],
-            "optimizer_state_dict": self.optimizer.state_dict(),
-        }
-        return state_dict
-
-    def load_state_dict(self, state_dict):
-        self.current_step = state_dict["current_step"]
-        self.lr = state_dict["lr"]
-        self.momentum = state_dict["momentum"]
-        self.k = state_dict["k"]
-        for p_src, p_dst in zip(state_dict["outer_buf"], self.outer_buf):
-            p_dst.copy_(p_src)
-        self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
-
+torch._inductor.config.coordinate_descent_tuning = True # we allow this flag for medium track
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -139,19 +68,13 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
 
 
 @torch.compile
-def update(
-    acc_bf16_view_u16: Tensor,
-    mantissa: Tensor,
-    momentum_buffer: Tensor,
-    grad: Tensor,
-    momentum: Tensor,
-    eff_lr: Tensor,
-    eff_weight_decay: Tensor,
-):
+def update(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Tensor, smoothed_update_buffer: Tensor, grad: Tensor, momentum: Tensor, update_smoothing: Tensor, eff_lr: Tensor, eff_weight_decay: Tensor):
     assert acc_bf16_view_u16.dtype == mantissa.dtype == torch.uint16
     grad = grad.float()
     momentum_buffer.copy_(momentum * momentum_buffer + (1 - momentum) * grad)
     v = zeropower_via_newtonschulz5(momentum * momentum_buffer + (1 - momentum) * grad)
+    smoothed_update_buffer.copy_(update_smoothing * smoothed_update_buffer + (1 - update_smoothing) * v)
+    v = update_smoothing * smoothed_update_buffer + (1-update_smoothing) * v
 
     acc_m_u32 = (acc_bf16_view_u16.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
     acc_m_u32.view(torch.float32).mul_(1 - eff_weight_decay)
@@ -174,13 +97,10 @@ class Muon(torch.optim.Optimizer):
     Warning: This optimizer should not be used for the embedding layer, the final fully connected layer,
     or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
     """
-
-    def __init__(
-        self, params, lr=0.02, weight_decay=0.01, momentum=0.95, rank=0, world_size=1
-    ):
+    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, update_smoothing=0.0, rank=0, world_size=1):
         self.rank = rank
         self.world_size = world_size
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, update_smoothing=update_smoothing)
         super().__init__(params, defaults)
         assert all(
             p.dtype == torch.bfloat16
@@ -195,29 +115,24 @@ class Muon(torch.optim.Optimizer):
             params: list[Tensor] = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * self.world_size
             momentum = torch._as_tensor_fullprec(group["momentum"])
-            for base_i in range(len(params))[:: self.world_size]:
+            update_smoothing = torch._as_tensor_fullprec(group["update_smoothing"])
+            for base_i in range(len(params))[::self.world_size]:
                 if base_i + self.rank < len(params):
                     p = params[base_i + self.rank]
+                    # if "step_count" not in self.state:
+                    #     self.state["step_count"] = torch._as_tensor_fullprec(0.0)
+                    # step_count = self.state["step_count"]
+                    # step_count.add_(1)
                     state = self.state[p]
                     if len(state) == 0:
                         state["mantissa"] = torch.zeros_like(p, dtype=torch.uint16)
-                        state["momentum_buffer"] = torch.zeros_like(
-                            p, dtype=torch.float32
-                        )
+                        state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
+                        state["smoothed_update_buffer"] = torch.zeros_like(p, dtype=torch.bfloat16)
                     update(
-                        p.view(torch.uint16),
-                        state["mantissa"],
-                        state["momentum_buffer"],
-                        p.grad,
-                        momentum,
-                        eff_lr=torch._as_tensor_fullprec(
-                            group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5
-                        ),
-                        eff_weight_decay=torch._as_tensor_fullprec(
-                            group["lr"]
-                            * group["weight_decay"]
-                            * getattr(p, "wd_mul", 1.0)
-                        ),
+                        p.view(torch.uint16), state["mantissa"], state["momentum_buffer"], state["smoothed_update_buffer"],
+                        p.grad, momentum, update_smoothing,
+                        eff_lr=torch._as_tensor_fullprec((group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5)), # /(1-update_smoothing**step_count)),
+                        eff_weight_decay=torch._as_tensor_fullprec(group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)),
                     )
                 futures.append(
                     dist.all_gather(
@@ -345,14 +260,14 @@ class Block(nn.Module):
         self.mlp = MLP(dim)
 
     def forward(
-        self,
-        x: Tensor,
-        ve: Tensor | None,
-        x00: Tensor,
-        x01: Tensor,
-        block_mask: BlockMask,
-        lambdas: Tensor,
-        sa_lambdas: Tensor,
+            self,
+            x: Tensor,
+            ve: Tensor | None,
+            x00: Tensor,
+            x01: Tensor,
+            block_mask: BlockMask,
+            lambdas: Tensor,
+            sa_lambdas: Tensor,
     ):
         x = lambdas[0] * x + lambdas[1] * x00 + lambdas[2] * x01
         if self.attn is not None:
@@ -383,12 +298,8 @@ class GPT(nn.Module):
         self.embed2 = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
-        self.value_embeds = nn.ModuleList(
-            [nn.Embedding(vocab_size, model_dim) for _ in range(5)]
-        )
-        self.blocks = nn.ModuleList(
-            [Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)]
-        )
+        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(5)])
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head_w = nn.Parameter(
@@ -396,22 +307,11 @@ class GPT(nn.Module):
         )
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
-        self.scalars = nn.Parameter(
-            torch.cat(
-                [
-                    torch.ones(num_layers),  # skip_weights
-                    *[
-                        torch.tensor([1.0, 0.0, 0.0]) for _ in range(num_layers)
-                    ],  # block lambdas
-                    *[
-                        torch.tensor([0.5, 0.5]) for _ in range(num_layers)
-                    ],  # SA lambdas
-                ]
-            )
-        )
-        for m in self.modules():
-            if isinstance(m, nn.Embedding):
-                m.bfloat16()
+        self.scalars = nn.Parameter(torch.cat([
+            torch.ones(num_layers), # skip_weights
+            *[torch.tensor([1.0, 0.0, 0.0]) for _ in range(num_layers)], # block lambdas
+            *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)], # SA lambdas
+        ]))
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
@@ -477,11 +377,7 @@ class GPT(nn.Module):
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        ve = (
-            [ve[0], ve[1], ve[2], ve[3], ve[4]]
-            + [None] * (len(self.blocks) - 10)
-            + [ve[0], ve[1], ve[2], ve[3], ve[4]]
-        )
+        ve = [ve[0], ve[1], ve[2], ve[3], ve[4]] + [None] * (len(self.blocks) - 10) + [ve[0], ve[1], ve[2], ve[3], ve[4]]
         assert len(ve) == len(self.blocks)
 
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
@@ -505,9 +401,7 @@ class GPT(nn.Module):
         ]
         assert len(block_masks) == len(self.blocks)
 
-        x = x00 = norm(
-            self.embed1(input_seq)[None]
-        )  # use of norm here by @Grad62304977
+        x = x00 = norm(self.embed1(input_seq)[None]) # use of norm here by @Grad62304977
         x01 = norm(self.embed2(input_seq)[None])
 
         skip_connections = []
@@ -516,17 +410,13 @@ class GPT(nn.Module):
             10: 4,
             11: 2,
         }
-        skip_weights = self.scalars[: len(self.blocks)]
-        lambdas = self.scalars[1 * len(self.blocks) : 4 * len(self.blocks)].view(-1, 3)
-        sa_lambdas = self.scalars[4 * len(self.blocks) : 6 * len(self.blocks)].view(
-            -1, 2
-        )
+        skip_weights = self.scalars[:len(self.blocks)]
+        lambdas = self.scalars[1 * len(self.blocks): 4 * len(self.blocks)].view(-1, 3)
+        sa_lambdas = self.scalars[4 * len(self.blocks): 6 * len(self.blocks)].view(-1, 2)
         for i in range(len(self.blocks)):
             if i in skip_map:
                 x = x + skip_weights[skip_map[i]] * skip_connections[skip_map[i]]
-            x = self.blocks[i](
-                x, ve[i], x00, x01, block_masks[i], lambdas[i], sa_lambdas[i]
-            )
+            x = self.blocks[i](x, ve[i], x00, x01, block_masks[i], lambdas[i], sa_lambdas[i])
             skip_connections.append(x)
 
         x = norm(x)
@@ -614,8 +504,9 @@ class Hyperparameters:
     train_seq_len = 64 * 1024  # FlexAttention sequence length
     val_seq_len = 4 * 64 * 1024  # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 5640  # number of iterations to run
-    cooldown_frac = 0.7  # fraction of training spent cooling down the learning rate
+    num_iterations = 5610 # number of iterations to run
+    cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
+    final_lr_scale = 0.01
     # architecture
     vocab_size = 50257
     # evaluation and logging
@@ -654,7 +545,6 @@ def print0(s, console=False):
             if console:
                 print(s)
             print(s, file=f)
-
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -720,15 +610,11 @@ for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
 # collect the parameters to optimize
-hidden_matrix_params = sorted(
-    (p for p in model.blocks.parameters() if p.ndim >= 2),
-    key=lambda x: x.size(),
-    reverse=True,
-)
+hidden_matrix_params = sorted((p for p in model.blocks.parameters() if p.ndim >= 2), key=lambda x: x.size(), reverse=True)
 embed_params = [
     *model.embed1.parameters(),
     *model.embed2.parameters(),
-    *model.value_embeds.parameters(),
+    *model.value_embeds.parameters()
 ]
 scalar_params = [model.scalars]
 head_params: list[nn.Parameter] = [model.lm_head_w]
@@ -746,19 +632,9 @@ adam_param_groups = [
 ]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-inner_optimizers = [
-    torch.optim.AdamW(
-        adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True
-    )
-]
-inner_hidden_optim = Muon(
-    hidden_matrix_params, lr=0.027, momentum=0.95, rank=rank, world_size=world_size
-)
-inner_optimizers += [inner_hidden_optim]
-outer_optim = Snoo(model, lr=0.68, momentum=0.37, k=28)
-all_optimizers: list[torch.optim.Optimizer] = [outer_optim] + inner_optimizers
-
-
+optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
+optimizer2 = Muon(hidden_matrix_params, lr=0.03, momentum=0.95, update_smoothing=0.5, rank=rank, world_size=world_size)
+optimizers: list[torch.optim.Optimizer] = [optimizer1, optimizer2]
 def opt_params(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
     return [p for group in opt.param_groups for p in group["params"]]
 
@@ -776,7 +652,7 @@ def get_lr(step: int):
     if x < 1 - args.cooldown_frac:
         return 1.0
     else:
-        return (1 - x) / args.cooldown_frac
+        return (1 - x) / args.cooldown_frac * (1-args.final_lr_scale) + args.final_lr_scale
 
 
 # attention window size schedule: linearly increase
@@ -805,16 +681,10 @@ model: nn.Module = torch.compile(model, dynamic=False)
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 warmup_steps = 10
-initial_state = copy.deepcopy(
-    dict(
-        model=model.state_dict(),
-        optimizers=[opt.state_dict() for opt in all_optimizers],
-    )
-)
-for _ in range(warmup_steps):
-    inputs = targets = torch.randint(
-        0, args.vocab_size, size=(args.train_seq_len,), device="cuda"
-    )
+initial_state = copy.deepcopy(dict(model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers]))
+for warmup_step in range(warmup_steps):
+    print0(f"Warmup step {warmup_step+1}/{warmup_steps}")
+    inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
     model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
@@ -903,6 +773,9 @@ for step in range(train_steps + 1):
     for group in inner_hidden_optim.param_groups:
         frac = min(step / 300, 1)  # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+
+        smoothing_frac=min(step / 3000, 1)
+        group["update_smoothing"] = (1 - smoothing_frac) * 0.5 + smoothing_frac * 0.2
     # step the optimizers
     for opt in inner_optimizers:
         torch.futures.collect_all(opt2futures[opt]).wait()
