@@ -231,8 +231,9 @@ class GradAllReducer:
             for bucket in _chunk_by_bytes(grads_to_reduce, max_bytes):
                 if not bucket:
                     continue
-                work = dist.all_reduce_coalesced(bucket, op=dist.ReduceOp.SUM, async_op=True)
-                fut = work.get_future()
+                fut = _work_to_future(
+                    dist.all_reduce_coalesced(bucket, op=dist.ReduceOp.SUM, async_op=True)
+                )
 
                 # Scale grads after the SUM completes (foreach is reasonably cheap).
                 def _scale_cb(f, bucket=bucket, inv_world=inv_world):
@@ -245,6 +246,14 @@ class GradAllReducer:
 
         return opt2futures
 
+def _work_to_future(work_or_future):
+    """Normalize c10d async returns to a Future.
+
+    PyTorch returns either:
+      - a Work object (with .get_future()), or
+      - a torch._C.Future directly.
+    """
+    return work_or_future.get_future() if hasattr(work_or_future, "get_future") else work_or_future
 
 def run_training(
     args,
