@@ -45,7 +45,7 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@byronxu99](https://github.com/byronxu99), [@varunneal](https://x.com/varunneal), [@EmelyanenkoK](https://github.com/EmelyanenkoK), 
 [@bernard24](https://github.com/bernard24)/https://www.hiverge.ai/, [@Gusarich](https://x.com/Gusarich), [@li_zichong](https://x.com/li_zichong),
 [@akash5474](https://github.com/akash5474), [@snimu](https://x.com/omouamoua), [@roeeshenberg](https://x.com/roeeshenberg),
-[@ChrisJMcCormick](https://x.com/ChrisJMcCormick)
+[@ChrisJMcCormick](https://x.com/ChrisJMcCormick), @dominikkallusky, @acutkosky, @manikbhandari
 
 
 ---
@@ -244,6 +244,7 @@ All other rules remain the same.
 14 | 23.08 minutes | Combine both records 12 & 13 | 09/30/25 | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/137) | @acutkosky
 15 | 23.03 minutes | Backout (Skip from 2/3 point to pre-lm_head) | 10/04/25 | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/139) | @snimu
 16 | 22.99 minutes | Smear-MTP | 11/02/25 | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/151) | @snimu
+17 | 22.98 minutes | Remove Redundant Mask Op | 11/12/25 | [log](records/track_2_medium/2025-11-12_BlockMaskRedundantOp/000_3b22a9d4-b52e-4916-99bf-3d48b38747a7.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/157/) | @manikbhandari
 ---
 
 ### Q: What is the point of NanoGPT speedrunning?
