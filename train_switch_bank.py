@@ -200,8 +200,8 @@ class Hyperparameters:
     use_router_adapters = True
     router_block_pos_bins = 8  # 4 / 8 / 16
     first_doc_tokens_N = 64
-    router_enable_forward_ema = False #False
-    router_enable_reverse_ema = True #True
+    router_enable_forward_ema = False
+    router_enable_reverse_ema = True
     ema_alpha_fwd = 0.80
     ema_alpha_rev = 0.85
     ema_window_size_fwd = 128  # <=0 means full sequence
@@ -217,7 +217,7 @@ class Hyperparameters:
     shared_ffn_lr_reduce_start_frac = -1.0
     # skip-attention layers (short-SWA) — exactly two
     skip_attn_layers = (11,)  # (7,)
-    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (75, 2), (141, 3), (234, 4), (338, 5), (441, 6), (591, 7), (695, 8),)     #((0, 1), (200, 2), (375, 3), (625, 4), (900, 5), (1175, 6), (1575, 7), (1850, 8),) # (2175, 9))
+    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (575, 2), (641, 3), (734, 4), (838, 5), (941, 6), (1091, 7), (1195, 8),) #((0, 1), (75, 2), (141, 3), (234, 4), (338, 5), (441, 6), (591, 7), (695, 8),)     #((0, 1), (200, 2), (375, 3), (625, 4), (900, 5), (1175, 6), (1575, 7), (1850, 8),) # (2175, 9))
     router_temp_init = 1.464
     router_temp_final = 0.93744
     router_temp_power = 1.5  # fallback if anchor disabled
