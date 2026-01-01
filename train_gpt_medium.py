@@ -529,7 +529,6 @@ class NorMuon(torch.optim.Optimizer):
         params_list = list(params)
         module_group_order = ['attn_gate', 'value_embed_gate', 'attn', 'mlp'] # 16, 10, 16, 32
         group_sizes = [16, 10, 16, 16, 16]
-        # 72... its actually 74
         params_list.sort(key=lambda x: module_group_order.index(x.label))
         print0(len(params_list), console=True)
         idx = 0
@@ -768,7 +767,7 @@ class DistAdam(torch.optim.Optimizer):
                 )
 
     def copy_lm_to_embed(self):
-        # run at 2/3 of training
+        # run at 1/6 of training
         lm_head = self.param_groups[0]['params'][0]
         embed = self.param_groups[-1]['params'][0]
         lm_head_state = self.state[lm_head]
@@ -843,7 +842,7 @@ def norm(x: Tensor):
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
         super().__init__(in_features, out_features, bias=False)
-        self.use_fp8 = False # use_fp8
+        self.use_fp8 = False # turn off fp8 for now -> requires tuning of scales which hasnt been done on medium track
         self.x_s = x_s
         self.w_s = w_s
         self.grad_s = grad_s
@@ -951,7 +950,7 @@ class CausalSelfAttention(nn.Module):
         self.attn_gate.weight.lr_mul = 0.1
 
         # only include gates on layers with value embeds used on forward pass
-        if layer_idx in [0,1,2,3,4,11, 12, 13, 14, 15]:
+        if layer_idx in [0, 1, 2, 3, 4, 11, 12, 13, 14, 15]:
             self.value_embed_gate = CastedLinear(16, num_heads)
             self.value_embed_gate.weight.label = 'value_embed_gate'
             self.value_embed_gate.weight.lr_mul = 0.1
@@ -1015,16 +1014,12 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
         super().__init__()
-        # skip attention of blocks.6 (the 7th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, head_dim, num_heads, layer_idx)
-        # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP(dim)
 
     def forward(self, x: Tensor, attn_args: AttnArgs):
-        if self.attn is not None:
-            x = x + self.attn(norm(x), attn_args)
-        if self.mlp is not None:
-            x = x + self.mlp(norm(x))
+        x = x + self.attn(norm(x), attn_args)
+        x = x + self.mlp(norm(x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -1113,7 +1108,8 @@ class GPT(nn.Module):
             param.wd_mul = 150.
         self.scalars.lr_mul = 5.0
         self.scalars.wd_mul = 0.0
-
+        
+        # start training with tied embed/lm_head
         self.split_embed = False
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, schedule_cfg: ForwardScheduleConfig):
@@ -1189,7 +1185,7 @@ class GPT(nn.Module):
             if i == backout_layer:
                 x_backout = x
 
-        # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
+        # back out contributions from first 2/3 layers that are only required for downstream context and not direct prediction
         x -= backout_lambda * x_backout
         x = norm(x)
 
@@ -1208,7 +1204,7 @@ class GPT(nn.Module):
         logits_for_loss = logits.float() if not self.training else logits
 
         n_predict = mtp_weights.size(0) if mtp_weights is not None else 1
-        if self.training and n_predict > 1:
+        if n_predict > 1:
             # Multi-token prediction: take loss of the weighted average of next n_predict tokens
             logits_flat = logits_for_loss.view(-1, logits_for_loss.size(-1))
             idx = F.pad(target_seq, (0, n_predict - 1)).unfold(0, n_predict, 1)  # [T, n_predict] of shifted targets
@@ -1217,10 +1213,8 @@ class GPT(nn.Module):
             for k in range(1, n_predict):  # zero out preds past end of sequence
                 cross_entropy[-k:, k] = 0
             loss = (cross_entropy * mtp_weights).sum()
-        elif self.training:
-            loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="sum")
         else:
-            loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
+            loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="sum")
         return loss
 
 # -----------------------------------------------------------------------------
@@ -1628,7 +1622,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16 * 2 # doubled to enable longer window sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 4600  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 4700  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.70  # fraction of num_scheduled_iterations spent cooling down the learning rate
