@@ -451,13 +451,8 @@ class GPT(nn.Module):
         causal_blockmask_all = block_idx[:, None] > block_idx
         docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
         docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
-        document_blockmask_any = (docs_low[:, None] <= docs_high) & (
-            docs_high[:, None] >= docs_low
-        )
-        document_blockmask_all = (docs_low[:, None] == docs_high) & (
-            docs_high[:, None] == docs_low
-        )
-        blockmask_any = causal_blockmask_any & document_blockmask_any
+        document_blockmask_all = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
+        blockmask_any = causal_blockmask_any & (docs_low[:, None] <= docs_high)
         blockmask_all = causal_blockmask_all & document_blockmask_all
         partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(
             blockmask_any & ~blockmask_all
@@ -674,7 +669,15 @@ def print0(s, console=False):
             if console:
                 print(s)
             print(s, file=f)
-
+from torch._logging._internal import trace_structured # noqa: E402
+import torch._inductor.codecache # noqa: E402
+import torch._inductor.graph # noqa: E402
+def _patched_trace_structured(name, metadata_fn, **kwargs):
+    if name == "inductor_output_code":
+        print0(f'inductor_output_code: {metadata_fn().get("filename", "Unknown")}')
+    trace_structured(name, metadata_fn, **kwargs)
+torch._inductor.codecache.trace_structured = _patched_trace_structured
+torch._inductor.graph.trace_structured = _patched_trace_structured
 
 # begin by printing this file (the Python code)
 print0(code)
