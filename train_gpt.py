@@ -476,17 +476,13 @@ class NorMuon(torch.optim.Optimizer):
     dist.reduce_scatter_tensor() call. The model architecture has been customized to enable
     (n_attn_layers+n_mlp_layers*2)%8==0 for batching across 8 GPUs with zero padding on mlp and attn.
     The scheduling is:
-        1. reduce scatter attn_gate (10 params 6 padding params)
-        2. reduce scatter attn/mlp round 1 (10 attn params 6 mlp params)
-        3. reduce scatter attn/mlp round 2 (16 mlp params)
-        4. wait on step 1, then compute update of 1 and schedule all gather
-        5. wait on step 2, then compute update of 2 and schedule all gather
-        6. wait on step 3, then compute update of 3 and schedule all gather
+        1. reduce scatter attn/mlp round 1 (10 attn params 6 mlp params)
+        2. reduce scatter attn/mlp round 2 (16 mlp params)
+        3. wait on step 1, then compute update of 1 and schedule all gather
+        4. wait on step 2, then compute update of 2 and schedule all gather
             GPUs receive [2 ATTN, 2 ATTN, 2 ATTN, 2 ATTN, 2 ATTN, 2 MLP, 2 MLP, 2 MLP]
             GPUs that receive params of type attn reshape before computing update
-        7. wait on 4, then compute update of 4 and schedule all gather
-        8. wait for each all gather to complete and update params
-    Empirically, leading with small params provides an additional 0.2s improvement.
+        5. wait for each all gather to complete and update params
     """
     def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, beta2=0.95, custom_sizing=True):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2)
@@ -527,8 +523,8 @@ class NorMuon(torch.optim.Optimizer):
         and mlp params when a param group is split across GPUs.
         """
         params_list = list(params)
-        module_group_order = ['attn_gate', 'value_embed_gate', 'attn', 'mlp']
-        group_sizes = [15, 16, 16]
+        module_group_order = ['attn', 'mlp']
+        group_sizes = [16, 16]  # 10 attn + 6 mlp, then 16 mlp
         params_list.sort(key=lambda x: module_group_order.index(x.label))
 
         idx = 0
@@ -732,18 +728,39 @@ class DistAdam(torch.optim.Optimizer):
         # init state: small params (numel < 1024) use full-sized state, others use sharded
         for p in params:
             chunk = p if p.numel() < 1024 else p[:p.size(0) // self.world_size]
-            exp_avg = torch.zeros_like(chunk, dtype=torch.bfloat16, device=p.device)
+            exp_avg = torch.zeros_like(chunk, dtype=torch.float32, device=p.device)
             self.state[p] = dict(step=0, exp_avg=exp_avg, exp_avg_sq=torch.zeros_like(exp_avg))
         # DistributedAdam implementation by @vagrawal, @akash5474
         self.should_sync = False
         self._reduce_scatter_hooks = []
         self._reduce_scatter_futures = {}
+        # 0-D CPU tensors to avoid recompilation in _update_step
+        self._step_size_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._eff_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self.register_backward_hooks()
 
     def register_backward_hooks(self):
         for group in self.param_groups:
             for param in group["params"]:
                 self._reduce_scatter_hooks.append(param.register_post_accumulate_grad_hook(self._sync_gradient))
+
+    def load_state_dict(self, state_dict):
+        """Override to preserve optimizer state dtypes (avoid BFloat16->Float32 cast that causes recompilation)."""
+        # Save original state dtypes before loading
+        original_dtypes = {}
+        for p, s in self.state.items():
+            original_dtypes[p] = {k: v.dtype for k, v in s.items() if isinstance(v, torch.Tensor)}
+        
+        # Call parent load_state_dict (which may cast dtypes to match param dtype)
+        super().load_state_dict(state_dict)
+        
+        # Restore original dtypes
+        for p, s in self.state.items():
+            if p in original_dtypes:
+                for k, v in s.items():
+                    if isinstance(v, torch.Tensor) and k in original_dtypes[p]:
+                        if v.dtype != original_dtypes[p][k]:
+                            s[k] = v.to(original_dtypes[p][k])
 
     @torch.no_grad()
     def _sync_gradient(self, param):
@@ -777,7 +794,19 @@ class DistAdam(torch.optim.Optimizer):
         embed_state['exp_avg_sq'] = lm_head_state['exp_avg_sq'].clone()
         embed.data.copy_(lm_head.data)
 
-    @torch.compile
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _update_step(p_slice, g_slice, exp_avg, exp_avg_sq, beta1, beta2, eps, step_size_t, eff_wd_t):
+        """Compiled Adam update step. step_size_t and eff_wd_t are 0-D CPU tensors to avoid recompilation."""
+        exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)  # exp_avg = beta1 * exp_avg + (1 - beta1) * g_slice
+        exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)  # exp_avg_sq = beta2 * exp_avg_sq + (1 - beta2) * g_slice^2
+        # compute step
+        update = exp_avg.div(exp_avg_sq.sqrt().add_(eps)).mul_(step_size_t)  # update = (exp_avg / (sqrt(exp_avg_sq) + eps)) * step_size
+        # cautious weight decay
+        mask = (update * p_slice) > 0
+        update.addcmul_(p_slice, mask, value=eff_wd_t)  # update += eff_wd_t * p_slice * mask
+        p_slice.add_(other=update, alpha=-1.0)  # p_slice -= update
+
     @torch.no_grad()
     def step(self):
         rank = dist.get_rank()
@@ -804,28 +833,17 @@ class DistAdam(torch.optim.Optimizer):
 
                 lr = group['lr'] * getattr(param, "lr_mul", 1.0)
                 state = self.state[param]
-
-                exp_avg = state["exp_avg"]
-                exp_avg_sq = state["exp_avg_sq"]
                 state["step"] += 1
                 t = state["step"]
-                # update running averages
-                exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
-                # bias corrections
-                bias1 = 1 - beta1 ** t
-                bias2 = 1 - beta2 ** t
-                # compute step
-                denom = exp_avg_sq.sqrt().add_(eps)
-                step_size = lr * (bias2 ** 0.5 / bias1)
-                update = exp_avg.div(denom).mul_(step_size)
-                # cautious weight decay
-                mask = (update * p_slice) > 0
-                # lr as weight decay schedule
-                eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
-                update.addcmul_(p_slice, mask, value=eff_weight_decay * lr)
+                
+                # Pre-compute changing values as 0-D CPU tensors to avoid recompilation.
+                # `.fill_(value)` is the same as "= value", but doesn't change the tensor object.
+                bias1, bias2 = 1 - beta1 ** t, 1 - beta2 ** t
+                self._step_size_t.fill_(lr * (bias2 ** 0.5 / bias1))
+                self._eff_wd_t.fill_(lr * lr * wd * getattr(param, "wd_mul", 1.0)) # `lr` included twice to serve as weight decay schedule.
 
-                p_slice.add_(other=update, alpha=-1.0)
+                DistAdam._update_step(p_slice, g_slice, state["exp_avg"], state["exp_avg_sq"],
+                                      beta1, beta2, eps, self._step_size_t, self._eff_wd_t)
 
                 if not is_small:
                     all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
@@ -919,6 +937,8 @@ class AttnArgs:
     sin: torch.Tensor
     attn_scale: float
     key_offset: bool
+    attn_gate_w: torch.Tensor
+    ve_gate_w: torch.Tensor
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
@@ -944,15 +964,6 @@ class CausalSelfAttention(nn.Module):
             self.qkvo_w[:self.dim * 3].uniform_(-bound, bound)  # init QKV weights
             self.qkvo_w[self.dim * 3:].zero_()  # init O weights to zero
 
-        # sparse gated attention to enable context based no-op by @classiclarryd
-        self.attn_gate = CastedLinear(12, num_heads)
-        self.attn_gate.weight.label = 'attn_gate'
-
-        # only include gates on layers with value embeds used on forward pass
-        if layer_idx in [0,1,8,9,10]:
-            self.value_embed_gate = CastedLinear(12, num_heads)
-            self.value_embed_gate.weight.label = 'value_embed_gate'
-
     def forward(self, x: Tensor, attn_args: AttnArgs):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "varlen sequences requires B == 1"
@@ -961,6 +972,9 @@ class CausalSelfAttention(nn.Module):
         cos, sin = attn_args.cos, attn_args.sin
         ve, sa_lambdas, key_offset = attn_args.ve, attn_args.sa_lambdas, attn_args.key_offset
         seqlens, attn_scale, bm_size = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size
+        # sparse gated attention to enable context based no-op by @classiclarryd
+        # only include gates on layers with value embeds used on forward pass
+        attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
 
         q, k, v = F.linear(x, sa_lambdas[0] * self.qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
@@ -970,7 +984,7 @@ class CausalSelfAttention(nn.Module):
             k[:, 1:, :, self.head_dim // 4:self.head_dim // 2] = k[:, :-1, :, self.head_dim // 4:self.head_dim // 2]
             k[:, 1:, :, 3 * self.head_dim // 4:] = k[:, :-1, :, 3 * self.head_dim // 4:]
         if ve is not None:
-            ve_gate_out = 2 * torch.sigmoid(self.value_embed_gate(x[..., :self.value_embed_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
+            ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T, self.num_heads, 1)
             v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
 
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
@@ -980,7 +994,7 @@ class CausalSelfAttention(nn.Module):
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
-        y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
+        y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * self.qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
@@ -1059,6 +1073,13 @@ class GPT(nn.Module):
             nn.init.zeros_(embed.weight)
         for ve in self.value_embeds:
             ve.weight.label = 'value_embed'
+        
+        # parameter banks for attention and value embedding gate weights
+        self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
+        self.attn_gate_bank.label = 'attn_gate_bank'
+        self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 layers
+        self.ve_gate_bank.label = 've_gate_bank'
+
         self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i) for i in range(num_layers)])
         self.yarn = Yarn(head_dim, max_seq_len)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
@@ -1150,6 +1171,14 @@ class GPT(nn.Module):
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
+        # unbind gate banks to avoid select_backwards kernel
+        ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)] 
+        veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
+        attn_gates = ag[:6] + [None] + ag[6:]
+        ve_gates = [veg[0], veg[1]] + [None] * (self.num_layers - 5) + [veg[2], veg[3], veg[4]]
+        assert len(attn_gates) == self.num_layers
+        assert len(ve_gates) == self.num_layers
+
         for i in range(self.num_layers):
             attn_args = AttnArgs(
                 ve=ve[i],
@@ -1159,7 +1188,9 @@ class GPT(nn.Module):
                 cos=self.yarn.cos,
                 sin=self.yarn.sin,
                 attn_scale=self.yarn.attn_scale,
-                key_offset = key_offset[i]
+                key_offset=key_offset[i],
+                attn_gate_w=attn_gates[i],
+                ve_gate_w=ve_gates[i]
             )
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
@@ -1453,9 +1484,9 @@ class TrainingManager():
         self.mtp_weights_schedule = self._build_mtp_schedule()
         self.model = model
 
-        adam_labels = ['lm_head', 'value_embed', 'smear_gate', 'skip_gate', 'x0_lambdas', 'embed']
+        adam_labels = ['lm_head', 'value_embed', 'smear_gate', 'attn_gate_bank', 've_gate_bank', 'skip_gate', 'x0_lambdas', 'embed']
         scalar_labels = ['scalars']
-        muon_labels = ['attn_gate', 'value_embed_gate', 'attn', 'mlp']
+        muon_labels = ['attn', 'mlp']
         adam_params = [p for p in model.parameters() if getattr(p, 'label', None) in adam_labels]
         scalar_params = [p for p in model.parameters() if getattr(p, 'label', None) in scalar_labels]
         muon_params = [p for p in model.parameters() if getattr(p, 'label', None) in muon_labels]
@@ -1511,7 +1542,7 @@ class TrainingManager():
         return (opt.odd_step_only and step%2==1) or not opt.odd_step_only
 
     def get_transition_steps(self):
-        transition_steps = [0]
+        transition_steps = []
         ws_short, ws_long = get_ws(0)
         for step in range(1, args.num_iterations):
             ws_short, new_ws_long = get_ws(step)
@@ -1524,6 +1555,7 @@ class TrainingManager():
         self.ws_short, new_ws_long = get_ws(step)
         if new_ws_long != self.ws_long:
             self.model.yarn.apply(self.ws_long, new_ws_long)
+            #self.start_transition() # Freeze scalar weights during transition
 
         new_batch_size = get_bs(step)
         if new_batch_size != self.batch_size:
@@ -1571,6 +1603,8 @@ class TrainingManager():
             for opt, opt_state in zip(self.optimizers, state):
                 opt.should_sync = False
                 opt.load_state_dict(opt_state)
+                if isinstance(opt, DistAdam):
+                    opt.freeze_timer = 0
 
         # muon momentum buffers not in state dict
         self.muon_opt.reset()
@@ -1598,7 +1632,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 1805  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1785  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
@@ -1670,6 +1704,8 @@ model: nn.Module = GPT(
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
         m.weight.data = m.weight.data.bfloat16()
+model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
+model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
@@ -1687,7 +1723,8 @@ train_loader = distributed_data_generator(args.train_files, args.train_bs_schedu
 val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
 
 transition_steps = training_manager.get_transition_steps()
-warmup_steps = sorted(set(s + offset for s in transition_steps for offset in [-1, 0, 1] if s + offset >= 0))
+# first few steps plus transitions
+warmup_steps = sorted({0, 1, 2} | set(s + offset for s in transition_steps for offset in [-1, 0, 1] if s + offset >= 0)) 
 print0(f"Sampling steps {warmup_steps} for warmup", console=True)
 for step in warmup_steps:
     training_manager.advance_schedule(step)
