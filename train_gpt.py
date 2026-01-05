@@ -33,7 +33,6 @@ from torch import Tensor, nn
 
 dynamo.config.recompile_limit = 64
 
-
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -425,13 +424,23 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 # Compiled helpers for NorMuon by @chrisjmccormick
 
 @torch.compile(dynamic=False, fullgraph=True)
-def cautious_wd_and_update_inplace(p, v, wd_tensor, lr_tensor):
-    """Cautious weight decay + parameter update. wd_tensor and lr_tensor are 0-D CPU tensors."""
-    mask = (v * p) >= 0
-    wd_factor = wd_tensor.to(p.dtype)
-    lr_factor = lr_tensor.to(p.dtype)
-    p.copy_(p - (p * mask * wd_factor * lr_factor) - (v * lr_factor))
-
+def cautious_wd_and_update_inplace(p, mantissa, grad, wd_tensor, lr_tensor):
+    """
+    Cautious weight decay + parameter update. wd_tensor and lr_tensor are 0-D CPU tensors.
+    Mantissa is tracked to enable higher precision updates on bfloat16 parameters.
+    bfloat16 format: 1 sign bit + 8 exponent bits + 7 mantissa bits = 16 bits total
+    float32 format: 1 sign bit + 8 exponent bits + 23 mantissa bits = 32 bits total
+    """
+    assert p.dtype == mantissa.dtype == torch.uint16
+    grad = grad.float()
+    wd_factor = wd_tensor.to(torch.float32)
+    lr_factor = lr_tensor.to(torch.float32)
+    p_precise_raw = (p.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
+    p_precise = p_precise_raw.view(torch.float32)
+    mask = (grad * p_precise) >= 0
+    p_precise.copy_(p_precise - (p_precise * mask * wd_factor * lr_factor) - (grad * lr_factor))
+    p.copy_((p_precise_raw >> 16).to(torch.uint16))
+    mantissa.copy_(p_precise_raw.to(torch.uint16))
 
 @torch.compile(dynamic=False, fullgraph=True)
 def apply_normuon_variance_reduction(v_chunk, second_momentum_buffer, beta2, red_dim):
@@ -499,6 +508,7 @@ class NorMuon(torch.optim.Optimizer):
         for group in self.param_groups:
             if "momentum_buffer" in group:
                 group["momentum_buffer"].zero_()
+                group["mantissa"].zero_()
                 group["second_momentum_buffer"].zero_()
 
     def generate_standard_param_groups(self, params):
@@ -538,12 +548,18 @@ class NorMuon(torch.optim.Optimizer):
 
         return param_groups
 
-    @torch.no_grad()
     def step(self):
-        # Efficient distributed step by @YouJiacheng, @KonstantinWilleke, @alexrgilbert,
-        # @adricarda, @tuttyfrutyee, @vdlad, @ryanyang0, @vagrawal, @varunneal, @chrisjmccormick
+        self.step_p1()
+        self.step_p2()
+        self.step_p3()
+        
+    @torch.no_grad()
+    def step_p1(self):
+        """
+        Part 1: Launch distributed reduce_scatter operations for parameter groups.
+        """
         rank = dist.get_rank()
-        group_infos = []
+        self.group_infos = []
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             if not params:
@@ -568,16 +584,27 @@ class NorMuon(torch.optim.Optimizer):
                 grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True
             ).get_future()
 
-            group_infos.append(dict(grad_chunk=grad_chunk, reduce_future=reduce_future))
-
-        all_gather_infos = []
+            self.group_infos.append(dict(grad_chunk=grad_chunk, reduce_future=reduce_future))
+    
+    @torch.no_grad()
+    def step_p2(self):
+        """
+        Part 2: Compute gradient updates and launch all_gather operations
+        Wait for all gather to complete for all parameter groups except final one
+        """
+        # Efficient distributed step by @YouJiacheng, @KonstantinWilleke, @alexrgilbert,
+        # @adricarda, @tuttyfrutyee, @vdlad, @ryanyang0, @vagrawal, @varunneal, @chrisjmccormick
+        rank = dist.get_rank()
+        group_infos = self.group_infos
+        
+        self.all_gather_infos = []
         # Second pass: wait for gradients, compute updates for the local shard of parameters,
         # and launch all async all_gather operations.
         for group, info in zip(self.param_groups, group_infos):
             info["reduce_future"].wait()
 
             params = group["params"]
-            grad_chunk = info["grad_chunk"]
+            grad_chunk = info["grad_chunk"].float()
             chunk_size = group["chunk_size"]
             padded_num_params = chunk_size * self.world_size
 
@@ -587,7 +614,8 @@ class NorMuon(torch.optim.Optimizer):
             num_params = min(chunk_size, max(0, len(params) - start_idx))  # num params for this rank
 
             if "momentum_buffer" not in group:
-                group["momentum_buffer"]  = torch.zeros_like(grad_chunk[:num_params])
+                group["momentum_buffer"]  = torch.zeros_like(grad_chunk[:num_params], dtype=torch.float32)
+                
             momentum_buffer = group["momentum_buffer"]
             # Apply momentum update to the persistent momentum buffer in-place
             momentum_buffer.lerp_(grad_chunk[:num_params], 1 - group["momentum"])
@@ -595,26 +623,17 @@ class NorMuon(torch.optim.Optimizer):
 
             grad_shape = updated_grads.shape
             if params[module_idx].label == 'attn':
-
                 for p in params[module_idx:module_idx + num_params]:
                     assert p.label == 'attn'
-
                 updated_grads = updated_grads.view(4 * grad_shape[0], grad_shape[1] // 4, grad_shape[2])
 
             ref_param = params[module_idx]
             param_shape = ref_param.shape
 
-            # The below shape-based heuristic assumes that matrices have their input along the
-            # row dimension and their output along the columns. Gates are an exception.
-            is_gate = 'gate' in ref_param.label
-
             if "second_momentum_buffer" not in group:
-                if is_gate:
-                    group["second_momentum_buffer"] = torch.zeros_like(updated_grads[..., :, :1])
-                else:
-                    group["second_momentum_buffer"] = (torch.zeros_like(updated_grads[..., :, :1])
-                        if param_shape[-2] >= param_shape[-1] else torch.zeros_like(updated_grads[..., :1, :])
-                    )
+                group["second_momentum_buffer"] = (torch.zeros_like(updated_grads[..., :, :1], dtype=torch.float32)
+                    if param_shape[-2] >= param_shape[-1] else torch.zeros_like(updated_grads[..., :1, :])
+                )
             second_momentum_buffer = group["second_momentum_buffer"]
 
             if "param_lr_cpu" not in group:
@@ -651,7 +670,7 @@ class NorMuon(torch.optim.Optimizer):
 
             # Note that the head orientation in O is transposed relative to QKV, so red_dim
             # is 'incorrect' for O. However, correcting this showed no improvement. @chrisjmccormick
-            red_dim = -1 if (is_gate or param_shape[-2] >= param_shape[-1]) else -2
+            red_dim = -1 if param_shape[-2] >= param_shape[-1] else -2
 
             v_chunk = apply_normuon_variance_reduction(
                 v_chunk, second_momentum_buffer, group["beta2"], red_dim
@@ -660,17 +679,22 @@ class NorMuon(torch.optim.Optimizer):
             v_chunk = v_chunk.view(grad_shape)
 
             # # "Cautious" weight decay (https://arxiv.org/abs/2510.12402)
-            updated_params = torch.empty_like(grad_chunk)
+            updated_params = torch.empty_like(grad_chunk, dtype=torch.bfloat16)
             if num_params > 0:
                 # Work on a stacked copy to avoid touching original params
                 param_chunk = torch.stack(params[module_idx:module_idx + num_params])
 
+                if "mantissa" not in group:
+                    group["mantissa"] = torch.zeros_like(param_chunk, dtype=torch.uint16)
+                mantissa = group["mantissa"]
+
                 for local_idx in range(num_params):
                     cautious_wd_and_update_inplace(
-                        param_chunk[local_idx],
+                        param_chunk[local_idx].view(torch.uint16),
+                        mantissa[local_idx],
                         v_chunk[local_idx],
                         eff_wd_cpu[local_idx],
-                        eff_lr_cpu[local_idx],
+                        eff_lr_cpu[local_idx]
                     )
             else:
                 param_chunk = torch.zeros_like(v_chunk)
@@ -689,7 +713,7 @@ class NorMuon(torch.optim.Optimizer):
                 stacked_params, updated_params, async_op=True
             ).get_future()
 
-            all_gather_infos.append(
+            self.all_gather_infos.append(
                 {
                     "gather_future": gather_future,
                     "stacked_params": stacked_params,
@@ -697,8 +721,8 @@ class NorMuon(torch.optim.Optimizer):
                 }
             )
 
-        # Final pass: wait for all_gather to complete and copy results back into original parameter tensors.
-        for info in all_gather_infos:
+        # Final pass: wait for all_gather to complete for all except final and copy results back into original parameter tensors.
+        for info in self.all_gather_infos[:-1]:
             info["gather_future"].wait()
             stacked_params = info["stacked_params"]
             orig_params = info["orig_params"]
@@ -707,20 +731,34 @@ class NorMuon(torch.optim.Optimizer):
             for i, p in enumerate(orig_params):
                 p.copy_(unstacked_params[i], non_blocking=True)
 
+    @torch.no_grad()
+    def step_p3(self):
+        """
+        Part 3: Wait for final all gather to complete and copy results back into original parameter tensors
+        """
+        info = self.all_gather_infos[-1]
+        info["gather_future"].wait()
+        stacked_params = info["stacked_params"]
+        orig_params = info["orig_params"]
+
+        unstacked_params = torch.unbind(stacked_params)
+        for i, p in enumerate(orig_params):
+            p.copy_(unstacked_params[i], non_blocking=True)
+
 
 class DistAdam(torch.optim.Optimizer):
-    def __init__(self, params, label_order: list[str],lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01):
+    def __init__(self, params, label_order: list[str], betas: list[list[float]], lr: float = 1e-3, eps: float = 1e-8, weight_decay: float = 0.01):
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        defaults = dict(lr=lr, eps=eps, weight_decay=weight_decay)
         params = list(params)
         # Group by label, with explicit ordering for execution control.
         params_by_label = defaultdict(list)
         for p in params:
             params_by_label[getattr(p, 'label', None)].append(p)
         param_groups = []
-        for label in label_order:
+        for idx, label in enumerate(label_order):
             if label in params_by_label:
-                param_groups.append(dict(params=params_by_label[label]))
+                param_groups.append(dict(params=params_by_label[label], betas=betas[idx]))
         # include any unlabeled params at the end (processed last)
         if None in params_by_label:
             param_groups.append(dict(params=params_by_label[None]))
@@ -730,6 +768,10 @@ class DistAdam(torch.optim.Optimizer):
             chunk = p if p.numel() < 1024 else p[:p.size(0) // self.world_size]
             exp_avg = torch.zeros_like(chunk, dtype=torch.float32, device=p.device)
             self.state[p] = dict(step=0, exp_avg=exp_avg, exp_avg_sq=torch.zeros_like(exp_avg))
+
+        # tag the final param for optimizer pipelining, run all gather after muon copy
+        param_groups[-1]['params'][-1].is_final_param = True
+        
         # DistributedAdam implementation by @vagrawal, @akash5474
         self.should_sync = False
         self._reduce_scatter_hooks = []
@@ -786,7 +828,7 @@ class DistAdam(torch.optim.Optimizer):
     def copy_lm_to_embed(self):
         # run at 2/3 of training
         lm_head = self.param_groups[0]['params'][0]
-        embed = self.param_groups[-1]['params'][0]
+        embed = self.param_groups[-2]['params'][0]
         lm_head_state = self.state[lm_head]
         embed_state = self.state[embed]
         embed_state['step'] = lm_head_state['step']
@@ -808,11 +850,14 @@ class DistAdam(torch.optim.Optimizer):
         p_slice.add_(other=update, alpha=-1.0)  # p_slice -= update
 
     @torch.no_grad()
-    def step(self):
+    def step(self, muon_opt):
+        muon_opt.step_p1()
         rank = dist.get_rank()
         all_gather_futures: list[torch.Future] = []
 
-        for group in self.param_groups:
+        last_param = None
+        last_p_slice = None
+        for group in self.param_groups:      
             beta1, beta2 = group['betas']
             eps = group['eps']
             wd = group['weight_decay']
@@ -846,10 +891,20 @@ class DistAdam(torch.optim.Optimizer):
                                       beta1, beta2, eps, self._step_size_t, self._eff_wd_t)
 
                 if not is_small:
-                    all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
-
+                    if getattr(param, "is_final_param", False):
+                        last_param = param
+                        last_p_slice = p_slice
+                    else:
+                        all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
         self._reduce_scatter_futures.clear()
+
+        muon_opt.step_p2()
         torch.futures.collect_all(all_gather_futures).wait()
+
+        if last_param is not None:
+            last_all_gather_future = dist.all_gather_into_tensor(last_param, last_p_slice, async_op=True).get_future()
+        muon_opt.step_p3()
+        torch.futures.collect_all([last_all_gather_future]).wait()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -956,7 +1011,7 @@ class CausalSelfAttention(nn.Module):
         # merged QKVO weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
         # Simplified layout by @chrisjmccormick
-        self.qkvo_w = nn.Parameter(torch.empty(self.dim * 4, self.hdim))
+        self.qkvo_w = nn.Parameter(torch.empty(self.dim * 4, self.hdim, dtype=torch.bfloat16))
         # label all modules for explicit optimizer grouping
         self.qkvo_w.label = 'attn'
 
@@ -1004,8 +1059,8 @@ class MLP(nn.Module):
         super().__init__()
         hdim = 4 * dim
         # Transposed layout to match attention weights
-        self.c_fc = nn.Parameter(torch.empty(hdim, dim))
-        self.c_proj = nn.Parameter(torch.empty(hdim, dim))
+        self.c_fc = nn.Parameter(torch.empty(hdim, dim, dtype=torch.bfloat16))
+        self.c_proj = nn.Parameter(torch.empty(hdim, dim, dtype=torch.bfloat16))
         # label all modules for explicit optimizer grouping
         self.c_fc.label = 'mlp'
         self.c_proj.label = 'mlp'
@@ -1411,7 +1466,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 
 # -----------------------------------------------------------------------------
 # Training Management
-
+ 
 def get_bs(step: int):
     if step >= args.num_scheduled_iterations:
         return args.train_bs_extension
@@ -1483,25 +1538,33 @@ class TrainingManager():
     def __init__(self, model):
         self.mtp_weights_schedule = self._build_mtp_schedule()
         self.model = model
-
-        adam_labels = ['lm_head', 'value_embed', 'smear_gate', 'attn_gate_bank', 've_gate_bank', 'skip_gate', 'x0_lambdas', 'embed']
-        scalar_labels = ['scalars']
+        adam_betas = {
+            'lm_head': [0.5, 0.95],
+            'smear_gate': [0.9, 0.99],
+            'attn_gate_bank': [0.9, 0.99],
+            've_gate_bank': [0.9, 0.99],
+            'skip_gate': [0.9, 0.99],
+            'x0_lambdas': [0.65, 0.95],
+            'scalars': [0.9, 0.99],
+            'embed': [0.5, 0.95],
+            'value_embed': [0.75, 0.95]
+        }
+        adam_labels = list(adam_betas.keys())
+        adam_beta_values = list(adam_betas.values())
         muon_labels = ['attn', 'mlp']
         adam_params = [p for p in model.parameters() if getattr(p, 'label', None) in adam_labels]
-        scalar_params = [p for p in model.parameters() if getattr(p, 'label', None) in scalar_labels]
         muon_params = [p for p in model.parameters() if getattr(p, 'label', None) in muon_labels]
-        assert set(getattr(p, 'label', None) for p in model.parameters()) == set(adam_labels + scalar_labels + muon_labels), "All params must have label"
+        assert set(getattr(p, 'label', None) for p in model.parameters()) == set(adam_labels + muon_labels), "All params must have label"
 
-        self.adam_opt = DistAdam(adam_params, adam_labels, lr=0.008, betas=(0.65, 0.95), eps=1e-8, weight_decay=0.005)
-        self.scalar_opt = DistAdam(scalar_params, scalar_labels, lr=0.008, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.005)
+        self.adam_opt = DistAdam(adam_params, adam_labels, adam_beta_values, lr=0.008, eps=1e-10, weight_decay=0.005)
         self.muon_opt = NorMuon(muon_params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2)
-        self.optimizers = [self.adam_opt, self.scalar_opt, self.muon_opt]
+        self.optimizers = [self.adam_opt, self.muon_opt]
+
         # split after odd number step
         self.split_step = math.ceil(args.split_embed_frac * args.num_scheduled_iterations) | 1
 
         # set defaults
         for opt in self.optimizers:
-            opt.freeze_timer = 0
             opt.odd_step_only = False 
             opt.should_sync = True
             for group in opt.param_groups:
@@ -1509,7 +1572,6 @@ class TrainingManager():
 
         # on even steps, only step Muon params
         self.adam_opt.odd_step_only = True
-        self.scalar_opt.odd_step_only = True
 
         self.reset()
 
@@ -1555,7 +1617,6 @@ class TrainingManager():
         self.ws_short, new_ws_long = get_ws(step)
         if new_ws_long != self.ws_long:
             self.model.yarn.apply(self.ws_long, new_ws_long)
-            #self.start_transition() # Freeze scalar weights during transition
 
         new_batch_size = get_bs(step)
         if new_batch_size != self.batch_size:
@@ -1573,25 +1634,21 @@ class TrainingManager():
             group["momentum"] = muon_momentum
 
         for opt in self.optimizers:
-            if opt.freeze_timer > 0:
-                opt.freeze_timer -= 1
-                opt.zero_grad(set_to_none=True)
-            else:
-                if self._is_active_step(opt, step):
-                    for group in opt.param_groups:
-                        group["lr"] = group["initial_lr"] * step_lr
-                    opt.step()
-                    opt.zero_grad(set_to_none=True)
-                    if opt.odd_step_only:
-                        opt.should_sync = False
-        
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * step_lr
+                
+        if self._is_active_step(self.adam_opt, step):
+            # adam will interleave calls to muon step
+            self.adam_opt.step(self.muon_opt)
+            self.model.zero_grad(set_to_none=True)
+            self.adam_opt.should_sync = False
+        else:
+            self.muon_opt.step()
+            self.muon_opt.zero_grad(set_to_none=True)
+            
         if step == self.split_step:
             self.adam_opt.copy_lm_to_embed()
             self.model.split_embed = True
-
-    def start_transition(self, freeze_count=40):
-        # freeze scalar weights during transition
-        self.scalar_opt.freeze_timer = freeze_count
     
     def activate_hooks(self, step: int):
         for opt in self.optimizers:
@@ -1603,8 +1660,6 @@ class TrainingManager():
             for opt, opt_state in zip(self.optimizers, state):
                 opt.should_sync = False
                 opt.load_state_dict(opt_state)
-                if isinstance(opt, DistAdam):
-                    opt.freeze_timer = 0
 
         # muon momentum buffers not in state dict
         self.muon_opt.reset()
@@ -1632,7 +1687,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 1785  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1800  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
