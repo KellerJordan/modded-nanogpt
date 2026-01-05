@@ -11,7 +11,15 @@ Without the mantissa tracking the bfloat16 update is substantially detrimental t
 
 I observed that the lm_head/embed slightly benefits from a very low beta1 term in Adam (0.5), whereas standard convention is closer to 0.9 for Adam parameters. I hypothesis that this is driven by the asymmetrical gradient distribution caused by the nature of low frequency tokens. Consider a parameter with a very large gradient signal once every 100 steps. A small beta1 causes the parameter to take a massive step in the direction of the large gradient, and then quickly fall back to whatever the weak gradient signal is when the parameter is not the target. A large beta1 causes the parameter to continue moving in whatever direction activated it for 100+ steps, even after the signal is long gone and the network has a new topology. It may be worth exploring different beta1 values for different tokens as a function of token frequency. I find it quite unlikely that a token that occurs once every 1 million tokens should have the same beta as a token that occurs once every 100 tokens.
 
-Muon.step() is separated into 3 modular components, such that when Adam.step() is called Adam can selectively interweave Muon components. Adam first immediately calls the muon reduce scatter, then Adam kicks off every all gather except for the last value embed, then muon runs polar express and kicks off its all gathers and completes its first all gather and parameter copy, then Adam kicks off its last all gather, then Muon runs its final parameter copy, then Adam finishes its last all gather. This enables close to zero communication downtime.
+Muon.step() is separated into 3 modular components, such that when Adam.step() is called Adam can selectively interweave Muon components. 
+* Adam first immediately calls the muon reduce scatter
+* Adam kicks off every all gather except for the last value embed
+* muon runs polar express and kicks off its all gathers and completes its first all gather and parameter copy
+* Adam kicks off its last all gather
+* Muon runs its final parameter copy
+* Adam finishes its last all gather.
+
+This enables close to zero communication downtime.
 
 <img width="1434" height="377" alt="image" src="https://github.com/user-attachments/assets/05eee60f-ffd4-4327-b437-47310d121c17" />
 
