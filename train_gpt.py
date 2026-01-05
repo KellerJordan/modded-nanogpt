@@ -1,5 +1,9 @@
 import os
 import sys
+import uuid
+
+run_id = f"v2 - 01-06 - {str(uuid.uuid4())[0:5]}"
+
 
 with open(sys.argv[0]) as f:
     code = f.read()  # read the code of this file ASAP, for logging
@@ -943,10 +947,17 @@ class AttnArgs:
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
 # Residual dim split.
-smear_dims = (0, 12)
-skip_dims = (6, 18)
-attn_dims = (18, 30)
-ve_dims = (18, 30)
+# @photo_mz No loss change, miniscule inductive bias.
+if True:
+    smear_dims = (0, 12)
+    skip_dims = (6, 18)
+    attn_dims = (18, 30)
+    ve_dims = (18, 30)
+else:
+    smear_dims = (0, 12)
+    skip_dims = (0, 12)
+    attn_dims = (0, 12)
+    ve_dims = (0, 12)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
@@ -1703,124 +1714,168 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
-model: nn.Module = GPT(
-    vocab_size=50257,
-    num_layers=11,
-    num_heads=6,
-    head_dim=128,
-    model_dim=768,
-    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
-).cuda()
-for m in model.modules():
-    if isinstance(m, (nn.Embedding, nn.Linear)):
-        m.weight.data = m.weight.data.bfloat16()
-model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
-model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
-for param in model.parameters():
-    dist.broadcast(param.detach(), 0)
+from torch.profiler import profile, ProfilerActivity, schedule
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
-training_manager = TrainingManager(model)
+profile_steps = 14
 
-########################################
-#            Warmup kernels            #
-########################################
-print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True)
-# Warmup the training kernels, then re-initialize the state so we aren't cheating
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizers=training_manager.get_state()) # save the initial state
-train_loader = distributed_data_generator(args.train_files, args.train_bs_schedule[0], args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
-val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+def trace_handler(prof: torch.profiler.profile):
+    path_prefix = f"{run_id}-rank{rank}"
+    prof.export_chrome_trace(f"{path_prefix}-chrome-trace.json.gz")
 
-transition_steps = training_manager.get_transition_steps()
-# first few steps plus transitions
-warmup_steps = sorted({0, 1, 2} | set(s + offset for s in transition_steps for offset in [-1, 0, 1] if s + offset >= 0)) 
-print0(f"Sampling steps {warmup_steps} for warmup", console=True)
-for step in warmup_steps:
-    training_manager.advance_schedule(step)
-    model.eval()
-    with torch.no_grad():
-        inputs, targets, cum_seqlens = next(val_loader)
-        model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
-    model.train()
-    for idx in range(grad_accum_steps):
-        # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
-        if idx == grad_accum_steps - 1:
-            training_manager.activate_hooks(step)
-        send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
-    training_manager.step_optimizers(step)
-print0("Resetting Model", console=True)
-model.zero_grad(set_to_none=True)
-model.load_state_dict(initial_state["model"])
-training_manager.reset(initial_state["optimizers"])
-del val_loader, train_loader, initial_state
-model.train()
+prof_ctx = torch.profiler.profile(
+    activities=[
+        # profile activity on the CPU and GPU
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ],
+    # Setup the profiler schedule to wait 5 steps, warmup for 5 steps,
+    # then activate for the remaining steps.
+    schedule=torch.profiler.schedule(wait=5, warmup=5, active=profile_steps - 10),
+    # This callback will be fired when the trace files are ready
+    on_trace_ready=trace_handler,
+    # Records the file and line number for the operation.
+    # Disabling this mainly to make the traces less cluttered
+    with_stack=False,
+    record_shapes=True,
+)
 
-########################################
-#        Training and validation       #
-########################################
-train_loader = distributed_data_generator(args.train_files, args.train_bs_schedule[0], args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+num_repeats = int(os.environ.get("NUM_REPEATS", 1))  # Set via NUM_REPEATS=n
+loss_reps = []
+time_reps = []
+for repeat_idx in range(num_repeats):
+    if repeat_idx != 0:
+        print0(f"\n{'='*50}\nRepeat {repeat_idx + 1}/{num_repeats}\n{'='*50}", console=True)
 
-gc.collect()
+    model: nn.Module = GPT(
+        vocab_size=50257,
+        num_layers=11,
+        num_heads=6,
+        head_dim=128,
+        model_dim=768,
+        max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
+    ).cuda()
+    for m in model.modules():
+        if isinstance(m, (nn.Embedding, nn.Linear)):
+            m.weight.data = m.weight.data.bfloat16()
+    model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
+    model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
+    for param in model.parameters():
+        dist.broadcast(param.detach(), 0)
 
-training_time_ms = 0
-# start the clock
-torch.cuda.synchronize()
-t0 = time.perf_counter()
-# begin training
-train_steps = args.num_iterations
-for step in range(train_steps + 1):
-    last_step = (step == train_steps)
-    training_manager.advance_schedule(step)
-    # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-        if last_step:
-            training_manager.apply_final_ws_ext()
-        # stop the clock
-        torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.perf_counter() - t0)
+    model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+    training_manager = TrainingManager(model)
+
+    ########################################
+    #            Warmup kernels            #
+    ########################################
+    print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True)
+    # Warmup the training kernels, then re-initialize the state so we aren't cheating
+    initial_state = dict(model=copy.deepcopy(model.state_dict()),
+                        optimizers=training_manager.get_state()) # save the initial state
+    train_loader = distributed_data_generator(args.train_files, args.train_bs_schedule[0], args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+    val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+
+    transition_steps = training_manager.get_transition_steps()
+    # first few steps plus transitions
+    warmup_steps = sorted({0, 1, 2} | set(s + offset for s in transition_steps for offset in [-1, 0, 1] if s + offset >= 0)) 
+    print0(f"Sampling steps {warmup_steps} for warmup", console=True)
+    for step in warmup_steps:
+        training_manager.advance_schedule(step)
         model.eval()
-        assert args.val_tokens % args.val_batch_size == 0
-        val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-        val_loss = 0
         with torch.no_grad():
-            for _ in range(val_steps):
-                inputs, targets, cum_seqlens = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
-        val_loss /= val_steps
-        del val_loader
-        dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            inputs, targets, cum_seqlens = next(val_loader)
+            model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
         model.train()
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
+        for idx in range(grad_accum_steps):
+            # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
+            if idx == grad_accum_steps - 1:
+                training_manager.activate_hooks(step)
+            send_args = training_manager.train_loader_send_args
+            inputs, targets, cum_seqlens = train_loader.send(send_args)
+            (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        training_manager.step_optimizers(step)
+    print0("Resetting Model", console=True)
+    model.zero_grad(set_to_none=True)
+    model.load_state_dict(initial_state["model"])
+    training_manager.reset(initial_state["optimizers"])
+    del val_loader, train_loader, initial_state
 
-    if last_step:
-        if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-            os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
-        # the last step only has the validation loop, so break to avoid training
-        break
+    model.train()
 
-    # --------------- TRAINING SECTION -----------------
-    for idx in range(grad_accum_steps):
-        # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
-        if idx == grad_accum_steps - 1:
-            training_manager.activate_hooks(step)
-        send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
-    training_manager.step_optimizers(step)
+    ########################################
+    #        Training and validation       #
+    ########################################
 
-    # logging
-    approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    train_loader = distributed_data_generator(args.train_files, args.train_bs_schedule[0], args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
 
+    gc.collect()
+
+    training_time_ms = 0
+    # start the clock
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    # begin training
+    train_steps = args.num_iterations
+    prof_ctx.__enter__()
+    # for step in range(train_steps + 1):
+    for step in range(profile_steps):
+        last_step = (step == train_steps)
+        training_manager.advance_schedule(step)
+        # --------------- VALIDATION SECTION -----------------
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            if last_step:
+                training_manager.apply_final_ws_ext()
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            model.eval()
+            assert args.val_tokens % args.val_batch_size == 0
+            val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+            val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+            val_loss = 0
+            with torch.no_grad():
+                for _ in range(val_steps):
+                    inputs, targets, cum_seqlens = next(val_loader)
+                    val_loss += model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+            val_loss /= val_steps
+            del val_loader
+            dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+            print0(f"step {step:4d}/{train_steps} | time: {int(training_time_ms):,}ms | step avg: {training_time_ms/max(step, 1):.2f}ms | val loss: {val_loss:.4f}", console=True)
+            model.train()
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        if last_step:
+            loss_reps.append(val_loss.cpu().item())
+            time_reps.append(training_time_ms)
+            if master_process and args.save_checkpoint:
+                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in training_manager.optimizers])
+                os.makedirs(f"logs/{run_id}", exist_ok=True)
+                torch.save(log, f"logs/{run_id}/state_step{step:06d}_repeat{repeat_idx}.pt")
+            # the last step only has the validation loop, so break to avoid training
+            break
+
+        # --------------- TRAINING SECTION -----------------
+        for idx in range(grad_accum_steps):
+            # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
+            if idx == grad_accum_steps - 1:
+                training_manager.activate_hooks(step)
+            send_args = training_manager.train_loader_send_args
+            inputs, targets, cum_seqlens = train_loader.send(send_args)
+            (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        training_manager.step_optimizers(step)
+
+        # logging
+        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+        print0(f"step {(step+1):4d}/{train_steps:4d} | time: {int(approx_training_time_ms):,}ms | step avg: {approx_training_time_ms/(step + 1):.2f}ms", console=True)
+
+        prof_ctx.step()
+
+    prof_ctx.__exit__(None, None, None)
+
+print0(f"loss_reps: {loss_reps}", console=True)
+print0(f"time_reps: {time_reps}", console=True)
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
 dist.destroy_process_group()
