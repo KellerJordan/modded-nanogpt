@@ -998,7 +998,9 @@ class CausalSelfAttention(nn.Module):
         q, k = rotary(q, cos, sin), rotary(k, cos, sin)
         if key_offset:
             # shift keys forward for the stationary head dims. Enables 1-layer induction.
+            # 0...31 1-shift
             k[:, 1:, :, self.head_dim // 4:self.head_dim // 2] = k[:, :-1, :, self.head_dim // 4:self.head_dim // 2]
+            # 64...95 1-shift
             k[:, 1:, :, 3 * self.head_dim // 4:] = k[:, :-1, :, 3 * self.head_dim // 4:]
         if ve is not None:
             ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., ve_dims[0]:ve_dims[1]], ve_gate_w)).view(B, T, self.num_heads, 1)
@@ -1094,7 +1096,7 @@ class GPT(nn.Module):
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
         self.attn_gate_bank.label = 'attn_gate_bank'
-        self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 layers
+        self.ve_gate_bank = nn.Parameter(torch.zeros(6, num_heads, 12)) # 3 layers
         self.ve_gate_bank.label = 've_gate_bank'
 
         self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i) for i in range(num_layers)])
@@ -1175,6 +1177,7 @@ class GPT(nn.Module):
         bm_sizes = [short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, None, short_bm, short_bm, short_bm, long_bm]
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==long_bm for b in bm_sizes] # apply partial key offset to long windows
+        value_offset = [b==long_bm for b in bm_sizes] # apply partial value offset to long windows
 
         # weight-tied: use lm_head.weight for embedding lookup (or separate embed after split)
         if self.split_embed:
@@ -1183,8 +1186,8 @@ class GPT(nn.Module):
             x = F.embedding(input_seq, self.lm_head.weight)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        # dropping first layer updates this to .12 ... 012
-        ve = [ve[1], ve[2]] + [None] * (self.num_layers - 5) + [ve[0], ve[1], ve[2]]
+        # dropping first layer and shifting updates this to 012 ... 012
+        ve = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == self.num_layers
 
         # smear token embed forward 1 position @classiclarryd
@@ -1196,7 +1199,7 @@ class GPT(nn.Module):
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)] 
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
         attn_gates = ag[:6] + [None] + ag[6:]
-        ve_gates = [veg[0], veg[1]] + [None] * (self.num_layers - 5) + [veg[2], veg[3], veg[4]]
+        ve_gates = [veg[0], veg[1], veg[2]] + [None] * (self.num_layers - 6) + [veg[3], veg[4], veg[5]]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
 
@@ -1210,6 +1213,7 @@ class GPT(nn.Module):
                 sin=self.yarn.sin,
                 attn_scale=self.yarn.attn_scale,
                 key_offset=key_offset[i],
+                value_offset=value_offset[i],
                 attn_gate_w=attn_gates[i],
                 ve_gate_w=ve_gates[i]
             )
@@ -1714,32 +1718,32 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
-from torch.profiler import profile, ProfilerActivity, schedule
+# from torch.profiler import profile, ProfilerActivity, schedule
 
-profile_steps = 14
+# profile_steps = 14
 
-def trace_handler(prof: torch.profiler.profile):
-    path_prefix = f"{run_id}-rank{rank}"
-    prof.export_chrome_trace(f"{path_prefix}-chrome-trace.json.gz")
+# def trace_handler(prof: torch.profiler.profile):
+#     path_prefix = f"{run_id}-rank{rank}"
+#     prof.export_chrome_trace(f"{path_prefix}-chrome-trace.json.gz")
 
-prof_ctx = torch.profiler.profile(
-    activities=[
-        # profile activity on the CPU and GPU
-        torch.profiler.ProfilerActivity.CPU,
-        torch.profiler.ProfilerActivity.CUDA,
-    ],
-    # Setup the profiler schedule to wait 5 steps, warmup for 5 steps,
-    # then activate for the remaining steps.
-    schedule=torch.profiler.schedule(wait=5, warmup=5, active=profile_steps - 10),
-    # This callback will be fired when the trace files are ready
-    on_trace_ready=trace_handler,
-    # Records the file and line number for the operation.
-    # Disabling this mainly to make the traces less cluttered
-    with_stack=False,
-    record_shapes=True,
-)
+# prof_ctx = torch.profiler.profile(
+#     activities=[
+#         # profile activity on the CPU and GPU
+#         torch.profiler.ProfilerActivity.CPU,
+#         torch.profiler.ProfilerActivity.CUDA,
+#     ],
+#     # Setup the profiler schedule to wait 5 steps, warmup for 5 steps,
+#     # then activate for the remaining steps.
+#     schedule=torch.profiler.schedule(wait=5, warmup=5, active=profile_steps - 10),
+#     # This callback will be fired when the trace files are ready
+#     on_trace_ready=trace_handler,
+#     # Records the file and line number for the operation.
+#     # Disabling this mainly to make the traces less cluttered
+#     with_stack=False,
+#     record_shapes=True,
+# )
 
-num_repeats = int(os.environ.get("NUM_REPEATS", 1))  # Set via NUM_REPEATS=n
+num_repeats = int(os.environ.get("NUM_REPEATS", 5))  # Set via NUM_REPEATS=n
 loss_reps = []
 time_reps = []
 for repeat_idx in range(num_repeats):
@@ -1816,9 +1820,9 @@ for repeat_idx in range(num_repeats):
     t0 = time.perf_counter()
     # begin training
     train_steps = args.num_iterations
-    prof_ctx.__enter__()
-    # for step in range(train_steps + 1):
-    for step in range(profile_steps):
+    # prof_ctx.__enter__()
+    for step in range(train_steps + 1):
+    # for step in range(profile_steps):
         last_step = (step == train_steps)
         training_manager.advance_schedule(step)
         # --------------- VALIDATION SECTION -----------------
@@ -1870,12 +1874,12 @@ for repeat_idx in range(num_repeats):
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
         print0(f"step {(step+1):4d}/{train_steps:4d} | time: {int(approx_training_time_ms):,}ms | step avg: {approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
-        prof_ctx.step()
+        # prof_ctx.step()
 
-    prof_ctx.__exit__(None, None, None)
+    # prof_ctx.__exit__(None, None, None)
 
-print0(f"loss_reps: {loss_reps}", console=True)
-print0(f"time_reps: {time_reps}", console=True)
+print0(f"loss_reps: {loss_reps}, mean = {(sum(loss_reps) / len(loss_reps)):.4f}", console=True)
+print0(f"time_reps: {time_reps}, mean = {(sum(time_reps) / len(time_reps) / 1000):.2f}s", console=True)
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
 dist.destroy_process_group()
