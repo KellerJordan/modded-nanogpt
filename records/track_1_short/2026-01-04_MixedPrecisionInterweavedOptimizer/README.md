@@ -13,6 +13,11 @@ I observed that the lm_head/embed slightly benefits from a very low beta1 term i
 
 Muon.step() is separated into 3 modular components, such that when Adam.step() is called Adam can selectively interweave Muon components. Adam first immediately calls the muon reduce scatter, then Adam kicks off every all gather except for the last value embed, then muon runs polar express and kicks off its all gathers and completes its first all gather and parameter copy, then Adam kicks off its last all gather, then Muon runs its final parameter copy, then Adam finishes its last all gather. This enables close to zero communication downtime.
 
+<img width="1434" height="377" alt="image" src="https://github.com/user-attachments/assets/05eee60f-ffd4-4327-b437-47310d121c17" />
+
+Whereas before:
+<img width="998" height="310" alt="image" src="https://github.com/user-attachments/assets/85a0b4a9-0ad6-4933-a669-1d0f231e3674" />
+
 
 ## Timing and Validation
 ```
