@@ -1177,7 +1177,6 @@ class GPT(nn.Module):
         bm_sizes = [short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, None, short_bm, short_bm, short_bm, long_bm]
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==long_bm for b in bm_sizes] # apply partial key offset to long windows
-        value_offset = [b==long_bm for b in bm_sizes] # apply partial value offset to long windows
 
         # weight-tied: use lm_head.weight for embedding lookup (or separate embed after split)
         if self.split_embed:
@@ -1213,7 +1212,6 @@ class GPT(nn.Module):
                 sin=self.yarn.sin,
                 attn_scale=self.yarn.attn_scale,
                 key_offset=key_offset[i],
-                value_offset=value_offset[i],
                 attn_gate_w=attn_gates[i],
                 ve_gate_w=ve_gates[i]
             )
@@ -1657,7 +1655,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 1790  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1770  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
