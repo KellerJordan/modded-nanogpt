@@ -5,6 +5,7 @@ Updates in PR:
 * 0.5s faster implementation of RoPE
 
 The main idea behind paired head attention is to let queries attend to multiple representations of every position, and have multiple logits for the same position going into the same softmax. Implemented by interleaving the k, q, and v for pairs of heads to form twice as long sequences. EG [k1_h1, k2_h1, k3_h1], [k1_h2, k2_h2, k3_h2] -> [k1_h1, k1_h2, k2_h1, k2_h2, k3_h1, k3_h2], repeat for q and v
+<img width="4222" height="2326" alt="pairedheadattn" src="https://github.com/user-attachments/assets/728be861-0828-4f52-8bf9-4ed8d9ec0733" />
 
 I update rotary() to run in a single line. Interestingly, pytorch is capable of computing x_flip without performing any data copying.
 ```
