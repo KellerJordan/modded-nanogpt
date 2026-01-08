@@ -52,8 +52,13 @@ def get_window_size_blocks(args, step: int):
 
 
 def get_router_temp(args, step: int):
+    total_steps = args.num_iterations
+    schedule_end = getattr(args, "router_temp_schedule_end_step", -1)
+    if schedule_end is not None and schedule_end > 0:
+        step = min(step, schedule_end)
+        total_steps = min(total_steps, schedule_end)
     return _compute_router_temp(
-        step, args.num_iterations, args.router_temp_init, args.router_temp_final,
+        step, total_steps, args.router_temp_init, args.router_temp_final,
         args.router_temp_power, args.router_temp_anchor_delta_steps, args.router_temp_anchor_ratio,
         start_step=_second_expert_step(tuple(args.expert_activation_schedule)))
 

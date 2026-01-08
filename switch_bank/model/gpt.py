@@ -86,6 +86,7 @@ class GPT(nn.Module):
                  ema_alpha_fwd: float, ema_alpha_rev: float,
                  router_temp_init: float, router_temp_final: float, router_temp_power: float,
                  router_temp_anchor_delta_steps: int | None, router_temp_anchor_ratio: float | None,
+                 router_temp_schedule_end_step: int | None,
                  router_logit_cap_initial: float, router_logit_cap_final: float, router_logit_cap_delta_steps: int,
                  router_layer_peak_frac: float, router_temp_boost: float, router_lb_boost: float, router_boost_shape: str,
                  use_router_adapters: bool, expert_activation_schedule: tuple[tuple[int, int], ...],
@@ -147,6 +148,9 @@ class GPT(nn.Module):
         self.router_temp_power = float(router_temp_power)
         self.router_temp_anchor_delta_steps = (int(router_temp_anchor_delta_steps) if router_temp_anchor_delta_steps is not None else -1)
         self.router_temp_anchor_ratio = (float(router_temp_anchor_ratio) if router_temp_anchor_ratio is not None else None)
+        self.router_temp_schedule_end_step = (
+            int(router_temp_schedule_end_step) if router_temp_schedule_end_step is not None else -1
+        )
         self.router_logit_cap_delta_steps = int(router_logit_cap_delta_steps)
         self.router_logit_cap_initial = float(router_logit_cap_initial)
         self.router_logit_cap_final = float(router_logit_cap_final)
@@ -318,6 +322,10 @@ class GPT(nn.Module):
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
     def compute_router_temp(self, step: int, total_steps: int) -> float:
+        schedule_end = self.router_temp_schedule_end_step
+        if schedule_end is not None and schedule_end > 0:
+            step = min(step, schedule_end)
+            total_steps = min(total_steps, schedule_end)
         return _compute_router_temp(
             step, total_steps, self.router_temp_init, self.router_temp_final,
             self.router_temp_power, self.router_temp_anchor_delta_steps, self.router_temp_anchor_ratio,

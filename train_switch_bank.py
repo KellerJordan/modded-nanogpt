@@ -145,18 +145,18 @@ class Hyperparameters:
     # data
     train_files = "data/fineweb10B/fineweb_train_*.bin"
     val_files = "data/fineweb10B/fineweb_val_*.bin"
-    val_tokens = 10485760
-    val_tokens_intermediate: int | None = 32768 * 7
-    val_tokens_final: int | None = 10485760
-    train_seq_len = 12*1024 #64*1024          # effective tokens per optimizer step per rank
+    val_tokens = 10485760  # Only used if val_tokens_intermediate or val_tokens_final = None
+    val_tokens_intermediate: int | None = 32768 * 15
+    val_tokens_final: int | None = 32768 * 80 #10485760
+    train_seq_len = 96*1024 #64*1024          # effective tokens per optimizer step per rank
     val_seq_len = 8192 #4*64*1024
     # minibatch / gradient accumulation
-    grad_accum_steps = 1 # default=1 keeps original, multi-GPU behavior
+    grad_accum_steps = 24 #1 # default=1 keeps original, multi-GPU behavior
     train_micro_seq_len: int | None = None  # if None, computed as train_seq_len // grad_accum_steps
     # optimization
-    num_iterations = 3000 #1750
+    num_iterations = 1750*2 #3250 #1750
     early_stop_step: int | None = None
-    cooldown_frac = 0.65  #0.7
+    cooldown_frac = 0.65
     lr_final_mult = 0.0  # decay to this % of original lr at final iteration
     lr_freeze_last_steps = 0 # decay toward lr_final_mult at final step, but freeze lr at num_iterations-lr_freeze_last_steps
     lr_embed = 0.3
@@ -178,7 +178,7 @@ class Hyperparameters:
     # architecture
     vocab_size = 50257
     model_dim = 896
-    num_layers = 28
+    num_layers = 12
     # Layer weight tying (attention + router adapters). Set to () to disable. Avoid tying layers with different attention types (short/long).
     layer_tie_groups: tuple[tuple[int, ...], ...] = (
         #(9, 10), (13, 14), (17, 18), (21, 22), (25, 26),  # Add 5,6 if need more. Remove from the beginning for fewer.
@@ -191,8 +191,8 @@ class Hyperparameters:
     tie_lm_head = False
     untie_lm_head_frac = -1.0
     # Bank / routing
-    num_experts = 8 #9
-    ffn_hidden = 1792 #1024
+    num_experts = 8
+    ffn_hidden = 1024
     topk = 1
     topk_val: int | None = None
     lb_coeff = 2.15e-3
@@ -216,26 +216,27 @@ class Hyperparameters:
     shared_ffn_freeze_frac = 1.0
     shared_ffn_lr_reduce_start_frac = -1.0
     # skip-attention layers (short-SWA) — exactly two
-    skip_attn_layers = (11,)  # (7,)
-    expert_activation_schedule: tuple[tuple[int, int], ...] = ((0, 1), (75, 2), (141, 3), (234, 4), (338, 5), (441, 6), (591, 7), (695, 8),)
+    skip_attn_layers = () #(11,)  # (7,)
+    expert_activation_schedule: tuple[tuple[int, int], ...] =  ((0, 1), (200//2, 2), (375//2, 3), (625//2, 4), (900//2, 5), (1175//2, 6), (1575//2, 7), (1850//2, 8),) #((0, 1), (75, 2), (141, 3), (234, 4), (338, 5), (441, 6), (591, 7), (695, 8),)
     router_temp_init = 1.464
     router_temp_final = 0.93744
     router_temp_power = 1.5  # fallback if anchor disabled
-    router_temp_anchor_delta_steps = 284 #756  # steps after 2nd expert activation to hit anchor ratio
+    router_temp_anchor_delta_steps = 756//2 #284 #756  # steps after 2nd expert activation to hit anchor ratio
     router_temp_anchor_ratio = 0.49  # temp curve hits this ratio at anchor delta
+    router_temp_schedule_end_step = 1750 // 2
     router_logit_cap_initial = 1.166
     router_logit_cap_final = 13.757
-    router_logit_cap_delta_steps = 237 #632  # ramp length after second expert activation
+    router_logit_cap_delta_steps = 632//2 #237 #632  # ramp length after second expert activation
     # Optional Gumbel exploration (off by default)
     router_use_gumbel = True
-    router_gumbel_schedule: tuple[tuple[int, int], ...] = ((75, 441), (459, 488), (534, 722), (900, 909), (1004, 1022), (1097, 1107), (1200, 1209), (1284, 1313), (1472, 1500))       #((200, 1175), (1225, 1300), (1425, 1925),) # (2400, 2425), (2675, 2725), (2925, 2950), (3200, 3225), ) #(3425, 3500), (3925, -1))
+    router_gumbel_schedule: tuple[tuple[int, int], ...] = ((200//2, 1175), (1225//2, 1300), (1425//2, 1925), (2400//2, 2425), (2675//2, 2725), (2925//2, 2950), (3200//2, 3225), )           #((75, 441), (459, 488), (534, 722), (900, 909), (1004, 1022), (1097, 1107), (1200, 1209), (1284, 1313), (1472, 1500))       #((200, 1175), (1225, 1300), (1425, 1925),) # (2400, 2425), (2675, 2725), (2925, 2950), (3200, 3225), ) #(3425, 3500), (3925, -1))
     # Layerwise router temp & lb boosts.
     router_boost_shape = "peak"  # options: peak (default), valley, linear_start, linear_end
     router_temp_boost = 0.2
     router_lb_boost = 0.5
     router_layer_peak_frac = 0.475  # only used for peak or valley shapes. boosts are calculated continuously
     # evaluation and logging
-    val_loss_every = 50  # 0 for only at end
+    val_loss_every = 125//2 #50  # 0 for only at end
     save_final_checkpoint = True
     save_final_checkpoint_if_loss_below: bool = True
     save_final_checkpoint_max_loss: float = 2.92
@@ -243,7 +244,7 @@ class Hyperparameters:
     resume_checkpoint: str | None = None
     log_dir: str = "records/track_2_medium/2025-12-27_SwitchBank_reverse_ema_fix"
     use_wandb = True
-    wandb_project = "switch-bank-final"
+    wandb_project = "switch-bank-long"
     wandb_run_name = ""
     wandb_log_every = 1
     enable_extra_logging = False
@@ -544,6 +545,7 @@ def run_training(
             router_temp_power=args.router_temp_power,
             router_temp_anchor_delta_steps=args.router_temp_anchor_delta_steps,
             router_temp_anchor_ratio=args.router_temp_anchor_ratio,
+            router_temp_schedule_end_step=args.router_temp_schedule_end_step,
             router_logit_cap_initial=args.router_logit_cap_initial,
             router_logit_cap_final=args.router_logit_cap_final,
             router_logit_cap_delta_steps=args.router_logit_cap_delta_steps,
@@ -659,6 +661,7 @@ def run_training(
             "router_temp_power",
             "router_temp_anchor_delta_steps",
             "router_temp_anchor_ratio",
+            "router_temp_schedule_end_step",
             "router_logit_cap_initial",
             "router_logit_cap_final",
             "router_logit_cap_delta_steps",
