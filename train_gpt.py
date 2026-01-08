@@ -1344,6 +1344,7 @@ class GPT(nn.Module):
             x = F.embedding(input_seq, self.lm_head.weight)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
+        # dropping first layer and shifting updates this to 012 ... 012, @photomz
         ve = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == self.num_layers
 
