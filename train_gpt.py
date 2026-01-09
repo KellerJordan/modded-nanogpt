@@ -1815,8 +1815,8 @@ model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
-training_manager = TrainingManager(model)
+    model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+    training_manager = TrainingManager(model)
 
 ########################################
 #            Warmup kernels            #
@@ -1875,10 +1875,6 @@ for step in range(train_steps + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        assert args.val_tokens % args.val_batch_size == 0
-        val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-        val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
@@ -1888,9 +1884,20 @@ for step in range(train_steps + 1):
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
+        for idx in range(grad_accum_steps):
+            # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
+            if idx == grad_accum_steps - 1:
+                training_manager.activate_hooks(step)
+            send_args = training_manager.train_loader_send_args
+            inputs, targets, cum_seqlens = train_loader.send(send_args)
+            (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        training_manager.step_optimizers(step)
+    print0("Resetting Model", console=True)
+    model.zero_grad(set_to_none=True)
+    model.load_state_dict(initial_state["model"])
+    training_manager.reset(initial_state["optimizers"])
+    del val_loader, train_loader, initial_state
+    model.train()
 
     if last_step:
         if master_process and args.save_checkpoint:
@@ -1906,10 +1913,62 @@ for step in range(train_steps + 1):
         (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 
-    # logging
-    approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    training_time_ms = 0
+    # start the clock
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    # begin training
+    train_steps = args.num_iterations
+    for step in range(train_steps + 1):
+        last_step = (step == train_steps)
+        training_manager.advance_schedule(step)
+        # --------------- VALIDATION SECTION -----------------
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            if last_step:
+                training_manager.apply_final_ws_ext()
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            model.eval()
+            assert args.val_tokens % args.val_batch_size == 0
+            val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+            val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+            val_loss = 0
+            with torch.no_grad():
+                for _ in range(val_steps):
+                    inputs, targets, cum_seqlens = next(val_loader)
+                    val_loss += model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+            val_loss /= val_steps
+            del val_loader
+            dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            model.train()
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
 
-print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-       f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
-dist.destroy_process_group()
+        if last_step:
+            if master_process and args.save_checkpoint:
+                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+                os.makedirs(f"logs/{run_id}", exist_ok=True)
+                torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            # the last step only has the validation loop, so break to avoid training
+            break
+
+        # --------------- TRAINING SECTION -----------------
+        for idx in range(grad_accum_steps):
+            # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
+            if idx == grad_accum_steps - 1:
+                training_manager.activate_hooks(step)
+            send_args = training_manager.train_loader_send_args
+            inputs, targets, cum_seqlens = train_loader.send(send_args)
+            (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        training_manager.step_optimizers(step)
+
+        # logging
+        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+
+    print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+    dist.destroy_process_group()
