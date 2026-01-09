@@ -223,7 +223,7 @@ class Hyperparameters:
     router_temp_power = 1.5  # fallback if anchor disabled
     router_temp_anchor_delta_steps = 756//2 #284 #756  # steps after 2nd expert activation to hit anchor ratio
     router_temp_anchor_ratio = 0.49  # temp curve hits this ratio at anchor delta
-    router_temp_schedule_end_step = 1750 // 2
+    router_temp_schedule_end_step = 1750 #1750 // 2
     router_logit_cap_initial = 1.166
     router_logit_cap_final = 13.757
     router_logit_cap_delta_steps = 632//2 #237 #632  # ramp length after second expert activation
@@ -237,6 +237,7 @@ class Hyperparameters:
     router_layer_peak_frac = 0.475  # only used for peak or valley shapes. boosts are calculated continuously
     # evaluation and logging
     val_loss_every = 125//2 #50  # 0 for only at end
+    window_schedule_end_step = 1750 #1750 // 2
     save_final_checkpoint = True
     save_final_checkpoint_if_loss_below: bool = True
     save_final_checkpoint_max_loss: float = 2.92

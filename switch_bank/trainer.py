@@ -44,7 +44,12 @@ def get_window_size_blocks_helper(window_size: int):
 
 
 def get_window_size_blocks(args, step: int):
-    x = step / args.num_iterations
+    total_steps = args.num_iterations
+    schedule_end = getattr(args, "window_schedule_end_step", -1)
+    if schedule_end is not None and schedule_end > 0:
+        step = min(step, schedule_end)
+        total_steps = min(total_steps, schedule_end)
+    x = step / total_steps
     assert 0 <= x <= 1
     factor = 4 * x ** 3 - 6 * x ** 2 + 3 * x
     window_size = next_multiple_of_n(3456 * factor, n=128)
