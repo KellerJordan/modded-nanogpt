@@ -1,5 +1,9 @@
 import os
 import sys
+import uuid
+
+run_id = f"v2 - 01-06 - {str(uuid.uuid4())[0:5]}"
+
 
 with open(sys.argv[0]) as f:
     code = f.read()  # read the code of this file ASAP, for logging
@@ -9,11 +13,13 @@ import math
 import threading
 import time
 import uuid
+import scipy.stats
 from dataclasses import dataclass
 from collections import defaultdict
 from itertools import accumulate
 from pathlib import Path
 import gc
+from pushover import send_pushover
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -32,6 +38,10 @@ from kernels import get_kernel
 from torch import Tensor, nn
 
 dynamo.config.recompile_limit = 64
+
+# env var
+TREATMENT = int(os.environ.get("TREATMENT", 0))
+TITLE = os.environ.get("TITLE", "A Run")
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -936,6 +946,7 @@ class CastedLinear(nn.Linear):
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
 
+# yarn implementation @classiclarryd
 class Yarn(nn.Module):
     def __init__(self, head_dim, max_seq_len):
         super().__init__()
@@ -943,29 +954,18 @@ class Yarn(nn.Module):
         self.max_seq_len = max_seq_len
         self.reset()
 
-    def rotary(self, x_BTHD):
-        assert self.factor1.size(0) >= x_BTHD.size(-3)
-        factor1, factor2 = (
-            self.factor1[None, : x_BTHD.size(-3), None, :],
-            self.factor2[None, : x_BTHD.size(-3), None, :],
-        )
-        x_flip = x_BTHD.view(*x_BTHD.shape[:-1], x_BTHD.shape[-1] // 2, 2).flip(-1).view(x_BTHD.shape)
-        return factor1 * x_BTHD + factor2 * x_flip
-
     def reset(self):
         angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=self.head_dim//4, dtype=torch.float32, device=device)
-        angular_freq = angular_freq.repeat_interleave(2)
         # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(self.head_dim//2)])
-        t = torch.arange(2*self.max_seq_len, dtype=torch.float32, device=device)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(self.head_dim//4)])
+        t = torch.arange(self.max_seq_len, dtype=torch.float32, device=device)
         theta = torch.outer(t, angular_freq)
-        self.factor1 = nn.Buffer(
+        self.cos = nn.Buffer(
             theta.cos().to(torch.bfloat16), persistent=False
         )
-        self.factor2 = nn.Buffer(
+        self.sin = nn.Buffer(
             theta.sin().to(torch.bfloat16), persistent=False
         )
-        self.factor2[..., 1::2] *= -1
         self.angular_freq = angular_freq
         # start with 0.1, inspired by 0.12 from @leloykun and learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = 0.1
@@ -975,65 +975,22 @@ class Yarn(nn.Module):
         scaling_factor = old_window / new_window
         interpolation_weight = torch.clamp((rotations - alpha) / (beta - alpha), 0, 1)
         self.angular_freq *= scaling_factor + interpolation_weight * (1 - scaling_factor)
-        t = torch.arange(2*self.max_seq_len, dtype=torch.float32, device=self.angular_freq.device)
+        t = torch.arange(self.max_seq_len, dtype=torch.float32, device=self.angular_freq.device)
         theta = torch.outer(t, self.angular_freq)
-        self.factor1.copy_(theta.cos())
-        self.factor2.copy_(theta.sin())
-        self.factor2[..., 1::2] *= -1
+        self.cos.copy_(theta.cos())
+        self.sin.copy_(theta.sin())
         self.attn_scale *= 0.2 * math.log(new_window / old_window) + 1
 
-class YarnPairedHead(nn.Module):
-    def __init__(self, head_dim, max_seq_len):
-        super().__init__()
-        self.head_dim = head_dim
-        self.max_seq_len = max_seq_len
-        self.reset()
-
-    def rotary(self, x_BTHD):
-        assert self.factor1.size(0) >= x_BTHD.size(-3)
-        factor1, factor2 = (
-            self.factor1[None, : x_BTHD.size(-3), None, :],
-            self.factor2[None, : x_BTHD.size(-3), None, :],
-        )
-        x_flip = x_BTHD.view(*x_BTHD.shape[:-1], x_BTHD.shape[-1] // 2, 2).flip(-1).view(x_BTHD.shape)
-        return factor1 * x_BTHD + factor2 * x_flip
-
-    def reset(self):
-        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=self.head_dim//4, dtype=torch.float32, device=device)
-        angular_freq = angular_freq.repeat_interleave(2)
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(self.head_dim//2)])
-        t = torch.arange(2*self.max_seq_len, dtype=torch.float32, device=device)
-        t_even = 2 * t
-        t_odd = 2 * t + 1
-        theta1 = torch.outer(t_even, angular_freq)
-        theta2 = torch.outer(t_odd, angular_freq)
-        self.factor1 = nn.Buffer(
-            torch.cat((theta1.cos(),theta2.cos()), dim=-1).to(torch.bfloat16), 
-            persistent=False
-        )
-        self.factor2 = nn.Buffer(
-            torch.cat((theta1.sin(),theta2.sin()), dim=-1).to(torch.bfloat16), 
-            persistent=False
-        )
-        self.factor2[..., 1::2] *= -1
-        self.angular_freq = angular_freq
-        # start with 0.1, inspired by 0.12 from @leloykun and learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-        self.attn_scale = 0.1
-
-    def apply(self, old_window: int, new_window: int, alpha: int=1, beta: int=32):
-        rotations = args.block_size * old_window * self.angular_freq / (2 * torch.pi)
-        scaling_factor = old_window / new_window
-        interpolation_weight = torch.clamp((rotations - alpha) / (beta - alpha), 0, 1)
-        self.angular_freq *= scaling_factor + interpolation_weight * (1 - scaling_factor)
-        t = torch.arange(2*self.max_seq_len, dtype=torch.float32, device=self.angular_freq.device)
-        t_even = 2 * t
-        t_odd = 2 * t + 1
-        theta1 = torch.outer(t_even, self.angular_freq)
-        theta2 = torch.outer(t_odd, self.angular_freq)
-        self.factor1.copy_(torch.cat((theta1.cos(),theta2.cos()), dim=-1))
-        self.factor2.copy_( torch.cat((theta1.sin(),theta2.sin()), dim=-1))
-        self.factor2[..., 1::2] *= -1
-        self.attn_scale *= 0.2 * math.log(new_window / old_window) + 1
+def rotary(x_BTHD: Tensor, cos: Tensor, sin: Tensor):
+    assert cos.size(0) >= x_BTHD.size(-3)
+    cos, sin = (
+        cos[None, : x_BTHD.size(-3), None, :],
+        sin[None, : x_BTHD.size(-3), None, :],
+    )
+    x1, x2 = x_BTHD.chunk(2, dim=-1)
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat((y1, y2), 3)
 
 @dataclass
 class AttnArgs:
@@ -1041,18 +998,27 @@ class AttnArgs:
     sa_lambdas: torch.Tensor
     seqlens: torch.Tensor
     bm_size: int
-    yarn: Yarn
+    cos: torch.Tensor
+    sin: torch.Tensor
+    attn_scale: float
     key_offset: bool
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
-# Residual dim split by @photo_mz
-smear_dims = (0, 12)
-skip_dims = (6, 18)
-attn_dims = (18, 30)
-ve_dims = (18, 30)
+# Residual dim split.
+# @photo_mz No loss change, miniscule inductive bias.
+if TREATMENT:
+    smear_dims = (0, 12)
+    skip_dims = (6, 18)
+    attn_dims = (18, 30)
+    ve_dims = (18, 30)
+else:
+    smear_dims = (0, 12)
+    skip_dims = (0, 12)
+    attn_dims = (0, 12)
+    ve_dims = (0, 12)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
@@ -1081,19 +1047,21 @@ class CausalSelfAttention(nn.Module):
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
         # unpack attention args
-        yarn = attn_args.yarn
+        cos, sin = attn_args.cos, attn_args.sin
         ve, sa_lambdas, key_offset = attn_args.ve, attn_args.sa_lambdas, attn_args.key_offset
-        seqlens, bm_size = attn_args.seqlens, attn_args.bm_size
+        seqlens, attn_scale, bm_size = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size
         # sparse gated attention to enable context based no-op by @classiclarryd
         # only include gates on layers with value embeds used on forward pass
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
 
         q, k, v = F.linear(x, sa_lambdas[0] * self.qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
-        q, k = yarn.rotary(q), yarn.rotary(k)
+        q, k = rotary(q, cos, sin), rotary(k, cos, sin)
         if key_offset:
             # shift keys forward for the stationary head dims. Enables 1-layer induction.
+            # 0...31 1-shift
             k[:, 1:, :, self.head_dim // 4:self.head_dim // 2] = k[:, :-1, :, self.head_dim // 4:self.head_dim // 2]
+            # 64...95 1-shift
             k[:, 1:, :, 3 * self.head_dim // 4:] = k[:, :-1, :, 3 * self.head_dim // 4:]
         if ve is not None:
             ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., ve_dims[0]:ve_dims[1]], ve_gate_w)).view(B, T, self.num_heads, 1)
@@ -1104,76 +1072,11 @@ class CausalSelfAttention(nn.Module):
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
         y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+                                                        causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., attn_dims[0]:attn_dims[1]], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * self.qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
-        return y
-
-class PairedHeadCausalSelfAttention(nn.Module):
-    """
-    Pairs up attention heads such that queries from head 1 can attend to keys in head 2, and vice-versa.
-    Implemented by interleaving the k, q, and v for pairs of heads to form twice as long sequences
-    EG [k1_h1, k2_h1, k3_h1], [k1_h2, k2_h2, k3_h2] -> [k1_h1, k1_h2, k2_h1, k2_h2, k3_h1, k3_h2], repeat for q and v
-    """
-    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.dim = dim
-        self.hdim = num_heads * head_dim
-
-        assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
-        std = self.dim ** -0.5
-        bound = (3 ** 0.5) * std
-        self.qkvo_w = nn.Parameter(torch.empty(self.dim * 4, self.hdim, dtype=torch.bfloat16))
-        self.qkvo_w.label = 'attn'
-
-        with torch.no_grad():
-            self.qkvo_w[:self.dim * 3].uniform_(-bound, bound)
-            self.qkvo_w[self.dim * 3:].zero_()
-
-    def forward(self, x: Tensor, attn_args: AttnArgs):
-        B, T = x.size(0), x.size(1) # batch size, sequence length
-        assert B == 1, "varlen sequences requires B == 1"
-        assert T % 16 == 0
-        # unpack attention args
-        yarn = attn_args.yarn
-        ve, sa_lambdas = attn_args.ve, attn_args.sa_lambdas
-        seqlens, bm_size = attn_args.seqlens, attn_args.bm_size
-        attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
-
-        q, k, v = F.linear(x, sa_lambdas[0] * self.qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        q, k = norm(q), norm(k)
-
-        # delay q,k reshape until rotary makes data contiguous, to enable view (non-copy)
-        q = q.view(B, T, self.num_heads // 2, self.head_dim * 2)
-        k = k.view(B, T, self.num_heads // 2, self.head_dim * 2)
-        v = v.reshape(B, T*2, self.num_heads//2, self.head_dim)
-
-        q, k = yarn.rotary(q), yarn.rotary(k)
-
-        q = q.view(B, T*2, self.num_heads//2, self.head_dim)
-        k = k.view(B, T*2, self.num_heads//2, self.head_dim)
-
-        if ve is not None:
-            ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., ve_dims[0]:ve_dims[1]], ve_gate_w)).view(B, T*2, self.num_heads//2, 1)
-            v = v + ve_gate_out * ve.view_as(v)
-
-        max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
-
-        # paired head correction
-        seqlens = 2 * seqlens
-        max_len = 2 * max_len
-
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
-        y = y.view(B, T, self.num_heads, self.head_dim)
-        y = y * torch.sigmoid(F.linear(x[..., attn_dims[0]:attn_dims[1]], attn_gate_w)).view(B, T, self.num_heads, 1)
-        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
-        y = F.linear(y, sa_lambdas[1] * self.qkvo_w[self.dim * 3:].type_as(y))
         return y
 
 class MLP(nn.Module):
@@ -1201,13 +1104,10 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, use_paired_head: bool):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
         super().__init__()
         # skip attention of blocks.6 (the 7th layer) by @YouJiacheng
-        if use_paired_head:
-            self.attn = PairedHeadCausalSelfAttention(dim, head_dim, num_heads, layer_idx)
-        else:
-            self.attn = CausalSelfAttention(dim, head_dim, num_heads, layer_idx) if layer_idx != 6 else None
+        self.attn = CausalSelfAttention(dim, head_dim, num_heads, layer_idx) if layer_idx != 6 else None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP(dim)
 
@@ -1257,13 +1157,17 @@ class GPT(nn.Module):
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
         self.attn_gate_bank.label = 'attn_gate_bank'
-        self.ve_gate_bank = nn.Parameter(torch.zeros(6, num_heads, 12)) # 6 layers
+        
+        if TREATMENT:
+            ve_gate_bank_size = 6
+        else:
+            ve_gate_bank_size = 5
+        
+        self.ve_gate_bank = nn.Parameter(torch.zeros(ve_gate_bank_size, num_heads, 12)) # 3 layers
         self.ve_gate_bank.label = 've_gate_bank'
 
-        self.paired_head_layers = [0, 2, 5, 9]
-        self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i, i in self.paired_head_layers) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i) for i in range(num_layers)])
         self.yarn = Yarn(head_dim, max_seq_len)
-        self.yarn_paired_head = YarnPairedHead(head_dim, max_seq_len)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
@@ -1308,6 +1212,10 @@ class GPT(nn.Module):
         self.scalars.wd_mul = 0.0
 
         self.split_embed = False
+        
+        # Assert gate sizes match dims
+        assert self.smear_gate.weight.size(-1) == smear_dims[1] - smear_dims[0]
+        assert self.skip_gate.weight.size(-1) == skip_dims[1] - skip_dims[0]
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
@@ -1344,8 +1252,11 @@ class GPT(nn.Module):
             x = F.embedding(input_seq, self.lm_head.weight)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        # dropping first layer and shifting updates this to 012 ... 012, @photomz
-        ve = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 6) + [ve[0], ve[1], ve[2]]
+        # dropping first layer and shifting updates this to 012 ... 012
+        if TREATMENT:
+            ve = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 6) + [ve[0], ve[1], ve[2]]
+        else:
+            ve = [ve[1], ve[2]] + [None] * (self.num_layers - 5) + [ve[0], ve[1], ve[2]]
         assert len(ve) == self.num_layers
 
         # smear token embed forward 1 position @classiclarryd
@@ -1357,18 +1268,22 @@ class GPT(nn.Module):
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)] 
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
         attn_gates = ag[:6] + [None] + ag[6:]
-        ve_gates = [veg[0], veg[1], veg[2]] + [None] * (self.num_layers - 6) + [veg[3], veg[4], veg[5]]
+        if TREATMENT:
+            ve_gates = [veg[0], veg[1], veg[2]] + [None] * (self.num_layers - 6) + [veg[3], veg[4], veg[5]]
+        else:
+            ve_gates = [veg[1], veg[2]] + [None] * (self.num_layers - 5) + [veg[2], veg[3], veg[4]]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
 
         for i in range(self.num_layers):
-            yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
             attn_args = AttnArgs(
                 ve=ve[i],
                 sa_lambdas=sa_lambdas[i],
                 seqlens=seqlens,
                 bm_size=bm_sizes[i],
-                yarn=yarn,
+                cos=self.yarn.cos,
+                sin=self.yarn.sin,
+                attn_scale=self.yarn.attn_scale,
                 key_offset=key_offset[i],
                 attn_gate_w=attn_gates[i],
                 ve_gate_w=ve_gates[i]
@@ -1743,7 +1658,6 @@ class TrainingManager():
         self.ws_short, new_ws_long = get_ws(step)
         if new_ws_long != self.ws_long:
             self.model.yarn.apply(self.ws_long, new_ws_long)
-            self.model.yarn_paired_head.apply(self.ws_long, new_ws_long)
 
         new_batch_size = get_bs(step)
         if new_batch_size != self.batch_size:
@@ -1795,7 +1709,6 @@ class TrainingManager():
         self.ws_short, self.ws_long = get_ws(0)
         self.batch_size = get_bs(0)
         self.model.yarn.reset()
-        self.model.yarn_paired_head.reset()
 
     def get_state(self):
         return [copy.deepcopy(opt.state_dict()) for opt in self.optimizers]
@@ -1815,7 +1728,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 1720  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = int(os.environ.get("NUM_ITERATIONS", 1800))  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
@@ -1823,6 +1736,7 @@ class Hyperparameters:
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every_end: int = 5 # eval val more frequently near end, to find exact step.
     save_checkpoint: bool = False
     # attention masking
     block_size: int = 128
@@ -1855,12 +1769,16 @@ if master_process:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     print(logfile)
-def print0(s, console=False):
+def print0(s, console=False, push=False):
     if master_process:
         with open(logfile, "a") as f:
             if console:
                 print(s)
+            if push:
+                send_pushover(s, TITLE)
             print(s, file=f)
+def p_normal(std_mean):
+    return f"N({std_mean[1].item():.4f}, {std_mean[0].item():.4f})"
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -1876,8 +1794,39 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
-# allow custom harnesses to import train_gpt.py without running default trainer.
-if __name__ == "__main__":
+# from torch.profiler import profile, ProfilerActivity, schedule
+
+# profile_steps = 14
+
+# def trace_handler(prof: torch.profiler.profile):
+#     path_prefix = f"{run_id}-rank{rank}"
+#     prof.export_chrome_trace(f"{path_prefix}-chrome-trace.json.gz")
+
+# prof_ctx = torch.profiler.profile(
+#     activities=[
+#         # profile activity on the CPU and GPU
+#         torch.profiler.ProfilerActivity.CPU,
+#         torch.profiler.ProfilerActivity.CUDA,
+#     ],
+#     # Setup the profiler schedule to wait 5 steps, warmup for 5 steps,
+#     # then activate for the remaining steps.
+#     schedule=torch.profiler.schedule(wait=5, warmup=5, active=profile_steps - 10),
+#     # This callback will be fired when the trace files are ready
+#     on_trace_ready=trace_handler,
+#     # Records the file and line number for the operation.
+#     # Disabling this mainly to make the traces less cluttered
+#     with_stack=False,
+#     record_shapes=True,
+# )
+
+num_repeats = int(os.environ.get("NUM_REPEATS", 5))  # Set via NUM_REPEATS=n
+loss_reps = []
+time_reps = []
+for repeat_idx in range(num_repeats):
+    last_rep = (repeat_idx == num_repeats - 1)
+    if repeat_idx != 0:
+        print0(f"\n{'='*50}\nRepeat {repeat_idx + 1}/{num_repeats}\n{'='*50}", console=True)
+
     model: nn.Module = GPT(
         vocab_size=50257,
         num_layers=11,
@@ -1900,7 +1849,7 @@ if __name__ == "__main__":
     ########################################
     #            Warmup kernels            #
     ########################################
-    print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True)
+    print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True, push=repeat_idx == 0)
     # Warmup the training kernels, then re-initialize the state so we aren't cheating
     initial_state = dict(model=copy.deepcopy(model.state_dict()),
                         optimizers=training_manager.get_state()) # save the initial state
@@ -1931,11 +1880,13 @@ if __name__ == "__main__":
     model.load_state_dict(initial_state["model"])
     training_manager.reset(initial_state["optimizers"])
     del val_loader, train_loader, initial_state
+
     model.train()
 
     ########################################
     #        Training and validation       #
     ########################################
+
     train_loader = distributed_data_generator(args.train_files, args.train_bs_schedule[0], args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
 
     gc.collect()
@@ -1946,11 +1897,13 @@ if __name__ == "__main__":
     t0 = time.perf_counter()
     # begin training
     train_steps = args.num_iterations
+    # prof_ctx.__enter__()
     for step in range(train_steps + 1):
+    # for step in range(profile_steps):
         last_step = (step == train_steps)
         training_manager.advance_schedule(step)
         # --------------- VALIDATION SECTION -----------------
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0) or (step > args.num_scheduled_iterations and step % args.val_loss_every_end == 0):
             if last_step:
                 training_manager.apply_final_ws_ext()
             # stop the clock
@@ -1968,17 +1921,23 @@ if __name__ == "__main__":
             val_loss /= val_steps
             del val_loader
             dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            print0(f"step {step:4d}/{train_steps} | time: {int(training_time_ms):,}ms | step avg: {training_time_ms/max(step, 1):.2f}ms | val loss: {val_loss:.4f}", console=True)
             model.train()
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
         if last_step:
+            loss_reps.append(val_loss.cpu().item())
+            time_reps.append(training_time_ms)
             if master_process and args.save_checkpoint:
-                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in training_manager.optimizers])
                 os.makedirs(f"logs/{run_id}", exist_ok=True)
-                torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+                torch.save(log, f"logs/{run_id}/state_step{step:06d}_repeat{repeat_idx}.pt")
+            if master_process:
+                p_loss = p_normal(torch.std_mean(torch.tensor(loss_reps)))
+                p_time = p_normal(torch.std_mean(torch.tensor(time_reps)))
+                print0(f"Rep {repeat_idx + 1}/{num_repeats} | Loss {p_loss} | Time {p_time}", push=True, console=True)
             # the last step only has the validation loop, so break to avoid training
             break
 
@@ -1994,8 +1953,15 @@ if __name__ == "__main__":
 
         # logging
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+        print0(f"step {(step+1):4d}/{train_steps:4d} | time: {int(approx_training_time_ms):,}ms | step avg: {approx_training_time_ms/(step + 1):.2f}ms", console=step % 10 == 0)
 
-    print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
-    dist.destroy_process_group()
+        # prof_ctx.step()
+
+    # prof_ctx.__exit__(None, None, None)
+
+print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+       f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+dist.destroy_process_group()
+
+print0(f"Losses: {loss_reps} \n Times: {time_reps}", push=True, console=True)
+print0(f"loss < 3.28: p={scipy.stats.ttest_1samp(loss_reps, 3.28, alternative='less').pvalue:.4f}", push=True, console=True)
