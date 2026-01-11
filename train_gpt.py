@@ -1172,13 +1172,13 @@ class PairedHeadCausalSelfAttention(nn.Module):
         return y
 
 @triton.jit
-def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,  #
-                                 M, N, K,  #
-                                 BLOCK_SIZE_M: tl.constexpr,  #
-                                 BLOCK_SIZE_N: tl.constexpr,  #
-                                 BLOCK_SIZE_K: tl.constexpr,  #
-                                 GROUP_SIZE_M: tl.constexpr,  #
-                                 NUM_SMS: tl.constexpr,  #
+def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
+                                 M, N, K,
+                                 BLOCK_SIZE_M: tl.constexpr,
+                                 BLOCK_SIZE_N: tl.constexpr,
+                                 BLOCK_SIZE_K: tl.constexpr,
+                                 GROUP_SIZE_M: tl.constexpr,
+                                 NUM_SMS: tl.constexpr,
                                  FORWARD: tl.constexpr,
                                  ):
     dtype = tl.bfloat16
@@ -1271,13 +1271,13 @@ def linear_relu_square(a, b, aux=None):
         ), )
 
     linear_relu_square_kernel[grid](
-        a_desc, b_desc, c_desc, aux_desc,#
-        M, N, K,  #
+        a_desc, b_desc, c_desc, aux_desc,
+        M, N, K,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         GROUP_SIZE_M=1,
-        NUM_SMS=NUM_SMS,  #
+        NUM_SMS=NUM_SMS,
         FORWARD=FORWARD,
         num_stages=num_stages,
         num_warps=num_warps
@@ -1324,6 +1324,10 @@ class MLP(nn.Module):
             self.c_proj.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor):
+        # relu(x)^2:
+        # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+
+        # This call computes relu(x @ W1.T)^2 @ W2.T
         return FusedLinearReLUSquareFunction.apply(x, self.c_fc, self.c_proj)
 
 
