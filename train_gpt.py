@@ -1,8 +1,13 @@
 import os
 import sys
 
-with open(sys.argv[0]) as f:
-    code = f.read()  # read the code of this file ASAP, for logging
+# Read the current file and the kernels file code ASAP, for logging
+with open(sys.argv[0], 'r') as f: 
+    code = f.read()
+with open(os.path.join(os.path.dirname(sys.argv[0]), 'triton_kernels.py'), 'r') as f:
+    code += f"\n\n{'-'*40}\n# triton_kernels.py\n{'-'*40}\n\n" 
+    code += f.read()
+
 import copy
 import glob
 import math
@@ -10,13 +15,13 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from collections import defaultdict
 from itertools import accumulate
 from pathlib import Path
 import gc
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
+import triton
 
 torch.empty(
     1, device=f"cuda:{os.environ['LOCAL_RANK']}", requires_grad=True
@@ -26,27 +31,35 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-import triton
-import triton.language as tl
-from triton.tools.tensor_descriptor import TensorDescriptor
 from kernels import get_kernel
 from torch import Tensor, nn
+
+from triton_kernels import XXT, ba_plus_cAA, linear_relu_square
 
 dynamo.config.recompile_limit = 64
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
+# Transposed layout by @ChrisJMcCormick allows for faster gradient accumulation.
 
-@torch.library.custom_op("nanogpt::mm", mutates_args=())
-def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
+@torch.library.custom_op("nanogpt::mm_t", mutates_args=())
+def mm_t_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
+    """Computes y = x @ w with F8 weights stored as (in_features, out_features)."""
     @torch.compile
     def impl(x: Tensor, w: Tensor):
         assert x.is_contiguous() and w.is_contiguous()
+        assert x.shape[1] == w.shape[0]  # x: (batch, in), w: (in, out)
+
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
         w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
+
+        # _scaled_mm requires column-major B. w_f8 is row-major (in, out).
+        # .T.contiguous().T creates a column-major view without changing logical shape.
+        w_f8_col_major = w_f8.T.contiguous().T
+
         out = torch._scaled_mm(
             x_f8,
-            w_f8.T,
+            w_f8_col_major,
             out_dtype=torch.bfloat16,
             scale_a=x.new_tensor(x_s, dtype=torch.float32),
             scale_b=x.new_tensor(w_s, dtype=torch.float32),
@@ -56,314 +69,75 @@ def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[
 
     return impl(x, w)
 
-@mm_op.register_fake
+@mm_t_op.register_fake
 def _(x: Tensor, w: Tensor, *_):
     assert x.ndim == w.ndim == 2
-    assert x.shape[1] == w.shape[1]
+    assert x.shape[1] == w.shape[0]
     assert x.device == w.device
     assert x.is_contiguous() and w.is_contiguous()
-    return x @ w.T, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+    return x @ w, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
 
-@torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
-def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
+@torch.library.custom_op("nanogpt::mm_t_backward", mutates_args=())
+def mm_t_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
     @torch.compile
     def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
         assert grad.is_contiguous()
-        x_inv_s = grad.new_tensor(x_s, dtype=torch.float32)
-        w_inv_s = grad.new_tensor(w_s, dtype=torch.float32)
-        grad_inv_s = grad.new_tensor(grad_s, dtype=torch.float32)
+        
+        x_scale = grad.new_tensor(x_s, dtype=torch.float32)
+        w_scale = grad.new_tensor(w_s, dtype=torch.float32)
+        grad_scale = grad.new_tensor(grad_s, dtype=torch.float32)
         grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
+        
+        # grad_x = grad @ w.T
         grad_x = torch._scaled_mm(
             grad_f8,
-            w_f8.T.contiguous().T,
+            w_f8.T, 
             out_dtype=torch.bfloat16,
-            scale_a=grad_inv_s,
-            scale_b=w_inv_s,
+            scale_a=grad_scale,
+            scale_b=w_scale,
             use_fast_accum=False,
         )
-        # faster than grad_f8_t @ x_f8, for (d_out, d_in) == (50304, 768)
+        
+        # grad_w = x.T @ grad
+        # Result is (in, out), naturally matching weight storage. No final .T needed.
         grad_w = torch._scaled_mm(
             x_f8.T.contiguous(),
             grad_f8.T.contiguous().T,
             out_dtype=torch.float32,
-            scale_a=x_inv_s,
-            scale_b=grad_inv_s,
+            scale_a=x_scale,
+            scale_b=grad_scale,
             use_fast_accum=False,
-        ).T
+        )
+        
         return grad_x, grad_w
 
-    return impl(g, x_f8, w_f8)
+    grad_x, grad_w = impl(g, x_f8, w_f8)
 
-@mm_backward_op.register_fake
+    return grad_x, grad_w
+
+@mm_t_backward_op.register_fake
 def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
-    return x_f8.to(torch.bfloat16), w_f8.T.contiguous().T.to(torch.float32)
+    return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
 
-def backward(ctx, grad_out: Tensor, *_):
+def backward_t(ctx, grad_out: Tensor, *_):
     x_f8, w_f8 = ctx.saved_tensors
     x_s, w_s, grad_s = ctx.scales
-    grad_x, grad_w = torch.ops.nanogpt.mm_backward(
+    grad_x, grad_w = torch.ops.nanogpt.mm_t_backward(
         grad_out, x_f8, w_f8, x_s, w_s, grad_s
     )
     return grad_x, grad_w, None, None, None
 
-def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
+def setup_context_t(ctx: torch.autograd.function.FunctionCtx, inputs, output):
     *_, x_s, w_s, grad_s = inputs
     _, x_f8, w_f8 = output
     ctx.save_for_backward(x_f8, w_f8)
     ctx.scales = x_s, w_s, grad_s
     ctx.set_materialize_grads(False)
 
-mm_op.register_autograd(backward, setup_context=setup_context)
+mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 
 # -----------------------------------------------------------------------------
-# Triton kernel for symmetric matrix multiplication by @byronxu99
-
-def _get_autotune_configs():
-    return [
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": bm,
-                "BLOCK_SIZE_N": bn,
-                "BLOCK_SIZE_K": bk,
-                "GROUP_SIZE_M": 8,
-                "LOWER_UPPER": 1,
-            },
-            num_stages=stages,
-            num_warps=warps,
-        )
-        for bm in [64, 128]
-        for bn in [64, 128, 256]
-        for bk in [64, 128]
-        for stages, warps in [(3, 4), (3, 8), (4, 4)]
-        if bm // bn <= 2 and bn // bm <= 2
-    ]
-
-@triton.jit
-def _pid_to_block(
-    pid,
-    M,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    # Split output matrix into blocks of size (BLOCK_SIZE_M, BLOCK_SIZE_N)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(M, BLOCK_SIZE_N)
-
-    # Map PID to a single matrix in batch
-    batch_idx = pid // (num_pid_m * num_pid_n)
-    pid = pid % (num_pid_m * num_pid_n)
-
-    # Map PID to 2D grid of blocks
-    pid_m = pid // num_pid_n
-    pid_n = pid % num_pid_n
-    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
-
-    m_idx = pid_m * BLOCK_SIZE_M
-    n_idx = pid_n * BLOCK_SIZE_N
-    return batch_idx, m_idx, n_idx
-
-@triton.autotune(
-    configs=_get_autotune_configs(),
-    key=["M", "K", "a_stride_r", "a_stride_c", "c_stride_r", "c_stride_c"],
-)
-@triton.jit
-def XXT_kernel(
-    A_ptr, C_ptr,
-    M, K,
-    a_stride_b, a_stride_r, a_stride_c,
-    c_stride_b, c_stride_r, c_stride_c,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    LOWER_UPPER: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    batch_idx, m_idx, n_idx = _pid_to_block(
-        pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
-    )
-
-    # Skip blocks that don't need to be computed
-    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
-    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
-    if skip_block_below_diag or skip_block_above_diag:
-        return
-
-    # Index into one matrix of batch
-    A_ptr += batch_idx * a_stride_b
-    C_ptr += batch_idx * c_stride_b
-
-    # Create pointer arrays for A and A.T
-    offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
-    at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
-
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
-    # Accumulate over blocks of K
-    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        at = tl.load(at_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        accumulator = tl.dot(a, at, accumulator)
-        a_ptrs += BLOCK_SIZE_K * a_stride_c
-        at_ptrs += BLOCK_SIZE_K * a_stride_c
-
-    out_dtype = C_ptr.dtype.element_ty
-    output = accumulator.to(out_dtype)
-
-    # Store block of C
-    offs_cm = m_idx + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C_ptr + (offs_cm[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
-    tl.store(c_ptrs, output, mask=c_mask)
-
-    # Store block of C mirrored across the diagonal
-    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
-    c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
-    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
-
-def XXT(A: torch.Tensor, out: torch.Tensor):
-    """
-    Launch Triton kernel to compute C = A @ A.T
-    """
-    assert A.ndim == 2 or A.ndim == 3
-    M, K = A.shape[-2:]
-    assert out.size(-2) == M, "Output matrix has incorrect shape"
-    assert out.size(-1) == M, "Output matrix has incorrect shape"
-
-    batch_size = A.size(0) if A.ndim == 3 else 1
-    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
-    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
-
-    grid = lambda meta: (
-        batch_size * triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(M, meta["BLOCK_SIZE_N"]),
-    )
-    XXT_kernel[grid](
-        A_ptr=A,
-        C_ptr=out,
-        M=M,
-        K=K,
-        a_stride_b=input_batch_stride,
-        a_stride_r=A.stride(-2),
-        a_stride_c=A.stride(-1),
-        c_stride_b=output_batch_stride,
-        c_stride_r=out.stride(-2),
-        c_stride_c=out.stride(-1),
-    )
-    return out
-
-@triton.autotune(
-    configs=_get_autotune_configs(),
-    key=["M", "a_stride_r", "a_stride_c", "c_stride_r", "c_stride_c"],
-)
-@triton.jit
-def ba_plus_cAA_kernel(
-    A_ptr, C_ptr,
-    M,
-    a_stride_b, a_stride_r, a_stride_c,
-    c_stride_b, c_stride_r, c_stride_c,
-    alpha, beta,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    LOWER_UPPER: tl.constexpr,
-):
-    # This is mostly duplicated from XXT_kernel, but also loads and adds a block of A
-    # Performance is slightly slower than XXT_kernel, so we use two separate kernels
-    pid = tl.program_id(axis=0)
-    batch_idx, m_idx, n_idx = _pid_to_block(
-        pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
-    )
-
-    # Skip blocks that don't need to be computed
-    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
-    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
-    if skip_block_below_diag or skip_block_above_diag:
-        return
-
-    # Index into one matrix of batch
-    A_ptr += batch_idx * a_stride_b
-    C_ptr += batch_idx * c_stride_b
-
-    # Create pointer arrays for A and A.T
-    offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
-    at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
-
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
-    # Accumulate over blocks of K
-    for k in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < M - k * BLOCK_SIZE_K, other=0.0)
-        at = tl.load(at_ptrs, mask=offs_k[:, None] < M - k * BLOCK_SIZE_K, other=0.0)
-        accumulator = tl.dot(a, at, accumulator)
-        a_ptrs += BLOCK_SIZE_K * a_stride_c
-        at_ptrs += BLOCK_SIZE_K * a_stride_c
-
-    # Load block of A to add (corresponds to the current block of C)
-    offs_am = m_idx + tl.arange(0, BLOCK_SIZE_M)
-    offs_an = n_idx + tl.arange(0, BLOCK_SIZE_N)
-    a_add_ptrs = A_ptr + (offs_am[:, None] * a_stride_r + offs_an[None, :] * a_stride_c)
-    a_add_mask = (offs_am[:, None] < M) & (offs_an[None, :] < M)
-    a_add = tl.load(a_add_ptrs, mask=a_add_mask, other=0.0).to(tl.float32)
-
-    # Apply alpha and beta
-    accumulator *= alpha
-    accumulator += a_add * beta
-
-    out_dtype = C_ptr.dtype.element_ty
-    output = accumulator.to(out_dtype)
-
-    # Store block of C
-    offs_cm = m_idx + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C_ptr + (offs_cm[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
-    tl.store(c_ptrs, output, mask=c_mask)
-
-    # Store block of C mirrored across the diagonal
-    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
-    c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
-    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
-
-def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
-    """
-    Launch Triton kernel to compute C = alpha * A @ A.T + beta * A
-    """
-    assert A.ndim == 2 or A.ndim == 3
-    M, K = A.shape[-2:]
-    assert M == K, "Input matrix must be square"
-    assert out.size(-2) == M
-    assert out.size(-1) == M
-
-    batch_size = A.size(0) if A.ndim == 3 else 1
-    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
-    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
-
-    grid = lambda meta: (
-        batch_size * triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(M, meta["BLOCK_SIZE_N"]),
-    )
-    ba_plus_cAA_kernel[grid](
-        A_ptr=A,
-        C_ptr=out,
-        M=M,
-        a_stride_b=input_batch_stride,
-        a_stride_r=A.stride(-2),
-        a_stride_c=A.stride(-1),
-        c_stride_b=output_batch_stride,
-        c_stride_r=out.stride(-2),
-        c_stride_c=out.stride(-1),
-        alpha=alpha,
-        beta=beta,
-    )
-    return out
+# Polar Express
 
 # Computed for num_iters=5, safety_factor=2e-2, cushion=2
 polar_express_coeffs = [
@@ -422,490 +196,547 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 
 
 # -----------------------------------------------------------------------------
-# Compiled helpers for NorMuon by @chrisjmccormick
+# Combined NorMuon + Adam Optimizer
 
-@torch.compile(dynamic=False, fullgraph=True)
-def cautious_wd_and_update_inplace(p, mantissa, grad, wd_tensor, lr_tensor):
+class NorMuonAndAdam:
     """
-    Cautious weight decay + parameter update. wd_tensor and lr_tensor are 0-D CPU tensors.
-    Mantissa is tracked to enable higher precision updates on bfloat16 parameters.
-    bfloat16 format: 1 sign bit + 8 exponent bits + 7 mantissa bits = 16 bits total
-    float32 format: 1 sign bit + 8 exponent bits + 23 mantissa bits = 32 bits total
-    """
-    assert p.dtype == mantissa.dtype == torch.uint16
-    grad = grad.float()
-    wd_factor = wd_tensor.to(torch.float32)
-    lr_factor = lr_tensor.to(torch.float32)
-    p_precise_raw = (p.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
-    p_precise = p_precise_raw.view(torch.float32)
-    mask = (grad * p_precise) >= 0
-    p_precise.copy_(p_precise - (p_precise * mask * wd_factor * lr_factor) - (grad * lr_factor))
-    p.copy_((p_precise_raw >> 16).to(torch.uint16))
-    mantissa.copy_(p_precise_raw.to(torch.uint16))
+    Combined optimizer that handles both NorMuon (for weight matrices) and Adam (for embeddings/scalars).
 
-@torch.compile(dynamic=False, fullgraph=True)
-def apply_normuon_variance_reduction(v_chunk, second_momentum_buffer, beta2, red_dim):
-    """NorMuon variance reduction. Algebraically fuses the normalization steps to minimize memory ops."""
-    v_mean = v_chunk.float().square().mean(dim=red_dim, keepdim=True)
-    red_dim_size = v_chunk.size(red_dim)
-    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True).mul_(red_dim_size)
-    v_norm = v_norm_sq.sqrt_()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
-    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt_()
-    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt_()
-    final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
-    return v_chunk.mul_(final_scale.type_as(v_chunk))
+    Unlike torch.optim.Optimizer, this class uses per-parameter settings from a param_table
+    instead of parameter groups. Also, instead of using backward hooks for communication scheduling,
+    this class uses explicit ordering.
 
-
-# -----------------------------------------------------------------------------
-# NorMuon optimizer
-
-class NorMuon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
-
-    https://kellerjordan.github.io/posts/muon/
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Warning: This optimizer should not be used for the embedding layer, the final fully connected layer,
-    or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
-
-    Differences from standard Muon:
-    - Newton-Shulz is replaced with Polar Express for the orthogonalization step
-    - NorMuon adds a low-rank variance estimator similar to Adafactor. https://arxiv.org/pdf/2510.05491
-    - small 1D parameters handled here instead of in Adam
-    - Cautious weight decay, a gated version of decoupled weight decay
-    - Custom distributed sizing:
-    The model stores all attn and mlp weights in the same shape, and then updates the view as
-    needed on the forward pass. This enables attn and mlp weights to be contained within the same
-    dist.reduce_scatter_tensor() call. The model architecture has been customized to enable
-    (n_attn_layers+n_mlp_layers*2)%8==0 for batching across 8 GPUs with zero padding on mlp and attn.
-    The scheduling is:
-        1. reduce scatter attn/mlp round 1 (10 attn params 6 mlp params)
-        2. reduce scatter attn/mlp round 2 (16 mlp params)
-        3. wait on step 1, then compute update of 1 and schedule all gather
-        4. wait on step 2, then compute update of 2 and schedule all gather
-            GPUs receive [2 ATTN, 2 ATTN, 2 ATTN, 2 ATTN, 2 ATTN, 2 MLP, 2 MLP, 2 MLP]
-            GPUs that receive params of type attn reshape before computing update
-        5. wait for each all gather to complete and update params
-    """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, beta2=0.95, custom_sizing=True):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2)
-        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
-        # custom sizing requires 8 GPUs
-        if custom_sizing and dist.get_world_size()==8:
-            param_groups = self.generate_custom_param_groups(params)
-        else:
-            param_groups = self.generate_standard_param_groups(params)
-        super().__init__(param_groups, defaults)
-
-    def reset(self):
-        # expose a reset for clearing buffers
-        for group in self.param_groups:
-            if "momentum_buffer" in group:
-                group["momentum_buffer"].zero_()
-                group["mantissa"].zero_()
-                group["second_momentum_buffer"].zero_()
-
-    def generate_standard_param_groups(self, params):
-        """
-        Use this method if running on less than 8 GPU or experimenting with additional attn or mlp modules.
-        Creates one param group per module.
-        """
-        groups = defaultdict(list)
-        for param in params:
-            groups[param.label].append(param)
-
-        param_groups = []
-        for module_name, group_params in groups.items():
-            chunk_size = (len(group_params) + self.world_size - 1) // self.world_size
-            param_groups.append(dict(params=group_params, chunk_size=chunk_size))
-
-        return param_groups
-
-    def generate_custom_param_groups(self, params):
-        """
-        Implementation requires that a single GPU does not receive both attn
-        and mlp params when a param group is split across GPUs.
-        """
-        params_list = list(params)
-        module_group_order = ['attn', 'mlp']
-        group_sizes = [16, 16]  # 10 attn + 6 mlp, then 16 mlp
-        params_list.sort(key=lambda x: module_group_order.index(x.label))
-
-        idx = 0
-        assert len(params_list) == sum(group_sizes)
-        param_groups = []
-        for size in group_sizes:
-            chunk_size = (size + self.world_size - 1) // self.world_size
-            group_params = params_list[idx: idx + size]
-            param_groups.append(dict(params=group_params, chunk_size=chunk_size))
-            idx += size
-
-        return param_groups
-
-    def step(self):
-        self.step_p1()
-        self.step_p2()
-        self.step_p3()
-        
-    @torch.no_grad()
-    def step_p1(self):
-        """
-        Part 1: Launch distributed reduce_scatter operations for parameter groups.
-        """
-        rank = dist.get_rank()
-        self.group_infos = []
-        for group in self.param_groups:
-            params: list[Tensor] = group["params"]
-            if not params:
-                continue
-
-            chunk_size = group["chunk_size"]
-            padded_num_params = chunk_size * self.world_size
-
-            stacked_grads = torch.empty(
-                (padded_num_params, *params[0].shape),
-                dtype=params[0].dtype,
-                device=params[0].device
-            )
-            for i, p in enumerate(params):
-                stacked_grads[i].copy_(p.grad, non_blocking=True)
-            if len(params) < padded_num_params:
-                stacked_grads[len(params):].zero_()
-
-            grad_chunk = torch.empty_like(stacked_grads[:chunk_size])
-
-            reduce_future = dist.reduce_scatter_tensor(
-                grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True
-            ).get_future()
-
-            self.group_infos.append(dict(grad_chunk=grad_chunk, reduce_future=reduce_future))
+    Two separate orderings are supported:
+    - scatter_order: Order to launch reduce/reduce_scatter operations (for communication overlap)
+    - work_order: Order to wait for reduce, compute update, and launch gather (for compute overlap)
     
-    @torch.no_grad()
-    def step_p2(self):
-        """
-        Part 2: Compute gradient updates and launch all_gather operations
-        Wait for all gather to complete for all parameter groups except final one
-        """
-        # Efficient distributed step by @YouJiacheng, @KonstantinWilleke, @alexrgilbert,
-        # @adricarda, @tuttyfrutyee, @vdlad, @ryanyang0, @vagrawal, @varunneal, @chrisjmccormick
-        rank = dist.get_rank()
-        group_infos = self.group_infos
-        
-        self.all_gather_infos = []
-        # Second pass: wait for gradients, compute updates for the local shard of parameters,
-        # and launch all async all_gather operations.
-        for group, info in zip(self.param_groups, group_infos):
-            info["reduce_future"].wait()
+    NorMuon (for attn/mlp banks):
+    - SGD-momentum with Polar Express orthogonalization
+    - Low-rank variance estimator (NorMuon)
+    - Cautious weight decay
+    - Mantissa tracking for precision
+    - Parameter bank sharding
+    
+    Adam (for embeddings/scalars):
+    - Standard Adam with bias correction
+    - Cautious weight decay
+    
+    # Contributors include @YouJiacheng, @KonstantinWilleke, @alexrgilbert,
+    # @adricarda, @tuttyfrutyee, @vdlad, @ryanyang0, @vagrawal, @varunneal, @chrisjmccormick
 
-            params = group["params"]
-            grad_chunk = info["grad_chunk"].float()
-            chunk_size = group["chunk_size"]
-            padded_num_params = chunk_size * self.world_size
+    Args:
+        named_params: Iterator of (name, param) tuples from model.named_parameters()
+        param_table: Dict mapping label -> settings dict with keys:
+            optim: "adam" or "normuon"
+            comms: "replicated" or "sharded" 
+            adam_betas: [beta1, beta2] for adam params, None for normuon
+        scatter_order: List of labels specifying order to launch reduces
+        work_order: List of labels specifying order to process updates
+        adam_defaults: Dict of Adam hyperparameters (lr, eps, weight_decay)
+        normuon_defaults: Dict of NorMuon hyperparameters (lr, weight_decay, momentum, beta2)
+    """
 
-            start_idx = rank * chunk_size
-            module_idx = start_idx if start_idx < len(params) else 0
+    # -----------------------------------
+    # Initialization
 
-            num_params = min(chunk_size, max(0, len(params) - start_idx))  # num params for this rank
-
-            if "momentum_buffer" not in group:
-                group["momentum_buffer"]  = torch.zeros_like(grad_chunk[:num_params], dtype=torch.float32)
-                
-            momentum_buffer = group["momentum_buffer"]
-            # Apply momentum update to the persistent momentum buffer in-place
-            momentum_buffer.lerp_(grad_chunk[:num_params], 1 - group["momentum"])
-            updated_grads = grad_chunk[:num_params].lerp_(momentum_buffer, group["momentum"])
-
-            grad_shape = updated_grads.shape
-            if params[module_idx].label == 'attn':
-                for p in params[module_idx:module_idx + num_params]:
-                    assert p.label == 'attn'
-                updated_grads = updated_grads.view(4 * grad_shape[0], grad_shape[1] // 4, grad_shape[2])
-
-            ref_param = params[module_idx]
-            param_shape = ref_param.shape
-
-            if "second_momentum_buffer" not in group:
-                group["second_momentum_buffer"] = (torch.zeros_like(updated_grads[..., :, :1], dtype=torch.float32)
-                    if param_shape[-2] >= param_shape[-1] else torch.zeros_like(updated_grads[..., :1, :])
-                )
-            second_momentum_buffer = group["second_momentum_buffer"]
-
-            if "param_lr_cpu" not in group:
-                # Define multipliers for ALL params in this group (global, not per-shard)
-                lr_mults = []
-                wd_mults = []
-                for p in params:
-                    # Increase learning rate for modules with larger inputs than outputs.
-                    # This shape check also assumes rows=input, columns=output, so take care
-                    # when changing memory layouts. @chrisjmccormick
-                    shape = p.shape
-                    if len(shape) >= 2:
-                        shape_mult = max(1.0, shape[-2] / shape[-1]) ** 0.5
-                    else:
-                        shape_mult = 1.0
-                    lr_mults.append(shape_mult * getattr(p, "lr_mul", 1.0))
-                    wd_mults.append(getattr(p, "wd_mul", 1.0))
-                # Define as cpu tensors to enable Inductor constant folding
-                group["param_lr_cpu"] = torch.tensor(lr_mults, dtype=torch.float32, device="cpu")
-                group["param_wd_cpu"] = torch.tensor(wd_mults, dtype=torch.float32, device="cpu")
-
-            eff_lr_all = group["param_lr_cpu"] * group["lr"]
-            eff_wd_all = group["param_wd_cpu"] * group["weight_decay"] * group["lr"]
-
-            # Slice the portion corresponding to this rank's shard
-            eff_lr_cpu = eff_lr_all[module_idx:module_idx + num_params]
-            eff_wd_cpu = eff_wd_all[module_idx:module_idx + num_params]
-
-            # Compute zeropower for the entire chunk in a single, batched call.
-            if num_params == 0:
-                v_chunk = updated_grads
-            else:
-                v_chunk = polar_express(updated_grads, split_baddbmm=(ref_param.label == 'mlp'))
-
-            # Note that the head orientation in O is transposed relative to QKV, so red_dim
-            # is 'incorrect' for O. However, correcting this showed no improvement. @chrisjmccormick
-            red_dim = -1 if param_shape[-2] >= param_shape[-1] else -2
-
-            v_chunk = apply_normuon_variance_reduction(
-                v_chunk, second_momentum_buffer, group["beta2"], red_dim
-            )
-
-            v_chunk = v_chunk.view(grad_shape)
-
-            # # "Cautious" weight decay (https://arxiv.org/abs/2510.12402)
-            updated_params = torch.empty_like(grad_chunk, dtype=torch.bfloat16)
-            if num_params > 0:
-                # Work on a stacked copy to avoid touching original params
-                param_chunk = torch.stack(params[module_idx:module_idx + num_params])
-
-                if "mantissa" not in group:
-                    group["mantissa"] = torch.zeros_like(param_chunk, dtype=torch.uint16)
-                mantissa = group["mantissa"]
-
-                for local_idx in range(num_params):
-                    cautious_wd_and_update_inplace(
-                        param_chunk[local_idx].view(torch.uint16),
-                        mantissa[local_idx],
-                        v_chunk[local_idx],
-                        eff_wd_cpu[local_idx],
-                        eff_lr_cpu[local_idx]
-                    )
-            else:
-                param_chunk = torch.zeros_like(v_chunk)
-
-            updated_params[:num_params].copy_(param_chunk)
-            if num_params < chunk_size:
-                updated_params[num_params:].zero_()
-
-            stacked_params = torch.empty(
-                (padded_num_params, *param_shape),
-                dtype=updated_params.dtype,
-                device=updated_params.device,
-            )
-
-            gather_future = dist.all_gather_into_tensor(
-                stacked_params, updated_params, async_op=True
-            ).get_future()
-
-            self.all_gather_infos.append(
-                {
-                    "gather_future": gather_future,
-                    "stacked_params": stacked_params,
-                    "orig_params": params,
-                }
-            )
-
-        # Final pass: wait for all_gather to complete for all except final and copy results back into original parameter tensors.
-        for info in self.all_gather_infos[:-1]:
-            info["gather_future"].wait()
-            stacked_params = info["stacked_params"]
-            orig_params = info["orig_params"]
-
-            unstacked_params = torch.unbind(stacked_params)
-            for i, p in enumerate(orig_params):
-                p.copy_(unstacked_params[i], non_blocking=True)
-
-    @torch.no_grad()
-    def step_p3(self):
-        """
-        Part 3: Wait for final all gather to complete and copy results back into original parameter tensors
-        """
-        info = self.all_gather_infos[-1]
-        info["gather_future"].wait()
-        stacked_params = info["stacked_params"]
-        orig_params = info["orig_params"]
-
-        unstacked_params = torch.unbind(stacked_params)
-        for i, p in enumerate(orig_params):
-            p.copy_(unstacked_params[i], non_blocking=True)
-
-
-class DistAdam(torch.optim.Optimizer):
-    def __init__(self, params, label_order: list[str], betas: list[list[float]], lr: float = 1e-3, eps: float = 1e-8, weight_decay: float = 0.01):
+    def __init__(self, named_params, param_table: dict, scatter_order: list, work_order: list,
+                 adam_defaults: dict, normuon_defaults: dict):
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
-        defaults = dict(lr=lr, eps=eps, weight_decay=weight_decay)
-        params = list(params)
-        # Group by label, with explicit ordering for execution control.
-        params_by_label = defaultdict(list)
-        for p in params:
-            params_by_label[getattr(p, 'label', None)].append(p)
-        param_groups = []
-        for idx, label in enumerate(label_order):
-            if label in params_by_label:
-                param_groups.append(dict(params=params_by_label[label], betas=betas[idx]))
-        # include any unlabeled params at the end (processed last)
-        if None in params_by_label:
-            param_groups.append(dict(params=params_by_label[None]))
-        super().__init__(param_groups, defaults)
-        # init state: small params (numel < 1024) use full-sized state, others use sharded
-        for p in params:
-            chunk = p if p.numel() < 1024 else p[:p.size(0) // self.world_size]
-            exp_avg = torch.zeros_like(chunk, dtype=torch.float32, device=p.device)
-            self.state[p] = dict(step=0, exp_avg=exp_avg, exp_avg_sq=torch.zeros_like(exp_avg))
-
-        # tag the final param for optimizer pipelining, run all gather after muon copy
-        param_groups[-1]['params'][-1].is_final_param = True
         
-        # DistributedAdam implementation by @vagrawal, @akash5474
-        self.should_sync = False
-        self._reduce_scatter_hooks = []
-        self._reduce_scatter_futures = {}
-        # 0-D CPU tensors to avoid recompilation in _update_step
+        # Store defaults for each optimizer type
+        self.adam_defaults = adam_defaults
+        self.normuon_defaults = normuon_defaults
+        self.param_table = param_table
+        self.scatter_order = scatter_order
+        self.work_order = work_order
+        
+        # Collect params by label and build settings
+        self.settings: dict[nn.Parameter, dict] = {}
+        self.state: dict[nn.Parameter, dict] = {}
+        self._param_by_label: dict[str, nn.Parameter] = {}
+        for name, param in named_params:
+            label = getattr(param, "label", None)
+            assert label is not None and label in param_table  # all params must have valid label
+            assert label not in self._param_by_label  # exactly one param per label
+            self._param_by_label[label] = param
+            self._build_param_settings(param, label)
+        
+        # Assert scatter_order and work_order match present labels exactly
+        present = set(self._param_by_label.keys())
+        assert set(scatter_order) == present and set(work_order) == present
+        
+        # Handle world_size=1: overwrite comms to "none"
+        if self.world_size == 1:
+            for settings in self.settings.values():
+                settings["comms"] = "none"
+        
+        # Initialize state for all params
+        self._init_state()
+        
+        # 0-D CPU tensors to avoid recompilation
         self._step_size_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self.register_backward_hooks()
-
-    def register_backward_hooks(self):
-        for group in self.param_groups:
-            for param in group["params"]:
-                self._reduce_scatter_hooks.append(param.register_post_accumulate_grad_hook(self._sync_gradient))
-
-    def load_state_dict(self, state_dict):
-        """Override to preserve optimizer state dtypes (avoid BFloat16->Float32 cast that causes recompilation)."""
-        # Save original state dtypes before loading
-        original_dtypes = {}
-        for p, s in self.state.items():
-            original_dtypes[p] = {k: v.dtype for k, v in s.items() if isinstance(v, torch.Tensor)}
+        self._eff_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         
-        # Call parent load_state_dict (which may cast dtypes to match param dtype)
-        super().load_state_dict(state_dict)
+        # Track async operations
+        self._reduce_futures: dict[nn.Parameter, tuple] = {}
         
-        # Restore original dtypes
-        for p, s in self.state.items():
-            if p in original_dtypes:
-                for k, v in s.items():
-                    if isinstance(v, torch.Tensor) and k in original_dtypes[p]:
-                        if v.dtype != original_dtypes[p][k]:
-                            s[k] = v.to(original_dtypes[p][k])
-
-    @torch.no_grad()
-    def _sync_gradient(self, param):
-        if not self.should_sync:
-            return
-
-        grad = param.grad
-        if param.numel() < 1024:
-            # Small params: use all_reduce (no scatter/gather needed)
-            self._reduce_scatter_futures[param] = (
-                dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future(),
-                grad
-            )
-        else:
-            rank_size = grad.shape[0] // self.world_size
-            if grad is not None:
-                grad_slice = torch.empty_like(grad[:rank_size])
-                self._reduce_scatter_futures[param] = (
-                    dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future(),
-                    grad_slice
+        # Embed/lm_head tying state
+        self.split_embed = False
+        self._lm_head_param = self._param_by_label.get("lm_head")
+        self._embed_param = self._param_by_label.get("embed")
+    
+    def _build_param_settings(self, param: nn.Parameter, label: str):
+        """Build settings for a single parameter from param_table."""
+        table_entry = self.param_table[label]
+        optim = table_entry["optim"]
+        comms = table_entry["comms"]
+        adam_betas = table_entry.get("adam_betas")
+        
+        settings = {
+            "label": label,
+            "optim": optim,
+            "comms": comms,
+            "adam_betas": tuple(adam_betas) if adam_betas else None,
+            "lr_mul": getattr(param, "lr_mul", 1.0),
+            "wd_mul": getattr(param, "wd_mul", 1.0),
+        }
+        
+        if optim == "adam":
+            settings["lr"] = self.adam_defaults["lr"]
+            settings["eps"] = self.adam_defaults["eps"]
+            settings["weight_decay"] = self.adam_defaults["weight_decay"]
+            settings["initial_lr"] = self.adam_defaults["lr"]
+        elif optim == "normuon":
+            reshape = getattr(param, "reshape", None)
+            if reshape is None:
+                raise ValueError(f"NorMuon param {label} must have .reshape attribute")
+            if reshape[0] % self.world_size != 0:
+                raise ValueError(f"reshape[0]={reshape[0]} must be divisible by world_size")
+            
+            chunk_size = reshape[0] // self.world_size
+            settings["reshape"] = reshape
+            settings["chunk_size"] = chunk_size
+            settings["lr"] = self.normuon_defaults["lr"]
+            settings["weight_decay"] = self.normuon_defaults["weight_decay"]
+            settings["momentum"] = self.normuon_defaults["momentum"]
+            settings["beta2"] = self.normuon_defaults["beta2"]
+            settings["initial_lr"] = self.normuon_defaults["lr"]
+            
+            # Compute shape-based LR multiplier
+            chunk_shape = (chunk_size, *reshape[1:])
+            shape_mult = max(1.0, chunk_shape[-2] / chunk_shape[-1]) ** 0.5 if len(chunk_shape) >= 2 else 1.0
+            settings["lr_mul"] = shape_mult * getattr(param, "lr_mul", 1.0)
+            
+            # Per-matrix LR multipliers for MLP c_proj (2x LR on odd indices)
+            if label == "mlp":
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                start_idx = rank * chunk_size
+                per_matrix_lr_mul = []
+                for i in range(chunk_size):
+                    global_idx = start_idx + i
+                    is_c_proj = (global_idx % 2 == 1)
+                    per_matrix_lr_mul.append(2.0 if is_c_proj else 1.0)
+                settings["per_matrix_lr_mul"] = per_matrix_lr_mul
+        
+        # Compute chunk_size for sharded Adam params
+        if optim == "adam" and comms == "sharded":
+            settings["chunk_size"] = param.shape[0] // self.world_size
+        
+        self.settings[param] = settings
+    
+    def _init_state(self):
+        """Initialize optimizer state for all parameters."""
+        for param, settings in self.settings.items():
+            if settings["optim"] == "adam":
+                # Sharded params use chunk state, replicated use full state
+                if settings["comms"] == "sharded":
+                    chunk_size = settings["chunk_size"]
+                    chunk = param[:chunk_size]
+                else:
+                    chunk = param
+                exp_avg = torch.zeros_like(chunk, dtype=torch.float32, device=param.device)
+                self.state[param] = dict(step=0, exp_avg=exp_avg, exp_avg_sq=torch.zeros_like(exp_avg))
+            
+            elif settings["optim"] == "normuon":
+                reshape = settings["reshape"]
+                chunk_size = settings["chunk_size"]
+                chunk_shape = (chunk_size, *reshape[1:])
+                
+                # Momentum buffer (FP32 for precision)
+                momentum_buffer = torch.zeros(
+                    chunk_shape, dtype=torch.float32, device=param.device
+                )
+                
+                # Second momentum buffer - reduced along one dimension
+                if chunk_shape[-2] >= chunk_shape[-1]:
+                    second_mom_shape = (*chunk_shape[:-1], 1)
+                else:
+                    second_mom_shape = (*chunk_shape[:-2], 1, chunk_shape[-1])
+                second_momentum_buffer = torch.zeros(
+                    second_mom_shape, dtype=torch.float32, device=param.device
+                )
+                
+                # Mantissa buffer for precision tracking
+                mantissa = torch.zeros(
+                    chunk_shape, dtype=torch.uint16, device=param.device
+                )
+                
+                self.state[param] = dict(
+                    momentum_buffer=momentum_buffer,
+                    second_momentum_buffer=second_momentum_buffer,
+                    mantissa=mantissa,
                 )
 
+    # -----------------------------------
+    # Reduce/Gather operations
+    
+    def _launch_reduce(self, param: nn.Parameter, grad: Tensor):
+        """Launch async reduce for a parameter based on its comms policy."""
+        settings = self.settings[param]
+        comms = settings["comms"]
+        
+        if comms == "none":
+            if settings["optim"] == "normuon":
+                # NorMuon needs reshaped gradient even without communication
+                reshape = settings["reshape"]
+                grad = grad.view(reshape)
+            self._reduce_futures[param] = (None, grad)
+        elif comms == "replicated":
+            future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
+            self._reduce_futures[param] = (future, grad)
+        elif comms == "sharded":
+            if settings["optim"] == "normuon":
+                # NorMuon: reshape before reduce_scatter
+                reshape = settings["reshape"]
+                chunk_size = settings["chunk_size"]
+                grad_reshaped = grad.view(reshape)
+                grad_chunk = torch.empty(
+                    (chunk_size, *grad_reshaped.shape[1:]),
+                    dtype=grad.dtype,
+                    device=grad.device
+                )
+                future = dist.reduce_scatter_tensor(
+                    grad_chunk, grad_reshaped.contiguous(), op=dist.ReduceOp.AVG, async_op=True
+                ).get_future()
+                self._reduce_futures[param] = (future, grad_chunk)
+            else:
+                # Adam: simple reduce_scatter
+                chunk_size = settings["chunk_size"]
+                grad_chunk = torch.empty_like(grad[:chunk_size])
+                future = dist.reduce_scatter_tensor(
+                    grad_chunk, grad, op=dist.ReduceOp.AVG, async_op=True
+                ).get_future()
+                self._reduce_futures[param] = (future, grad_chunk)
+
+    def _launch_gather(self, param: nn.Parameter, p_slice: Tensor) -> "torch.futures.Future":
+        """Launch async all_gather for a sharded parameter."""
+        settings = self.settings[param]
+        if settings["optim"] == "normuon":
+            reshape = settings["reshape"]
+            full_param = param.data.view(reshape)
+            assert full_param.is_contiguous()
+            return dist.all_gather_into_tensor(
+                full_param, p_slice.contiguous(), async_op=True
+            ).get_future()
+        else:
+            return dist.all_gather_into_tensor(
+                param, p_slice.contiguous(), async_op=True
+            ).get_future()
+
+    # -----------------------------------
+    # State management
+    
+    def reset(self):
+        """Reset NorMuon momentum buffers and split_embed state (called on training reset)."""
+        self.split_embed = False
+        for param, settings in self.settings.items():
+            if settings["optim"] == "normuon":
+                state = self.state[param]
+                state["momentum_buffer"].zero_()
+                state["mantissa"].zero_()
+                state["second_momentum_buffer"].zero_()
+    
     def copy_lm_to_embed(self):
-        # run at 2/3 of training
-        lm_head = self.param_groups[0]['params'][0]
-        embed = self.param_groups[-2]['params'][0]
-        lm_head_state = self.state[lm_head]
+        """Copy lm_head weights to embed at split point (2/3 of training).
+        
+        Note: lm_head uses transposed storage (model_dim, vocab_size) while embed
+        uses standard storage (vocab_size, model_dim), so we transpose when copying.
+        
+        Optimizer state is not copied because lm_head and embed have different sharding:
+        - lm_head (768, 50304) is sharded to (96, 50304) per rank
+        - embed (50304, 768) is sharded to (6288, 768) per rank
+        The shapes are incompatible, so embed's optimizer state starts fresh.
+        """
+        lm_head = self._lm_head_param
+        embed = self._embed_param
+        if lm_head is None or embed is None:
+            return
+        
+        # Copy step count so bias correction is consistent
+        lm_state = self.state[lm_head]
         embed_state = self.state[embed]
-        embed_state['step'] = lm_head_state['step']
-        embed_state['exp_avg'] = lm_head_state['exp_avg'].clone()
-        embed_state['exp_avg_sq'] = lm_head_state['exp_avg_sq'].clone()
-        embed.data.copy_(lm_head.data)
+        embed_state['step'] = lm_state['step']
+        
+        # Transpose weight data (optimizer state stays at zeros - different sharding)
+        embed.data.copy_(lm_head.data.T)
+        
+        # Mark as split
+        self.split_embed = True
+    
+    def state_dict(self):
+        """Return the optimizer state as a dict."""
+        return {
+            "state": {id(p): s for p, s in self.state.items()},
+            "settings": {id(p): s for p, s in self.settings.items()},
+        }
+    
+    def load_state_dict(self, state_dict):
+        """Load optimizer state from a dict."""
+        # Build id->param mapping
+        id_to_param = {id(p): p for p in self.settings.keys()}
+        
+        # Load state, preserving dtypes
+        for param_id, saved_state in state_dict["state"].items():
+            if param_id in id_to_param:
+                param = id_to_param[param_id]
+                current_state = self.state[param]
+                for k, v in saved_state.items():
+                    if isinstance(v, torch.Tensor) and k in current_state:
+                        target_dtype = current_state[k].dtype
+                        current_state[k] = v.to(dtype=target_dtype, device=current_state[k].device)
+                    else:
+                        current_state[k] = v
+
+    # -----------------------------------
+    # Unified optimizer step with explicit ordering
+
+    @torch.no_grad()
+    def step(self, do_adam: bool = True):
+        """
+        Combined optimizer step with explicit ordering.
+        
+        Args:
+            do_adam: If True, update Adam params. NorMuon params always updated.
+        
+        Flow:
+        1. Scatter phase: Launch reduces in scatter_order
+        2. Work phase: Process updates in work_order
+           - Wait for reduce, compute update, launch gather
+        3. Finalize phase: Wait for gathers
+        
+        When split_embed=False (tied):
+        - embed.grad.T is aggregated into lm_head.grad before lm_head's reduce
+        - embed is not updated (skipped entirely)
+        - After lm_head gather, embed.data is copied from lm_head.data.T
+        
+        When split_embed=True (untied):
+        - Both lm_head and embed are updated independently
+        """
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        lm_param, embed_param = self._lm_head_param, self._embed_param
+        
+        # ===== Phase 1: Launch reduces in scatter_order =====
+        for label in self.scatter_order:
+            param = self._param_by_label[label]
+            settings = self.settings[param]
+            
+            if settings["optim"] == "adam" and not do_adam:
+                continue
+            if param.grad is None:
+                continue
+            
+            # lm_head when tied: aggregate embed.grad.T (transposed shapes)
+            if label == "lm_head" and do_adam and not self.split_embed:
+                if embed_param is not None and embed_param.grad is not None:
+                    param.grad.add_(embed_param.grad.T)
+            
+            # Skip embed when tied (copied from lm_head after gather)
+            if label == "embed" and not self.split_embed:
+                continue
+            
+            self._launch_reduce(param, param.grad)
+        
+        # ===== Phase 2: Process updates in work_order =====
+        gather_futures = []
+        lm_head_gather_future = None
+        
+        for label in self.work_order:
+            param = self._param_by_label[label]
+            if param not in self._reduce_futures:
+                continue
+            
+            settings = self.settings[param]
+            if settings["optim"] == "adam" and not do_adam:
+                continue
+            # Wait for reduce
+            future, grad_chunk = self._reduce_futures[param]
+            if future is not None:
+                future.wait()
+            # Apply update based on optim type
+            if settings["optim"] == "adam":
+                p_slice = self._adam_update(param, grad_chunk, settings, rank)
+            else:
+                p_slice = self._normuon_update(param, grad_chunk, settings, rank)
+            # Launch gather for sharded params
+            if settings["comms"] == "sharded" and self.world_size > 1:
+                gather_fut = self._launch_gather(param, p_slice)
+                if label == "lm_head":
+                    lm_head_gather_future = gather_fut
+                else:
+                    gather_futures.append(gather_fut)
+        
+        # ===== Phase 3: Wait for gathers, sync embed if tied =====
+        # Wait for lm_head gather first so we can copy to embed while other gathers complete
+        if lm_head_gather_future is not None:
+            lm_head_gather_future.wait()
+        
+        # When tied: copy lm_head.T to embed
+        if do_adam and not self.split_embed and embed_param is not None and lm_param is not None:
+            embed_param.data.copy_(lm_param.data.T)
+        
+        # Wait for remaining gathers
+        for fut in gather_futures:
+            fut.wait()
+        
+        self._reduce_futures.clear()
+        
+        # Clear grads for updated params
+        for param, settings in self.settings.items():
+            if settings["optim"] == "adam" and not do_adam:
+                continue  # Don't clear Adam grads on even steps
+            param.grad = None
+
+    # -----------------------------------
+    # Adam update
+
+    def _adam_update(self, param: nn.Parameter, grad_chunk: Tensor, settings: dict, rank: int) -> Tensor:
+        """Apply Adam update to a parameter. Returns the updated p_slice."""
+        beta1, beta2 = settings["adam_betas"]
+        eps = settings["eps"]
+        wd = settings["weight_decay"]
+        lr = settings["lr"] * settings["lr_mul"]
+        
+        # Get parameter slice
+        if settings["comms"] == "sharded":
+            chunk_size = settings["chunk_size"]
+            p_slice = param[rank * chunk_size:(rank + 1) * chunk_size]
+        else:
+            p_slice = param
+        
+        state = self.state[param]
+        state["step"] += 1
+        t = state["step"]
+        
+        bias1, bias2 = 1 - beta1 ** t, 1 - beta2 ** t
+        self._step_size_t.fill_(lr * (bias2 ** 0.5 / bias1))
+        self._eff_wd_t.fill_(lr * lr * wd * settings["wd_mul"])
+        
+        NorMuonAndAdam._adam_update_step(
+            p_slice, grad_chunk, state["exp_avg"], state["exp_avg_sq"],
+            beta1, beta2, eps, self._step_size_t, self._eff_wd_t
+        )
+        
+        return p_slice
 
     @staticmethod
     @torch.compile(dynamic=False, fullgraph=True)
-    def _update_step(p_slice, g_slice, exp_avg, exp_avg_sq, beta1, beta2, eps, step_size_t, eff_wd_t):
-        """Compiled Adam update step. step_size_t and eff_wd_t are 0-D CPU tensors to avoid recompilation."""
-        exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)  # exp_avg = beta1 * exp_avg + (1 - beta1) * g_slice
-        exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)  # exp_avg_sq = beta2 * exp_avg_sq + (1 - beta2) * g_slice^2
-        # compute step
-        update = exp_avg.div(exp_avg_sq.sqrt().add_(eps)).mul_(step_size_t)  # update = (exp_avg / (sqrt(exp_avg_sq) + eps)) * step_size
-        # cautious weight decay
+    def _adam_update_step(p_slice, g_slice, exp_avg, exp_avg_sq, beta1, beta2, eps, step_size_t, eff_wd_t):
+        """Compiled Adam update step."""
+        exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
+        update = exp_avg.div(exp_avg_sq.sqrt().add_(eps)).mul_(step_size_t)
+        # Cautious weight decay
         mask = (update * p_slice) > 0
-        update.addcmul_(p_slice, mask, value=eff_wd_t)  # update += eff_wd_t * p_slice * mask
-        p_slice.add_(other=update, alpha=-1.0)  # p_slice -= update
+        update.addcmul_(p_slice, mask, value=eff_wd_t)
+        p_slice.add_(other=update, alpha=-1.0)
 
-    @torch.no_grad()
-    def step(self, muon_opt):
-        muon_opt.step_p1()
-        rank = dist.get_rank()
-        all_gather_futures: list[torch.Future] = []
+    # -----------------------------------
+    # NorMuon update
 
-        last_param = None
-        last_p_slice = None
-        for group in self.param_groups:      
-            beta1, beta2 = group['betas']
-            eps = group['eps']
-            wd = group['weight_decay']
-            for param in group['params']:
-                if param not in self._reduce_scatter_futures:
-                    continue
+    def _normuon_update(self, param: nn.Parameter, grad_chunk: Tensor, settings: dict, rank: int) -> Tensor:
+        """Apply NorMuon update to a parameter. Returns the updated p_slice."""
+        reshape = settings["reshape"]
+        chunk_size = settings["chunk_size"]
+        chunk_shape = grad_chunk.shape
+        
+        state = self.state[param]
+        grad_chunk = grad_chunk.float()  # FP32 for momentum
+        
+        # Momentum update
+        momentum_buffer = state["momentum_buffer"]
+        momentum_buffer.lerp_(grad_chunk, 1 - settings["momentum"])
+        updated_grads = grad_chunk.lerp_(momentum_buffer, settings["momentum"])
+        
+        self._eff_lr_t.fill_(settings["lr_mul"] * settings["lr"])
+        self._eff_wd_t.fill_(settings["wd_mul"] * settings["weight_decay"] * settings["lr"])
+        
+        # Polar Express orthogonalization
+        is_large_matrix = chunk_shape[-2] > 1024
+        v_chunk = polar_express(updated_grads, split_baddbmm=is_large_matrix)
+        
+        # Variance reduction
+        red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
+        v_chunk = NorMuonAndAdam._apply_normuon_variance_reduction(
+            v_chunk, state["second_momentum_buffer"], settings["beta2"], red_dim
+        )
+        
+        # Update parameter, in place, with cautious weight decay
+        param_view = param.data.view(reshape)
+        p_slice = param_view[rank * chunk_size:(rank + 1) * chunk_size]
+        
+        # MLP has per-matrix LR multipliers (c_proj gets 2x LR)
+        if "per_matrix_lr_mul" in settings:
+            per_matrix_lr_mul = settings["per_matrix_lr_mul"]
+            for mat_idx in range(chunk_size):
+                self._eff_lr_t.fill_(settings["lr_mul"] * per_matrix_lr_mul[mat_idx] * settings["lr"])
+                self._eff_wd_t.fill_(settings["wd_mul"] * settings["weight_decay"] * settings["lr"])
+                NorMuonAndAdam._cautious_wd_and_update_inplace(
+                    p_slice[mat_idx].view(torch.uint16), state["mantissa"][mat_idx], v_chunk[mat_idx],
+                    self._eff_wd_t, self._eff_lr_t
+                )
+        else:
+            NorMuonAndAdam._cautious_wd_and_update_inplace(
+                p_slice.view(torch.uint16), state["mantissa"], v_chunk,
+                self._eff_wd_t, self._eff_lr_t
+            )
+        
+        return p_slice
 
-                fut, g_slice = self._reduce_scatter_futures[param]
-                fut.wait()
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _cautious_wd_and_update_inplace(p, mantissa, grad, wd_tensor, lr_tensor):
+        """
+        Cautious weight decay + parameter update. wd_tensor and lr_tensor are 0-D CPU tensors.
+        Mantissa is tracked to enable higher precision updates on bfloat16 parameters.
+        bfloat16 format: 1 sign bit + 8 exponent bits + 7 mantissa bits = 16 bits total
+        float32 format: 1 sign bit + 8 exponent bits + 23 mantissa bits = 32 bits total
+        """
+        assert p.dtype == mantissa.dtype == torch.uint16
+        grad = grad.float()
+        wd_factor = wd_tensor.to(torch.float32)
+        lr_factor = lr_tensor.to(torch.float32)
+        p_precise_raw = (p.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
+        p_precise = p_precise_raw.view(torch.float32)
+        mask = (grad * p_precise) >= 0
+        p_precise.copy_(p_precise - (p_precise * mask * wd_factor * lr_factor) - (grad * lr_factor))
+        p.copy_((p_precise_raw >> 16).to(torch.uint16))
+        mantissa.copy_(p_precise_raw.to(torch.uint16))
 
-                is_small = param.numel() < 1024
-                if is_small:
-                    # Small params: g_slice is actually full grad, p_slice is full param
-                    p_slice = param
-                else:
-                    rank_size = param.shape[0] // self.world_size
-                    p_slice = param[rank * rank_size:(rank + 1) * rank_size]
-
-                lr = group['lr'] * getattr(param, "lr_mul", 1.0)
-                state = self.state[param]
-                state["step"] += 1
-                t = state["step"]
-                
-                # Pre-compute changing values as 0-D CPU tensors to avoid recompilation.
-                # `.fill_(value)` is the same as "= value", but doesn't change the tensor object.
-                bias1, bias2 = 1 - beta1 ** t, 1 - beta2 ** t
-                self._step_size_t.fill_(lr * (bias2 ** 0.5 / bias1))
-                self._eff_wd_t.fill_(lr * lr * wd * getattr(param, "wd_mul", 1.0)) # `lr` included twice to serve as weight decay schedule.
-
-                DistAdam._update_step(p_slice, g_slice, state["exp_avg"], state["exp_avg_sq"],
-                                      beta1, beta2, eps, self._step_size_t, self._eff_wd_t)
-
-                if not is_small:
-                    if getattr(param, "is_final_param", False):
-                        last_param = param
-                        last_p_slice = p_slice
-                    else:
-                        all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
-        self._reduce_scatter_futures.clear()
-
-        muon_opt.step_p2()
-        torch.futures.collect_all(all_gather_futures).wait()
-
-        if last_param is not None:
-            last_all_gather_future = dist.all_gather_into_tensor(last_param, last_p_slice, async_op=True).get_future()
-        muon_opt.step_p3()
-        torch.futures.collect_all([last_all_gather_future]).wait()
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _apply_normuon_variance_reduction(v_chunk, second_momentum_buffer, beta2, red_dim):
+        """NorMuon variance reduction. Algebraically fuses the normalization steps to minimize memory ops."""
+        v_mean = v_chunk.float().square().mean(dim=red_dim, keepdim=True)
+        red_dim_size = v_chunk.size(red_dim)
+        v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True).mul_(red_dim_size)
+        v_norm = v_norm_sq.sqrt_()
+        second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+        step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt_()
+        scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+        v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt_()
+        final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
+        return v_chunk.mul_(final_scale.type_as(v_chunk))
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -913,26 +744,35 @@ class DistAdam(torch.optim.Optimizer):
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
-class CastedLinear(nn.Linear):
+
+class CastedLinearT(nn.Module):
+    """
+    Linear layer with transposed weight storage (in_features, out_features) which
+    addresses the slow kernel that was used for gradient accumulation. @chrisjmccormick
+    """
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
-        super().__init__(in_features, out_features, bias=False)
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
         self.use_fp8 = use_fp8
         self.x_s = x_s
         self.w_s = w_s
         self.grad_s = grad_s
+        
+        self.weight = nn.Parameter(torch.empty(in_features, out_features, dtype=torch.bfloat16))
+        self.reset_parameters()
 
     def reset_parameters(self) -> None:
         with torch.no_grad():
-            self.weight.zero_()  # @Grad62304977 and others
+            nn.init.zeros_(self.weight) # @Grad62304977 and others
 
     def forward(self, x: Tensor):
         if self.use_fp8 and self.training:
             _x = x.flatten(0, -2)
-            out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
+            out = torch.ops.nanogpt.mm_t(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
             return out.reshape(*x.shape[:-1], -1)
         else:
-            return F.linear(x, self.weight.type_as(x))
-
+            return x @ self.weight.type_as(x)
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -1050,28 +890,16 @@ class AttnArgs:
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
+    def __init__(self, dim: int, head_dim: int, num_heads: int):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.dim = dim
         self.hdim = num_heads * head_dim
-
         assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
-        std = self.dim ** -0.5
-        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
-        # merged QKVO weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
-        # https://x.com/hi_tysam/status/1879699187107033311
-        # Simplified layout by @chrisjmccormick
-        self.qkvo_w = nn.Parameter(torch.empty(self.dim * 4, self.hdim, dtype=torch.bfloat16))
-        # label all modules for explicit optimizer grouping
-        self.qkvo_w.label = 'attn'
+        # Weights are stored in parameter banks and passed via forward()
 
-        with torch.no_grad():
-            self.qkvo_w[:self.dim * 3].uniform_(-bound, bound)  # init QKV weights
-            self.qkvo_w[self.dim * 3:].zero_()  # init O weights to zero
-
-    def forward(self, x: Tensor, attn_args: AttnArgs):
+    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
@@ -1083,7 +911,7 @@ class CausalSelfAttention(nn.Module):
         # only include gates on layers with value embeds used on forward pass
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
 
-        q, k, v = F.linear(x, sa_lambdas[0] * self.qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = yarn.rotary(q), yarn.rotary(k)
         if key_offset:
@@ -1103,7 +931,7 @@ class CausalSelfAttention(nn.Module):
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = F.linear(y, sa_lambdas[1] * self.qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
+        y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
 
 class PairedHeadCausalSelfAttention(nn.Module):
@@ -1112,24 +940,16 @@ class PairedHeadCausalSelfAttention(nn.Module):
     Implemented by interleaving the k, q, and v for pairs of heads to form twice as long sequences
     EG [k1_h1, k2_h1, k3_h1], [k1_h2, k2_h2, k3_h2] -> [k1_h1, k1_h2, k2_h1, k2_h2, k3_h1, k3_h2], repeat for q and v
     """
-    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
+    def __init__(self, dim: int, head_dim: int, num_heads: int):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.dim = dim
         self.hdim = num_heads * head_dim
-
         assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
-        std = self.dim ** -0.5
-        bound = (3 ** 0.5) * std
-        self.qkvo_w = nn.Parameter(torch.empty(self.dim * 4, self.hdim, dtype=torch.bfloat16))
-        self.qkvo_w.label = 'attn'
+        # Weights are stored in parameter banks and passed via forward()
 
-        with torch.no_grad():
-            self.qkvo_w[:self.dim * 3].uniform_(-bound, bound)
-            self.qkvo_w[self.dim * 3:].zero_()
-
-    def forward(self, x: Tensor, attn_args: AttnArgs):
+    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
@@ -1139,7 +959,7 @@ class PairedHeadCausalSelfAttention(nn.Module):
         seqlens, bm_size = attn_args.seqlens, attn_args.bm_size
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
 
-        q, k, v = F.linear(x, sa_lambdas[0] * self.qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k)
 
         # delay q,k reshape until rotary makes data contiguous, to enable view (non-copy)
@@ -1168,125 +988,8 @@ class PairedHeadCausalSelfAttention(nn.Module):
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
-        y = F.linear(y, sa_lambdas[1] * self.qkvo_w[self.dim * 3:].type_as(y))
+        y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))
         return y
-
-@triton.jit
-def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
-                                 M, N, K,
-                                 BLOCK_SIZE_M: tl.constexpr,
-                                 BLOCK_SIZE_N: tl.constexpr,
-                                 BLOCK_SIZE_K: tl.constexpr,
-                                 GROUP_SIZE_M: tl.constexpr,
-                                 NUM_SMS: tl.constexpr,
-                                 FORWARD: tl.constexpr,
-                                 ):
-    dtype = tl.bfloat16
-    start_pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-    num_tiles = num_pid_m * num_pid_n
-
-    tile_id_c = start_pid - NUM_SMS
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-
-    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
-        pid_m = tile_id // num_pid_n
-        pid_n = tile_id % num_pid_n
-        offs_am = pid_m * BLOCK_SIZE_M
-        offs_bn = pid_n * BLOCK_SIZE_N
-
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for ki in range(k_tiles):
-            offs_k = ki * BLOCK_SIZE_K
-            a = a_desc.load([offs_am, offs_k])
-            b = b_desc.load([offs_bn, offs_k])
-            accumulator = tl.dot(a, b.T, accumulator)
-
-        tile_id_c += NUM_SMS
-        pid_m = tile_id // num_pid_n
-        pid_n = tile_id % num_pid_n
-        offs_am_c = pid_m * BLOCK_SIZE_M
-        offs_bn_c = pid_n * BLOCK_SIZE_N
-
-        acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
-        acc = tl.permute(acc, (0, 2, 1))
-        acc0, acc1 = tl.split(acc)
-
-        c0 = acc0.to(dtype)
-        if not FORWARD:
-            c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
-            c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
-
-        c_desc.store([offs_am_c, offs_bn_c], c0)
-
-        if FORWARD:
-            c0_post = tl.maximum(c0, 0)
-            c0_post = c0_post * c0_post
-            aux_desc.store([offs_am_c, offs_bn_c], c0_post)
-
-        c1 = acc1.to(dtype)
-        if not FORWARD:
-            c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
-            c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
-
-        c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
-
-        if FORWARD:
-            c1_post = tl.maximum(c1, 0)
-            c1_post = c1_post * c1_post
-            aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
-
-
-def linear_relu_square(a, b, aux=None):
-    M, K = a.shape
-    N, K = b.shape
-    dtype = a.dtype
-
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
-
-    FORWARD = False
-    if aux is None:
-        FORWARD = True
-        aux = torch.empty((M, N), device=a.device, dtype=dtype)
-
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-
-    BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 256
-    BLOCK_SIZE_K = 64
-    num_stages = 4 if FORWARD else 3
-    num_warps = 8
-
-    a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
-    b_desc = TensorDescriptor.from_tensor(b, [BLOCK_SIZE_N, BLOCK_SIZE_K])
-    c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
-    aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
-
-    def grid(META):
-        return (min(
-            NUM_SMS,
-            triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
-        ), )
-
-    linear_relu_square_kernel[grid](
-        a_desc, b_desc, c_desc, aux_desc,
-        M, N, K,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        GROUP_SIZE_M=1,
-        NUM_SMS=NUM_SMS,
-        FORWARD=FORWARD,
-        num_stages=num_stages,
-        num_warps=num_warps
-    )
-
-    if FORWARD:
-        return c, aux
-    else:
-        return c
 
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
@@ -1306,47 +1009,35 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         return dx.view(x.shape), dW1, dW2
 
 class MLP(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self):
         super().__init__()
-        hdim = 4 * dim
-        # Transposed layout to match attention weights
-        self.c_fc = nn.Parameter(torch.empty(hdim, dim, dtype=torch.bfloat16))
-        self.c_proj = nn.Parameter(torch.empty(hdim, dim, dtype=torch.bfloat16))
-        # label all modules for explicit optimizer grouping
-        self.c_fc.label = 'mlp'
-        self.c_proj.label = 'mlp'
-        self.c_proj.lr_mul = 2.
+        # Weights are stored in parameter banks and passed via forward()
 
-        std = 0.5 * (dim ** -0.5)
-        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
-        with torch.no_grad():
-            self.c_fc.uniform_(-bound, bound)
-            self.c_proj.zero_() # zero init suggested by @Grad62304977
-
-    def forward(self, x: Tensor):
+    def forward(self, x: Tensor, c_fc: Tensor, c_proj: Tensor):
         # relu(x)^2:
         # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-
-        # This call computes relu(x @ W1.T)^2 @ W2.T
-        return FusedLinearReLUSquareFunction.apply(x, self.c_fc, self.c_proj)
-
+        # Fused triton kernel for relu(x @ W1.T)^2 @ W2.T
+        return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
 
 class Block(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, use_paired_head: bool):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, has_attn: bool, has_mlp: bool, use_paired_head: bool):
         super().__init__()
         # skip attention of blocks.6 (the 7th layer) by @YouJiacheng
-        if use_paired_head:
-            self.attn = PairedHeadCausalSelfAttention(dim, head_dim, num_heads, layer_idx)
+        if has_attn:
+            if use_paired_head:
+                self.attn = PairedHeadCausalSelfAttention(dim, head_dim, num_heads)
+            else:
+                self.attn = CausalSelfAttention(dim, head_dim, num_heads)
         else:
-            self.attn = CausalSelfAttention(dim, head_dim, num_heads, layer_idx) if layer_idx != 6 else None
+            self.attn = None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
-        self.mlp = MLP(dim)
+        self.mlp = MLP() if has_mlp else None
 
-    def forward(self, x: Tensor, attn_args: AttnArgs):
+    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor = None, c_fc: Tensor = None, c_proj: Tensor = None):
         if self.attn is not None:
-            x = x + self.attn(norm(x), attn_args)
+            x = x + self.attn(norm(x), attn_args, qkvo_w)
         if self.mlp is not None:
-            x = x + self.mlp(norm(x))
+            x = x + self.mlp(norm(x), c_fc, c_proj)
         return x
 
 # -----------------------------------------------------------------------------
@@ -1367,12 +1058,14 @@ class GPT(nn.Module):
         self.num_layers = num_layers
         vocab_size = next_multiple_of_n(vocab_size, n=128)
 
-        self.smear_gate = CastedLinear(12, 1)
+        self.smear_gate = nn.Linear(12, 1, bias=False)
+        nn.init.zeros_(self.smear_gate.weight)
         self.smear_gate.weight.label = 'smear_gate'
         self.smear_gate.weight.lr_mul = 0.01
         self.smear_gate.weight.wd_mul = 0.0
 
-        self.skip_gate = CastedLinear(12, 1)
+        self.skip_gate = nn.Linear(12, 1, bias=False)
+        nn.init.zeros_(self.skip_gate.weight)
         self.skip_gate.weight.label = 'skip_gate'
         self.skip_gate.weight.lr_mul = 0.05
         self.skip_gate.weight.wd_mul = 0.0
@@ -1382,8 +1075,8 @@ class GPT(nn.Module):
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
         for embed in self.value_embeds:
             nn.init.zeros_(embed.weight)
-        for ve in self.value_embeds:
-            ve.weight.label = 'value_embed'
+        for i, ve in enumerate(self.value_embeds):
+            ve.weight.label = f've{i}'  # ve0, ve1, ve2
         
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
@@ -1391,20 +1084,79 @@ class GPT(nn.Module):
         self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 layers
         self.ve_gate_bank.label = 've_gate_bank'
 
+        # -----------------------------------
+        # Parameter banks for sharded optimization, by @chrisjmccormick
+
+        # Identify which layers have attention/MLP
+        # Attention is skipped in layer 6 by @YouJiacheng
+        self.attn_layer_indices = [i for i in range(num_layers) if i != 6]
+        # All layers have MLP (At 11 layers--dropped first layer @EmelyanenkoK)
+        self.mlp_layer_indices = list(range(num_layers))
+
+        hdim = num_heads * head_dim
+        mlp_hdim = 4 * model_dim
+
+        # Create index mappings: layer_idx -> bank_idx
+        self.layer_to_attn_idx = {layer_idx: bank_idx for bank_idx, layer_idx in enumerate(self.attn_layer_indices)}
+        self.layer_to_mlp_idx = {layer_idx: bank_idx for bank_idx, layer_idx in enumerate(self.mlp_layer_indices)}
+
+        # Attention bank: stores QKVO weights for all attention layers
+        # merged QKVO weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
+        # https://x.com/hi_tysam/status/1879699187107033311
+        # Simplified layout by @chrisjmccormick
+        # Shape: (num_attn_layers, 4*model_dim, hdim) = (10, 3072, 768)
+        # Reshape for sharding: (40, 768, 768) for even distribution across 8 GPUs
+        self.attn_bank = nn.Parameter(torch.empty(len(self.attn_layer_indices), 4 * model_dim, hdim))
+        self.attn_bank.label = 'attn'
+        self.attn_bank.reshape = (len(self.attn_layer_indices) * 4, hdim, hdim)  # (40, 768, 768)
+
+        # MLP bank: stores c_fc and c_proj for all MLP layers
+        # Shape: (num_mlp_layers + padding, 2, mlp_hdim, model_dim) = (12, 2, 3072, 768)
+        # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
+        # Reshape for sharding: (24, 3072, 768)
+        num_mlp_with_padding = len(self.mlp_layer_indices) + 1  # 11 + 1 = 12
+        self.mlp_bank = nn.Parameter(torch.empty(num_mlp_with_padding, 2, mlp_hdim, model_dim))
+        self.mlp_bank.label = 'mlp'
+        self.mlp_bank.reshape = (num_mlp_with_padding * 2, mlp_hdim, model_dim)  # (24, 3072, 768)
+
+        # improved init scale by @YouJiacheng
+        # Attention uses dim^-0.5, MLP uses 0.5 * dim^-0.5
+        attn_std = model_dim ** -0.5
+        attn_bound = (3 ** 0.5) * attn_std
+        mlp_std = 0.5 * (model_dim ** -0.5)
+        mlp_bound = (3 ** 0.5) * mlp_std
+        with torch.no_grad():
+            # Init attention bank (QKV uniform, O zero)
+            self.attn_bank[:, :model_dim * 3, :].uniform_(-attn_bound, attn_bound)
+            self.attn_bank[:, model_dim * 3:, :].zero_()
+            # Init MLP bank (c_fc uniform, c_proj zero) 
+            self.mlp_bank[:, 0, :, :].uniform_(-mlp_bound, mlp_bound)  # c_fc
+            self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
+
+        # Create blocks with has_attn/has_mlp flags
         self.paired_head_layers = [0, 2, 5, 9]
-        self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i, i in self.paired_head_layers) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([
+            Block(model_dim, head_dim, num_heads, 
+                  has_attn=(i in self.layer_to_attn_idx), 
+                  has_mlp=(i in self.layer_to_mlp_idx),
+                  use_paired_head=(i in self.paired_head_layers))
+            for i in range(num_layers)
+        ])
         self.yarn = Yarn(head_dim, max_seq_len)
         self.yarn_paired_head = YarnPairedHead(head_dim, max_seq_len)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
+        # Transposed weight storage for faster gradient accumulation
+        self.lm_head = CastedLinearT(model_dim, vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=0.75/448)
 
-        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=0.75/448)
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
         self.lm_head.weight.label = 'lm_head'
 
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.embed.weight.label = 'embed'
+        with torch.no_grad():
+            self.embed.weight.copy_(self.lm_head.weight.T)
 
         # x0_lambdas separated out for different optimizer treatment (no beta smoothing)
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
@@ -1438,8 +1190,6 @@ class GPT(nn.Module):
         self.scalars.lr_mul = 5.0
         self.scalars.wd_mul = 0.0
 
-        self.split_embed = False
-
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
@@ -1468,11 +1218,10 @@ class GPT(nn.Module):
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==long_bm for b in bm_sizes] # apply partial key offset to long windows
 
-        # weight-tied: use lm_head.weight for embedding lookup (or separate embed after split)
-        if self.split_embed:
-            x = self.embed(input_seq)
-        else:
-            x = F.embedding(input_seq, self.lm_head.weight)
+        # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
+        x = self.embed(input_seq)
+        
+        # Value embeddings - always computed (not precomputed)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
         # dropping first layer updates this to .12 ... 012
@@ -1491,6 +1240,11 @@ class GPT(nn.Module):
         ve_gates = [veg[0], veg[1]] + [None] * (self.num_layers - 5) + [veg[2], veg[3], veg[4]]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
+
+        # unbind weight banks to avoid select_backwards kernel
+        attn_weights = self.attn_bank.unbind(0)  # tuple of [4*dim, hdim] tensors
+        mlp_fcs = self.mlp_bank[:, 0, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
+        mlp_projs = self.mlp_bank[:, 1, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
 
         for i in range(self.num_layers):
             yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
@@ -1511,7 +1265,13 @@ class GPT(nn.Module):
                 x = (resid_lambdas[0] + x0_lambdas[0]) * x
             else:
                 x = resid_lambdas[i] * x + x0_lambdas[i] * x0
-            x = self.blocks[i](x, attn_args)
+            
+            # Get weights for this layer from banks
+            qkvo_w = attn_weights[self.layer_to_attn_idx[i]] if i in self.layer_to_attn_idx else None
+            c_fc = mlp_fcs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
+            c_proj = mlp_projs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
+            
+            x = self.blocks[i](x, attn_args, qkvo_w, c_fc, c_proj)
             if i in skip_in:
                 skip_connections.append(x)
             if i == backout_layer:
@@ -1773,62 +1533,79 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
 
 class TrainingManager():
     """
-    Manages three optimizers for Adam embed/lm_head, Adam scalars, and Muon weight matrices.
+    Manages the NorMuonAndAdam for all parameters with explicit ordering.
     Notable Features:
         1. Scalars are given higher momentum terms to smooth learning @ChrisJMcCormick
-        2. Scalar weights are temporarily frozen during batch size or window size updates @ChrisJMcCormick
-        3. Adam optimizers are only stepped on odd steps @classiclarryd
-        4. Adam optimizers have hooks to start gradient communication during backwards pass @akash5474
-        5. Muon has a linear momentum warmup and cooldown schedule
-        6. Learning rates follow a linear decay schedule
-        7. Embed/lm_head weights and optimizer state splits at 2/3 of training @classiclarryd
+        2. Adam optimizers are only stepped on odd steps @classiclarryd
+        3. Explicit scatter_order and work_order for communication scheduling (no backward hooks)
+        4. Muon has a linear momentum warmup and cooldown schedule
+        5. Learning rates follow a linear decay schedule
+        6. Embed is tied to lm_head until split step (2/3 of training), then untied @classiclarryd
 
     Manages model architecture, data, and target that changes during training
     Notable Features:
         1. Multi Token Prediction schedule of [1, 0.5, 0.25->0] -> [1, 0.5->0] -> [1] @varunneal
         2. Sliding Attention window schedule of [1,3] -> [3,7] -> [5,11] -> [6,13]
         3. YaRN updates to RoPE on window changes
-        4. Split embed and lm head at 2/3 of training
+        4. Split embed and lm_head at 2/3 of training (weights and optimizer state copied)
         5. Batch size schedule of 8 -> 16 -> 24
         6. Post training extension of long windows from 13 to 20
     """
     def __init__(self, model):
         self.mtp_weights_schedule = self._build_mtp_schedule()
         self.model = model
-        adam_betas = {
-            'lm_head': [0.5, 0.95],
-            'smear_gate': [0.9, 0.99],
-            'attn_gate_bank': [0.9, 0.99],
-            've_gate_bank': [0.9, 0.99],
-            'skip_gate': [0.9, 0.99],
-            'x0_lambdas': [0.65, 0.95],
-            'scalars': [0.9, 0.99],
-            'embed': [0.5, 0.95],
-            'value_embed': [0.75, 0.95]
+        
+        # - Ordering dictates when to launch reduce/reduce_scatter operations
+        # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
+        self.param_table = {
+            "attn":           {"optim": "normuon", "comms": "sharded",     "adam_betas": None},
+            "mlp":            {"optim": "normuon", "comms": "sharded",     "adam_betas": None},         
+            "scalars":        {"optim": "adam",    "comms": "replicated",  "adam_betas": [0.9,  0.99]},
+            "ve0":            {"optim": "adam",    "comms": "sharded",     "adam_betas": [0.75, 0.95]},
+            "ve1":            {"optim": "adam",    "comms": "sharded",     "adam_betas": [0.75, 0.95]},
+            "ve2":            {"optim": "adam",    "comms": "sharded",     "adam_betas": [0.75, 0.95]},
+            "smear_gate":     {"optim": "adam",    "comms": "replicated",  "adam_betas": [0.9,  0.99]},
+            "skip_gate":      {"optim": "adam",    "comms": "replicated",  "adam_betas": [0.9,  0.99]},
+            "attn_gate_bank": {"optim": "adam",    "comms": "replicated",  "adam_betas": [0.9,  0.99]},
+            "ve_gate_bank":   {"optim": "adam",    "comms": "replicated",  "adam_betas": [0.9,  0.99]},
+            "x0_lambdas":     {"optim": "adam",    "comms": "replicated",  "adam_betas": [0.65, 0.95]},
+            "lm_head":        {"optim": "adam",    "comms": "sharded",     "adam_betas": [0.5,  0.95]}, # Before embed for grad aggregation
+            "embed":          {"optim": "adam",    "comms": "sharded",     "adam_betas": [0.5,  0.95]}, # Last (skipped when tied)
         }
-        adam_labels = list(adam_betas.keys())
-        adam_beta_values = list(adam_betas.values())
-        muon_labels = ['attn', 'mlp']
-        adam_params = [p for p in model.parameters() if getattr(p, 'label', None) in adam_labels]
-        muon_params = [p for p in model.parameters() if getattr(p, 'label', None) in muon_labels]
-        assert set(getattr(p, 'label', None) for p in model.parameters()) == set(adam_labels + muon_labels), "All params must have label"
 
-        self.adam_opt = DistAdam(adam_params, adam_labels, adam_beta_values, lr=0.008, eps=1e-10, weight_decay=0.005)
-        self.muon_opt = NorMuon(muon_params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2)
-        self.optimizers = [self.adam_opt, self.muon_opt]
+        # - Process smaller/faster params first while large reduces complete
+        # - lm_head must complete before embed sync (when tied)
+        self.work_order = [
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
+            "ve0", "ve1", "ve2",  # Medium
+            "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
+            "attn", "mlp",        # Large, polar express - process last to maximize overlap
+        ]
 
-        # split after odd number step
-        self.split_step = math.ceil(args.split_embed_frac * args.num_scheduled_iterations) | 1
+        adam_defaults = dict(
+            lr=0.008,
+            eps=1e-10,
+            weight_decay=0.005,
+        )
+        
+        normuon_defaults = dict(
+            lr=0.023,
+            momentum=0.95,
+            beta2=0.95,
+            weight_decay=1.2,
+        )
+        
+        self.optimizer = NorMuonAndAdam(
+            model.named_parameters(),
+            param_table=self.param_table,
+            scatter_order=list(self.param_table.keys()),  # Dict order defines scatter priority
+            work_order=self.work_order,
+            adam_defaults=adam_defaults,
+            normuon_defaults=normuon_defaults,
+        )
 
-        # set defaults
-        for opt in self.optimizers:
-            opt.odd_step_only = False 
-            opt.should_sync = True
-            for group in opt.param_groups:
-                group["initial_lr"] = group["lr"]
-
-        # on even steps, only step Muon params
-        self.adam_opt.odd_step_only = True
+        # Split embed from lm_head at 2/3 of training (on an odd step so Adam updates)
+        self.split_step = math.ceil(args.split_embed_frac * args.num_scheduled_iterations - 50) | 1
 
         self.reset()
 
@@ -1857,8 +1634,9 @@ class TrainingManager():
             ws_long = self.ws_long
         )
     
-    def _is_active_step(self, opt, step: int):
-        return (opt.odd_step_only and step%2==1) or not opt.odd_step_only
+    def _is_adam_step(self, step: int):
+        """Adam params are only updated on odd steps."""
+        return step % 2 == 1
 
     def get_transition_steps(self):
         transition_steps = []
@@ -1879,49 +1657,37 @@ class TrainingManager():
         new_batch_size = get_bs(step)
         if new_batch_size != self.batch_size:
             self.train_loader_send_args = (new_batch_size, args.train_max_seq_len, grad_accum_steps)
+            self.batch_size = new_batch_size # fix - train_loader_send_args was being set every step after the first batch size transition, instead of only on transitions.
         else:
             self.train_loader_send_args = None
 
         self.ws_long = new_ws_long
         self.mtp_weights = self.mtp_weights_schedule[step]
     
-    def step_optimizers(self, step: int):                
+    def step_optimizers(self, step: int):
         step_lr = get_lr(step)
         muon_momentum = get_muon_momentum(step)
-        for group in self.muon_opt.param_groups:
-            group["momentum"] = muon_momentum
-
-        for opt in self.optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * step_lr
-                
-        if self._is_active_step(self.adam_opt, step):
-            # adam will interleave calls to muon step
-            self.adam_opt.step(self.muon_opt)
-            self.model.zero_grad(set_to_none=True)
-            self.adam_opt.should_sync = False
-        else:
-            self.muon_opt.step()
-            self.muon_opt.zero_grad(set_to_none=True)
-            
+        do_adam = self._is_adam_step(step)
+        
+        # Update learning rates and momentum for all params
+        for param, settings in self.optimizer.settings.items():
+            settings["lr"] = settings["initial_lr"] * step_lr
+            if settings["optim"] == "normuon":
+                settings["momentum"] = muon_momentum
+        
+        # Step optimizer with do_adam flag
+        self.optimizer.step(do_adam=do_adam)
+        
+        # At split step: copy lm_head to embed and mark as split
         if step == self.split_step:
-            self.adam_opt.copy_lm_to_embed()
-            self.model.split_embed = True
-    
-    def activate_hooks(self, step: int):
-        for opt in self.optimizers:
-            if self._is_active_step(opt, step):
-                opt.should_sync = True
+            self.optimizer.copy_lm_to_embed()
 
     def reset(self, state=None):
         if state is not None:
-            for opt, opt_state in zip(self.optimizers, state):
-                opt.should_sync = False
-                opt.load_state_dict(opt_state)
+            self.optimizer.load_state_dict(state)
 
-        # muon momentum buffers not in state dict
-        self.muon_opt.reset()
-        self.model.split_embed = False
+        # Reset NorMuon momentum buffers and split_embed state
+        self.optimizer.reset()
 
         self.ws_short, self.ws_long = get_ws(0)
         self.batch_size = get_bs(0)
@@ -1929,7 +1695,7 @@ class TrainingManager():
         self.model.yarn_paired_head.reset()
 
     def get_state(self):
-        return [copy.deepcopy(opt.state_dict()) for opt in self.optimizers]
+        return copy.deepcopy(self.optimizer.state_dict())
 
 # -----------------------------------------------------------------------------
 # int main
@@ -2020,6 +1786,8 @@ for m in model.modules():
         m.weight.data = m.weight.data.bfloat16()
 model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
+model.attn_bank.data = model.attn_bank.data.bfloat16()
+model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
@@ -2032,7 +1800,7 @@ training_manager = TrainingManager(model)
 print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True)
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizers=training_manager.get_state()) # save the initial state
+                     optimizer=training_manager.get_state()) # save the initial state
 train_loader = distributed_data_generator(args.train_files, args.train_bs_schedule[0], args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
 val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
 
@@ -2048,9 +1816,6 @@ for step in warmup_steps:
         model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
     model.train()
     for idx in range(grad_accum_steps):
-        # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
-        if idx == grad_accum_steps - 1:
-            training_manager.activate_hooks(step)
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens = train_loader.send(send_args)
         (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
@@ -2058,7 +1823,7 @@ for step in warmup_steps:
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
-training_manager.reset(initial_state["optimizers"])
+training_manager.reset(initial_state["optimizer"])
 del val_loader, train_loader, initial_state
 model.train()
 
@@ -2105,7 +1870,7 @@ for step in range(train_steps + 1):
 
     if last_step:
         if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state())
             os.makedirs(f"logs/{run_id}", exist_ok=True)
             torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
@@ -2113,11 +1878,7 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
-        # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
-        if idx == grad_accum_steps - 1:
-            training_manager.activate_hooks(step)
-        send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens = train_loader.send(send_args)
+        inputs, targets, cum_seqlens = train_loader.send(training_manager.train_loader_send_args)
         (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 
