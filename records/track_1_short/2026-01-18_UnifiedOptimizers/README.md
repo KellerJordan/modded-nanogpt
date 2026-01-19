@@ -6,7 +6,7 @@ The main contributions of this record are:
 2. MLP and Attention parameter banks, allowing for a uniform workload across the gpus and eliminating all memcpys.
 3. A transposed memory layout for the LM head, which resolves the slow element-wise gradient accumulation kernel.
 
-I did my development against record 59. After integrating record 60 (logit softacp kernel) and re-timing I was able to remove another 5 steps (-10 steps total):
+I did my development against record 59. After integrating record 60 (logit softcap kernel) and re-timing I was able to remove another 5 steps (-10 steps total):
 ```
                    Runs   Time μ  Time σ  Time +/-  Time p  Loss μ  Loss σ  Loss +/-      p
 baseline              8 105.5361  0.0923    0.0000     NaN  3.2783  0.0008    0.0000 0.0003 # At 1775 steps
@@ -115,7 +115,7 @@ self.param_table = {
 
 The one remaining set of components that could arguably still be grouped are the value embedding tables. Instead, I've individually labeled them as 've0', 've1', and 've2' to treat them as distinct parameters.
 
-## 1.3. Replacing Hooks with Explicit Ordering
+### 1.3. Replacing Hooks with Explicit Ordering
 
 The most substantial benefit we were getting from registering gradient accumulation hooks was to overlap communication with the lengthy lm_head gradient accumulation kernel. With that removed (as described further down), there's less benefit to overlapping the smaller kernels, and I chose to remove the feature for simplicity and added flexibility in ordering the communication and workload.
 
@@ -136,7 +136,7 @@ This ordering was chosen by Claude Opus, and the comments are its' rationale. Th
 
 I think the rationale for the work order makes sense, but note how its roughly the opposite of the communication order--that part seems counterintuitive to me.
 
-### 1.3. Debugging Comms
+### 1.4. Debugging Comms
 
 I've been having issues lately with getting good trace data. The profiler is somehow slowing things down much more than usual, and the communication data in particular doesn't look right. This has made it hard to arrive on a deliberate strategy and validate it.
 
@@ -210,15 +210,15 @@ An additional challenge was setting up the optimizer state for the `embed` matri
 
 Thank you to @ClassicLarry for suggesting a more straightforward solution to this than what I had been trying. We simply perform an explicit communication step to make sure every GPU has the correct momentum buffer state for `embed`. This preserves the behavior and accuracy of the existing implementation.
 
-## Ideas
+## 3. Ideas
 
 With the Muon memcpys gone, we have quite a lot of compute available during the optimizer window. Here are a few things I played with that might deserve exploring more, or might spark other ideas.
 
-### Interpolated Embedding Updates
+### 3.1. Interpolated Embedding Updates
 
 Because we're now manually combining the gradient updates of the input embeddings and LM heads to tie them, we have the opportunity to "mix" them differently; i.e., we could scale the input embedding gradients up or down relative to the lm_head before combining them. 
 
-### Blending / Switching Muon and Adam
+### 3.2. Blending / Switching Muon and Adam
 
 Adam is remarkably fast, and I think we can afford to run both NorMuon and Adam on the MLP and Attention weights at the same time. I tried some experiments blending their updates over the course of training, but nothing looked promising.
 
@@ -226,7 +226,7 @@ What I'd still be interested to try, though, is switching the projection matrice
 
 (Larry has some interesting notes on this idea in the comments of the PR)
 
-### Starting `forward` Within `step`
+### 3.3. Starting `forward` Within `step`
 
 It's not a giant time savings, but inside of the optimizer window, while still waiting for the attention and MLP gathers to complete, we can start selecting the next input embeddings, normalizing them, applying the smear gate, and perhaps even running the first attention layer (since those weights arrive before the MLPs).
 
@@ -234,7 +234,7 @@ I started on this, but set it aside when I realized how complicated / impossible
 
 I think the solution there would probably be to define a separate training loop that's only for the 8x gpu setup (with no gradient accumulation support), where we could apply this.
 
-### Leveraging the Spare MLP Weights
+### 3.4. Leveraging the Spare MLP Weights
 
 We are now paying the communication and optimizer overhead for another MLP's worth of weights. 
 
