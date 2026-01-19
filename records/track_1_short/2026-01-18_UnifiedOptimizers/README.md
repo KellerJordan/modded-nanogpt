@@ -57,7 +57,7 @@ One of the core changes in this PR is the consolidation of the attention and mlp
 The approach to communicating the Muon parameters has been to:
 
 1. Assign different attention and MLP matrices to different GPUs.
-2. Assemble each GPUs set of gradients by stacking them together.
+2. Assemble each GPU's set of gradients by stacking them together.
 3. Scatter the stacks, do the Muon math, then gather the updates.
 4. Unstack the received updates and apply them to the local parameters.
 
@@ -75,14 +75,14 @@ This illustration is out-of-date, so ignore what it says about comms and compute
 
 This PR utilitizes a "parameter bank" strategy that was introduced in a previous PR for the attention gates and ve gates, and I've extended it to the attention and mlp projection matrices.
 
-The QKVO weight matrices from all 10 attention modules are stored as a single parameter of shape (10, 4*768, 768). This can be 'reshaped' without memory movement to (40, 768, 768), and then sharded evenly across the 8 GPUs (so that each gets five attention matrices). 
+The QKVO weight matrices from all 10 attention modules are stored as a single parameter of shape `(10, 4×768, 768)`. This can be 'reshaped' without memory movement to `(40, 768, 768)`, and then sharded evenly across the 8 GPUs (so that each gets five attention matrices). 
 
-The MLP weight matrices (11 modules, 2 matrices per module) require padding to be sharded evenly. Their parameter bank is (12, 2, 4*768), and this is "reshaped" to (24, 4*768) so that each GPU receives 3 matrices to process.
+The MLP weight matrices (11 modules, 2 matrices per module) require padding to be sharded evenly. Their parameter bank is `(12, 2, 3072)`, and this is "reshaped" to `(24, 3072)` so that each GPU receives 3 matrices to process.
 
-Note that means we're paying the communication and optimizer overhead for an entire additional MLP, so we may be able to find a use for those weights. There are some notes on what I tried under the `Ideas` section. 
+Note that means we're paying the communication and optimizer overhead for an entire additional MLP, so we may be able to find a use for those weights. There are some notes on what I tried under the **Ideas** section. 
 
 Now, both passes have balanced workloads, and:
-* The first pass should be significantly faster than before, with each GPU working only on attention weights, and only (5, 768, 768) each. 
+* The first pass should be significantly faster than before, with each GPU working only on attention weights, and only `(5, 768, 768)` each. 
 * The second pass will be slower than before, with each GPU now working on 3 MLP matrices instead of two.
 
 ### 1.2. Individual Parameters
