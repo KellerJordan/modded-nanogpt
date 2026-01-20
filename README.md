@@ -5,7 +5,7 @@ This repository hosts the *NanoGPT speedrun*, in which we (collaboratively|compe
 The target (3.28 validation loss on FineWeb) follows Andrej Karpathy's [GPT-2 replication in llm.c, which attains that loss after running for 45 minutes](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 The speedrun code also descends from llm.c's [PyTorch trainer](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py), which itself descends from NanoGPT, hence the name of the repo.
 Thanks to the efforts of many contributors, this repo now contains a training algorithm which attains the target performance in:
-* 2 minutes on 8xH100 (the llm.c GPT-2 replication needed 45)
+* Under 100 seconds on 8xH100 (the llm.c GPT-2 replication needed 45 minutes)
 * under 500M tokens (the llm.c GPT-2 replication needed 10B)
 
 This improvement in training speed has been brought about by the following techniques:
@@ -163,7 +163,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 59 | 1.781 minutes | [Fused triton kernel for linear relu square MLP step](https://x.com/classiclarryd/status/2010545452832407943) | 01/10/26 | [log](records/track_1_short/2026-01-10_FusedLinearReLUSquare/3c47e63b-075e-4b5b-9c76-9dbe7bad9ad4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/197) | @andrewbriand, @jrauvola
 60 | 1.765 minutes | [Fused triton kernel for softcapped multi-token prediction cross entropy step](https://x.com/classiclarryd/status/2012927211448516796) | 01/16/26 | [log](records/track_1_short/2026-01-16_FusedSoftcappedEntropy/45beba56-93e2-4995-bc5b-caff3cb2c1b5.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/199) | @soren_dunn_ & AI System [Locus](https://www.intology.ai/blog/previewing-locus)
 61 | 1.748 minutes | [Unified Optimizers and Transposed LM Head](https://x.com/classiclarryd/status/2013399457841160702) | 01/18/26 | [log](records/track_1_short/2026-01-18_UnifiedOptimizers/unified-optimizer/2fc79469-a527-4bde-8540-8426ed3352d1.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/200) | @ChrisJMcCormick
-62 | 1.655 minutes | Bigram Hash Embedding | 01/19/26 | [log](records/track_1_short/2026-01-19_BigramHashEmbedding/40ec7bb6-14b3-46f8-90b7-bb5ed188faba.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/201) | @classiclarryd
+62 | 1.655 minutes | [Bigram Hash Embedding](https://x.com/classiclarryd/status/2013520088297558274) | 01/19/26 | [log](records/track_1_short/2026-01-19_BigramHashEmbedding/40ec7bb6-14b3-46f8-90b7-bb5ed188faba.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/201) | @classiclarryd
 ## Rules
 
 New records must:
