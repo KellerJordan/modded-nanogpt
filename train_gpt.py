@@ -194,6 +194,77 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
         X = X.mT
     return X
 
+# -----------------------------------------------------------------------------
+# Sparse Comms for bigram embedding gradient
+
+# comm_stream = torch.cuda.streams.Stream()
+
+def a2a_prefwd_start(idxes, N, world):
+    rows_per_rank = N // world
+    idxes = bigram_inputs.to(torch.int64)
+
+    # mapping of which device owns the updates to each index
+    # assuming even split of params/gradients between devices
+    owner = idxes // rows_per_rank
+
+    # with torch.cuda.stream(comm_stream):
+    send_counts = []
+    idxes_parts = []
+    for dst in range(world):
+        m = (owner == dst)
+        part = idxes[m].to(torch.int32).unique()
+        idxes_parts.append(part)
+        send_counts.append(part.numel())
+    send_idxes = torch.cat(idxes_parts, 0)
+
+    # counts (tiny) then indices (big, async)
+    send_counts_t = torch.tensor(send_counts, device=idxes.device, dtype=torch.int64)
+    recv_counts_t = torch.empty_like(send_counts_t)
+    dist.all_to_all_single(recv_counts_t, send_counts_t,
+                            input_split_sizes=[1]*world, output_split_sizes=[1]*world,)
+    recv_counts = [int(x) for x in recv_counts_t.tolist()]
+    recv_idxes = torch.empty(sum(recv_counts), device=idxes.device, dtype=torch.int32)
+
+    idxes_fut = dist.all_to_all_single(recv_idxes, send_idxes,
+                                        input_split_sizes=send_counts,
+                                        output_split_sizes=recv_counts,
+                                        async_op=True)
+
+    return owner, send_counts, recv_counts, recv_idxes, idxes_fut
+
+def a2a_postbwd_grad_comm_start(grad, world, owner, send_counts, recv_counts):
+
+    device = grad.device
+    d = grad.shape[1]
+
+    # with torch.cuda.stream(comm_stream):
+    # pack values in same dst order
+    val_parts = []
+    for dst in range(world):
+        m = (owner == dst)
+        val_parts.append(grad[m].reshape(-1))
+    send_vals = torch.cat(val_parts, 0)
+
+    send_splits = [c * d for c in send_counts]
+    recv_splits = [c * d for c in recv_counts]
+    recv_vals = torch.empty(sum(recv_splits), device=device, dtype=grad.dtype)
+
+    val_fut = dist.all_to_all_single(recv_vals, send_vals,
+                                        input_split_sizes=send_splits,
+                                        output_split_sizes=recv_splits,
+                                        async_op=True)
+    return recv_vals, val_fut
+
+def a2a_postbwd_grad_comm_wait(grad, world, recv_idx, recv_vals):
+    rows_per_rank = grad.shape[0] // world
+    d = grad.shape[1]
+
+    # accumulate into dense local grad slice
+    grad_slice = torch.zeros((rows_per_rank, d), device=device, dtype=grad.dtype)
+    local_pos = recv_idx.to(torch.int64) - rank * rows_per_rank
+    grad_slice.index_add_(0, local_pos, recv_vals.view(-1, d))
+
+    return grad_slice
 
 # -----------------------------------------------------------------------------
 # Combined NorMuon + Adam Optimizer
@@ -312,7 +383,8 @@ class NorMuonAndAdam:
         
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
-        
+        self._sparse_async_data: dict[nn.Parameter, tuple] = {}
+
         # Embed/lm_head tying state
         self.split_embed = False
         self._lm_head_param = self._param_by_label.get("lm_head")
@@ -328,7 +400,7 @@ class NorMuonAndAdam:
         wd_mul = table_entry.get("wd_mul", 1.0)
         
         if optim == "adam":
-            chunk_size = param.shape[0] // self.world_size if comms == "sharded" else None
+            chunk_size = param.shape[0] // self.world_size if comms.startswith("sharded") else None
             p_cfg = ParamConfig(
                 label=label,
                 optim=optim,
@@ -392,7 +464,7 @@ class NorMuonAndAdam:
         for param, p_cfg in self.param_cfgs.items():
             if p_cfg.optim == "adam":
                 # Sharded params use chunk state, replicated use full state
-                if p_cfg.comms == "sharded":
+                if p_cfg.comms.startswith("sharded"):
                     chunk = param[:p_cfg.chunk_size]
                 else:
                     chunk = param
@@ -462,6 +534,11 @@ class NorMuonAndAdam:
                     grad_chunk, grad, op=dist.ReduceOp.AVG, async_op=True
                 ).get_future()
                 self._reduce_futures[param] = (future, grad_chunk)
+        elif p_cfg.comms == "sharded_sparse":
+            # TODO: hack! world size 8
+            owner, send_counts, recv_counts = self._sparse_async_data[param]
+            recv_vals, val_fut = a2a_postbwd_grad_comm_start(grad, 8, owner, send_counts, recv_counts)
+            self._reduce_futures[param].extend((val_fut, recv_vals))
 
     def _launch_gather(self, param: nn.Parameter, p_slice: Tensor) -> "torch.futures.Future":
         """Launch async all_gather for a sharded parameter."""
@@ -612,16 +689,24 @@ class NorMuonAndAdam:
             if p_cfg.optim == "adam" and not do_adam:
                 continue
             # Wait for reduce
-            future, grad_chunk = self._reduce_futures[param]
-            if future is not None:
-                future.wait()
+            if p_cfg.comms != "sharded_sparse":
+                future, grad_chunk = self._reduce_futures[param]
+                if future is not None:
+                    future.wait()
+            else:
+                idxes_fut, idxes, recv_fut, recv_vals = self._reduce_futures[param]
+                idxes_fut.wait()
+                recv_fut.wait()
+                # TODO: hck
+                grad_chunk = a2a_postbwd_grad_comm_wait(param.grad, world_size, idxes, recv_vals)
+
             # Apply update based on optim type
             if p_cfg.optim == "adam":
                 p_slice = self._adam_update(param, grad_chunk, p_cfg, rank)
             else:
                 p_slice = self._normuon_update(param, grad_chunk, p_cfg, rank)
             # Launch gather for sharded params
-            if p_cfg.comms == "sharded" and self.world_size > 1:
+            if p_cfg.comms.startswith("sharded") and self.world_size > 1:
                 gather_fut = self._launch_gather(param, p_slice)
                 if label == "lm_head":
                     lm_head_gather_future = gather_fut
@@ -658,7 +743,7 @@ class NorMuonAndAdam:
         lr = p_cfg.lr * p_cfg.lr_mul
         
         # Get parameter slice
-        if p_cfg.comms == "sharded":
+        if p_cfg.comms.startswith("sharded"):
             p_slice = param[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size]
         else:
             p_slice = param
@@ -1579,7 +1664,7 @@ class TrainingManager():
             "ve0":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "ve1":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "ve2":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
@@ -1836,7 +1921,19 @@ for step in warmup_steps:
     for idx in range(grad_accum_steps):
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(send_args)
+
+        # TODO: hack
+        if world_size == 8:
+            if not training_manager._do_adam_step():
+                bigrams_old = bigram_inputs
+            else:
+                bigram_idx = torch.cat([bigrams_old, bigram_inputs])
+                # start comms for sparse bigram update now as we don't need to compute forward pass to pass the indices
+                owner, send_counts, recv_counts, recv_idxes, idxes_fut = a2a_prefwd_start(bigram_idx, args.bigram_vocab_size, world_size)
+                training_manager.optimizer._reduce_futures[model.bigram_embed.weight] = [recv_idxes, idxes_fut]
+
         (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
+
     training_manager.step_optimizers(step)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
