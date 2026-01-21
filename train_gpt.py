@@ -201,7 +201,7 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 
 def a2a_prefwd_start(idxes, N, world):
     rows_per_rank = N // world
-    idxes = bigram_inputs.to(torch.int64)
+    idxes = bigram_inputs.to(torch.int64).unique()
 
     # mapping of which device owns the updates to each index
     # assuming even split of params/gradients between devices
@@ -212,7 +212,7 @@ def a2a_prefwd_start(idxes, N, world):
     idxes_parts = []
     for dst in range(world):
         m = (owner == dst)
-        part = idxes[m].to(torch.int32).unique()
+        part = idxes[m].to(torch.int32)
         idxes_parts.append(part)
         send_counts.append(part.numel())
     send_idxes = torch.cat(idxes_parts, 0)
@@ -727,6 +727,7 @@ class NorMuonAndAdam:
             fut.wait()
         
         self._reduce_futures.clear()
+        self._sparse_async_data.clear()
         
         # Clear grads for updated params
         for param, p_cfg in self.param_cfgs.items():
