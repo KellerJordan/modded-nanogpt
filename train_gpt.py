@@ -1924,7 +1924,7 @@ for step in warmup_steps:
 
         # TODO: hack
         if world_size == 8:
-            if not training_manager._do_adam_step():
+            if not training_manager._is_adam_step():
                 bigrams_old = bigram_inputs
             else:
                 bigram_idx = torch.cat([bigrams_old, bigram_inputs])
