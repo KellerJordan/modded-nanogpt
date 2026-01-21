@@ -199,6 +199,7 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 
 # comm_stream = torch.cuda.streams.Stream()
 
+@torch.compile
 def a2a_prefwd_start(idxes, N, world):
     rows_per_rank = N // world
     idxes = bigram_inputs.to(torch.int64).unique(sorted=False)
@@ -232,6 +233,7 @@ def a2a_prefwd_start(idxes, N, world):
 
     return idxes_parts, send_counts, recv_counts, recv_idxes, idxes_fut
 
+@torch.compile
 def a2a_postbwd_grad_comm_start(grad, idxes_by_owner, send_counts, recv_counts):
 
     device = grad.device
@@ -254,14 +256,15 @@ def a2a_postbwd_grad_comm_start(grad, idxes_by_owner, send_counts, recv_counts):
                                         async_op=True)
     return recv_vals, val_fut
 
+@torch.compile
 def a2a_postbwd_grad_comm_wait(grad, world, recv_idx, recv_vals):
     rows_per_rank = grad.shape[0] // world
     d = grad.shape[1]
 
     # accumulate into dense local grad slice
-    grad_slice = torch.zeros((rows_per_rank, d), device=device, dtype=grad.dtype)
+    grad_slice = torch.zeros((rows_per_rank, d), device=grad.device, dtype=grad.dtype)
     local_pos = recv_idx.to(torch.int64) - rank * rows_per_rank
-    grad_slice.index_add_(0, local_pos, recv_vals.view(-1, d))
+    grad_slice.index_add_(0, local_pos, recv_vals.view(-1, d) / world)
 
     return grad_slice
 
@@ -1927,7 +1930,7 @@ for step in warmup_steps:
                 bigrams_old = bigram_inputs
             else:
                 bigram_idx = torch.cat([bigrams_old, bigram_inputs])
-                # start comms for sparse bigram update now as we don't need to compute forward pass to pass the indices
+                # start comms for sparse bigram update now as we don't need to compute forward pass to communicate the indices
                 idxes_by_owner, send_counts, recv_counts, recv_idxes, idxes_fut = a2a_prefwd_start(bigram_idx, args.bigram_vocab_size, world_size)
                 training_manager.optimizer._reduce_futures[model.bigram_embed.weight] = [idxes_fut, recv_idxes]
                 training_manager.optimizer._sparse_async_data[model.bigram_embed.weight] = (idxes_by_owner, send_counts, recv_counts)
