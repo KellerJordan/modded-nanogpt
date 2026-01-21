@@ -1994,6 +1994,17 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(training_manager.train_loader_send_args)
+        # TODO: hack
+        if world_size == 8:
+            if not training_manager._is_adam_step(step):
+                bigrams_old = bigram_inputs
+            else:
+                bigram_idx = torch.cat([bigrams_old, bigram_inputs])
+                # start comms for sparse bigram update now as we don't need to compute forward pass to pass the indices
+                idxes_by_owner, send_counts, recv_counts, recv_idxes, idxes_fut = a2a_prefwd_start(bigram_idx, args.bigram_vocab_size, world_size)
+                training_manager.optimizer._reduce_futures[model.bigram_embed.weight] = [idxes_fut, recv_idxes]
+                training_manager.optimizer._sparse_async_data[model.bigram_embed.weight] = (idxes_by_owner, send_counts, recv_counts)
+
         (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 
