@@ -201,7 +201,7 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 
 def a2a_prefwd_start(idxes, N, world):
     rows_per_rank = N // world
-    idxes = bigram_inputs.to(torch.int64).unique()
+    idxes = bigram_inputs.to(torch.int64).unique(sorted=False)
 
     # mapping of which device owns the updates to each index
     # assuming even split of params/gradients between devices
@@ -232,7 +232,7 @@ def a2a_prefwd_start(idxes, N, world):
 
     return owner, send_counts, recv_counts, recv_idxes, idxes_fut
 
-def a2a_postbwd_grad_comm_start(grad, world, owner, send_counts, recv_counts):
+def a2a_postbwd_grad_comm_start(grad, world, idxes, owner, send_counts, recv_counts):
 
     device = grad.device
     d = grad.shape[1]
@@ -242,7 +242,7 @@ def a2a_postbwd_grad_comm_start(grad, world, owner, send_counts, recv_counts):
     val_parts = []
     for dst in range(world):
         m = (owner == dst)
-        val_parts.append(grad[m].reshape(-1))
+        val_parts.append(grad[idxes[m]].reshape(-1))
     send_vals = torch.cat(val_parts, 0)
 
     send_splits = [c * d for c in send_counts]
