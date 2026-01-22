@@ -200,6 +200,7 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 # comm_stream = torch.cuda.streams.Stream()
 
 @torch.compile
+@torch.no_grad
 def a2a_prefwd_start(idxes, N, world):
     rows_per_rank = N // world
     idxes = idxes.to(torch.int64).unique(sorted=False)
@@ -234,6 +235,7 @@ def a2a_prefwd_start(idxes, N, world):
     return idxes_parts, send_counts, recv_counts, recv_idxes, idxes_fut
 
 @torch.compile
+@torch.no_grad
 def a2a_postbwd_grad_comm_start(grad, idxes_by_owner, send_counts, recv_counts):
 
     device = grad.device
@@ -257,6 +259,7 @@ def a2a_postbwd_grad_comm_start(grad, idxes_by_owner, send_counts, recv_counts):
     return recv_vals, val_fut
 
 @torch.compile
+@torch.no_grad
 def a2a_postbwd_grad_comm_wait(grad, world, recv_idx, recv_vals):
     rows_per_rank = grad.shape[0] // world
     d = grad.shape[1]
