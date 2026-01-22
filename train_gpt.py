@@ -266,7 +266,7 @@ def a2a_postbwd_grad_comm_wait(grad, world, recv_idx, recv_vals):
 
     # accumulate into dense local grad slice
     grad_slice = torch.zeros((rows_per_rank, d), device=grad.device, dtype=grad.dtype)
-    local_pos = recv_idx.to(torch.int64) - rank * rows_per_rank
+    local_pos = recv_idx - rank * rows_per_rank
     grad_slice.index_add_(0, local_pos, recv_vals.view(-1, d), alpha=1 / world)
 
     return grad_slice
