@@ -203,7 +203,7 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 @torch.no_grad
 def a2a_prefwd_start(idxes, N, world):
     rows_per_rank = N // world
-    idxes = idxes.to(torch.int64).unique(sorted=False)
+    idxes = idxes.to(torch.int32).unique(sorted=False)
 
     # mapping of which device owns the updates to each index
     # assuming even split of params/gradients between devices
