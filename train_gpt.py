@@ -214,16 +214,16 @@ def a2a_prefwd_start(idxes, N, world):
     idxes_parts = []
     for dst in range(world):
         m = (owner == dst)
-        part = idxes[m].to(torch.int32)
+        part = idxes[m]
         idxes_parts.append(part)
         send_counts.append(part.numel())
     send_idxes = torch.cat(idxes_parts, 0)
 
     # counts (tiny) then indices (big, async)
-    send_counts_t = torch.tensor(send_counts, device=idxes.device, dtype=torch.int64)
+    send_counts_t = torch.tensor(send_counts, device=idxes.device, dtype=torch.int32)
     recv_counts_t = torch.empty_like(send_counts_t)
-    dist.all_to_all_single(recv_counts_t, send_counts_t,
-                            input_split_sizes=[1]*world, output_split_sizes=[1]*world,)
+    dist.all_to_all_single(recv_counts_t, send_counts_t)
+
     recv_counts = [int(x) for x in recv_counts_t.tolist()]
     recv_idxes = torch.empty(sum(recv_counts), device=idxes.device, dtype=torch.int32)
 
