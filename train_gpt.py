@@ -480,15 +480,21 @@ class NorMuonAndAdam:
     # -----------------------------------
     # State management
     
-    def reset(self):
-        """Reset NorMuon momentum buffers and split_embed state (called on training reset)."""
-        self.split_embed = False
+    def reset(self, adam: bool = False, normuon: bool = True, retie_embed: bool = True):
+        """Reset NorMuon and/or Adam and/or split_embed state (called on training reset)."""
+        if retie_embed:
+            self.split_embed = False
         for param, p_cfg in self.param_cfgs.items():
-            if p_cfg.optim == "normuon":
+            if normuon and p_cfg.optim == "normuon":
                 p_state = self.param_states[param]
                 p_state["momentum_buffer"].zero_()
                 p_state["mantissa"].zero_()
                 p_state["second_momentum_buffer"].zero_()
+            if adam and p_cfg.optim == "adam":
+                p_state = self.param_states[param]
+                p_state["step"] = 0
+                p_state["exp_avg"].zero_()
+                p_state["exp_avg_sq"].zero_()
     
     def copy_lm_state_to_embed(self):
         """
@@ -557,12 +563,13 @@ class NorMuonAndAdam:
     # Unified optimizer step with explicit ordering
 
     @torch.no_grad()
-    def step(self, do_adam: bool = True):
+    def step(self, adam: bool = True, normuon: bool = True):
         """
         Combined optimizer step with explicit ordering.
         
         Args:
-            do_adam: If True, update Adam params. NorMuon params always updated.
+            adam: If True, update Adam params.
+            normuon: If True, update NorMuon params.
         
         Flow:
         1. Scatter phase: Launch reduces in scatter_order
@@ -577,19 +584,21 @@ class NorMuonAndAdam:
         """
         rank = dist.get_rank() if dist.is_initialized() else 0
         lm_param, embed_param = self._lm_head_param, self._embed_param
-        
+
         # ===== Phase 1: Launch reduces in scatter_order =====
         for label in self.scatter_order:
             param = self._param_by_label[label]
             p_cfg = self.param_cfgs[param]
             
-            if p_cfg.optim == "adam" and not do_adam:
+            if p_cfg.optim == "adam" and not adam:
+                continue
+            if p_cfg.optim == "normuon" and not normuon:
                 continue
             if param.grad is None:
                 continue
             
             # lm_head when tied: aggregate embed.grad.T (transposed shapes)
-            if label == "lm_head" and do_adam and not self.split_embed:
+            if label == "lm_head" and adam and not self.split_embed:
                 if embed_param is not None and embed_param.grad is not None:
                     param.grad.add_(embed_param.grad.T)
             
@@ -609,7 +618,9 @@ class NorMuonAndAdam:
                 continue
             
             p_cfg = self.param_cfgs[param]
-            if p_cfg.optim == "adam" and not do_adam:
+            if p_cfg.optim == "adam" and not adam:
+                continue
+            if p_cfg.optim == "normuon" and not normuon:
                 continue
             # Wait for reduce
             future, grad_chunk = self._reduce_futures[param]
@@ -634,9 +645,9 @@ class NorMuonAndAdam:
             lm_head_gather_future.wait()
         
         # When tied: copy lm_head.T to embed
-        if do_adam and not self.split_embed and embed_param is not None and lm_param is not None:
+        if adam and not self.split_embed and embed_param is not None and lm_param is not None:
             embed_param.data.copy_(lm_param.data.T)
-        
+
         # Wait for remaining gathers
         for fut in gather_futures:
             fut.wait()
@@ -645,8 +656,10 @@ class NorMuonAndAdam:
         
         # Clear grads for updated params
         for param, p_cfg in self.param_cfgs.items():
-            if p_cfg.optim == "adam" and not do_adam:
+            if p_cfg.optim == "adam" and not adam:
                 continue  # Don't clear Adam grads on even steps
+            if p_cfg.optim == "normuon" and not normuon:
+                continue  # Don't clear NorMuon grads when normuon is disabled
             param.grad = None
 
     # -----------------------------------
@@ -1196,7 +1209,9 @@ class GPT(nn.Module):
         )
         self.scalars.label = 'scalars'
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
+    def forward(
+        self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor,
+        bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig, ttt_loss_mask: Tensor | None = None):
         assert input_seq.ndim == 1
 
         # unpack schedule_cfg
@@ -1292,12 +1307,21 @@ class GPT(nn.Module):
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
-            losses = FusedSoftcappedCrossEntropy.apply(logits.view(-1, logits.size(-1)), target_seq, mtp_weights)
-            loss = losses.sum()
+            if ttt_loss_mask is None:
+                losses = FusedSoftcappedCrossEntropy.apply(logits.view(-1, logits.size(-1)), target_seq, mtp_weights)
+                loss = losses.sum()
+            else:
+                logits = 23 * torch.sigmoid((logits + 5) / 7.5)
+                logits_flat = logits.view(-1, logits.size(-1))
+                loss = F.cross_entropy(logits_flat[ttt_loss_mask].float(), target_seq[ttt_loss_mask], reduction="sum")
         else:
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
             logits_for_loss = logits.float()
-            loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
+            logits_flat = logits_for_loss.view(-1, logits_for_loss.size(-1))
+            if ttt_loss_mask is not None:
+                logits_flat = logits_flat[ttt_loss_mask]
+                target_seq = target_seq[ttt_loss_mask]
+            loss = F.cross_entropy(logits_flat, target_seq, reduction="mean")
         return loss
 # -----------------------------------------------------------------------------
 # Distributed data loader
@@ -1680,19 +1704,19 @@ class TrainingManager():
         self.ws_long = new_ws_long
         self.mtp_weights = self.mtp_weights_schedule[step]
     
-    def step_optimizers(self, step: int):
+    def step_optimizers(self, step: int, adam: bool | None = None, normuon: bool = True):
         step_lr = get_lr(step)
         muon_momentum = get_muon_momentum(step)
-        do_adam = self._is_adam_step(step)
-        
+        do_adam = self._is_adam_step(step) if adam is None else adam
+
         # Update learning rates and momentum for all params
         for param, p_cfg in self.optimizer.param_cfgs.items():
             p_cfg.lr = p_cfg.initial_lr * step_lr
             if p_cfg.optim == "normuon":
                 p_cfg.momentum = muon_momentum
         
-        # Step optimizer with do_adam flag
-        self.optimizer.step(do_adam=do_adam)
+        # Step optimizer with selected optimizers
+        self.optimizer.step(adam=do_adam, normuon=normuon)
         
         # At split step: copy lm_head optimizer state to embed and mark as split
         if step == self.split_step:
@@ -1714,6 +1738,147 @@ class TrainingManager():
         return copy.deepcopy(self.optimizer.state_dict())
 
 # -----------------------------------------------------------------------------
+# Test-time training
+
+def get_sequence_boundaries(cum_seqlens: Tensor, num_tokens: int) -> list[tuple[int, int]]:
+    """Extract (start, end) for each document from cum_seqlens."""
+    assert cum_seqlens[0].item() == 0
+    boundaries = []
+    prev = 0
+    for end in cum_seqlens[1:].tolist():
+        if end >= num_tokens:
+            break
+        if end != prev:  # Skip duplicates
+            assert end > prev
+            boundaries.append((prev, end))
+            prev = end
+    if prev < num_tokens:  # Final document ends at batch boundary
+        boundaries.append((prev, num_tokens))
+    return boundaries
+
+def pad_to_multiple(t: Tensor, n: int, pad_value: int = 0) -> Tensor:
+    remainder = t.numel() % n
+    if remainder == 0:
+        return t
+    return F.pad(t, (0, n - remainder), value=pad_value)
+
+def pad_to_len(t: Tensor, length: int, pad_value: int = 0) -> Tensor:
+    return F.pad(t, (0, length - t.numel()), value=pad_value)
+
+def build_single_seq_seqlens(seq_len: int, max_num_docs: int) -> Tensor:
+    """Build cum_seqlens tensor for a single sequence (pads with seq_len)."""
+    seqlens = torch.full((max_num_docs,), seq_len, dtype=torch.int32, device=device)
+    seqlens[0] = 0
+    return seqlens
+
+def ttt_val_batch(
+    inputs: Tensor, targets: Tensor, cum_seqlens: Tensor, bigram_inputs: Tensor,
+    fwd_args: ForwardScheduleConfig, ttt_step: int | None, initial_model_state: dict | None,
+    chunk_size: int, ttt_window_len: int, ttt_window_seqlens: Tensor, max_num_docs: int,
+) -> tuple[Tensor, int]:
+
+    batch_ttt_loss_sum, batch_ttt_tokens = 0.0, 0
+
+    boundaries = get_sequence_boundaries(cum_seqlens, inputs.numel())
+    seq_items = []
+    for seq_idx, (seq_start, seq_end) in enumerate(boundaries):
+        seq_len = seq_end - seq_start
+        seq_inputs = inputs[seq_start:seq_end]
+        seq_targets = targets[seq_start:seq_end]
+        seq_bigram = bigram_inputs[seq_start:seq_end]
+
+        assert seq_idx == 0 or seq_inputs[0].item() == BOS_ID, \
+            f"Sequence {seq_idx} doesn't start with BOS (got {seq_inputs[0].item()})"
+        seq_items.append((seq_inputs, seq_targets, seq_bigram, seq_len))
+
+    # Pad so each GPU has the same number of sequences.
+    local_seq_count = len(seq_items)
+    t = torch.tensor(local_seq_count, dtype=torch.int32, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    max_seq_count = int(t.item())
+    if local_seq_count < max_seq_count:
+        empty_inputs = inputs[:0]
+        empty_targets = targets[:0]
+        empty_bigram = bigram_inputs[:0]
+        seq_items.extend([(empty_inputs, empty_targets, empty_bigram, 0)] * (max_seq_count - local_seq_count))
+
+    seq_lens = [seq_len for _, _, _, seq_len in seq_items]
+    t = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    max_seq_lens = t.tolist()   # Max seq length across GPUs for each seq in batch.
+    for (seq_inputs, seq_targets, seq_bigram, seq_len), max_len in zip(seq_items, max_seq_lens):
+
+        # Reset model state for each sequence (all ranks).
+        model_raw.load_state_dict(initial_model_state)
+        training_manager.optimizer.reset(adam=True, normuon=True, retie_embed=False)
+
+        max_chunks = (max_len + chunk_size - 1) // chunk_size
+        for chunk_idx in range(max_chunks):
+            chunk_start = chunk_idx * chunk_size
+
+            # Eval on local chunk conditioned on entire sequence.
+            # Ignore if local slice has < chunk_idx+1 chunks.
+            if chunk_start < seq_len:
+                chunk_end = min(chunk_start + chunk_size, seq_len)
+                chunk_len = chunk_end - chunk_start
+
+                eval_inputs_padded = pad_to_multiple(seq_inputs[:chunk_end], 16)
+                eval_targets_padded = pad_to_multiple(seq_targets[:chunk_end], 16)
+                eval_bigram_padded = pad_to_multiple(seq_bigram[:chunk_end], 16)
+                eval_seqlens = build_single_seq_seqlens(eval_inputs_padded.numel(), max_num_docs)
+                mask = torch.zeros(eval_inputs_padded.numel(), dtype=torch.bool, device=device)
+                mask[chunk_start:chunk_end] = True
+                model.eval()
+                with torch.no_grad():
+                    chunk_loss = model(
+                        eval_inputs_padded, eval_targets_padded,
+                        eval_seqlens, eval_bigram_padded, fwd_args,
+                        ttt_loss_mask=mask,
+                    )
+                batch_ttt_loss_sum += chunk_loss.item() * chunk_len
+                batch_ttt_tokens += chunk_len
+
+            # Train on chunk (after calculating loss, conditional on TTT bs tokens).
+            # Ignore last chunk, as we don't share weight updates between sequences
+            # so this saves some time.
+            if chunk_idx == max_chunks - 1:
+                continue
+            if chunk_start < seq_len:
+                chunk_end = min(chunk_start + chunk_size, seq_len)
+                chunk_len = chunk_end - chunk_start
+            else:   # Dummy chunk.
+                chunk_end = chunk_start
+                chunk_len = 0
+
+            train_start = max(0, chunk_end - args.ttt_bs)
+            chunk_inputs = pad_to_len(seq_inputs[train_start:chunk_end], ttt_window_len)
+            chunk_targets = pad_to_len(seq_targets[train_start:chunk_end], ttt_window_len)
+            chunk_bigram = pad_to_len(seq_bigram[train_start:chunk_end], ttt_window_len)
+
+            # All ranks must participate in optimizer step (collective ops), even if no local data.
+            skip_train = (chunk_end >= seq_len or chunk_len <= 0)
+
+            mask = torch.zeros(ttt_window_len, dtype=torch.bool, device=device)
+            if not skip_train:
+                prefix_len = chunk_start - train_start
+                mask[prefix_len:prefix_len + chunk_len] = True
+            model.train()
+            for _ in range(args.ttt_grad_steps):
+                train_loss = model(
+                    chunk_inputs, chunk_targets,
+                    ttt_window_seqlens, chunk_bigram, fwd_args,
+                    ttt_loss_mask=mask,
+                )
+                train_loss.backward()
+                training_manager.step_optimizers(
+                    ttt_step, adam=True, normuon=not args.ttt_adam_only
+                )
+                ttt_step += 1
+
+    batch_avg = batch_ttt_loss_sum / batch_ttt_tokens
+    return torch.tensor(batch_avg, device=device), ttt_step
+
+# -----------------------------------------------------------------------------
 # int main
 
 @dataclass
@@ -1729,7 +1894,7 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
     num_scheduled_iterations: int = 1560  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.55  # fraction of num_scheduled_iterations spent cooling down the learning rate
     split_embed_frac: float = 2/3  # fraction of training when embeddings split from lm_head
@@ -1744,8 +1909,19 @@ class Hyperparameters:
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
     # bigram hash embedding
     bigram_vocab_size = 50304 * 5
+    # TTT (test-time training)
+    ttt: bool = True
+    ttt_lr_mult: float = 1.0            # multiply LR by this factor during TTT
+    ttt_wd_mult: float = 0.1            # multiply weight decay by this factor during TTT
+    ttt_grad_steps: int = 1             # num gradient steps per batch
+    ttt_chunk_size: int = 512           # tokens per chunk for chunked TTT
+    ttt_bs: int = train_max_seq_len     # tokens per GPU for TTT context window
+    ttt_adam_only: bool = True          # only update Adam params, freeze NorMuon
 
 args = Hyperparameters()
+
+assert args.ttt_chunk_size % 16 == 0, "ttt_chunk_size must be multiple of 16"
+assert args.ttt_bs % 16 == 0, "ttt_bs must be multiple of 16"
 
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
@@ -1809,7 +1985,10 @@ model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+# Keep a handle to the underlying module so we can have two compiled wrappers:
+# static (training) and dynamic (final eval with TTT which deals w/ diff sizes).
+model_raw = model
+model = torch.compile(model_raw, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
 ########################################
@@ -1817,7 +1996,7 @@ training_manager = TrainingManager(model)
 ########################################
 print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True)
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
+initial_state = dict(model=copy.deepcopy(model_raw.state_dict()),
                      optimizer=training_manager.get_state()) # save the initial state
 train_loader = distributed_data_generator(args.train_files, args.train_bs_schedule[0], args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
 val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
@@ -1839,8 +2018,8 @@ for step in warmup_steps:
         (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 print0("Resetting Model", console=True)
-model.zero_grad(set_to_none=True)
-model.load_state_dict(initial_state["model"])
+model_raw.zero_grad(set_to_none=True)
+model_raw.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
 del val_loader, train_loader, initial_state
 model.train()
@@ -1864,6 +2043,7 @@ for step in range(train_steps + 1):
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         if last_step:
+            val_start_t0 = time.time()
             training_manager.apply_final_ws_ext()
         # stop the clock
         torch.cuda.synchronize()
@@ -1873,10 +2053,41 @@ for step in range(train_steps + 1):
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
         val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
         val_loss = 0
-        with torch.no_grad():
-            for _ in range(val_steps):
-                inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+
+        if last_step and args.ttt:
+            print0("Starting TTT (can take a few minutes)", console=True)
+            model = torch.compile(model_raw, dynamic=True, fullgraph=True)
+            training_manager.model = model
+            model.eval()
+
+            for p_cfg in training_manager.optimizer.param_cfgs.values():
+                p_cfg.initial_lr *= args.ttt_lr_mult
+                p_cfg.weight_decay *= args.ttt_wd_mult
+            max_num_docs = next_multiple_of_n(
+                args.val_batch_size // (grad_accum_steps * world_size) // 300, n=128
+            )
+            ttt_window_seqlens = build_single_seq_seqlens(args.ttt_bs, max_num_docs)
+            initial_model_state = copy.deepcopy(model_raw.state_dict())
+            ttt_step = args.num_scheduled_iterations + args.num_scheduled_iterations + args.num_scheduled_iterations + args.num_scheduled_iterations + args.num_scheduled_iterations
+
+            for i in range(val_steps):
+                print0(f"val_step {i+1}/{val_steps}", console=True)
+                inputs, targets, cum_seqlens, bigram_inputs = val_loader.send(training_manager.train_loader_send_args)
+                batch_loss, ttt_step = ttt_val_batch(
+                    inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(),
+                    ttt_step, initial_model_state,
+                    chunk_size=args.ttt_chunk_size,
+                    ttt_window_len=args.ttt_bs,
+                    ttt_window_seqlens=ttt_window_seqlens,
+                    max_num_docs=max_num_docs,
+                )
+                val_loss += batch_loss
+        else:
+            with torch.no_grad():
+                for _ in range(val_steps):
+                    inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
+                    val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
@@ -1887,8 +2098,9 @@ for step in range(train_steps + 1):
         t0 = time.perf_counter()
 
     if last_step:
+        print0(f"Validation took {time.time() - val_start_t0:.2f}s", console=True)
         if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state())
+            log = dict(step=step, code=code, model=model_raw.state_dict(), optimizer=training_manager.get_state())
             os.makedirs(f"logs/{run_id}", exist_ok=True)
             torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
