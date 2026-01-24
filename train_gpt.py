@@ -559,6 +559,17 @@ class NorMuonAndAdam:
                     else:
                         p_state[k] = v
 
+    def enable_local_mode(self):
+        """Switch to local mode for TTT: no communication, full param updates."""
+        for param, p_cfg in self.param_cfgs.items():
+            if p_cfg.comms == "sharded" and p_cfg.optim == "adam":
+                # Reallocate full-size optimizer state
+                p_state = self.param_states[param]
+                p_state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
+                p_state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
+                p_cfg.chunk_size = param.shape[0]  # Full size
+            p_cfg.comms = "none"
+
     # -----------------------------------
     # Unified optimizer step with explicit ordering
 
@@ -1762,9 +1773,6 @@ def pad_to_multiple(t: Tensor, n: int, pad_value: int = 0) -> Tensor:
         return t
     return F.pad(t, (0, n - remainder), value=pad_value)
 
-def pad_to_len(t: Tensor, length: int, pad_value: int = 0) -> Tensor:
-    return F.pad(t, (0, length - t.numel()), value=pad_value)
-
 def build_single_seq_seqlens(seq_len: int, max_num_docs: int) -> Tensor:
     """Build cum_seqlens tensor for a single sequence (pads with seq_len)."""
     seqlens = torch.full((max_num_docs,), seq_len, dtype=torch.int32, device=device)
@@ -1773,110 +1781,97 @@ def build_single_seq_seqlens(seq_len: int, max_num_docs: int) -> Tensor:
 
 def ttt_val_batch(
     inputs: Tensor, targets: Tensor, cum_seqlens: Tensor, bigram_inputs: Tensor,
-    fwd_args: ForwardScheduleConfig, ttt_step: int | None, initial_model_state: dict | None,
-    chunk_size: int, ttt_window_len: int, ttt_window_seqlens: Tensor, max_num_docs: int,
-) -> tuple[Tensor, int]:
+    fwd_args: ForwardScheduleConfig, initial_model_state: dict | None,
+    ttt_window_seqlens: Tensor, max_num_docs: int,
+) -> Tensor:
+    """Calculate the loss on a batch when using test-time training.
 
-    batch_ttt_loss_sum, batch_ttt_tokens = 0.0, 0
+    TTT does the following:
+        1. Split batch into sequences (using BOS token).
+        2. Split each sequence into chunks.
+        3. From i=0 to i=n_chunks-1:
+            a). Calculate loss on chunk i.
+            b). Then, train on chunk i.
+    
+    Only aggregate losses between GPUs: keep optimization separate.
+    """
+    batch_loss_sum = torch.zeros((), device=device)
+    batch_tokens = torch.zeros((), dtype=torch.int64, device=device)
+
+    # Preallocate train buffers (reused across sequences/chunks).
+    buf_inputs = torch.zeros(args.ttt_bs, dtype=inputs.dtype, device=device)
+    buf_targets = torch.zeros(args.ttt_bs, dtype=targets.dtype, device=device)
+    buf_bigram = torch.zeros(args.ttt_bs, dtype=bigram_inputs.dtype, device=device)
+    train_mask = torch.zeros(args.ttt_bs, dtype=torch.bool, device=device)
 
     boundaries = get_sequence_boundaries(cum_seqlens, inputs.numel())
-    seq_items = []
-    for seq_idx, (seq_start, seq_end) in enumerate(boundaries):
+    for seq_start, seq_end in boundaries:
         seq_len = seq_end - seq_start
         seq_inputs = inputs[seq_start:seq_end]
         seq_targets = targets[seq_start:seq_end]
         seq_bigram = bigram_inputs[seq_start:seq_end]
 
-        assert seq_idx == 0 or seq_inputs[0].item() == BOS_ID, \
-            f"Sequence {seq_idx} doesn't start with BOS (got {seq_inputs[0].item()})"
-        seq_items.append((seq_inputs, seq_targets, seq_bigram, seq_len))
-
-    # Pad so each GPU has the same number of sequences.
-    local_seq_count = len(seq_items)
-    t = torch.tensor(local_seq_count, dtype=torch.int32, device=device)
-    dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    max_seq_count = int(t.item())
-    if local_seq_count < max_seq_count:
-        empty_inputs = inputs[:0]
-        empty_targets = targets[:0]
-        empty_bigram = bigram_inputs[:0]
-        seq_items.extend([(empty_inputs, empty_targets, empty_bigram, 0)] * (max_seq_count - local_seq_count))
-
-    seq_lens = [seq_len for _, _, _, seq_len in seq_items]
-    t = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-    dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    max_seq_lens = t.tolist()   # Max seq length across GPUs for each seq in batch.
-    for (seq_inputs, seq_targets, seq_bigram, seq_len), max_len in zip(seq_items, max_seq_lens):
-
-        # Reset model state for each sequence (all ranks).
+        # Reset model and optimizer for each sequence.
         model_raw.load_state_dict(initial_model_state)
+        model_raw.zero_grad(set_to_none=True)
         training_manager.optimizer.reset(adam=True, normuon=True, retie_embed=False)
 
-        max_chunks = (max_len + chunk_size - 1) // chunk_size
-        for chunk_idx in range(max_chunks):
-            chunk_start = chunk_idx * chunk_size
+        num_chunks = (seq_len + args.ttt_chunk_size - 1) // args.ttt_chunk_size
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * args.ttt_chunk_size
+            chunk_end = min(chunk_start + args.ttt_chunk_size, seq_len)
+            chunk_len = chunk_end - chunk_start
 
-            # Eval on local chunk conditioned on entire sequence.
-            # Ignore if local slice has < chunk_idx+1 chunks.
-            if chunk_start < seq_len:
-                chunk_end = min(chunk_start + chunk_size, seq_len)
-                chunk_len = chunk_end - chunk_start
+            # Eval on chunk (accumulate loss on GPU)
+            eval_inputs_padded = pad_to_multiple(seq_inputs[:chunk_end], 16)
+            eval_targets_padded = pad_to_multiple(seq_targets[:chunk_end], 16)
+            eval_bigram_padded = pad_to_multiple(seq_bigram[:chunk_end], 16)
+            eval_seqlens = build_single_seq_seqlens(eval_inputs_padded.numel(), max_num_docs)
+            mask = torch.zeros(eval_inputs_padded.numel(), dtype=torch.bool, device=device)
+            mask[chunk_start:chunk_end] = True
+            model.eval()
+            with torch.no_grad():
+                chunk_loss = model(
+                    eval_inputs_padded, eval_targets_padded,
+                    eval_seqlens, eval_bigram_padded, fwd_args,
+                    ttt_loss_mask=mask,
+                )
+            batch_loss_sum += chunk_loss.detach() * chunk_len
+            batch_tokens += chunk_len
 
-                eval_inputs_padded = pad_to_multiple(seq_inputs[:chunk_end], 16)
-                eval_targets_padded = pad_to_multiple(seq_targets[:chunk_end], 16)
-                eval_bigram_padded = pad_to_multiple(seq_bigram[:chunk_end], 16)
-                eval_seqlens = build_single_seq_seqlens(eval_inputs_padded.numel(), max_num_docs)
-                mask = torch.zeros(eval_inputs_padded.numel(), dtype=torch.bool, device=device)
-                mask[chunk_start:chunk_end] = True
-                model.eval()
-                with torch.no_grad():
-                    chunk_loss = model(
-                        eval_inputs_padded, eval_targets_padded,
-                        eval_seqlens, eval_bigram_padded, fwd_args,
-                        ttt_loss_mask=mask,
-                    )
-                batch_ttt_loss_sum += chunk_loss.item() * chunk_len
-                batch_ttt_tokens += chunk_len
-
-            # Train on chunk (after calculating loss, conditional on TTT bs tokens).
-            # Ignore last chunk, as we don't share weight updates between sequences
-            # so this saves some time.
-            if chunk_idx == max_chunks - 1:
+            # Train on chunk (skip last chunk - no prediction after it)
+            if chunk_idx == num_chunks - 1:
                 continue
-            if chunk_start < seq_len:
-                chunk_end = min(chunk_start + chunk_size, seq_len)
-                chunk_len = chunk_end - chunk_start
-            else:   # Dummy chunk.
-                chunk_end = chunk_start
-                chunk_len = 0
 
+            # Note: if L << ttt_bs, this is quite wasteful.
             train_start = max(0, chunk_end - args.ttt_bs)
-            chunk_inputs = pad_to_len(seq_inputs[train_start:chunk_end], ttt_window_len)
-            chunk_targets = pad_to_len(seq_targets[train_start:chunk_end], ttt_window_len)
-            chunk_bigram = pad_to_len(seq_bigram[train_start:chunk_end], ttt_window_len)
+            L = chunk_end - train_start
+            prefix_len = chunk_start - train_start
+            buf_inputs.zero_()
+            buf_targets.zero_()
+            buf_bigram.zero_()
+            train_mask.zero_()
+            buf_inputs[:L].copy_(seq_inputs[train_start:chunk_end])
+            buf_targets[:L].copy_(seq_targets[train_start:chunk_end])
+            buf_bigram[:L].copy_(seq_bigram[train_start:chunk_end])
+            train_mask[prefix_len:prefix_len + chunk_len] = True
 
-            # All ranks must participate in optimizer step (collective ops), even if no local data.
-            skip_train = (chunk_end >= seq_len or chunk_len <= 0)
-
-            mask = torch.zeros(ttt_window_len, dtype=torch.bool, device=device)
-            if not skip_train:
-                prefix_len = chunk_start - train_start
-                mask[prefix_len:prefix_len + chunk_len] = True
             model.train()
             for _ in range(args.ttt_grad_steps):
                 train_loss = model(
-                    chunk_inputs, chunk_targets,
-                    ttt_window_seqlens, chunk_bigram, fwd_args,
-                    ttt_loss_mask=mask,
+                    buf_inputs, buf_targets,
+                    ttt_window_seqlens, buf_bigram, fwd_args,
+                    ttt_loss_mask=train_mask,
                 )
                 train_loss.backward()
                 training_manager.step_optimizers(
-                    ttt_step, adam=True, normuon=not args.ttt_adam_only
+                    args.num_scheduled_iterations + 1, adam=True, normuon=not args.ttt_adam_only
                 )
-                ttt_step += 1
 
-    batch_avg = batch_ttt_loss_sum / batch_ttt_tokens
-    return torch.tensor(batch_avg, device=device), ttt_step
+    # Single sync at the end: reduce loss across all GPUs
+    dist.all_reduce(batch_loss_sum, op=dist.ReduceOp.SUM)
+    dist.all_reduce(batch_tokens, op=dist.ReduceOp.SUM)
+    return batch_loss_sum / batch_tokens
 
 # -----------------------------------------------------------------------------
 # int main
@@ -1920,6 +1915,8 @@ class Hyperparameters:
 
 args = Hyperparameters()
 
+if not args.ttt_adam_only:
+    raise ValueError("Local mode on GPUs (needed for TTT) only implemented for Adam.")
 assert args.ttt_chunk_size % 16 == 0, "ttt_chunk_size must be multiple of 16"
 assert args.ttt_bs % 16 == 0, "ttt_bs must be multiple of 16"
 
@@ -2042,8 +2039,8 @@ for step in range(train_steps + 1):
     training_manager.advance_schedule(step)
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        val_start_t0 = time.perf_counter()
         if last_step:
-            val_start_t0 = time.time()
             training_manager.apply_final_ws_ext()
         # stop the clock
         torch.cuda.synchronize()
@@ -2058,30 +2055,32 @@ for step in range(train_steps + 1):
             print0("Starting TTT (can take a few minutes)", console=True)
             model = torch.compile(model_raw, dynamic=True, fullgraph=True)
             training_manager.model = model
-            model.eval()
 
-            for p_cfg in training_manager.optimizer.param_cfgs.values():
+            for p, p_cfg in training_manager.optimizer.param_cfgs.items():
                 p_cfg.initial_lr *= args.ttt_lr_mult
                 p_cfg.weight_decay *= args.ttt_wd_mult
+                if args.ttt_adam_only and p_cfg.optim == "normuon":
+                    p.requires_grad_(False)
             max_num_docs = next_multiple_of_n(
                 args.val_batch_size // (grad_accum_steps * world_size) // 300, n=128
             )
             ttt_window_seqlens = build_single_seq_seqlens(args.ttt_bs, max_num_docs)
             initial_model_state = copy.deepcopy(model_raw.state_dict())
-            ttt_step = args.num_scheduled_iterations + args.num_scheduled_iterations + args.num_scheduled_iterations + args.num_scheduled_iterations + args.num_scheduled_iterations
+            training_manager.optimizer.enable_local_mode()  # Keep GPU opt states separate.
 
             for i in range(val_steps):
-                print0(f"val_step {i+1}/{val_steps}", console=True)
-                inputs, targets, cum_seqlens, bigram_inputs = val_loader.send(training_manager.train_loader_send_args)
-                batch_loss, ttt_step = ttt_val_batch(
+                inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
+                batch_loss = ttt_val_batch(
                     inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(),
-                    ttt_step, initial_model_state,
-                    chunk_size=args.ttt_chunk_size,
-                    ttt_window_len=args.ttt_bs,
-                    ttt_window_seqlens=ttt_window_seqlens,
+                    initial_model_state,  ttt_window_seqlens=ttt_window_seqlens,
                     max_num_docs=max_num_docs,
                 )
                 val_loss += batch_loss
+                val_time_ms = 1000 * (time.perf_counter() - val_start_t0)
+                print0(
+                    f"val_step:{i+1}/{val_steps} val_loss:{val_loss/(i+1):.4f} "
+                    f"val_time:{val_time_ms:.0f}ms step_avg:{val_time_ms / (i + 1):.2f}ms",
+                    console=True)
         else:
             with torch.no_grad():
                 for _ in range(val_steps):
@@ -2091,14 +2090,16 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        val_time_ms = 1000 * (time.perf_counter() - val_start_t0)
+        print0(
+            f"step:{step}/{train_steps} val_loss:{val_loss:.4f} val_time: {val_time_ms:.0f}ms "
+            f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
     if last_step:
-        print0(f"Validation took {time.time() - val_start_t0:.2f}s", console=True)
         if master_process and args.save_checkpoint:
             log = dict(step=step, code=code, model=model_raw.state_dict(), optimizer=training_manager.get_state())
             os.makedirs(f"logs/{run_id}", exist_ok=True)

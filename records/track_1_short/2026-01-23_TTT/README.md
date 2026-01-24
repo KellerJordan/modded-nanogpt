@@ -19,7 +19,8 @@ to sequence-to-sequence learning in many forms:
 [another good seq2seq TTT paper](https://arxiv.org/abs/2512.23675), + many others).
 
 In this implementation, I implement the most straightforward (naive) method: don't change training,
-and before predicting `P(token|context)`, train to improve `P(context)`. Importantly, this is a valid probability model: it just includes gradient updates in its processing of the context.
+and before predicting `P(token|context)`, train to improve `P(context)`. Importantly, this is a valid probability model: it just includes gradient updates in its processing of the context for a single
+sequence, and throws away the updated parameters after processing that sequence.
 
 This does not change training, but increases the validation performance of a given checkpoint, allowing us to train for less time to reach our target loss. See the below plot, which
 shows that for each checkpoint, TTT lowers the loss across training steps (loading from
@@ -50,8 +51,9 @@ forward pass through the model. With TTT, a given sequence is `n_chunks` forward
 sequence has < 700 tokens, and I report results with `ttt_chunk_size=512` and
 `ttt_grad_steps=1`, so there are < 2 forward and backward passes per sequence.
 
-Note that the models and optimizers are reset after each sequence, so there is no
-dependence between validation sequences.
+Note that the models and optimizers are reset after each sequence, and each GPU holds
+its own copy of model parameters and optimizer states during TTT,
+so there is no dependence between validation sequences. 
 
 Pseudocode:
 
@@ -102,9 +104,10 @@ Other notes on implementation:
     are *not* parallelized.
 
 ### Limitations
-- Latency: evaluation takes ~5 minutes.
+- Latency: evaluation takes ~2 minutes.
     - Ironically, for a speed run, this evaluation is very slow: longer than the training!
     - However:
+        - This includes compile time and doesn't allow kernel warmups, unlike in training.
         - I'm pretty sure this is a valid speed run: [discussion clarifying increasing validation time is OK](https://github.com/KellerJordan/modded-nanogpt/discussions/23?sort=new#discussioncomment-12109560).
         - My implementation can be sped up *significantly* -- I just wanted to get in the
             PR because it doesn't affect training time.
@@ -130,7 +133,9 @@ Other notes on implementation:
 
 ### Ideas
 - Optimization low-hanging fruits
-    - e.g. pre-allocate correct-length tensors instead of making them then padding.
+    - e.g. Ensure processing same shape tensors to avoid re-compiles and have faster
+        / warmed up kernel paths, re-tune any part of training now that this inference-time
+        strategy lowers loss, probably could even just chop off 5 more training steps.
     - There is a lot of this that would easily speed it up, which I wanted to do pre-PR,
         but this was for fun and I have to get back to my job so submitting PR now :)
 - Sharing weights across sequences.
@@ -175,16 +180,16 @@ Other notes on implementation:
 ```python
 >>> import torch
 >>> import scipy.stats
->>> losses = [3.2766, 3.2791, 3.2773, 3.2773, 3.2777]
->>> times = [95.739, 95.693, 95.760, 95.583, 95.683]
+>>> losses = [3.2766, 3.2778, 3.2769]
+>>> times = [95.515, 95.520, 95.498]
 >>> print("p=%.4f" % scipy.stats.ttest_1samp(losses, 3.28, alternative="less").pvalue)
-p=0.0022
+p=0.0076
 >>> print("p=%.4f" % scipy.stats.ttest_1samp(times, 95.9, alternative="less").pvalue)
-p=0.0012
+p=0.0001
 >>> print("losses:", torch.std_mean(torch.tensor(losses)))
-losses: (tensor(0.0009), tensor(3.2776))
+losses: (tensor(0.0006), tensor(3.2771))
 >>> print("time:", torch.std_mean(torch.tensor(times)))
-time: (tensor(0.0685), tensor(95.6916))
+time: (tensor(0.0115), tensor(95.5110))
 ```
 
 Meta-note on timing: even though this record (to my knowledge) fits under the current
