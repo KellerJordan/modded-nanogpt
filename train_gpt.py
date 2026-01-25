@@ -925,6 +925,12 @@ class AttnArgs:
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
+# Residual dim split by @photo_mz
+smear_dims = (0, 12)
+skip_dims = (6, 18)
+attn_dims = (18, 30)
+ve_dims = (18, 30)
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int):
         super().__init__()
@@ -954,7 +960,7 @@ class CausalSelfAttention(nn.Module):
             # shift keys forward for the stationary head dims. Enables 1-layer induction.
             k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:]
         if ve is not None:
-            ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T, self.num_heads, 1)
+            ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., ve_dims[0]:ve_dims[1]], ve_gate_w)).view(B, T, self.num_heads, 1)
             v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
 
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
@@ -964,7 +970,7 @@ class CausalSelfAttention(nn.Module):
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
-        y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
+        y = y * torch.sigmoid(F.linear(x[..., attn_dims[0]:attn_dims[1]], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
@@ -1008,7 +1014,7 @@ class PairedHeadCausalSelfAttention(nn.Module):
         k = k.view(B, T*2, self.num_heads//2, self.head_dim)
 
         if ve is not None:
-            ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T*2, self.num_heads//2, 1)
+            ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., ve_dims[0]:ve_dims[1]], ve_gate_w)).view(B, T*2, self.num_heads//2, 1)
             v = v + ve_gate_out * ve.view_as(v)
 
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
@@ -1021,7 +1027,7 @@ class PairedHeadCausalSelfAttention(nn.Module):
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
-        y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
+        y = y * torch.sigmoid(F.linear(x[..., attn_dims[0]:attn_dims[1]], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))
         return y
@@ -1095,7 +1101,7 @@ class GPT(nn.Module):
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
         self.attn_gate_bank.label = 'attn_gate_bank'
-        self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 layers
+        self.ve_gate_bank = nn.Parameter(torch.zeros(6, num_heads, 12)) # 6 layers
         self.ve_gate_bank.label = 've_gate_bank'
 
         # -----------------------------------
@@ -1232,12 +1238,12 @@ class GPT(nn.Module):
         # Value embeddings - always computed (not precomputed)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        # dropping first layer updates this to .12 ... 012
-        ve = [ve[1], ve[2]] + [None] * (self.num_layers - 5) + [ve[0], ve[1], ve[2]]
+        # dropping first layer and shifting updates this to 012 ... 012, @photomz
+        ve = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == self.num_layers
 
         # smear token embed forward 1 position @classiclarryd
-        smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
+        smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, smear_dims[0]:smear_dims[1]]))
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
@@ -1245,7 +1251,7 @@ class GPT(nn.Module):
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)] 
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
         attn_gates = ag[:6] + [None] + ag[6:]
-        ve_gates = [veg[0], veg[1]] + [None] * (self.num_layers - 5) + [veg[2], veg[3], veg[4]]
+        ve_gates = [veg[0], veg[1], veg[2]] + [None] * (self.num_layers - 6) + [veg[3], veg[4], veg[5]]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
 
@@ -1267,7 +1273,7 @@ class GPT(nn.Module):
                 ve_gate_w=ve_gates[i]
             )
             if i in skip_out:
-                skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
+                skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., skip_dims[0]:skip_dims[1]]))
                 x = x + skip_gate_out * skip_connections.pop()
             if i == 0:
                 x = (resid_lambdas[0] + x0_lambdas[0]) * x + bigram_lambdas[0] * x0_bigram
@@ -1809,8 +1815,8 @@ model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
-training_manager = TrainingManager(model)
+    model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+    training_manager = TrainingManager(model)
 
 ########################################
 #            Warmup kernels            #
@@ -1869,10 +1875,6 @@ for step in range(train_steps + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        assert args.val_tokens % args.val_batch_size == 0
-        val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-        val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
@@ -1882,9 +1884,20 @@ for step in range(train_steps + 1):
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
+        for idx in range(grad_accum_steps):
+            # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
+            if idx == grad_accum_steps - 1:
+                training_manager.activate_hooks(step)
+            send_args = training_manager.train_loader_send_args
+            inputs, targets, cum_seqlens = train_loader.send(send_args)
+            (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        training_manager.step_optimizers(step)
+    print0("Resetting Model", console=True)
+    model.zero_grad(set_to_none=True)
+    model.load_state_dict(initial_state["model"])
+    training_manager.reset(initial_state["optimizers"])
+    del val_loader, train_loader, initial_state
+    model.train()
 
     if last_step:
         if master_process and args.save_checkpoint:
@@ -1900,10 +1913,62 @@ for step in range(train_steps + 1):
         (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 
-    # logging
-    approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    training_time_ms = 0
+    # start the clock
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    # begin training
+    train_steps = args.num_iterations
+    for step in range(train_steps + 1):
+        last_step = (step == train_steps)
+        training_manager.advance_schedule(step)
+        # --------------- VALIDATION SECTION -----------------
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            if last_step:
+                training_manager.apply_final_ws_ext()
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            model.eval()
+            assert args.val_tokens % args.val_batch_size == 0
+            val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+            val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+            val_loss = 0
+            with torch.no_grad():
+                for _ in range(val_steps):
+                    inputs, targets, cum_seqlens = next(val_loader)
+                    val_loss += model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+            val_loss /= val_steps
+            del val_loader
+            dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            model.train()
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
 
-print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-       f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
-dist.destroy_process_group()
+        if last_step:
+            if master_process and args.save_checkpoint:
+                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+                os.makedirs(f"logs/{run_id}", exist_ok=True)
+                torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            # the last step only has the validation loop, so break to avoid training
+            break
+
+        # --------------- TRAINING SECTION -----------------
+        for idx in range(grad_accum_steps):
+            # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
+            if idx == grad_accum_steps - 1:
+                training_manager.activate_hooks(step)
+            send_args = training_manager.train_loader_send_args
+            inputs, targets, cum_seqlens = train_loader.send(send_args)
+            (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        training_manager.step_optimizers(step)
+
+        # logging
+        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+
+    print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+    dist.destroy_process_group()
