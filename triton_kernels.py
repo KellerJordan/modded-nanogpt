@@ -400,7 +400,8 @@ def fused_softcapped_entropy_fwd_kernel(
     stride_logits_n, stride_logits_v,
     n_rows, n_cols, n_predict,
     A, B, C,
-    BLOCK_SIZE: tl.constexpr
+    BLOCK_SIZE: tl.constexpr,
+    USE_SOFTCAPPING: tl.constexpr
 ):
     row_idx = tl.program_id(0).to(tl.int64)
     logits_row_ptr = logits_ptr + row_idx * stride_logits_n
@@ -412,7 +413,10 @@ def fused_softcapped_entropy_fwd_kernel(
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
         val = tl.load(logits_row_ptr + cols, mask=mask, other=-float('inf')).to(tl.float32)
-        z = A * tl.sigmoid((val + B) / C)
+        if USE_SOFTCAPPING:
+            z = A * tl.sigmoid((val + B) / C)
+        else:
+            z = val
         z = tl.where(mask, z, -float('inf'))
         curr_max = tl.max(z, axis=0)
         new_max = tl.maximum(max_val, curr_max)
@@ -431,7 +435,10 @@ def fused_softcapped_entropy_fwd_kernel(
                 target = tl.load(targets_ptr + target_idx).to(tl.int32)
                 if target >= 0 and target < n_cols:
                     val_target = tl.load(logits_row_ptr + target).to(tl.float32)
-                    z_target = A * tl.sigmoid((val_target + B) / C)
+                    if USE_SOFTCAPPING:
+                        z_target = A * tl.sigmoid((val_target + B) / C)
+                    else:
+                        z_target = val_target
                     total_loss += weight * (lse - z_target)
     
     tl.store(losses_ptr + row_idx, total_loss)
@@ -442,7 +449,9 @@ def fused_softcapped_entropy_bwd_kernel(
     stride_logits_n, stride_logits_v, stride_grad_n, stride_grad_v,
     n_rows, n_cols, n_predict,
     A, B, C,
-    BLOCK_SIZE: tl.constexpr
+    grad_s,
+    BLOCK_SIZE: tl.constexpr,
+    USE_SOFTCAPPING: tl.constexpr
 ):
     row_idx = tl.program_id(0).to(tl.int64)
 
@@ -456,14 +465,17 @@ def fused_softcapped_entropy_bwd_kernel(
     for k in range(n_predict):
         if row_idx + k < n_rows:
             S_w += tl.load(mtp_weights_ptr + k)
-            
+
     for off in range(0, n_cols, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
         val = tl.load(logits_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        u = (val + B) / C
-        sigmoid_u = tl.sigmoid(u)
-        z = A * sigmoid_u
+        if USE_SOFTCAPPING:
+            u = (val + B) / C
+            sigmoid_u = tl.sigmoid(u)
+            z = A * sigmoid_u
+        else:
+            z = val
         p = tl.exp(z - lse)
         
         term1 = S_w * p
@@ -475,13 +487,33 @@ def fused_softcapped_entropy_bwd_kernel(
                 term2 += tl.where(cols == target, weight, 0.0)
         
         grad_z = grad_loss * (term1 - term2)
-        dz_dx = (1.0 / C) * z * (1.0 - sigmoid_u)
+        if USE_SOFTCAPPING:
+            dz_dx = (1.0 / C) * z * (1.0 - sigmoid_u)
+        else:
+            dz_dx = 1
         grad_x = grad_z * dz_dx
-        tl.store(grad_row_ptr + cols, grad_x.to(tl.bfloat16), mask=mask)
+        grad_x = grad_x / grad_s
+        grad_x = grad_x.to(tl.float8e5)
+        tl.store(grad_row_ptr + cols, grad_x, mask=mask)
 
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, targets, mtp_weights, A=23.0, B=5.0, C=7.5):
+    def forward(ctx, x, targets, mtp_weights, USE_SOFTCAPPING, lm_head_weight, x_s, w_s, grad_s, A=23.0, B=5.0, C=7.5):
+
+        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+        w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
+
+        w_f8_col_major = w_f8.T.contiguous().T
+
+        logits = torch._scaled_mm(
+            x_f8,
+            w_f8_col_major,
+            out_dtype=torch.bfloat16,
+            scale_a=x.new_tensor(x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(w_s, dtype=torch.float32),
+            use_fast_accum=True,
+        )
+
         n_rows, n_cols = logits.shape
         if mtp_weights is None:
              mtp_weights = torch.tensor([1.0], device=logits.device, dtype=torch.float32)
@@ -501,32 +533,56 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             n_rows, n_cols, n_predict,
             A, B, C,
             BLOCK_SIZE=1024,
-            num_warps=8,
-            num_stages=4
+            USE_SOFTCAPPING=USE_SOFTCAPPING,
+            num_warps=2
         )
-        
-        ctx.save_for_backward(logits, targets, mtp_weights, lse)
-        ctx.params = (A, B, C)
+
+        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8)
+        ctx.params = (A, B, C, USE_SOFTCAPPING, x_s, w_s, grad_s)
         return losses
 
     @staticmethod
     def backward(ctx, grad_output):
-        logits, targets, mtp_weights, lse = ctx.saved_tensors
-        A, B, C = ctx.params
+        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8 = ctx.saved_tensors
+        A, B, C, USE_SOFTCAPPING, x_s, w_s, grad_s = ctx.params
         n_rows, n_cols = logits.shape
         n_predict = mtp_weights.shape[0]
-        
-        grad_input = torch.empty((n_rows, n_cols), dtype=torch.bfloat16, device=logits.device)
+
+        grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
         grad_output = grad_output.contiguous()
-        
+
         grid = (n_rows,)
         fused_softcapped_entropy_bwd_kernel[grid](
             grad_input, grad_output, lse, logits, targets, mtp_weights,
             logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
             n_rows, n_cols, n_predict,
             A, B, C,
+            grad_s,
             BLOCK_SIZE=1024,
-            num_warps=8,
-            num_stages=4
+            USE_SOFTCAPPING=USE_SOFTCAPPING,
+            num_warps=2
         )
-        return grad_input, None, None, None, None, None
+
+        x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
+        w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)
+        grad_scale = grad_input.new_tensor(grad_s, dtype=torch.float32)
+
+        grad_x = torch._scaled_mm(
+            grad_input,
+            w_f8.T,
+            out_dtype=torch.bfloat16,
+            scale_a=grad_scale,
+            scale_b=w_scale,
+            use_fast_accum=False,
+        )
+
+        grad_w = torch._scaled_mm(
+            x_f8.T.contiguous(),
+            grad_input.T.contiguous().T,
+            out_dtype=torch.float32,
+            scale_a=x_scale,
+            scale_b=grad_scale,
+            use_fast_accum=False,
+        )
+
+        return grad_x, None, None, None, grad_w, None, None, None

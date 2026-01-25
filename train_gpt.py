@@ -1288,14 +1288,16 @@ class GPT(nn.Module):
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
         x -= backout_lambda * x_backout
         x = norm(x)
-        logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
+        USE_SOFTCAPPING = True
         if self.training:
-            losses = FusedSoftcappedCrossEntropy.apply(logits.view(-1, logits.size(-1)), target_seq, mtp_weights)
+            losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, logits.size(-1)), target_seq, mtp_weights, USE_SOFTCAPPING, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, A=23, B=5, C=7.5)
             loss = losses.sum()
         else:
-            logits = 23 * torch.sigmoid((logits + 5) / 7.5)
+            logits = self.lm_head(x)
+            if USE_SOFTCAPPING:
+                logits = 23 * torch.sigmoid((logits + 5) / 7.5)
             logits_for_loss = logits.float()
             loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
         return loss
