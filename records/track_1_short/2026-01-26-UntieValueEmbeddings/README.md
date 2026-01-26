@@ -12,6 +12,8 @@ I tried these ablations:
 - Apply VE to all layers
 Surprisingly, the [old finding](https://github.com/KellerJordan/modded-nanogpt/pull/194) (1) that adding VE to the first layer no longer held up. I hypothesize that improvements in between (Partial Key Offset, Bigram Hash) removed the need for this somehow, but I'm not quite sure why.
 
+Unrelated to this VE idea, I tried to optimize the bwd with `torch.Embedding(..., sparse=True)`, but I'm running into 2 issues: 1) the metadata overhead of keeping count of the accessed indices complicates the Adam step, especially when distributed, and 2) Full CUDA graphs aren't preserved under sparse embeddings in [2.10](https://github.com/pytorch/pytorch/issues/150656).
+
 ## Timing
 
 The timings (-25 steps) hold up to the latest PR, and are significant (p<0.001).
