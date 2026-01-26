@@ -5,8 +5,6 @@ Updates in PR, building off latest [PR#201](https://github.com/KellerJordan/modd
 
 The latest idea is inspired by the principle of Bigram/Engram Hash embeddings to allow more uncontextualised information into the architecture. I believe there's further room in adding sparsity to be explored, i.e. Meta's STEM and optimizing the bwd to not communicate unaccessed indices in sparse embeddings.
 
-Surprisingly, the [old finding](https://github.com/KellerJordan/modded-nanogpt/pull/194) that adding VE to the first layer no longer held up after further improvements to the arch (Partial Key Offset, Bigram Hash).
-
 I tried these ablations:
 - Same weights but more tied layers: `ve[012...012]` (1) 
 - Fewer VE tied layers: `ve[01…01]`
