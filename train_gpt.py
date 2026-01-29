@@ -205,41 +205,36 @@ def a2a_prefwd_start(idxes, N, world):
     rows_per_rank = N // world
     # V2: sort indexes, find insertion points for transition points
     # end_indexes = torch.arange(rows_per_rank, rows_per_rank*(world + 1), rows_per_rank, dtype=torch.int32, device=idxes.device)
-    end_indexes = torch.arange(0, rows_per_rank*(world + 1), rows_per_rank, dtype=torch.int32, device=idxes.device)
-    idxes = idxes.to(torch.int32).unique(sorted=True)
-    insertion_points = torch.searchsorted(idxes, end_indexes, out_int32=True)
 
-    # delta between insertion points is number of items per rank
-    send_counts_t = insertion_points[1:] - insertion_points[:-1]
-
-    # counts (tiny) then indices (big, async)
-    sparse_state = {}
-    recv_counts_t = torch.empty_like(send_counts_t)
     with torch.cuda.stream(comm_stream):
-        counts_work = dist.all_to_all_single(
-            recv_counts_t, send_counts_t, async_op=True
-        )
-    counts_fut = counts_work.get_future()
+        end_indexes = torch.arange(0, rows_per_rank*(world + 1), rows_per_rank, dtype=torch.int32, device=idxes.device)
+        idxes = idxes.to(torch.int32).unique(sorted=True)
+        insertion_points = torch.searchsorted(idxes, end_indexes, out_int32=True)
 
-    def _after_counts(_):
+        # delta between insertion points is number of items per rank
+        send_counts_t = insertion_points[1:] - insertion_points[:-1]
+
+        # counts (tiny) then indices (big, async)
+        sparse_state = {}
+        recv_counts_t = torch.empty_like(send_counts_t)
+        dist.all_to_all_single(
+                recv_counts_t, send_counts_t
+        )
+
         send_counts = send_counts_t.tolist()
         recv_counts = recv_counts_t.tolist()
         recv_idxes = torch.empty(sum(recv_counts), device=idxes.device, dtype=torch.int32)
         sparse_state["send_counts"] = send_counts
         sparse_state["recv_counts"] = recv_counts
         sparse_state["recv_idxes"] = recv_idxes
-        with torch.cuda.stream(comm_stream):
-            idxes_work = dist.all_to_all_single(
-                recv_idxes,
-                idxes,
-                input_split_sizes=send_counts,
-                output_split_sizes=recv_counts,
-                async_op=True,
-            )
-        idxes_work.wait()
-        return None
-
-    idxes_fut = counts_fut.then(_after_counts)
+        idxes_fut = dist.all_to_all_single(
+            recv_idxes,
+            idxes,
+            input_split_sizes=send_counts,
+            output_split_sizes=recv_counts,
+            async_op=True,
+        )
+    idxes.record_stream(comm_stream)
 
     return idxes, sparse_state, idxes_fut
 
