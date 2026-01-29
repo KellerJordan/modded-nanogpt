@@ -199,13 +199,13 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 
 comm_stream = torch.cuda.streams.Stream()
 
-@torch.compile
+@torch._dynamo.disable
 @torch.no_grad
 def a2a_prefwd_start(idxes, N, world):
     rows_per_rank = N // world
     # V2: sort indexes, find insertion points for transition points
     # end_indexes = torch.arange(rows_per_rank, rows_per_rank*(world + 1), rows_per_rank, dtype=torch.int32, device=idxes.device)
-
+    comm_stream.wait_stream(torch.cuda.default_stream())
     with torch.cuda.stream(comm_stream):
         end_indexes = torch.arange(0, rows_per_rank*(world + 1), rows_per_rank, dtype=torch.int32, device=idxes.device)
         idxes = idxes.to(torch.int32).unique(sorted=True)
@@ -214,27 +214,37 @@ def a2a_prefwd_start(idxes, N, world):
         # delta between insertion points is number of items per rank
         send_counts_t = insertion_points[1:] - insertion_points[:-1]
 
-        # counts (tiny) then indices (big, async)
-        sparse_state = {}
         recv_counts_t = torch.empty_like(send_counts_t)
-        dist.all_to_all_single(
-                recv_counts_t, send_counts_t
-        )
+        dist.all_to_all_single(recv_counts_t, send_counts_t)
+        counts_done = torch.cuda.Event()
+        counts_done.record()
+    idxes.record_stream(comm_stream)
 
+    sparse_state = {}
+    idxes_fut = torch.futures.Future()
+    device = idxes.device
+
+    def _worker():
+        torch.cuda.set_device(device)
+        counts_done.synchronize()
         send_counts = send_counts_t.tolist()
         recv_counts = recv_counts_t.tolist()
-        recv_idxes = torch.empty(sum(recv_counts), device=idxes.device, dtype=torch.int32)
+        recv_idxes = torch.empty(sum(recv_counts), device=device, dtype=torch.int32)
         sparse_state["send_counts"] = send_counts
         sparse_state["recv_counts"] = recv_counts
         sparse_state["recv_idxes"] = recv_idxes
-        idxes_fut = dist.all_to_all_single(
-            recv_idxes,
-            idxes,
-            input_split_sizes=send_counts,
-            output_split_sizes=recv_counts,
-            async_op=True,
-        )
-    idxes.record_stream(comm_stream)
+        with torch.cuda.stream(comm_stream):
+            idxes_work = dist.all_to_all_single(
+                recv_idxes,
+                idxes,
+                input_split_sizes=send_counts,
+                output_split_sizes=recv_counts,
+                async_op=True,
+            )
+        idxes_work.wait()
+        idxes_fut.set_result(True)
+
+    threading.Thread(target=_worker, daemon=True).start()
 
     return idxes, sparse_state, idxes_fut
 
