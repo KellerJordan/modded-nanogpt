@@ -1231,8 +1231,7 @@ class GPT(nn.Module):
         
         # Value embeddings - always computed (not precomputed)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
-        # 01 ... 01 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        # shifting first layer updates this to 01 ... 01 @photomz
+        # 01 ... 234 structure on token value embeddings by @photomz
         ve = [ve[0], ve[1]] + [None] * (self.num_layers - 5) + [ve[2], ve[3], ve[4]]
         assert len(ve) == self.num_layers
 
