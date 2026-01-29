@@ -218,12 +218,12 @@ def _a2a_prefwd_impl(idxes, N, world):
 
         recv_counts_t = torch.empty_like(send_counts_t)
         dist.all_to_all_single(recv_counts_t, send_counts_t)
+        send_idxes.record_stream(comm_stream)
+        recv_counts_t.record_stream(comm_stream)
 
-    send_idxes.record_stream(comm_stream)
-    send_counts = send_counts_t.tolist()
-    recv_counts = recv_counts_t.tolist()
-    recv_idxes = torch.empty(sum(recv_counts), device=device, dtype=torch.int32)
-    with torch.cuda.stream(comm_stream):
+        send_counts = send_counts_t.tolist()
+        recv_counts = recv_counts_t.tolist()
+        recv_idxes = torch.empty(sum(recv_counts), device=device, dtype=torch.int32)
         idxes_fut = dist.all_to_all_single(
             recv_idxes,
             send_idxes,
@@ -231,7 +231,6 @@ def _a2a_prefwd_impl(idxes, N, world):
             output_split_sizes=recv_counts,
             async_op=True,
         )
-    recv_idxes.record_stream(comm_stream)
 
     sparse_state = {
         "send_counts": send_counts,
