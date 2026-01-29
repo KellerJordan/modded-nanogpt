@@ -1086,16 +1086,16 @@ class GPT(nn.Module):
 
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
-        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
+        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(5)])
         for embed in self.value_embeds:
             nn.init.zeros_(embed.weight)
         for i, ve in enumerate(self.value_embeds):
-            ve.weight.label = f've{i}'  # ve0, ve1, ve2
+            ve.weight.label = f've{i}'  # ve0, ve1, ve2, ve3, ve4
         
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
         self.attn_gate_bank.label = 'attn_gate_bank'
-        self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 layers
+        self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 unique gates
         self.ve_gate_bank.label = 've_gate_bank'
 
         # -----------------------------------
@@ -1231,9 +1231,9 @@ class GPT(nn.Module):
         
         # Value embeddings - always computed (not precomputed)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
-        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        # dropping first layer updates this to .12 ... 012
-        ve = [ve[1], ve[2]] + [None] * (self.num_layers - 5) + [ve[0], ve[1], ve[2]]
+        # 01 ... 01 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
+        # shifting first layer updates this to 01 ... 01 @photomz
+        ve = [ve[0], ve[1]] + [None] * (self.num_layers - 5) + [ve[2], ve[3], ve[4]]
         assert len(ve) == self.num_layers
 
         # smear token embed forward 1 position @classiclarryd
@@ -1579,6 +1579,8 @@ class TrainingManager():
             "ve0":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "ve1":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "ve2":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "ve3":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "ve4":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
@@ -1593,7 +1595,7 @@ class TrainingManager():
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
-            "ve0", "ve1", "ve2", "bigram_embed",  # Medium
+            "ve0", "ve1", "ve2", "ve3", "ve4", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
         ]
@@ -1728,7 +1730,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 1560  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1535  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.55  # fraction of num_scheduled_iterations spent cooling down the learning rate
