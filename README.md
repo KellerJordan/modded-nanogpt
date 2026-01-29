@@ -222,6 +222,8 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 This record is technically outside the rules of the speedrun, since we specified that the train/val tokens must be kept fixed.
 However, it's very interesting, and worth including. The run is not more data-efficient; rather, the speedup comes from the improved tokenizer allowing
 the vocabulary size to be reduced (nearly halved!) while preserving the same bytes-per-token, which saves lots of parameters and FLOPs in the head and embeddings.
+* [@samacqua's 1/23/2026 test time training run](https://github.com/KellerJordan/modded-nanogpt/pull/205). Sam found that prediction accuracy on the later portions of a given document could be improved by performing a training
+update on Adam parameters based on the early portion of the document. This 'parameter nudging' is repeated independently for each document. While technically a valid probability model, we are not allowing untimed backward passes.
 
 **Notable forks:**
 * [https://github.com/BlinkDL/modded-nanogpt-rwkv](https://github.com/BlinkDL/modded-nanogpt-rwkv)
