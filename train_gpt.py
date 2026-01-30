@@ -219,6 +219,8 @@ def _a2a_prefwd_impl(idxes, N, world):
 
         recv_counts_t = torch.empty_like(send_counts_t)
         dist.all_to_all_single(recv_counts_t, send_counts_t)
+        print(f'{recv_counts_t = }')
+        print(f'{send_counts_t = }')
 
         send_counts = send_counts_t.tolist()
         recv_counts = recv_counts_t.tolist()
