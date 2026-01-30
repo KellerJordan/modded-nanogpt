@@ -207,7 +207,8 @@ def _a2a_prefwd_impl(idxes, N, world):
     rows_per_rank = N // world
     # V2: sort indexes, find insertion points for transition points
     # end_indexes = torch.arange(rows_per_rank, rows_per_rank*(world + 1), rows_per_rank, dtype=torch.int32, device=idxes.device)
-    comm_stream.wait_stream(torch.cuda.default_stream())
+    curr_stream = torch.cuda.current_stream()
+    comm_stream.wait_stream(curr_stream)
     with torch.cuda.stream(comm_stream):
         end_indexes = torch.arange(0, rows_per_rank*(world + 1), rows_per_rank, dtype=torch.int32, device=idxes.device)
         send_idxes = idxes.to(torch.int32).unique(sorted=True)
@@ -218,19 +219,19 @@ def _a2a_prefwd_impl(idxes, N, world):
 
         recv_counts_t = torch.empty_like(send_counts_t)
         dist.all_to_all_single(recv_counts_t, send_counts_t)
-        send_idxes.record_stream(comm_stream)
-        recv_counts_t.record_stream(comm_stream)
 
         send_counts = send_counts_t.tolist()
         recv_counts = recv_counts_t.tolist()
         recv_idxes = torch.empty(sum(recv_counts), device=device, dtype=torch.int32)
-        idxes_fut = dist.all_to_all_single(
+        dist.all_to_all_single(
             recv_idxes,
             send_idxes,
             input_split_sizes=send_counts,
             output_split_sizes=recv_counts,
-            async_op=True,
         )
+        # mark these as used by the main stream so we don't delete them
+        send_idxes.record_stream(curr_stream)
+        recv_idxes.record_stream(curr_stream)
 
     sparse_state = {
         "send_counts": send_counts,
@@ -238,7 +239,7 @@ def _a2a_prefwd_impl(idxes, N, world):
         "recv_idxes": recv_idxes,
         "send_idxes": send_idxes,
     }
-    return send_idxes, sparse_state, idxes_fut
+    return send_idxes, sparse_state
 
 @torch._dynamo.disable
 @torch.no_grad
@@ -263,7 +264,8 @@ def a2a_postbwd_grad_comm_start(grad, idxes, send_counts, recv_counts):
     device = grad.device
     d = grad.shape[1]
 
-    # with torch.cuda.stream(comm_stream):
+    torch.cuda.current_stream().wait_stream(comm_stream) # make sure we have up-to-date tensors
+
     send_vals = grad[idxes].reshape(-1)
 
     send_splits = [c * d for c in send_counts]
@@ -559,14 +561,14 @@ class NorMuonAndAdam:
                 self._reduce_futures[param] = (future, grad_chunk)
         elif p_cfg.comms == "sharded_sparse":
             prefwd_fut = self._sparse_async_data[param]
-            send_idxes, sparse_state, idxes_fut = prefwd_fut.wait()
+            send_idxes, sparse_state = prefwd_fut.wait()
             send_counts = sparse_state["send_counts"]
             recv_counts = sparse_state["recv_counts"]
             recv_idxes = sparse_state["recv_idxes"]
             recv_vals, val_fut = a2a_postbwd_grad_comm_start(
                 grad, send_idxes, send_counts, recv_counts
             )
-            self._reduce_futures[param] = (idxes_fut, recv_idxes, val_fut, recv_vals, send_idxes)
+            self._reduce_futures[param] = (recv_idxes, val_fut, recv_vals)
 
     def _launch_gather(self, param: nn.Parameter, p_slice: Tensor) -> "torch.futures.Future":
         """Launch async all_gather for a sharded parameter."""
@@ -722,8 +724,7 @@ class NorMuonAndAdam:
                 if future is not None:
                     future.wait()
             else:
-                idxes_fut, recv_idxes, recv_fut, recv_vals, _send_idxes = self._reduce_futures[param]
-                idxes_fut.wait()
+                recv_idxes, recv_fut, recv_vals = self._reduce_futures[param]
                 recv_fut.wait()
                 # TODO: hck
                 grad_chunk = a2a_postbwd_grad_comm_wait(param.grad, world_size, recv_idxes, recv_vals)
