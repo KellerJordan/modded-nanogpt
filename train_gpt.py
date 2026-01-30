@@ -245,6 +245,7 @@ def a2a_prefwd_start(idxes, N, world):
 
     def _run():
         try:
+            print('aaa',flush=True)
             raise ValueError('test')
             device = idxes.device
             torch.cuda.set_device(device)
