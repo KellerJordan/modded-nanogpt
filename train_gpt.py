@@ -732,6 +732,8 @@ class NorMuonAndAdam:
                 recv_idxes, recv_fut, recv_vals = self._reduce_futures[param]
                 recv_fut.wait()
                 # TODO: hck
+                torch._dynamo.mark_dynamic(recv_idxes, 0)
+                torch._dynamo.mark_dynamic(recv_vals, 0)
                 grad_chunk = a2a_postbwd_grad_comm_wait(param.grad, world_size, recv_idxes, recv_vals)
 
             # Apply update based on optim type
