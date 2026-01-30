@@ -266,8 +266,6 @@ def a2a_postbwd_grad_comm_start(grad, idxes, send_counts, recv_counts):
     device = grad.device
     d = grad.shape[1]
 
-    torch.cuda.current_stream().wait_stream(comm_stream) # make sure we have up-to-date tensors
-
     send_vals = grad[idxes].reshape(-1)
 
     send_splits = [c * d for c in send_counts]
@@ -567,6 +565,8 @@ class NorMuonAndAdam:
             send_counts = sparse_state["send_counts"]
             recv_counts = sparse_state["recv_counts"]
             recv_idxes = sparse_state["recv_idxes"]
+            torch.cuda.current_stream().wait_stream(comm_stream) # make sure we have up-to-date tensors
+            print(f'{rank = }, {send_counts = }, {recv_counts = }')
             recv_vals, val_fut = a2a_postbwd_grad_comm_start(
                 grad, send_idxes, send_counts, recv_counts
             )
@@ -2034,7 +2034,7 @@ for step in range(train_steps + 1):
                 bigrams_old = bigram_inputs
             else:
                 with torch.no_grad():
-                    bigram_idx = torch.cat([bigrams_old, bigram_inputs])
+                    bigram_idx = torch.cat([bigrams_old, bigram_inputs]).detach()
                     # start comms for sparse bigram update now as we don't need to compute forward pass to communicate the indices
                     prefwd_fut = a2a_prefwd_start(bigram_idx, args.bigram_vocab_size, world_size)
                     training_manager.optimizer._reduce_futures[model.bigram_embed.weight] = [prefwd_fut]
