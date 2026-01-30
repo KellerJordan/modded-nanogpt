@@ -271,7 +271,7 @@ def a2a_postbwd_grad_comm_start(grad, idxes, send_counts, recv_counts):
     send_splits = [c * d for c in send_counts]
     recv_splits = [c * d for c in recv_counts]
     recv_vals = torch.empty(sum(recv_splits), device=device, dtype=grad.dtype)
-    torch._dynamo.mark_dynamic(recv_vals, 0)
+    # torch._dynamo.mark_dynamic(recv_vals, 0)
 
     val_fut = dist.all_to_all_single(recv_vals, send_vals,
                                         input_split_sizes=send_splits,
