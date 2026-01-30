@@ -202,38 +202,33 @@ comm_stream = torch.cuda.streams.Stream()
 _prefwd_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 def _a2a_prefwd_impl(idxes, N, world):
-    device = idxes.device
-    torch.cuda.set_device(device)
     rows_per_rank = N // world
     # V2: sort indexes, find insertion points for transition points
     # end_indexes = torch.arange(rows_per_rank, rows_per_rank*(world + 1), rows_per_rank, dtype=torch.int32, device=idxes.device)
-    curr_stream = torch.cuda.current_stream()
-    comm_stream.wait_stream(curr_stream)
-    with torch.cuda.stream(comm_stream):
-        end_indexes = torch.arange(0, rows_per_rank*(world + 1), rows_per_rank, dtype=torch.int32, device=idxes.device)
-        send_idxes = idxes.to(torch.int32).unique(sorted=True)
-        insertion_points = torch.searchsorted(send_idxes, end_indexes, out_int32=True)
+    end_indexes = torch.arange(0, rows_per_rank*(world + 1), rows_per_rank, dtype=torch.int32, device=idxes.device)
+    send_idxes = idxes.to(torch.int32).unique(sorted=True)
+    insertion_points = torch.searchsorted(send_idxes, end_indexes, out_int32=True)
 
-        # delta between insertion points is number of items per rank
-        send_counts_t = insertion_points[1:] - insertion_points[:-1]
+    # delta between insertion points is number of items per rank
+    send_counts_t = insertion_points[1:] - insertion_points[:-1]
 
-        recv_counts_t = torch.empty_like(send_counts_t)
-        dist.all_to_all_single(recv_counts_t, send_counts_t)
-        print(f'{recv_counts_t = }')
-        print(f'{send_counts_t = }')
+    recv_counts_t = torch.empty_like(send_counts_t)
+    dist.all_to_all_single(recv_counts_t, send_counts_t)
+    print(f'{recv_counts_t = }')
+    print(f'{send_counts_t = }')
 
-        send_counts = send_counts_t.tolist()
-        recv_counts = recv_counts_t.tolist()
-        recv_idxes = torch.empty(sum(recv_counts), device=device, dtype=torch.int32)
-        dist.all_to_all_single(
-            recv_idxes,
-            send_idxes,
-            input_split_sizes=send_counts,
-            output_split_sizes=recv_counts,
-        )
+    send_counts = send_counts_t.tolist()
+    recv_counts = recv_counts_t.tolist()
+    recv_idxes = torch.empty(sum(recv_counts), device=device, dtype=torch.int32)
+    dist.all_to_all_single(
+        recv_idxes,
+        send_idxes,
+        input_split_sizes=send_counts,
+        output_split_sizes=recv_counts,
+    )
         # mark these as used by the main stream so we don't delete them
-        send_idxes.record_stream(curr_stream)
-        recv_idxes.record_stream(curr_stream)
+        # send_idxes.record_stream(curr_stream)
+        # recv_idxes.record_stream(curr_stream)
 
     sparse_state = {
         "send_counts": send_counts,
@@ -249,12 +244,17 @@ def a2a_prefwd_start(idxes, N, world):
     prefwd_fut = torch.futures.Future()
 
     def _run():
-        try:
-            result = _a2a_prefwd_impl(idxes, N, world)
-        except Exception as exc:
-            prefwd_fut.set_exception(exc)
-        else:
-            prefwd_fut.set_result(result)
+        device = idxes.device
+        torch.cuda.set_device(device)
+        curr_stream = torch.cuda.current_stream()
+        comm_stream.wait_stream(curr_stream)
+        with torch.cuda.stream(comm_stream):
+            try:
+                result = _a2a_prefwd_impl(idxes, N, world)
+            except Exception as exc:
+                prefwd_fut.set_exception(exc)
+            else:
+                prefwd_fut.set_result(result)
 
     _prefwd_executor.submit(_run)
     return prefwd_fut
