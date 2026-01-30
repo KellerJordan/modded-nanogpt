@@ -259,7 +259,7 @@ def a2a_prefwd_start(idxes, N, world):
     _prefwd_executor.submit(_run)
     return prefwd_fut
 
-@torch.compile
+# @torch.compile
 @torch.no_grad
 def a2a_postbwd_grad_comm_start(grad, idxes, send_counts, recv_counts):
 
