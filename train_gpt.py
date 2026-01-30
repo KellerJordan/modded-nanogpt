@@ -253,6 +253,7 @@ def a2a_prefwd_start(idxes, N, world):
                 result = _a2a_prefwd_impl(idxes, N, world)
             except Exception as exc:
                 prefwd_fut.set_exception(exc)
+                print(exc)
             else:
                 prefwd_fut.set_result(result)
 
