@@ -252,8 +252,9 @@ def a2a_prefwd_start(idxes, N, world):
             curr_stream = torch.cuda.current_stream()
             comm_stream.wait_stream(curr_stream)
         except Exception as exc:
-            import traceback as tb
-            print(tb.format_exc(exc), flush=True)
+            print('bbb', flush=True)
+            # import traceback as tb
+            # print(tb.format_exc(exc), flush=True)
             prefwd_fut.set_exception(exc)
             return
         with torch.cuda.stream(comm_stream):
