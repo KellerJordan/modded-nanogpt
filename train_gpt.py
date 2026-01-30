@@ -565,8 +565,9 @@ class NorMuonAndAdam:
             send_counts = sparse_state["send_counts"]
             recv_counts = sparse_state["recv_counts"]
             recv_idxes = sparse_state["recv_idxes"]
+            print(f'{rank = }, waiting for comm_stream')
             torch.cuda.current_stream().wait_stream(comm_stream) # make sure we have up-to-date tensors
-            print(f'{rank = }, {send_counts = }, {recv_counts = }')
+            print(f'{rank = }, {send_counts = }, {recv_counts = }', flush=True)
             recv_vals, val_fut = a2a_postbwd_grad_comm_start(
                 grad, send_idxes, send_counts, recv_counts
             )
