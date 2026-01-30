@@ -729,16 +729,16 @@ class NorMuonAndAdam:
                 if future is not None:
                     future.wait()
             else:
-                print(f"{rank = } pre-last-wait")
+                print(f"{rank = } pre-last-wait", flush=True)
                 recv_idxes, recv_fut, recv_vals = self._reduce_futures[param]
                 recv_fut.wait()
-                print(f"{rank = } got last wait {recv_idxes.shape = } {recv_vals.shape =}")
+                print(f"{rank = } got last wait {recv_idxes.shape = } {recv_vals.shape =}", flush=True)
 
                 # TODO: hck
                 torch._dynamo.mark_dynamic(recv_idxes, 0)
                 torch._dynamo.mark_dynamic(recv_vals, 0)
                 grad_chunk = a2a_postbwd_grad_comm_wait(param.grad, world_size, recv_idxes, recv_vals)
-                print(f"{rank = } got gradient")
+                print(f"{rank = } got gradient", flush=True)
 
             # Apply update based on optim type
             if p_cfg.optim == "adam":
