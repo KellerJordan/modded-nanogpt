@@ -245,16 +245,13 @@ def a2a_prefwd_start(idxes, N, world):
 
     def _run():
         try:
-            print('aaa',flush=True)
-            raise ValueError('test')
+            # print('aaa',flush=True)
+            # raise ValueError('test')
             device = idxes.device
             torch.cuda.set_device(device)
             curr_stream = torch.cuda.current_stream()
             comm_stream.wait_stream(curr_stream)
         except Exception as exc:
-            print('bbb', flush=True)
-            # import traceback as tb
-            # print(tb.format_exc(exc), flush=True)
             prefwd_fut.set_exception(exc)
             return
         with torch.cuda.stream(comm_stream):
