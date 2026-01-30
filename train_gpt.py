@@ -244,11 +244,14 @@ def a2a_prefwd_start(idxes, N, world):
     prefwd_fut = torch.futures.Future()
 
     def _run():
-        raise ValueError('test')
-        device = idxes.device
-        torch.cuda.set_device(device)
-        curr_stream = torch.cuda.current_stream()
-        comm_stream.wait_stream(curr_stream)
+        try:
+            device = idxes.device
+            torch.cuda.set_device(device)
+            curr_stream = torch.cuda.current_stream()
+            comm_stream.wait_stream(curr_stream)
+        except Exception as exc:
+            import traceback as tb
+            print(tb.format_exc(exc), flush=True)
         with torch.cuda.stream(comm_stream):
             try:
                 result = _a2a_prefwd_impl(idxes, N, world)
