@@ -226,9 +226,9 @@ def _a2a_prefwd_impl(idxes, N, world):
         input_split_sizes=send_counts,
         output_split_sizes=recv_counts,
     )
-        # mark these as used by the main stream so we don't delete them
-        # send_idxes.record_stream(curr_stream)
-        # recv_idxes.record_stream(curr_stream)
+    # mark these as used by us for the main stream
+    send_idxes.record_stream(comm_stream)
+    recv_idxes.record_stream(comm_stream)
 
     sparse_state = {
         "send_counts": send_counts,
@@ -565,12 +565,13 @@ class NorMuonAndAdam:
             send_counts = sparse_state["send_counts"]
             recv_counts = sparse_state["recv_counts"]
             recv_idxes = sparse_state["recv_idxes"]
-            print(f'{rank = }, waiting for comm_stream')
+            print(f'{rank = }, waiting for comm_stream', flush=True)
             torch.cuda.current_stream().wait_stream(comm_stream) # make sure we have up-to-date tensors
             print(f'{rank = }, {send_counts = }, {recv_counts = }', flush=True)
             recv_vals, val_fut = a2a_postbwd_grad_comm_start(
                 grad, send_idxes, send_counts, recv_counts
             )
+            print(f'{rank = }, triggered grad all_to_all_single', flush=True)
             self._reduce_futures[param] = (recv_idxes, val_fut, recv_vals)
 
     def _launch_gather(self, param: nn.Parameter, p_slice: Tensor) -> "torch.futures.Future":
