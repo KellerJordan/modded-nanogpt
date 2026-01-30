@@ -245,6 +245,7 @@ def a2a_prefwd_start(idxes, N, world):
 
     def _run():
         try:
+            raise ValueError('test')
             device = idxes.device
             torch.cuda.set_device(device)
             curr_stream = torch.cuda.current_stream()
@@ -252,6 +253,8 @@ def a2a_prefwd_start(idxes, N, world):
         except Exception as exc:
             import traceback as tb
             print(tb.format_exc(exc), flush=True)
+            prefwd_fut.set_exception(exc)
+            return
         with torch.cuda.stream(comm_stream):
             try:
                 result = _a2a_prefwd_impl(idxes, N, world)
