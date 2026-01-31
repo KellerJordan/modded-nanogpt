@@ -1133,7 +1133,7 @@ class GPT(nn.Module):
         self.mlp_bank.label = 'mlp'
         self.mlp_bank.reshape = (num_mlp_with_padding * 2, mlp_hdim, model_dim)  # (24, 3072, 768)
 
-        # improved init scale by @YouJiacheng and @SulRash
+        # improved init scale by @YouJiacheng and @srashedll
         std = 0.5 * model_dim ** -0.5
         bound = (3 ** 0.5) * std
         with torch.no_grad():
