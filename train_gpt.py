@@ -1059,56 +1059,6 @@ class Block(nn.Module):
         return x
 
 # -----------------------------------------------------------------------------
-# Mimetic V-O Initialization (Trockman & Kolter, ICML 2023)
-# Initialize V and O such that V @ O^T ≈ -βI (negative identity-like)
-# This enables attention to make meaningful contributions from step 1
-
-def mimetic_vo_init(attn_bank, model_dim=768, num_heads=6, head_dim=128, beta=0.1, noise_std=0.01):
-    """
-    Initialize attention bank with mimetic structure for V and O.
-    Q and K use standard uniform init, V and O use identity-like structure.
-
-    Args:
-        attn_bank: Tensor of shape (num_layers, 4*model_dim, hdim)
-        model_dim: Model dimension (768)
-        num_heads: Number of attention heads (6)
-        head_dim: Dimension per head (128)
-        beta: Scale for identity structure (0.1 recommended with attn_scale=0.1)
-        noise_std: Standard deviation of noise for symmetry breaking
-    """
-    num_layers = attn_bank.shape[0]
-    dim = model_dim
-    sqrt_beta = beta ** 0.5
-
-    # Standard init for Q and K (existing behavior)
-    attn_std = model_dim ** -0.5
-    attn_bound = (3 ** 0.5) * attn_std
-
-    with torch.no_grad():
-        # Q and K: uniform init (first 2*dim rows)
-        attn_bank[:, :2*dim, :].uniform_(-attn_bound, attn_bound)
-
-        # V and O: mimetic identity structure
-        for layer_idx in range(num_layers):
-            W_V = torch.zeros(dim, dim, dtype=attn_bank.dtype, device=attn_bank.device)
-            W_O = torch.zeros(dim, dim, dtype=attn_bank.dtype, device=attn_bank.device)
-
-            # Create per-head identity blocks
-            for h in range(num_heads):
-                start, end = h * head_dim, (h + 1) * head_dim
-                eye = torch.eye(head_dim, dtype=attn_bank.dtype, device=attn_bank.device)
-                W_V[start:end, start:end] = sqrt_beta * eye
-                W_O[start:end, start:end] = -sqrt_beta * eye
-
-            # Add noise for symmetry breaking
-            W_V += noise_std * torch.randn_like(W_V)
-            W_O += noise_std * torch.randn_like(W_O)
-
-            # Store in attn_bank: V is rows [2*dim:3*dim], O is rows [3*dim:4*dim]
-            attn_bank[layer_idx, 2*dim:3*dim, :] = W_V
-            attn_bank[layer_idx, 3*dim:4*dim, :] = W_O
-
-# -----------------------------------------------------------------------------
 # The main model
 
 def next_multiple_of_n(v: float | int, *, n: int):
@@ -1183,23 +1133,12 @@ class GPT(nn.Module):
         self.mlp_bank.label = 'mlp'
         self.mlp_bank.reshape = (num_mlp_with_padding * 2, mlp_hdim, model_dim)  # (24, 3072, 768)
 
-        # improved init scale by @YouJiacheng
-        # MLP uses 0.5 * dim^-0.5
-        mlp_std = 0.5 * (model_dim ** -0.5)
-        mlp_bound = (3 ** 0.5) * mlp_std
+        # improved init scale by @YouJiacheng and @SulRash
+        std = 0.5 * model_dim ** -0.5
+        bound = (3 ** 0.5) * std
         with torch.no_grad():
-            # Init attention bank with MIMETIC V-O initialization
-            # Q and K: uniform init, V and O: identity-like structure for faster convergence
-            mimetic_vo_init(
-                self.attn_bank,
-                model_dim=model_dim,
-                num_heads=num_heads,
-                head_dim=head_dim,
-                beta=0.05,       # Scale for V@O^T ≈ -βI (tuned down from 0.1)
-                noise_std=0.01   # Symmetry breaking noise
-            )
-            # Init MLP bank (c_fc uniform, c_proj zero)
-            self.mlp_bank[:, 0, :, :].uniform_(-mlp_bound, mlp_bound)  # c_fc
+            self.attn_bank.uniform_(-bound, bound)
+            self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
 
         # Create blocks with has_attn/has_mlp flags
@@ -1775,8 +1714,8 @@ class TrainingManager():
 @dataclass
 class Hyperparameters:
     # data
-    train_files: str = "data/fineweb/fineweb_train_*.bin" # input .bin to train on
-    val_files: str = "data/fineweb/fineweb_val_*.bin" # input .bin to eval validation loss on
+    train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
+    val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
     train_bs_schedule: tuple = (8 * 2048 * 8, 16 * 2048 * 8, 24 * 2048 * 8)
