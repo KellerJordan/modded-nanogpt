@@ -1196,7 +1196,21 @@ class GPT(nn.Module):
         )
         self.scalars.label = 'scalars'
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _compute_bigram_hash(x: Tensor, mod: int) -> Tensor:
+        """
+        Computes bigram hash on GPU for each position using [prev_token, curr_token].
+        Mathematically identical to the CPU version but computed on device.
+        """
+        rand_int_1 = 36313
+        rand_int_2 = 27191
+        result = torch.empty_like(x)
+        result[0] = mod
+        result[1:] = torch.bitwise_xor(rand_int_1 * x[1:], rand_int_2 * x[:-1]) % mod
+        return result
+
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
         # unpack schedule_cfg
@@ -1227,7 +1241,9 @@ class GPT(nn.Module):
 
         # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
         x = self.embed(input_seq)
-        x0_bigram = self.bigram_embed(bigram_input_seq)[None]
+        # Compute bigram hash on GPU (moved from CPU data loader)
+        bigram_seq = self._compute_bigram_hash(input_seq, args.bigram_vocab_size - 1)
+        x0_bigram = self.bigram_embed(bigram_seq)[None]
         
         # Value embeddings - always computed (not precomputed)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
@@ -1402,21 +1418,6 @@ class DataPreloader:
             self.thread.join()
         return self.data
 
-def get_bigram_hash(x):
-    """
-    Computes bigram hash for each position using [prev_token, curr_token].
-    Multiply by arbitary large ints to get even spread over int32 range.
-    Position 0 is mapped to the reserved index (vocab_size - 1).
-    BOS_tokens within the batch will hash based on last token of prior doc. Masking this ran slower and showed no improvement.
-    """
-    rand_int_1 = 36313
-    rand_int_2 = 27191
-    mod = args.bigram_vocab_size-1
-    x = x.to(torch.int32).clone()
-    x[0] = mod
-    x[1:] = torch.bitwise_xor(rand_int_1 * x[1:], rand_int_2 * x[:-1]) % mod
-    return x
-
 def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -1478,13 +1479,12 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         _inputs = _inputs.to(dtype=torch.int32)
         _targets = _targets.to(dtype=torch.int64)
         _cum_lengths = _cum_lengths.to(dtype=torch.int32)
-        _bigram_inputs = get_bigram_hash(_inputs)
+        # Bigram hash computation moved to GPU in forward()
 
         new_params = yield (
             _inputs.to(device="cuda", non_blocking=True),
             _targets.to(device="cuda", non_blocking=True),
             _cum_lengths.to(device="cuda", non_blocking=True),
-            _bigram_inputs.to(device="cuda", non_blocking=True)
         )
 
         if new_params is not None:
@@ -1831,13 +1831,13 @@ for step in warmup_steps:
     training_manager.advance_schedule(step)
     model.eval()
     with torch.no_grad():
-        inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
-        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+        inputs, targets, cum_seqlens = next(val_loader)
+        model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
     model.train()
     for idx in range(grad_accum_steps):
         send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        inputs, targets, cum_seqlens = train_loader.send(send_args)
+        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
@@ -1876,8 +1876,8 @@ for step in range(train_steps + 1):
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
-                inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+                inputs, targets, cum_seqlens = next(val_loader)
+                val_loss += model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
@@ -1897,8 +1897,8 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
-        inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(training_manager.train_loader_send_args)
-        (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        inputs, targets, cum_seqlens = train_loader.send(training_manager.train_loader_send_args)
+        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 
     # logging
