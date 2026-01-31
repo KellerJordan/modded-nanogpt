@@ -6,26 +6,6 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 # -----------------------------------------------------------------------------
 # Triton kernel for symmetric matrix multiplication by @byronxu99
 
-def _get_autotune_configs():
-    return [
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": bm,
-                "BLOCK_SIZE_N": bn,
-                "BLOCK_SIZE_K": bk,
-                "GROUP_SIZE_M": 8,
-                "LOWER_UPPER": 1,
-            },
-            num_stages=stages,
-            num_warps=warps,
-        )
-        for bm in [64, 128]
-        for bn in [64, 128, 256]
-        for bk in [64, 128]
-        for stages, warps in [(3, 4), (3, 8), (4, 4)]
-        if bm // bn <= 2 and bn // bm <= 2
-    ]
-
 @triton.jit
 def _pid_to_block(
     pid,
@@ -51,10 +31,6 @@ def _pid_to_block(
     n_idx = pid_n * BLOCK_SIZE_N
     return batch_idx, m_idx, n_idx
 
-@triton.autotune(
-    configs=_get_autotune_configs(),
-    key=["M", "K", "a_stride_r", "a_stride_c", "c_stride_r", "c_stride_c"],
-)
 @triton.jit
 def XXT_kernel(
     A_ptr, C_ptr,
@@ -127,9 +103,15 @@ def XXT(A: torch.Tensor, out: torch.Tensor):
     input_batch_stride = A.stride(0) if A.ndim == 3 else 0
     output_batch_stride = out.stride(0) if out.ndim == 3 else 0
 
-    grid = lambda meta: (
-        batch_size * triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(M, meta["BLOCK_SIZE_N"]),
-    )
+    # Hardcoded configs based on H100 autotuning
+    if K == 768:
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
+        num_stages, num_warps = 4, 4
+    else:
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 128, 128
+        num_stages, num_warps = 4, 4
+
+    grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
     XXT_kernel[grid](
         A_ptr=A,
         C_ptr=out,
@@ -141,13 +123,16 @@ def XXT(A: torch.Tensor, out: torch.Tensor):
         c_stride_b=output_batch_stride,
         c_stride_r=out.stride(-2),
         c_stride_c=out.stride(-1),
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=8,
+        LOWER_UPPER=1,
+        num_stages=num_stages,
+        num_warps=num_warps,
     )
     return out
 
-@triton.autotune(
-    configs=_get_autotune_configs(),
-    key=["M", "a_stride_r", "a_stride_c", "c_stride_r", "c_stride_c"],
-)
 @triton.jit
 def ba_plus_cAA_kernel(
     A_ptr, C_ptr,
@@ -235,9 +220,11 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
     input_batch_stride = A.stride(0) if A.ndim == 3 else 0
     output_batch_stride = out.stride(0) if out.ndim == 3 else 0
 
-    grid = lambda meta: (
-        batch_size * triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(M, meta["BLOCK_SIZE_N"]),
-    )
+    # Hardcoded config based on H100 autotuning (M=768)
+    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
+    num_stages, num_warps = 4, 4
+
+    grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
     ba_plus_cAA_kernel[grid](
         A_ptr=A,
         C_ptr=out,
@@ -250,6 +237,13 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
         c_stride_c=out.stride(-1),
         alpha=alpha,
         beta=beta,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=8,
+        LOWER_UPPER=1,
+        num_stages=num_stages,
+        num_warps=num_warps,
     )
     return out
 
@@ -404,10 +398,10 @@ def fused_softcapped_entropy_fwd_kernel(
 ):
     row_idx = tl.program_id(0).to(tl.int64)
     logits_row_ptr = logits_ptr + row_idx * stride_logits_n
-    
+
     max_val = -float('inf')
     sum_exp = 0.0
-    
+
     for off in range(0, n_cols, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
@@ -418,10 +412,10 @@ def fused_softcapped_entropy_fwd_kernel(
         new_max = tl.maximum(max_val, curr_max)
         sum_exp = sum_exp * tl.exp(max_val - new_max) + tl.sum(tl.exp(z - new_max), axis=0)
         max_val = new_max
-    
+
     lse = max_val + tl.log(sum_exp)
     tl.store(lse_ptr + row_idx, lse)
-    
+
     total_loss = 0.0
     for k in range(n_predict):
         target_idx = row_idx + k
@@ -433,7 +427,7 @@ def fused_softcapped_entropy_fwd_kernel(
                     val_target = tl.load(logits_row_ptr + target).to(tl.float32)
                     z_target = A * tl.sigmoid((val_target + B) / C)
                     total_loss += weight * (lse - z_target)
-    
+
     tl.store(losses_ptr + row_idx, total_loss)
 
 @triton.jit
@@ -448,15 +442,15 @@ def fused_softcapped_entropy_bwd_kernel(
 
     logits_row_ptr = logits_ptr + row_idx * stride_logits_n
     grad_row_ptr = grad_input_ptr + row_idx * stride_grad_n
-    
+
     lse = tl.load(lse_ptr + row_idx)
     grad_loss = tl.load(grad_output_ptr + row_idx)
-    
+
     S_w = 0.0
     for k in range(n_predict):
         if row_idx + k < n_rows:
             S_w += tl.load(mtp_weights_ptr + k)
-            
+
     for off in range(0, n_cols, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
@@ -465,7 +459,7 @@ def fused_softcapped_entropy_bwd_kernel(
         sigmoid_u = tl.sigmoid(u)
         z = A * sigmoid_u
         p = tl.exp(z - lse)
-        
+
         term1 = S_w * p
         term2 = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
         for k in range(n_predict):
@@ -473,7 +467,7 @@ def fused_softcapped_entropy_bwd_kernel(
                 target = tl.load(targets_ptr + row_idx + k).to(tl.int32)
                 weight = tl.load(mtp_weights_ptr + k)
                 term2 += tl.where(cols == target, weight, 0.0)
-        
+
         grad_z = grad_loss * (term1 - term2)
         dz_dx = (1.0 / C) * z * (1.0 - sigmoid_u)
         grad_x = grad_z * dz_dx
@@ -489,7 +483,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
 
         losses = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
         lse = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
-        
+
         logits = logits.contiguous()
         targets = targets.contiguous()
         mtp_weights = mtp_weights.contiguous()
@@ -504,7 +498,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             num_warps=8,
             num_stages=4
         )
-        
+
         ctx.save_for_backward(logits, targets, mtp_weights, lse)
         ctx.params = (A, B, C)
         return losses
@@ -515,10 +509,10 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         A, B, C = ctx.params
         n_rows, n_cols = logits.shape
         n_predict = mtp_weights.shape[0]
-        
+
         grad_input = torch.empty((n_rows, n_cols), dtype=torch.bfloat16, device=logits.device)
         grad_output = grad_output.contiguous()
-        
+
         grid = (n_rows,)
         fused_softcapped_entropy_bwd_kernel[grid](
             grad_input, grad_output, lse, logits, targets, mtp_weights,
