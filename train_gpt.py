@@ -1078,18 +1078,12 @@ class GPT(nn.Module):
         self.mlp_bank.label = 'mlp'
         self.mlp_bank.reshape = (num_mlp_with_padding * 2, mlp_hdim, model_dim)  # (24, 3072, 768)
 
-        # improved init scale by @YouJiacheng
-        # Attention uses dim^-0.5, MLP uses 0.5 * dim^-0.5
-        attn_std = model_dim ** -0.5
-        attn_bound = (3 ** 0.5) * attn_std
-        mlp_std = 0.5 * (model_dim ** -0.5)
-        mlp_bound = (3 ** 0.5) * mlp_std
+        # improved init scale by @YouJiacheng and @srashedll
+        std = 0.5 * model_dim ** -0.5
+        bound = (3 ** 0.5) * std
         with torch.no_grad():
-            # Init attention bank (QKV uniform, O zero)
-            self.attn_bank[:, :model_dim * 3, :].uniform_(-attn_bound, attn_bound)
-            self.attn_bank[:, model_dim * 3:, :].zero_()
-            # Init MLP bank (c_fc uniform, c_proj zero)
-            self.mlp_bank[:, 0, :, :].uniform_(-mlp_bound, mlp_bound)  # c_fc
+            self.attn_bank.uniform_(-bound, bound)
+            self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
 
         # Create blocks with has_attn/has_mlp flags
