@@ -12,13 +12,13 @@ import copy
 import glob
 import math
 import threading
-import concurrent.futures
 import time
 import uuid
 from dataclasses import dataclass
 from itertools import accumulate
 from pathlib import Path
 import gc
+import numpy as np
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -199,103 +199,78 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 # Sparse Comms for bigram embedding gradient
 
 comm_stream = torch.cuda.streams.Stream()
-_prefwd_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-
-def _a2a_prefwd_impl(idxes, N, world):
-    rows_per_rank = N // world
-    # V2: sort indexes, find insertion points for transition points
-    # end_indexes = torch.arange(rows_per_rank, rows_per_rank*(world + 1), rows_per_rank, dtype=torch.int32, device=idxes.device)
-    end_indexes = torch.arange(0, rows_per_rank*(world + 1), rows_per_rank, dtype=torch.int32, device=idxes.device)
-    send_idxes = idxes.to(torch.int32).unique(sorted=True)
-    insertion_points = torch.searchsorted(send_idxes, end_indexes, out_int32=True)
-
-    # delta between insertion points is number of items per rank
-    send_counts_t = insertion_points[1:] - insertion_points[:-1]
-
-    recv_counts_t = torch.empty_like(send_counts_t)
-    dist.all_to_all_single(recv_counts_t, send_counts_t)
-    print(f'{recv_counts_t = }')
-    print(f'{send_counts_t = }')
-
-    send_counts = send_counts_t.tolist()
-    recv_counts = recv_counts_t.tolist()
-    recv_idxes = torch.empty(sum(recv_counts), device=device, dtype=torch.int32)
-    dist.all_to_all_single(
-        recv_idxes,
-        send_idxes,
-        input_split_sizes=send_counts,
-        output_split_sizes=recv_counts,
-    )
-    # mark these as used by us for the main stream
-    send_idxes.record_stream(comm_stream)
-    recv_idxes.record_stream(comm_stream)
-
-    sparse_state = {
-        "send_counts": send_counts,
-        "recv_counts": recv_counts,
-        "recv_idxes": recv_idxes,
-        "send_idxes": send_idxes,
-    }
-    return send_idxes, sparse_state
 
 @torch._dynamo.disable
 @torch.no_grad
-def a2a_prefwd_start(idxes, N, world):
-    prefwd_fut = torch.futures.Future()
+def a2a_prefwd_start(idxes_np, N, world):
+    rows_per_rank = N // world
+    # queue upload of indexes to gpu
+    send_idxes = torch.from_numpy(idxes_np).to(device, non_blocking=True)
 
-    def _run():
-        try:
-            # print('aaa',flush=True)
-            # raise ValueError('test')
-            device = idxes.device
-            torch.cuda.set_device(device)
-            curr_stream = torch.cuda.current_stream()
-            comm_stream.wait_stream(curr_stream)
-        except Exception as exc:
-            prefwd_fut.set_exception(exc)
-            return
-        with torch.cuda.stream(comm_stream):
-            try:
-                result = _a2a_prefwd_impl(idxes, N, world)
-            except Exception as exc:
-                prefwd_fut.set_exception(exc)
-                print(exc)
-            else:
-                prefwd_fut.set_result(result)
+    # calculate how many gradient rows we will send to every rank
+    insertion_points = np.searchsorted(idxes_np, np.arange(0, rows_per_rank*(world + 1), rows_per_rank, dtype=np.int32))
+    send_counts = torch.from_numpy(insertion_points[1:] - insertion_points[:-1])
 
-    _prefwd_executor.submit(_run)
-    return prefwd_fut
+    # share the send counts so that each rank will know how many rows
+    # to expect from every other rank
+    recv_counts = torch.empty_like(send_counts)
+    dist.all_to_all_single(recv_counts, send_counts)
 
-# @torch.compile
+    # cpu tensors, so these ops are cheap and don't force a host<->device sync
+    total_recv_count = recv_counts.sum().item()
+    recv_counts = recv_counts.tolist()
+    send_counts = send_counts.tolist()
+
+    # queue sharing of row indexes
+    recv_idxes = torch.empty(total_recv_count, dtype=torch.int32, device=device)
+    idxes_fut = dist.all_to_all_single(
+        recv_idxes,
+        send_idxes,
+        output_split_sizes=recv_counts,
+        input_split_sizes=send_counts,
+        async_op=True,
+    )
+
+    sparse_state = {
+        "send_idxes": send_idxes,
+        "send_counts": send_counts,
+        "recv_counts": recv_counts, # list for sharing
+    }
+    return recv_idxes, sparse_state, idxes_fut
+
+@torch.compile
 @torch.no_grad
 def a2a_postbwd_grad_comm_start(grad, idxes, send_counts, recv_counts):
+    # gather the rows that we want to send
+    send_vals = grad[idxes]
 
-    device = grad.device
-    d = grad.shape[1]
+    d = grad.shape[1] # model dim
 
-    send_vals = grad[idxes].reshape(-1)
+    send_sizes = [i*d for i in send_counts]
+    recv_sizes = [i*d for i in recv_counts]
 
-    send_splits = [c * d for c in send_counts]
-    recv_splits = [c * d for c in recv_counts]
-    recv_vals = torch.empty(sum(recv_splits), device=device, dtype=grad.dtype)
-    # torch._dynamo.mark_dynamic(recv_vals, 0)
+    recv_vals = torch.empty(sum(recv_sizes), device=send_vals.device, dtype=grad.dtype)
 
-    val_fut = dist.all_to_all_single(recv_vals, send_vals,
-                                        input_split_sizes=send_splits,
-                                        output_split_sizes=recv_splits,
-                                        async_op=True)
+    val_fut = dist.all_to_all_single(
+        recv_vals,
+        send_vals.view(-1),
+        input_split_sizes=send_sizes,
+        output_split_sizes=recv_sizes,
+        async_op=True,
+    )
     return recv_vals, val_fut
 
 @torch.compile
 @torch.no_grad
 def a2a_postbwd_grad_comm_wait(grad, world, recv_idx, recv_vals):
-    rows_per_rank = grad.shape[0] // world
     d = grad.shape[1]
+    rows_per_rank = grad.shape[0] // world
 
-    # accumulate into dense local grad slice
-    grad_slice = torch.zeros((rows_per_rank, d), device=grad.device, dtype=grad.dtype)
-    local_pos = recv_idx - rank * rows_per_rank
-    grad_slice.index_add_(0, local_pos, recv_vals.view(-1, d), alpha=1 / world)
+    # TODO: someone smarter could start with the slice taken directly from grad
+    #       and only index-add the data we received from the other ranks.
+    #       I did the simple solution
+    grad_slice = torch.zeros(rows_per_rank, d, dtype=grad.dtype, device=grad.device)
+    grad_slice.index_add_(0, recv_idx, recv_vals.view(-1, d), alpha=1 / world)
 
     return grad_slice
 
@@ -568,19 +543,14 @@ class NorMuonAndAdam:
                 ).get_future()
                 self._reduce_futures[param] = (future, grad_chunk)
         elif p_cfg.comms == "sharded_sparse":
-            prefwd_fut = self._sparse_async_data[param]
-            send_idxes, sparse_state = prefwd_fut.wait()
+            sparse_state = self._sparse_async_data[param]
+            send_idxes = sparse_state["send_idxes"]
             send_counts = sparse_state["send_counts"]
             recv_counts = sparse_state["recv_counts"]
-            recv_idxes = sparse_state["recv_idxes"]
-            print(f'{rank = }, waiting for comm_stream', flush=True)
-            torch.cuda.current_stream().wait_stream(comm_stream) # make sure we have up-to-date tensors
-            print(f'{rank = }, {send_counts = }, {recv_counts = }', flush=True)
             recv_vals, val_fut = a2a_postbwd_grad_comm_start(
-                grad, send_idxes, send_counts, recv_counts
+                grad, send_idxes, send_counts, recv_counts, self.world_size
             )
-            print(f'{rank = }, triggered grad all_to_all_single', flush=True)
-            self._reduce_futures[param] = (recv_idxes, val_fut, recv_vals)
+            self._reduce_futures[param].extend((val_fut, recv_vals))
 
     def _launch_gather(self, param: nn.Parameter, p_slice: Tensor) -> "torch.futures.Future":
         """Launch async all_gather for a sharded parameter."""
@@ -736,16 +706,12 @@ class NorMuonAndAdam:
                 if future is not None:
                     future.wait()
             else:
-                print(f"{rank = } pre-last-wait", flush=True)
-                recv_idxes, recv_fut, recv_vals = self._reduce_futures[param]
+                idxes_fut, recv_idxes, recv_fut, recv_vals = self._reduce_futures[param]
+                idxes_fut.wait()
                 recv_fut.wait()
-                print(f"{rank = } got last wait {recv_idxes.shape = } {recv_vals.shape =}", flush=True)
 
-                # TODO: hck
-                torch._dynamo.mark_dynamic(recv_idxes, 0)
-                torch._dynamo.mark_dynamic(recv_vals, 0)
+                # TODO: hack?
                 grad_chunk = a2a_postbwd_grad_comm_wait(param.grad, world_size, recv_idxes, recv_vals)
-                print(f"{rank = } got gradient", flush=True)
 
             # Apply update based on optim type
             if p_cfg.optim == "adam":
@@ -1618,7 +1584,8 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             _inputs.to(device="cuda", non_blocking=True),
             _targets.to(device="cuda", non_blocking=True),
             _cum_lengths.to(device="cuda", non_blocking=True),
-            _bigram_inputs.to(device="cuda", non_blocking=True)
+            _bigram_inputs.to(device="cuda", non_blocking=True),
+            _bigram_inputs.numpy(),
         )
 
         if new_params is not None:
@@ -1892,7 +1859,7 @@ grad_accum_steps = 8 // world_size
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
+dist.init_process_group(backend="cuda:nccl,cpu:gloo", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
@@ -1963,24 +1930,25 @@ for step in warmup_steps:
     training_manager.advance_schedule(step)
     model.eval()
     with torch.no_grad():
-        inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
+        inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
         model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
     model.train()
     for idx in range(grad_accum_steps):
         send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(send_args)
+        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
 
         # TODO: hack
         if world_size == 8:
             if not training_manager._is_adam_step(step):
-                bigrams_old = bigram_inputs.detach()
+                bigrams_old = bigram_cpu
             else:
                 with torch.no_grad():
-                    bigram_idx = torch.cat([bigrams_old, bigram_inputs]).detach()
+                    bigram_idx_np = np.union1d(bigrams_old, bigram_cpu)
+
                     # start comms for sparse bigram update now as we don't need to compute forward pass to communicate the indices
-                    prefwd_fut = a2a_prefwd_start(bigram_idx, args.bigram_vocab_size, world_size)
-                    training_manager.optimizer._reduce_futures[model.bigram_embed.weight] = [prefwd_fut]
-                    training_manager.optimizer._sparse_async_data[model.bigram_embed.weight] = prefwd_fut
+                    recv_idxes, sparse_state, idxes_fut = a2a_prefwd_start(bigram_idx_np, args.bigram_vocab_size, world_size)
+                    training_manager.optimizer._reduce_futures[model.bigram_embed.weight] = [idxes_fut, recv_idxes]
+                    training_manager.optimizer._sparse_async_data[model.bigram_embed.weight] = sparse_state
 
         (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
 
@@ -2022,7 +1990,7 @@ for step in range(train_steps + 1):
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
-                inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
+                inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
                 val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
         val_loss /= val_steps
         del val_loader
@@ -2043,18 +2011,19 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
-        inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(training_manager.train_loader_send_args)
+        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
         # TODO: hack
         if world_size == 8:
             if not training_manager._is_adam_step(step):
-                bigrams_old = bigram_inputs
+                bigrams_old = bigram_cpu
             else:
                 with torch.no_grad():
-                    bigram_idx = torch.cat([bigrams_old, bigram_inputs]).detach()
+                    bigram_idx_np = np.union1d(bigrams_old, bigram_cpu)
+
                     # start comms for sparse bigram update now as we don't need to compute forward pass to communicate the indices
-                    prefwd_fut = a2a_prefwd_start(bigram_idx, args.bigram_vocab_size, world_size)
-                    training_manager.optimizer._reduce_futures[model.bigram_embed.weight] = [prefwd_fut]
-                    training_manager.optimizer._sparse_async_data[model.bigram_embed.weight] = prefwd_fut
+                    recv_idxes, sparse_state, idxes_fut = a2a_prefwd_start(bigram_idx_np, args.bigram_vocab_size, world_size)
+                    training_manager.optimizer._reduce_futures[model.bigram_embed.weight] = [idxes_fut, recv_idxes]
+                    training_manager.optimizer._sparse_async_data[model.bigram_embed.weight] = sparse_state
 
         (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
