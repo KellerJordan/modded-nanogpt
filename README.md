@@ -165,8 +165,8 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 61 | 1.748 minutes | [Unified Optimizers and Transposed LM Head](https://x.com/classiclarryd/status/2013399457841160702) | 01/18/26 | [log](records/track_1_short/2026-01-18_UnifiedOptimizers/unified-optimizer/2fc79469-a527-4bde-8540-8426ed3352d1.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/200) | @ChrisJMcCormick
 62 | 1.655 minutes | [Bigram Hash Embedding](https://x.com/classiclarryd/status/2013520088297558274) | 01/19/26 | [log](records/track_1_short/2026-01-19_BigramHashEmbedding/40ec7bb6-14b3-46f8-90b7-bb5ed188faba.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/201) | @classiclarryd
 63 | 1.650 minutes | [Untie Value Embeds](https://x.com/classiclarryd/status/2016968386476200301) | 01/26/26 | [log](records/track_1_short/2026-01-26-UntieValueEmbeddings/43955d93-6914-40cb-bdf8-786ace93784f.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/209) | @photo_mz
-64 | 1.630 minutes | Tuned nonzero Attn V and O init | 01/30/26 | [log](records/track_1_short/2026-01-30_MimeticValueOutput/runs/0f262f64-20c4-4268-9ae7-d7440c810abd.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/214) | @srashedll
-
+64 | 1.630 minutes | [Tuned nonzero Attn V and O init](https://x.com/classiclarryd/status/2017735338601726357) | 01/30/26 | [log](records/track_1_short/2026-01-30_MimeticValueOutput/runs/0f262f64-20c4-4268-9ae7-d7440c810abd.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/214) | @srashedll
+65 | 1.613 minutes | Group Value Embeds into single parameter | 01/30/26 | [log](records/track_1_short/2026-01-30_VeFused/0ba09d92-4ef1-440f-85e3-9d2766294db4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/215) | @varunneal
 ## Rules
 
 New records must:
