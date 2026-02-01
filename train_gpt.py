@@ -262,7 +262,7 @@ def a2a_postbwd_grad_comm_start(grad, idxes, send_counts, recv_counts):
 
 @torch.compile
 @torch.no_grad
-def a2a_postbwd_grad_comm_wait(grad, world, recv_idx, recv_vals):
+def a2a_postbwd_grad_comm_wait(grad, recv_idx, recv_vals, rank, world):
     d = grad.shape[1]
     rows_per_rank = grad.shape[0] // world
 
@@ -711,7 +711,7 @@ class NorMuonAndAdam:
                 recv_fut.wait()
 
                 # TODO: hack?
-                grad_chunk = a2a_postbwd_grad_comm_wait(param.grad, world_size, recv_idxes, recv_vals)
+                grad_chunk = a2a_postbwd_grad_comm_wait(param.grad, recv_idxes, recv_vals, rank, world_size)
 
             # Apply update based on optim type
             if p_cfg.optim == "adam":
