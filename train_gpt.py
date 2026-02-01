@@ -548,7 +548,7 @@ class NorMuonAndAdam:
             send_counts = sparse_state["send_counts"]
             recv_counts = sparse_state["recv_counts"]
             recv_vals, val_fut = a2a_postbwd_grad_comm_start(
-                grad, send_idxes, send_counts, recv_counts, self.world_size
+                grad, send_idxes, send_counts, recv_counts
             )
             self._reduce_futures[param].extend((val_fut, recv_vals))
 
