@@ -270,7 +270,7 @@ def a2a_postbwd_grad_comm_wait(grad, world, recv_idx, recv_vals):
     #       and only index-add the data we received from the other ranks.
     #       I did the simple solution
     grad_slice = torch.zeros(rows_per_rank, d, dtype=grad.dtype, device=grad.device)
-    grad_slice.index_add_(0, recv_idx, recv_vals.view(-1, d), alpha=1 / world)
+    grad_slice.index_add_(0, recv_idx - rank * rows_per_rank, recv_vals.view(-1, d), alpha=1 / world)
 
     return grad_slice
 
