@@ -62,15 +62,22 @@ def XXT_kernel(
     offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
     offs_k = tl.arange(0, BLOCK_SIZE_K)
+    
+    # Load A blocks for C[m,n] = A[m,:] @ A[n,:].T
+    # Load A[m, k] -> shape (BM, BK)
     a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
-    at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
+    # Load A[n, k] -> shape (BN, BK). Transpose to get (BK, BN) for accumulation.
+    # Loading (BN, BK) is coalesced because stride_c is 1 (contiguous dim is k).
+    at_ptrs = A_ptr + (offs_n[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     # Accumulate over blocks of K
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        at = tl.load(at_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        k_remaining = K - k * BLOCK_SIZE_K
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        at_temp = tl.load(at_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        at = tl.trans(at_temp)
         accumulator = tl.dot(a, at, accumulator)
         a_ptrs += BLOCK_SIZE_K * a_stride_c
         at_ptrs += BLOCK_SIZE_K * a_stride_c
@@ -106,10 +113,10 @@ def XXT(A: torch.Tensor, out: torch.Tensor):
     # Hardcoded configs based on H100 autotuning
     if K == 768:
         BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
-        num_stages, num_warps = 4, 4
+        num_stages, num_warps = 4, 8
     else:
         BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 128, 128
-        num_stages, num_warps = 4, 4
+        num_stages, num_warps = 4, 8
 
     grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
     XXT_kernel[grid](
@@ -167,15 +174,19 @@ def ba_plus_cAA_kernel(
     offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
     offs_k = tl.arange(0, BLOCK_SIZE_K)
+    
+    # Coalesced loads similar to XXT_kernel
     a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
-    at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
+    at_ptrs = A_ptr + (offs_n[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     # Accumulate over blocks of K
     for k in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < M - k * BLOCK_SIZE_K, other=0.0)
-        at = tl.load(at_ptrs, mask=offs_k[:, None] < M - k * BLOCK_SIZE_K, other=0.0)
+        k_remaining = M - k * BLOCK_SIZE_K
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        at_temp = tl.load(at_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        at = tl.trans(at_temp)
         accumulator = tl.dot(a, at, accumulator)
         a_ptrs += BLOCK_SIZE_K * a_stride_c
         at_ptrs += BLOCK_SIZE_K * a_stride_c
@@ -222,7 +233,7 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
 
     # Hardcoded config based on H100 autotuning (M=768)
     BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
-    num_stages, num_warps = 4, 4
+    num_stages, num_warps = 4, 8
 
     grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
     ba_plus_cAA_kernel[grid](
@@ -402,11 +413,14 @@ def fused_softcapped_entropy_fwd_kernel(
     max_val = -float('inf')
     sum_exp = 0.0
 
+    inv_C = 1.0 / C
+    B_div_C = B * inv_C
+
     for off in range(0, n_cols, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
         val = tl.load(logits_row_ptr + cols, mask=mask, other=-float('inf')).to(tl.float32)
-        z = A * tl.sigmoid((val + B) / C)
+        z = A * tl.sigmoid(val * inv_C + B_div_C)
         z = tl.where(mask, z, -float('inf'))
         curr_max = tl.max(z, axis=0)
         new_max = tl.maximum(max_val, curr_max)
@@ -425,7 +439,7 @@ def fused_softcapped_entropy_fwd_kernel(
                 target = tl.load(targets_ptr + target_idx).to(tl.int32)
                 if target >= 0 and target < n_cols:
                     val_target = tl.load(logits_row_ptr + target).to(tl.float32)
-                    z_target = A * tl.sigmoid((val_target + B) / C)
+                    z_target = A * tl.sigmoid(val_target * inv_C + B_div_C)
                     total_loss += weight * (lse - z_target)
 
     tl.store(losses_ptr + row_idx, total_loss)
@@ -451,11 +465,15 @@ def fused_softcapped_entropy_bwd_kernel(
         if row_idx + k < n_rows:
             S_w += tl.load(mtp_weights_ptr + k)
 
+    inv_C = 1.0 / C
+    B_div_C = B * inv_C
+    inv_C_A = inv_C * A
+
     for off in range(0, n_cols, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
         val = tl.load(logits_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        u = (val + B) / C
+        u = val * inv_C + B_div_C
         sigmoid_u = tl.sigmoid(u)
         z = A * sigmoid_u
         p = tl.exp(z - lse)
@@ -469,7 +487,7 @@ def fused_softcapped_entropy_bwd_kernel(
                 term2 += tl.where(cols == target, weight, 0.0)
 
         grad_z = grad_loss * (term1 - term2)
-        dz_dx = (1.0 / C) * z * (1.0 - sigmoid_u)
+        dz_dx = inv_C_A * sigmoid_u * (1.0 - sigmoid_u)
         grad_x = grad_z * dz_dx
         tl.store(grad_row_ptr + cols, grad_x.to(tl.bfloat16), mask=mask)
 
@@ -494,7 +512,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             logits.stride(0), logits.stride(1),
             n_rows, n_cols, n_predict,
             A, B, C,
-            BLOCK_SIZE=1024,
+            BLOCK_SIZE=4096,
             num_warps=8,
             num_stages=4
         )
@@ -519,7 +537,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
             n_rows, n_cols, n_predict,
             A, B, C,
-            BLOCK_SIZE=1024,
+            BLOCK_SIZE=4096,
             num_warps=8,
             num_stages=4
         )
