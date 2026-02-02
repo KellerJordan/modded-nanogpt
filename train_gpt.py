@@ -219,8 +219,8 @@ def a2a_prefwd_start_1(idxes_np, N, rank, world):
     # in the optimizer, we'll use the slice of the gradient that already includes them as the basis
     send_counts[rank] = 0
     # remove our own indexes from the send list
-    send_idxes = torch.cat([send_idxes[:insertion_points[rank]], send_idxes[insertion_points[rank + 1:]]])
-    print(f"{rank = }, {send_counts = }, {send_counts.sum() = }, {send_idxes.shape = }")
+    send_idxes = torch.cat([send_idxes[: insertion_points[rank]], send_idxes[insertion_points[rank + 1] :]])
+    # print(f"{rank = }, {send_counts = }, {send_counts.sum() = }, {send_idxes.shape = }", flush=True)
 
     # share the send counts so that each rank will know how many rows
     # to expect from every other rank
