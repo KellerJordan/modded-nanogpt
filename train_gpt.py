@@ -1705,9 +1705,10 @@ class TrainingManager():
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
+            "bigram_embed",
             "lm_head", # lm_head must complete before embed sync (when tied), lm_head is first large param available
             "ve0", "ve1", "ve2",   # Medium
-            "embed", "bigram_embed", 
+            "embed",  
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
         ]
 
