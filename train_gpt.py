@@ -228,6 +228,7 @@ def a2a_prefwd_start_1(idxes_np, N, rank, world):
     recv_counts_fut = dist.all_to_all_single(recv_counts, send_counts, async_op=True)
     return send_idxes, send_counts, recv_counts, recv_counts_fut
 
+@torch.no_grad
 def a2a_prefwd_start_2(send_idxes, send_counts, recv_counts):
     # cpu tensors, so these ops are cheap and don't force a host<->device sync
     total_recv_count = recv_counts.sum().item()
@@ -1704,8 +1705,9 @@ class TrainingManager():
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
+            "lm_head", # lm_head must complete before embed sync (when tied), lm_head is first large param available
             "ve0", "ve1", "ve2", "bigram_embed",  # Medium
-            "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
+            "embed",   
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
         ]
 
