@@ -48,7 +48,7 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@akash5474](https://github.com/akash5474), [@snimu](https://x.com/omouamoua), [@roeeshenberg](https://x.com/roeeshenberg),
 [@ChrisJMcCormick](https://x.com/ChrisJMcCormick), [@dominikkallusky](https://github.com/dominikkallusky), [@acutkosky](https://github.com/acutkosky), 
 [@manikbhandari](https://github.com/manikbhandari), [@andrewbriand](https://github.com/andrewbriand), [@jrauvola](https://github.com/jrauvola),
-[@soren_dunn_](https://x.com/soren_dunn_)
+[@soren_dunn_](https://x.com/soren_dunn_), [@photon_mz](https://x.com/photon_mz), [@srashedll](https://x.com/srashedll)
 
 
 ---
@@ -164,6 +164,9 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 60 | 1.765 minutes | [Fused triton kernel for softcapped multi-token prediction cross entropy step](https://x.com/classiclarryd/status/2012927211448516796) | 01/16/26 | [log](records/track_1_short/2026-01-16_FusedSoftcappedEntropy/45beba56-93e2-4995-bc5b-caff3cb2c1b5.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/199) | @soren_dunn_ & AI System [Locus](https://www.intology.ai/blog/previewing-locus)
 61 | 1.748 minutes | [Unified Optimizers and Transposed LM Head](https://x.com/classiclarryd/status/2013399457841160702) | 01/18/26 | [log](records/track_1_short/2026-01-18_UnifiedOptimizers/unified-optimizer/2fc79469-a527-4bde-8540-8426ed3352d1.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/200) | @ChrisJMcCormick
 62 | 1.655 minutes | [Bigram Hash Embedding](https://x.com/classiclarryd/status/2013520088297558274) | 01/19/26 | [log](records/track_1_short/2026-01-19_BigramHashEmbedding/40ec7bb6-14b3-46f8-90b7-bb5ed188faba.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/201) | @classiclarryd
+63 | 1.650 minutes | [Untie Value Embeds](https://x.com/classiclarryd/status/2016968386476200301) | 01/26/26 | [log](records/track_1_short/2026-01-26-UntieValueEmbeddings/43955d93-6914-40cb-bdf8-786ace93784f.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/209) | @photo_mz
+64 | 1.630 minutes | [Tuned nonzero Attn V and O init](https://x.com/classiclarryd/status/2017735338601726357) | 01/30/26 | [log](records/track_1_short/2026-01-30_MimeticValueOutput/runs/0f262f64-20c4-4268-9ae7-d7440c810abd.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/214) | @srashedll
+65 | 1.613 minutes | Group Value Embeds into single parameter | 01/30/26 | [log](records/track_1_short/2026-01-30_VeFused/0ba09d92-4ef1-440f-85e3-9d2766294db4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/215) | @varunneal
 ## Rules
 
 New records must:
@@ -221,6 +224,8 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 This record is technically outside the rules of the speedrun, since we specified that the train/val tokens must be kept fixed.
 However, it's very interesting, and worth including. The run is not more data-efficient; rather, the speedup comes from the improved tokenizer allowing
 the vocabulary size to be reduced (nearly halved!) while preserving the same bytes-per-token, which saves lots of parameters and FLOPs in the head and embeddings.
+* [@samacqua's 1/23/2026 test time training run](https://github.com/KellerJordan/modded-nanogpt/pull/205). Sam found that prediction accuracy on the later portions of a given document could be improved by performing a training
+update on Adam parameters based on the early portion of the document. This 'parameter nudging' is repeated independently for each document. Interestingly, these gradient updates prove effective while only using ~500 tokens, substantially less than the over 200k tokens typically used on a normal training step. While technically a valid probability model, we are not allowing untimed backward passes.
 
 **Notable forks:**
 * [https://github.com/BlinkDL/modded-nanogpt-rwkv](https://github.com/BlinkDL/modded-nanogpt-rwkv)
