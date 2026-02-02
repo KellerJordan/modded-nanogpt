@@ -279,10 +279,10 @@ def a2a_postbwd_grad_comm_wait(grad, recv_idx, recv_vals, rank, world):
     d = grad.shape[1]
     rows_per_rank = grad.shape[0] // world
 
-    grad_slice = grad[rows_per_rank * rank : rows_per_rank * (rank + 1)]
-    grad_slice.index_add_(0, recv_idx, recv_vals.view(-1, d))
+    grad_slice = grad[rows_per_rank * rank : rows_per_rank * (rank + 1)] * (1 / world)
+    grad_slice.index_add_(0, recv_idx, recv_vals.view(-1, d), alpha = (1 / world))
 
-    return grad_slice * (1 / world)
+    return grad_slice 
 
 # -----------------------------------------------------------------------------
 # Combined NorMuon + Adam Optimizer
