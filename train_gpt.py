@@ -273,7 +273,6 @@ def a2a_postbwd_grad_comm_start(grad, idxes, send_counts, recv_counts):
     )
     return recv_vals, val_fut
 
-@torch.compile
 @torch.no_grad
 def a2a_postbwd_grad_comm_wait(grad, recv_idx, recv_vals, rank, world):
     d = grad.shape[1]
@@ -283,7 +282,7 @@ def a2a_postbwd_grad_comm_wait(grad, recv_idx, recv_vals, rank, world):
     # grad_slice.index_add_(0, recv_idx.remainder_(), recv_vals.view(-1, d), alpha = (1 / world))
     grad.index_add_(0, recv_idx, recv_vals.view(-1, d))
 
-    return grad[rows_per_rank * rank : rows_per_rank * (rank + 1)] * (1 / world)
+    return grad[rows_per_rank * rank : rows_per_rank * (rank + 1)].mul_((1 / world))
 
 # -----------------------------------------------------------------------------
 # Combined NorMuon + Adam Optimizer
