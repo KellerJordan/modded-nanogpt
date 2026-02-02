@@ -206,8 +206,8 @@ def a2a_prefwd_start_1(idxes_np, N, rank, world):
     rows_per_rank = N // world
 
     # queue upload of indexes to gpu
-    # translate from absolute indexes in the embedding table to indexes in the gradient slice
-    send_idxes = torch.from_numpy(np.remainder(idxes_np, rows_per_rank)).to(device, non_blocking=True)
+    # NOPE: translate from absolute indexes in the embedding table to indexes in the gradient slice
+    send_idxes = torch.from_numpy(idxes_np).to(device, non_blocking=True)
 
     # calculate how many gradient rows we will send to every rank
     insertion_points = np.searchsorted(
@@ -279,10 +279,11 @@ def a2a_postbwd_grad_comm_wait(grad, recv_idx, recv_vals, rank, world):
     d = grad.shape[1]
     rows_per_rank = grad.shape[0] // world
 
-    grad_slice = grad[rows_per_rank * rank : rows_per_rank * (rank + 1)] * (1 / world)
-    grad_slice.index_add_(0, recv_idx, recv_vals.view(-1, d), alpha = (1 / world))
+    # grad_slice = grad[rows_per_rank * rank : rows_per_rank * (rank + 1)] * (1 / world)
+    # grad_slice.index_add_(0, recv_idx.remainder_(), recv_vals.view(-1, d), alpha = (1 / world))
+    grad.index_add_(0, recv_idx, recv_vals.view(-1, d))
 
-    return grad_slice 
+    return grad[rows_per_rank * rank : rows_per_rank * (rank + 1)] * (1 / world)
 
 # -----------------------------------------------------------------------------
 # Combined NorMuon + Adam Optimizer
