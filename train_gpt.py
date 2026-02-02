@@ -202,7 +202,7 @@ comm_stream = torch.cuda.streams.Stream()
 
 @torch._dynamo.disable
 @torch.no_grad
-def a2a_prefwd_start_1(idxes_np, N, world):
+def a2a_prefwd_start_1(idxes_np, N, rank, world):
     rows_per_rank = N // world
 
     # queue upload of indexes to gpu
@@ -215,6 +215,11 @@ def a2a_prefwd_start_1(idxes_np, N, world):
         np.arange(0, rows_per_rank * (world + 1), rows_per_rank, dtype=np.int32),
     )
     send_counts = torch.from_numpy(insertion_points[1:] - insertion_points[:-1])
+    # zero-out own send-count - we won't send our own gradient rows to ourselves as it's a waste:
+    # in the optimizer, we'll use the slice of the gradient that already includes them as the basis
+    send_counts[rank] = 0
+    # remove our own indexes from the send list
+    send_idxes = torch.cat([send_idxes[:insertion_points[rank]], send_idxes[insertion_points[rank + 1:]]])
 
     # share the send counts so that each rank will know how many rows
     # to expect from every other rank
@@ -273,10 +278,7 @@ def a2a_postbwd_grad_comm_wait(grad, recv_idx, recv_vals, rank, world):
     d = grad.shape[1]
     rows_per_rank = grad.shape[0] // world
 
-    # TODO: someone smarter could start with the slice taken directly from grad
-    #       and only index-add the data we received from the other ranks.
-    #       I did the simple solution
-    grad_slice = torch.zeros(rows_per_rank, d, dtype=grad.dtype, device=grad.device)
+    grad_slice = grad[rows_per_rank * rank : rows_per_rank * (rank + 1)]
     grad_slice.index_add_(0, recv_idx, recv_vals.view(-1, d))
 
     return grad_slice * (1 / world)
@@ -716,8 +718,9 @@ class NorMuonAndAdam:
                 idxes_fut, recv_idxes, recv_fut, recv_vals = self._reduce_futures[param]
                 idxes_fut.wait()
                 recv_fut.wait()
+                torch._dynamo.mark_dynamic(recv_idxes, 0)
+                torch._dynamo.mark_dynamic(recv_vals, 0)
 
-                # TODO: hack?
                 grad_chunk = a2a_postbwd_grad_comm_wait(param.grad, recv_idxes, recv_vals, rank, world_size)
 
             # Apply update based on optim type
@@ -1952,7 +1955,7 @@ for step in warmup_steps:
                 with torch.no_grad():
                     bigram_idx_np = np.union1d(bigrams_old, bigram_cpu)
 
-                    send_idxes, send_counts, recv_counts, recv_counts_fut = a2a_prefwd_start_1(bigram_idx_np, args.bigram_vocab_size, world_size)
+                    send_idxes, send_counts, recv_counts, recv_counts_fut = a2a_prefwd_start_1(bigram_idx_np, args.bigram_vocab_size, rank, world_size)
 
         r = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps
         if training_manager._is_adam_step(step):
@@ -2033,7 +2036,7 @@ for step in range(train_steps + 1):
                     bigram_idx_np = np.union1d(bigrams_old, bigram_cpu)
 
                     # start comms for sparse bigram update now as we don't need to compute forward pass to communicate the indices
-                    send_idxes, send_counts, recv_counts, recv_counts_fut = a2a_prefwd_start_1(bigram_idx_np, args.bigram_vocab_size, world_size)
+                    send_idxes, send_counts, recv_counts, recv_counts_fut = a2a_prefwd_start_1(bigram_idx_np, args.bigram_vocab_size, rank, world_size)
 
         r = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps
         if training_manager._is_adam_step(step):
