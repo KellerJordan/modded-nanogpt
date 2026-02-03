@@ -203,11 +203,13 @@ comm_stream = torch.cuda.streams.Stream()
 @torch._dynamo.disable
 @torch.no_grad
 def a2a_prefwd_start_1(idxes_np, N, rank, world):
+    global send_idxes_buffer
     rows_per_rank = N // world
 
     # queue upload of indexes to gpu
-    # NOPE: translate from absolute indexes in the embedding table to indexes in the gradient slice
-    send_idxes = torch.from_numpy(idxes_np).to(device, non_blocking=True)
+    send_idxes = send_idxes_buffer[:idxes_np.shape[0]]
+    send_idxes.copy_(torch.from_numpy(idxes_np))
+    send_idxes = send_idxes.to(device, non_blocking=True)
 
     # calculate how many gradient rows we will send to every rank
     insertion_points = np.searchsorted(
@@ -1524,10 +1526,12 @@ def get_bigram_hash(x):
     rand_int_1 = 36313
     rand_int_2 = 27191
     mod = args.bigram_vocab_size-1
-    x = x.to(torch.int32).clone()
-    x[0] = mod
-    x[1:] = torch.bitwise_xor(rand_int_1 * x[1:], rand_int_2 * x[:-1]) % mod
-    return x
+    x = x.to(torch.int32, copy=True)
+    out = torch.empty_like(x, pin_memory=True)
+    out.copy_(x)
+    out[0] = mod
+    out[1:] = torch.bitwise_xor(rand_int_1 * out[1:], rand_int_2 * out[:-1]) % mod
+    return out
 
 def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
@@ -1925,6 +1929,9 @@ for param in model.parameters():
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
+
+# TODO:hack
+send_idxes_buffer = torch.empty(args.bigram_vocab_size, dtype=torch.int32, pin_memory=True)
 
 ########################################
 #            Warmup kernels            #
