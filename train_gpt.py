@@ -1957,7 +1957,10 @@ for step in warmup_steps:
                 bigrams_old = bigram_cpu
             else:
                 with torch.no_grad():
-                    bigram_idx_np = np.union1d(bigrams_old, bigram_cpu)
+                    mask = np.zeros(args.bigram_vocab_size, dtype=np.uint8)
+                    mask[bigrams_old] = 1
+                    mask[bigram_cpu] = 1
+                    bigram_idx_np = np.flatnonzero(mask)
 
                     send_idxes, send_counts, recv_counts, recv_counts_fut = a2a_prefwd_start_1(bigram_idx_np, args.bigram_vocab_size, rank, world_size)
 
@@ -2037,7 +2040,10 @@ for step in range(train_steps + 1):
                 bigrams_old = bigram_cpu
             else:
                 with torch.no_grad():
-                    bigram_idx_np = np.union1d(bigrams_old, bigram_cpu)
+                    mask = np.zeros(args.bigram_vocab_size, dtype=np.uint8)
+                    mask[bigrams_old] = 1
+                    mask[bigram_cpu] = 1
+                    bigram_idx_np = np.flatnonzero(mask)
 
                     # start comms for sparse bigram update now as we don't need to compute forward pass to communicate the indices
                     send_idxes, send_counts, recv_counts, recv_counts_fut = a2a_prefwd_start_1(bigram_idx_np, args.bigram_vocab_size, rank, world_size)
