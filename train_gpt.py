@@ -225,7 +225,7 @@ def a2a_prefwd_start_1(idxes_np, N, rank, world):
     # share the send counts so that each rank will know how many rows
     # to expect from every other rank
     recv_counts = torch.empty_like(send_counts)
-    recv_counts_fut = dist.all_to_all_single(recv_counts, send_counts, async_op=True)
+    recv_counts_fut = dist.all_to_all_single(recv_counts, send_counts, async_op=True).get_future()
     return send_idxes, send_counts, recv_counts, recv_counts_fut
 
 @torch.no_grad
@@ -243,7 +243,7 @@ def a2a_prefwd_start_2(send_idxes, send_counts, recv_counts):
         output_split_sizes=recv_counts,
         input_split_sizes=send_counts,
         async_op=True,
-    )
+    ).get_future()
 
     sparse_state = {
         "send_idxes": send_idxes,
@@ -271,7 +271,7 @@ def a2a_postbwd_grad_comm_start(grad, idxes, send_counts, recv_counts):
         input_split_sizes=send_sizes,
         output_split_sizes=recv_sizes,
         async_op=True,
-    )
+    ).get_future()
     return recv_vals, val_fut
 
 @torch.no_grad
