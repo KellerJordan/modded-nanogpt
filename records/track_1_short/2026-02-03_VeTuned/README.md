@@ -1,4 +1,4 @@
-Updates in PR, building off #215. I further tuned value embeddings
+Updates in PR, building off #215. I further tuned value embeddings by:
 - Init all VE to Normal(mean=0, std=0.01).
 - Change gating fn of VE from $g(x[:12])$ to $g(x[:6] + ve[:6])$
 - Shift 1st VE forward, so new pattern is .01...234
@@ -39,6 +39,8 @@ What didn't work:
 - Mind the Gap: 3.2818 (with simple centered attention)
 - QK-Clip tau=1 (from Kimi K2): 3.35
 - QK-Clip tau=10: 3.32
+- Subtract mean from RMS norm for stability: 3.2796
+- Pull last VE back: 3.2986
 
 ## Ablations
 
@@ -94,7 +96,7 @@ H6: ablation-ve-layout-last-back
 
 ## Timing
 
-The improvements were minor but consistent, so I also ablated the number of step decrease with 10 repeats each. 
+The improvements were minor but consistent, so I also ablated the number of step decrease with 10 repeats each. I haven't tested against currently open PRs (#207, #216, #217), but their ideas are mostly orthogonal to mine, so I should expect my improvements to hold if merged in any order.
 
 ```
 Steps  Δ    N   Time μ  Time σ   Loss μ   Loss σ   p-val    Sig
@@ -107,4 +109,22 @@ Steps  Δ    N   Time μ  Time σ   Loss μ   Loss σ   p-val    Sig
 1535 -20   17    94.47    0.04   3.2805   0.0014   0.9121    
 ```
 
-We include the runs for $\Delta=-8$ steps in the log. We achieve significance with $8$ steps, but I ran the timing ablations on different machines, so I suggest we merge at $-8\times 0.6 \approx -0.5$ sec improvement.
+We include the runs for $\Delta=-8$ steps in the log. We achieve significance with $8$ steps,
+```
+import scipy.stats
+import torch
+
+losses = [3.2765, 3.2777, 3.281, 3.2799, 3.2764, 3.2777, 3.2776, 3.2794, 3.2779, 3.2783]
+times = [95.352, 95.319, 95.321, 95.327, 95.248, 95.303, 95.283, 95.072, 95.359, 95.319]
+
+print("p=%.4f" % scipy.stats.ttest_1samp(losses, 3.28, alternative="less").pvalue)
+# p=0.0021
+
+print("losses:", torch.std_mean(torch.tensor(losses)))
+# losses: (std=0.0015, mean=3.2782)
+
+print("times:", torch.std_mean(torch.tensor(times)))
+# times: (std=0.0831, mean=95.2903)
+```
+
+I ran the timing ablations across different machines, so I think the step change is more reliable than the time change (given that none of the ideas add flops). I suggest we attempt to merge at $-8\times 61ms \approx -0.5$ sec improvement.
