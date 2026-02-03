@@ -218,11 +218,11 @@ def sparse_comms_start(idxes_np, N, rank, world):
     )
     send_counts = torch.from_numpy(insertion_points[1:] - insertion_points[:-1])
     # zero-out own send-count - we won't send our own gradient rows to ourselves as it's a waste:
-    # in the optimizer, we'll use the slice of the gradient that already includes them as the basis
+    # in the optimizer, we'll use the slice of the gradient that already includes them as the base tensor
     send_counts[rank] = 0
+
     # remove our own indexes from the send list
     send_idxes = torch.cat([send_idxes[: insertion_points[rank]], send_idxes[insertion_points[rank + 1] :]])
-    # print(f"{rank = }, {send_counts = }, {send_counts.sum() = }, {send_idxes.shape = }", flush=True)
 
     # share the send counts so that each rank will know how many rows
     # to expect from every other rank
@@ -281,8 +281,6 @@ def sparse_comms_merge_gradients(grad, recv_idx, recv_vals, rank, world):
     d = grad.shape[1]
     rows_per_rank = grad.shape[0] // world
 
-    # grad_slice = grad[rows_per_rank * rank : rows_per_rank * (rank + 1)] * (1 / world)
-    # grad_slice.index_add_(0, recv_idx.remainder_(), recv_vals.view(-1, d), alpha = (1 / world))
     grad.index_add_(0, recv_idx, recv_vals.view(-1, d))
 
     return grad[rows_per_rank * rank : rows_per_rank * (rank + 1)].mul_((1 / world))
@@ -1956,7 +1954,7 @@ for step in warmup_steps:
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
 
-        # TODO: hack
+        # TODO: cleaner integration of sparse comms
         if world_size == 8:
             if not training_manager._is_adam_step(step):
                 bigrams_old = bigram_cpu
@@ -1970,7 +1968,8 @@ for step in warmup_steps:
                     send_idxes, send_counts, recv_counts, recv_counts_fut = sparse_comms_start(bigram_idx_np, args.bigram_vocab_size, rank, world_size)
 
         r = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps
-        if training_manager._is_adam_step(step):
+        # TODO: cleaner integration of sparse comms
+        if world_size == 8 and training_manager._is_adam_step(step):
             recv_counts_fut.wait()
             recv_idxes, sparse_state, idxes_fut = sparse_comms_share_indexes(send_idxes, send_counts, recv_counts)
             training_manager.optimizer._reduce_futures[model.bigram_embed.weight] = [idxes_fut, recv_idxes]
@@ -2039,7 +2038,7 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
-        # TODO: hack
+        # TODO: cleaner integration of sparse comms
         if world_size == 8:
             if not training_manager._is_adam_step(step):
                 bigrams_old = bigram_cpu
@@ -2054,7 +2053,8 @@ for step in range(train_steps + 1):
                     send_idxes, send_counts, recv_counts, recv_counts_fut = sparse_comms_start(bigram_idx_np, args.bigram_vocab_size, rank, world_size)
 
         r = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps
-        if training_manager._is_adam_step(step):
+        # TODO: cleaner integration of sparse comms
+        if world_size == 8 and training_manager._is_adam_step(step):
             recv_counts_fut.wait()
             recv_idxes, sparse_state, idxes_fut = sparse_comms_share_indexes(send_idxes, send_counts, recv_counts)
             training_manager.optimizer._reduce_futures[model.bigram_embed.weight] = [idxes_fut, recv_idxes]
