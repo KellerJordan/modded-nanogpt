@@ -1705,7 +1705,7 @@ class TrainingManager():
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
-            "bigram_embed", 
+            "bigram_embed",
             "lm_head", # lm_head must complete before embed sync (when tied), lm_head is first large param available
             "ve0", "ve1", "ve2",   # Medium
             "embed",  
@@ -1960,7 +1960,7 @@ for step in warmup_steps:
                     mask = np.zeros(args.bigram_vocab_size, dtype=np.uint8)
                     mask[bigrams_old] = 1
                     mask[bigram_cpu] = 1
-                    bigram_idx_np = np.flatnonzero(mask)
+                    bigram_idx_np = np.flatnonzero(mask).atype(np.int32)
 
                     send_idxes, send_counts, recv_counts, recv_counts_fut = a2a_prefwd_start_1(bigram_idx_np, args.bigram_vocab_size, rank, world_size)
 
@@ -2043,7 +2043,7 @@ for step in range(train_steps + 1):
                     mask = np.zeros(args.bigram_vocab_size, dtype=np.uint8)
                     mask[bigrams_old] = 1
                     mask[bigram_cpu] = 1
-                    bigram_idx_np = np.flatnonzero(mask)
+                    bigram_idx_np = np.flatnonzero(mask).astype(np.int32)
 
                     # start comms for sparse bigram update now as we don't need to compute forward pass to communicate the indices
                     send_idxes, send_counts, recv_counts, recv_counts_fut = a2a_prefwd_start_1(bigram_idx_np, args.bigram_vocab_size, rank, world_size)
