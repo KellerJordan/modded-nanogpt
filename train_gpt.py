@@ -202,7 +202,7 @@ comm_stream = torch.cuda.streams.Stream()
 
 @torch._dynamo.disable
 @torch.no_grad
-def a2a_prefwd_start_1(idxes_np, N, rank, world):
+def sparse_comms_start(idxes_np, N, rank, world):
     global send_idxes_buffer
     rows_per_rank = N // world
 
@@ -231,7 +231,7 @@ def a2a_prefwd_start_1(idxes_np, N, rank, world):
     return send_idxes, send_counts, recv_counts, recv_counts_fut
 
 @torch.no_grad
-def a2a_prefwd_start_2(send_idxes, send_counts, recv_counts):
+def sparse_comms_share_indexes(send_idxes, send_counts, recv_counts):
     # cpu tensors, so these ops are cheap and don't force a host<->device sync
     total_recv_count = recv_counts.sum().item()
     recv_counts = recv_counts.tolist()
@@ -256,7 +256,7 @@ def a2a_prefwd_start_2(send_idxes, send_counts, recv_counts):
 
 @torch.compile
 @torch.no_grad
-def a2a_postbwd_grad_comm_start(grad, idxes, send_counts, recv_counts):
+def sparse_comms_share_gradients(grad, idxes, send_counts, recv_counts):
     # gather the rows that we want to send
     send_vals = grad[idxes]
 
@@ -277,7 +277,7 @@ def a2a_postbwd_grad_comm_start(grad, idxes, send_counts, recv_counts):
     return recv_vals, val_fut
 
 @torch.no_grad
-def a2a_postbwd_grad_comm_wait(grad, recv_idx, recv_vals, rank, world):
+def sparse_comms_merge_gradients(grad, recv_idx, recv_vals, rank, world):
     d = grad.shape[1]
     rows_per_rank = grad.shape[0] // world
 
@@ -560,7 +560,7 @@ class NorMuonAndAdam:
             send_idxes = sparse_state["send_idxes"]
             send_counts = sparse_state["send_counts"]
             recv_counts = sparse_state["recv_counts"]
-            recv_vals, val_fut = a2a_postbwd_grad_comm_start(
+            recv_vals, val_fut = sparse_comms_share_gradients(
                 grad, send_idxes, send_counts, recv_counts
             )
             self._reduce_futures[param].extend((val_fut, recv_vals))
@@ -722,10 +722,8 @@ class NorMuonAndAdam:
                 idxes_fut, recv_idxes, recv_fut, recv_vals = self._reduce_futures[param]
                 idxes_fut.wait()
                 recv_fut.wait()
-                torch._dynamo.mark_dynamic(recv_idxes, 0)
-                torch._dynamo.mark_dynamic(recv_vals, 0)
 
-                grad_chunk = a2a_postbwd_grad_comm_wait(param.grad, recv_idxes, recv_vals, rank, world_size)
+                grad_chunk = sparse_comms_merge_gradients(param.grad, recv_idxes, recv_vals, rank, world_size)
 
             # Apply update based on optim type
             if p_cfg.optim == "adam":
@@ -1969,12 +1967,12 @@ for step in warmup_steps:
                     mask[bigram_cpu] = 1
                     bigram_idx_np = np.flatnonzero(mask).astype(np.int32)
 
-                    send_idxes, send_counts, recv_counts, recv_counts_fut = a2a_prefwd_start_1(bigram_idx_np, args.bigram_vocab_size, rank, world_size)
+                    send_idxes, send_counts, recv_counts, recv_counts_fut = sparse_comms_start(bigram_idx_np, args.bigram_vocab_size, rank, world_size)
 
         r = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps
         if training_manager._is_adam_step(step):
             recv_counts_fut.wait()
-            recv_idxes, sparse_state, idxes_fut = a2a_prefwd_start_2(send_idxes, send_counts, recv_counts)
+            recv_idxes, sparse_state, idxes_fut = sparse_comms_share_indexes(send_idxes, send_counts, recv_counts)
             training_manager.optimizer._reduce_futures[model.bigram_embed.weight] = [idxes_fut, recv_idxes]
             training_manager.optimizer._sparse_async_data[model.bigram_embed.weight] = sparse_state
 
@@ -2053,12 +2051,12 @@ for step in range(train_steps + 1):
                     bigram_idx_np = np.flatnonzero(mask).astype(np.int32)
 
                     # start comms for sparse bigram update now as we don't need to compute forward pass to communicate the indices
-                    send_idxes, send_counts, recv_counts, recv_counts_fut = a2a_prefwd_start_1(bigram_idx_np, args.bigram_vocab_size, rank, world_size)
+                    send_idxes, send_counts, recv_counts, recv_counts_fut = sparse_comms_start(bigram_idx_np, args.bigram_vocab_size, rank, world_size)
 
         r = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps
         if training_manager._is_adam_step(step):
             recv_counts_fut.wait()
-            recv_idxes, sparse_state, idxes_fut = a2a_prefwd_start_2(send_idxes, send_counts, recv_counts)
+            recv_idxes, sparse_state, idxes_fut = sparse_comms_share_indexes(send_idxes, send_counts, recv_counts)
             training_manager.optimizer._reduce_futures[model.bigram_embed.weight] = [idxes_fut, recv_idxes]
             training_manager.optimizer._sparse_async_data[model.bigram_embed.weight] = sparse_state
 
