@@ -1960,7 +1960,7 @@ for step in warmup_steps:
                     mask = np.zeros(args.bigram_vocab_size, dtype=np.uint8)
                     mask[bigrams_old] = 1
                     mask[bigram_cpu] = 1
-                    bigram_idx_np = np.flatnonzero(mask).atype(np.int32)
+                    bigram_idx_np = np.flatnonzero(mask).astype(np.int32)
 
                     send_idxes, send_counts, recv_counts, recv_counts_fut = a2a_prefwd_start_1(bigram_idx_np, args.bigram_vocab_size, rank, world_size)
 
