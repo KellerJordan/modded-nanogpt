@@ -563,4 +563,4 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             use_fast_accum=False,
         )
 
-        return grad_x, None, None, None, grad_w, None, None, None
+        return grad_x, None, None, grad_w, None, None, None
