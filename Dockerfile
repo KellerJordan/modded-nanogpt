@@ -24,10 +24,9 @@ RUN ln -s /usr/local/bin/python3.12 /usr/local/bin/python && \
 COPY requirements.txt /modded-nanogpt/requirements.txt
 WORKDIR /modded-nanogpt
 
-RUN python -m pip install --upgrade pip && \
-    pip install -r requirements.txt
-
-RUN pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+RUN uv pip install --system -r requirements.txt
+RUN uv pip install --system --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade
 
 CMD ["bash"]
 ENTRYPOINT []
