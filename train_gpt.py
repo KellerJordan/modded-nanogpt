@@ -44,7 +44,7 @@ rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 assert 8 % world_size == 0, "world_size must be a divisor of 8"
 grad_accum_steps = 8 // world_size
-grad_scale = 2 / grad_accum_steps # consistent grad magnitudes between different num_devices
+grad_scale = 1 / grad_accum_steps # consistent grad magnitudes between different num_devices
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
