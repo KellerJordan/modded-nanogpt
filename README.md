@@ -47,7 +47,7 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@bernard24](https://github.com/bernard24)/https://www.hiverge.ai/, [@Gusarich](https://x.com/Gusarich), [@li_zichong](https://x.com/li_zichong),
 [@akash5474](https://github.com/akash5474), [@snimu](https://x.com/omouamoua), [@roeeshenberg](https://x.com/roeeshenberg),
 [@ChrisJMcCormick](https://x.com/ChrisJMcCormick), [@dominikkallusky](https://github.com/dominikkallusky), [@acutkosky](https://github.com/acutkosky), 
-[@manikbhandari](https://github.com/manikbhandari), [@andrewbriand](https://github.com/andrewbriand), [@jrauvola](https://github.com/jrauvola),
+[@manikbhandari](https://github.com/manikbhandari), [@andrewbriand](https://x.com/andrewbriand8), [@jrauvola](https://x.com/Joshrav21),
 [@soren_dunn_](https://x.com/soren_dunn_), [@photon_mz](https://x.com/photon_mz), [@srashedll](https://x.com/srashedll)
 
 
@@ -59,7 +59,6 @@ To run the current record, run the following commands.
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install -r requirements.txt
-pip install torch==2.10.0.dev20251210+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126
 # downloads only the first 900M training tokens to save time
 python data/cached_fineweb10B.py 9
 ./run.sh
@@ -160,13 +159,15 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 56 | 1.894 minutes | [Optimize and compile Adam, increase Adam buffer precision, move gates from Muon to Adam parameter banks](https://x.com/classiclarryd/status/2007882371576873445) | 12/31/25 | [log](records/track_1_short/2025-12-31_GatesToCompiledAdam/12-31-gates-to-adam-20stps/219a5f2f-151e-4c56-ab91-3735ae4610b8.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/187) | @ChrisJMcCormick
 57 | 1.878 minutes | [Bfloat16 attn/mlp weights, mixed precision Muon, interweave Adam/Muon, finer-grain Adam beta](https://x.com/classiclarryd/status/2008261904566022590) | 01/04/26 | [log](records/track_1_short/2026-01-04_MixedPrecisionInterweavedOptimizer/41f606b6-1b9c-46a3-b46e-2beff1521d18.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/190) | @classiclarryd, feat. @YouJiacheng, @ChrisJMcCormick
 58 | 1.820 minutes | [Paired Head Attention](https://x.com/classiclarryd/status/2008963501688324228) | 01/07/26 | [log](records/track_1_short/2026-01-07_PairedHeadAttention/2a5d5cde-db5f-4aab-a4a8-cc8e183ea671.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/191) | @classiclarryd
-59 | 1.781 minutes | [Fused triton kernel for linear relu square MLP step](https://x.com/classiclarryd/status/2010545452832407943) | 01/10/26 | [log](records/track_1_short/2026-01-10_FusedLinearReLUSquare/3c47e63b-075e-4b5b-9c76-9dbe7bad9ad4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/197) | @andrewbriand, @jrauvola
+59 | 1.781 minutes | [Fused triton kernel for linear relu square MLP step](https://x.com/classiclarryd/status/2010545452832407943) | 01/10/26 | [log](records/track_1_short/2026-01-10_FusedLinearReLUSquare/3c47e63b-075e-4b5b-9c76-9dbe7bad9ad4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/197) | @andrewbriand8, @Joshrav21
 60 | 1.765 minutes | [Fused triton kernel for softcapped multi-token prediction cross entropy step](https://x.com/classiclarryd/status/2012927211448516796) | 01/16/26 | [log](records/track_1_short/2026-01-16_FusedSoftcappedEntropy/45beba56-93e2-4995-bc5b-caff3cb2c1b5.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/199) | @soren_dunn_ & AI System [Locus](https://www.intology.ai/blog/previewing-locus)
 61 | 1.748 minutes | [Unified Optimizers and Transposed LM Head](https://x.com/classiclarryd/status/2013399457841160702) | 01/18/26 | [log](records/track_1_short/2026-01-18_UnifiedOptimizers/unified-optimizer/2fc79469-a527-4bde-8540-8426ed3352d1.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/200) | @ChrisJMcCormick
 62 | 1.655 minutes | [Bigram Hash Embedding](https://x.com/classiclarryd/status/2013520088297558274) | 01/19/26 | [log](records/track_1_short/2026-01-19_BigramHashEmbedding/40ec7bb6-14b3-46f8-90b7-bb5ed188faba.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/201) | @classiclarryd
 63 | 1.650 minutes | [Untie Value Embeds](https://x.com/classiclarryd/status/2016968386476200301) | 01/26/26 | [log](records/track_1_short/2026-01-26-UntieValueEmbeddings/43955d93-6914-40cb-bdf8-786ace93784f.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/209) | @photo_mz
 64 | 1.630 minutes | [Tuned nonzero Attn V and O init](https://x.com/classiclarryd/status/2017735338601726357) | 01/30/26 | [log](records/track_1_short/2026-01-30_MimeticValueOutput/runs/0f262f64-20c4-4268-9ae7-d7440c810abd.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/214) | @srashedll
 65 | 1.613 minutes | Group Value Embeds into single parameter | 01/30/26 | [log](records/track_1_short/2026-01-30_VeFused/0ba09d92-4ef1-440f-85e3-9d2766294db4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/215) | @varunneal
+66 | 1.595 minutes | Torch 2.10 | 02/03/26 | - | -
+67 | 1.540 minutes | Tune fused softcap kernels and fuse fp8 quantization in LM head | 02/03/26 | [log](records/track_1_short/2026-01-24_ImprovedLMHead/record/73a071ac-522d-4ce0-a4d6-cf3955a376e4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/207) | @andrewbriand8
 ## Rules
 
 New records must:
