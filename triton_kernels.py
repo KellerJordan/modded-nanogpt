@@ -436,6 +436,7 @@ def fused_softcapped_entropy_bwd_kernel(
     stride_logits_n, stride_logits_v, stride_grad_n, stride_grad_v,
     n_rows, n_cols, n_predict,
     A, B, C,
+    grad_s,
     BLOCK_SIZE: tl.constexpr
 ):
     row_idx = tl.program_id(0).to(tl.int64)
@@ -471,11 +472,28 @@ def fused_softcapped_entropy_bwd_kernel(
         grad_z = grad_loss * (term1 - term2)
         dz_dx = (1.0 / C) * z * (1.0 - sigmoid_u)
         grad_x = grad_z * dz_dx
-        tl.store(grad_row_ptr + cols, grad_x.to(tl.bfloat16), mask=mask)
+        grad_x = grad_x / grad_s
+        grad_x = grad_x.to(tl.float8e5)
+        tl.store(grad_row_ptr + cols, grad_x, mask=mask)
 
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, targets, mtp_weights, A=23.0, B=5.0, C=7.5):
+    def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, A=23.0, B=5.0, C=7.5):
+
+        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+        w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
+
+        w_f8_col_major = w_f8.T.contiguous().T
+
+        logits = torch._scaled_mm(
+            x_f8,
+            w_f8_col_major,
+            out_dtype=torch.bfloat16,
+            scale_a=x.new_tensor(x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(w_s, dtype=torch.float32),
+            use_fast_accum=True,
+        )
+
         n_rows, n_cols = logits.shape
         if mtp_weights is None:
              mtp_weights = torch.tensor([1.0], device=logits.device, dtype=torch.float32)
@@ -495,22 +513,21 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             n_rows, n_cols, n_predict,
             A, B, C,
             BLOCK_SIZE=1024,
-            num_warps=8,
-            num_stages=4
+            num_warps=2
         )
 
-        ctx.save_for_backward(logits, targets, mtp_weights, lse)
-        ctx.params = (A, B, C)
+        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8)
+        ctx.params = (A, B, C, x_s, w_s, grad_s)
         return losses
 
     @staticmethod
     def backward(ctx, grad_output):
-        logits, targets, mtp_weights, lse = ctx.saved_tensors
-        A, B, C = ctx.params
+        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8 = ctx.saved_tensors
+        A, B, C, x_s, w_s, grad_s = ctx.params
         n_rows, n_cols = logits.shape
         n_predict = mtp_weights.shape[0]
 
-        grad_input = torch.empty((n_rows, n_cols), dtype=torch.bfloat16, device=logits.device)
+        grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
         grad_output = grad_output.contiguous()
 
         grid = (n_rows,)
@@ -519,8 +536,31 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
             n_rows, n_cols, n_predict,
             A, B, C,
+            grad_s,
             BLOCK_SIZE=1024,
-            num_warps=8,
-            num_stages=4
+            num_warps=2
         )
-        return grad_input, None, None, None, None, None
+
+        x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
+        w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)
+        grad_scale = grad_input.new_tensor(grad_s, dtype=torch.float32)
+
+        grad_x = torch._scaled_mm(
+            grad_input,
+            w_f8.T,
+            out_dtype=torch.bfloat16,
+            scale_a=grad_scale,
+            scale_b=w_scale,
+            use_fast_accum=False,
+        )
+
+        grad_w = torch._scaled_mm(
+            x_f8.T.contiguous(),
+            grad_input.T.contiguous().T,
+            out_dtype=torch.float32,
+            scale_a=x_scale,
+            scale_b=grad_scale,
+            use_fast_accum=False,
+        )
+
+        return grad_x, None, None, grad_w, None, None, None
