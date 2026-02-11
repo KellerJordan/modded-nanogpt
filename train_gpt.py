@@ -390,15 +390,9 @@ class Dion2AndAdam:
                     chunk_shape, dtype=torch.uint16, device=param.device
                 )
 
-                # Pre-allocated buffer for sparse ortho update (avoids allocation every step)
-                full_update = torch.zeros(
-                    chunk_shape, dtype=torch.float32, device=param.device
-                )
-
                 self.param_states[param] = dict(
                     momentum_buffer=momentum_buffer,
                     mantissa=mantissa,
-                    full_update=full_update,
                 )
 
     # -----------------------------------
@@ -671,8 +665,6 @@ class Dion2AndAdam:
         p_state = self.param_states[param]
         M = p_state["momentum_buffer"]
         mantissa = p_state["mantissa"]
-        full_update = p_state["full_update"]
-
         # 1. Accumulate gradient into momentum (additive, not EMA)
         M.add_(grad_chunk.float())
 
@@ -699,11 +691,7 @@ class Dion2AndAdam:
         # 6. Orthogonalize selected submatrix via Newton-Schulz
         ortho = zeropower_via_newtonschulz5(selected)
 
-        # 7. Build full-size sparse update (zeros at non-selected, ortho at selected)
-        full_update.zero_()
-        full_update.scatter_(select_dim, idx_expanded, ortho.float())
-
-        # 8. Apply update with cautious weight decay + mantissa tracking
+        # 7. Apply weight decay (dense) + ortho gradient (sparse) — no full_update allocation
         param_view = param.data.view(p_cfg.reshape)
         p_slice = param_view[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size]
 
@@ -712,15 +700,17 @@ class Dion2AndAdam:
             for mat_idx in range(p_cfg.chunk_size):
                 self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.per_matrix_lr_mul[mat_idx] * p_cfg.lr)
                 self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
-                Dion2AndAdam._cautious_wd_and_update_inplace(
-                    p_slice[mat_idx].view(torch.uint16), mantissa[mat_idx], full_update[mat_idx],
+                Dion2AndAdam._cautious_wd_and_sparse_update_inplace(
+                    p_slice[mat_idx].view(torch.uint16), mantissa[mat_idx],
+                    ortho[mat_idx], idx_expanded[mat_idx], select_dim,
                     self._eff_wd_t, self._eff_lr_t
                 )
         else:
             self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
             self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
-            Dion2AndAdam._cautious_wd_and_update_inplace(
-                p_slice.view(torch.uint16), mantissa, full_update,
+            Dion2AndAdam._cautious_wd_and_sparse_update_inplace(
+                p_slice.view(torch.uint16), mantissa,
+                ortho, idx_expanded, select_dim,
                 self._eff_wd_t, self._eff_lr_t
             )
 
@@ -745,6 +735,43 @@ class Dion2AndAdam:
         p_precise.copy_(p_precise - (p_precise * mask * wd_factor * lr_factor) - (grad * lr_factor))
         p.copy_((p_precise_raw >> 16).to(torch.uint16))
         mantissa.copy_(p_precise_raw.to(torch.uint16))
+
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _cautious_wd_and_sparse_update_inplace(p, mantissa, ortho, idx_expanded, select_dim, wd_tensor, lr_tensor):
+        """
+        Applies weight decay densely to all params, then the ortho gradient
+        update only at selected indices. Avoids allocating a full-size
+        zeros_like intermediate tensor.
+
+        Equivalent to _cautious_wd_and_update_inplace with a sparse grad that
+        is zero at non-selected positions and ortho at selected positions.
+        """
+        assert p.dtype == mantissa.dtype == torch.uint16
+        ortho_f = ortho.float()
+        wd = wd_tensor.to(torch.float32)
+        lr = lr_tensor.to(torch.float32)
+        wd_lr = wd * lr
+
+        # Reconstruct full precision
+        raw = (p.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
+        p_fp32 = raw.view(torch.float32)
+
+        # Weight decay everywhere (at non-selected: grad=0, mask=True, wd applies)
+        p_fp32.mul_(1.0 - wd_lr)
+
+        # At selected indices: gather, compute cautious mask, apply gradient
+        p_sel = torch.gather(p_fp32, select_dim, idx_expanded)
+        # Sign is preserved by (1-wd_lr) > 0, so mask is equivalent pre/post decay
+        mask = (ortho_f * p_sel) >= 0
+        # mask True:  wd correct, apply grad  →  p_sel - ortho*lr
+        # mask False: undo wd, apply grad     →  p_sel/(1-wd_lr) - ortho*lr
+        p_sel_new = torch.where(mask, p_sel - ortho_f * lr, p_sel / (1.0 - wd_lr) - ortho_f * lr)
+        p_fp32.scatter_(select_dim, idx_expanded, p_sel_new)
+
+        # Write back to bf16 + mantissa
+        p.copy_((raw >> 16).to(torch.uint16))
+        mantissa.copy_(raw.to(torch.uint16))
 
 
 # -----------------------------------------------------------------------------
