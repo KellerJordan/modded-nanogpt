@@ -390,9 +390,15 @@ class Dion2AndAdam:
                     chunk_shape, dtype=torch.uint16, device=param.device
                 )
 
+                # Pre-allocated buffer for sparse ortho update (avoids allocation every step)
+                full_update = torch.zeros(
+                    chunk_shape, dtype=torch.float32, device=param.device
+                )
+
                 self.param_states[param] = dict(
                     momentum_buffer=momentum_buffer,
                     mantissa=mantissa,
+                    full_update=full_update,
                 )
 
     # -----------------------------------
@@ -665,6 +671,7 @@ class Dion2AndAdam:
         p_state = self.param_states[param]
         M = p_state["momentum_buffer"]
         mantissa = p_state["mantissa"]
+        full_update = p_state["full_update"]
 
         # 1. Accumulate gradient into momentum (additive, not EMA)
         M.add_(grad_chunk.float())
@@ -693,7 +700,7 @@ class Dion2AndAdam:
         ortho = zeropower_via_newtonschulz5(selected)
 
         # 7. Build full-size sparse update (zeros at non-selected, ortho at selected)
-        full_update = torch.zeros_like(M)
+        full_update.zero_()
         full_update.scatter_(select_dim, idx_expanded, ortho.float())
 
         # 8. Apply update with cautious weight decay + mantissa tracking
