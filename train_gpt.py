@@ -176,6 +176,35 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, epsilon: float = 1e-7):
         X = X.mT
     return X
 
+@torch.compile(dynamic=False, fullgraph=True)
+def _dion2_select_ortho_reconstruct(M, grad_chunk, full_update, ef_decay, k, select_rows):
+    """Compiled Dion2 core: accumulate gradient, select submatrix, orthogonalize, reconstruct.
+
+    Fuses gradient accumulation, L1-norm selection, error-feedback decay, Newton-Schulz
+    orthogonalization, and sparse reconstruction into a single compiled graph to reduce
+    kernel launch overhead.
+    """
+    M.add_(grad_chunk.float())
+    if select_rows:
+        norms = M.abs().sum(dim=-1)
+        _, indices = norms.topk(k, dim=-1)
+        idx_expanded = indices.unsqueeze(-1).expand(-1, -1, M.shape[-1])
+        selected = torch.gather(M, -2, idx_expanded)
+        M.scatter_(-2, idx_expanded, selected * ef_decay)
+        ortho = zeropower_via_newtonschulz5(selected)
+        full_update.zero_()
+        full_update.scatter_(-2, idx_expanded, ortho.float())
+    else:
+        norms = M.abs().sum(dim=-2)
+        _, indices = norms.topk(k, dim=-1)
+        idx_expanded = indices.unsqueeze(-2).expand(-1, M.shape[-2], -1)
+        selected = torch.gather(M, -1, idx_expanded)
+        M.scatter_(-1, idx_expanded, selected * ef_decay)
+        ortho = zeropower_via_newtonschulz5(selected)
+        full_update.zero_()
+        full_update.scatter_(-1, idx_expanded, ortho.float())
+    return full_update
+
 
 # -----------------------------------------------------------------------------
 # Combined Dion2 + Adam Optimizer
@@ -390,9 +419,15 @@ class Dion2AndAdam:
                     chunk_shape, dtype=torch.uint16, device=param.device
                 )
 
+                # Pre-allocated buffer for sparse ortho update (avoids allocation every step)
+                full_update = torch.zeros(
+                    chunk_shape, dtype=torch.float32, device=param.device
+                )
+
                 self.param_states[param] = dict(
                     momentum_buffer=momentum_buffer,
                     mantissa=mantissa,
+                    full_update=full_update,
                 )
 
     # -----------------------------------
@@ -665,38 +700,15 @@ class Dion2AndAdam:
         p_state = self.param_states[param]
         M = p_state["momentum_buffer"]
         mantissa = p_state["mantissa"]
+        full_update = p_state["full_update"]
 
-        # 1. Accumulate gradient into momentum (additive, not EMA)
-        M.add_(grad_chunk.float())
-
-        # 2. Determine selection dimension (select shorter dim, or rows if square)
-        select_dim = -2 if M.shape[-2] <= M.shape[-1] else -1
-        norm_dim = -1 if select_dim == -2 else -2
+        # Select submatrix, orthogonalize, reconstruct (single compiled graph)
+        select_rows = M.shape[-2] <= M.shape[-1]
+        select_dim = -2 if select_rows else -1
         k = math.ceil(p_cfg.fraction * M.shape[select_dim])
+        _dion2_select_ortho_reconstruct(M, grad_chunk, full_update, p_cfg.ef_decay, k, select_rows)
 
-        # 3. Compute L1 norms and select top-k indices per matrix in the bank
-        norms = M.abs().sum(dim=norm_dim)  # (chunk_size, dim_to_select)
-        _, indices = norms.topk(k, dim=-1)  # (chunk_size, k)
-
-        # 4. Gather selected submatrix from momentum and expand indices
-        if select_dim == -2:
-            idx_expanded = indices.unsqueeze(-1).expand(-1, -1, M.shape[-1])
-            selected = torch.gather(M, -2, idx_expanded)  # (chunk_size, k, N)
-        else:
-            idx_expanded = indices.unsqueeze(-2).expand(-1, M.shape[-2], -1)
-            selected = torch.gather(M, -1, idx_expanded)  # (chunk_size, M, k)
-
-        # 5. Error-feedback decay on selected entries in momentum
-        M.scatter_(select_dim, idx_expanded, selected * p_cfg.ef_decay)
-
-        # 6. Orthogonalize selected submatrix via Newton-Schulz
-        ortho = zeropower_via_newtonschulz5(selected)
-
-        # 7. Build full-size sparse update (zeros at non-selected, ortho at selected)
-        full_update = torch.zeros_like(M)
-        full_update.scatter_(select_dim, idx_expanded, ortho.float())
-
-        # 8. Apply update with cautious weight decay + mantissa tracking
+        # Apply update with cautious weight decay + mantissa tracking
         param_view = param.data.view(p_cfg.reshape)
         p_slice = param_view[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size]
 
