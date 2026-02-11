@@ -34,7 +34,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
+from triton_kernels import FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
 
 dynamo.config.recompile_limit = 64
 
@@ -151,72 +151,40 @@ def setup_context_t(ctx: torch.autograd.function.FunctionCtx, inputs, output):
 mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 
 # -----------------------------------------------------------------------------
-# Polar Express
+# Newton-Schulz orthogonalization (from Dion2: https://github.com/microsoft/dion)
 
-# Computed for num_iters=5, safety_factor=2e-2, cushion=2
-polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
+_ns_coeffs = [
+    (4.0848, -6.8946, 2.9270),
+    (3.9505, -6.3029, 2.6377),
+    (3.7418, -5.5913, 2.3037),
+    (2.8769, -3.1427, 1.2046),
+    (2.8366, -3.0525, 1.2012),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
-def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
-    """
-    Polar Express Sign Method: https://arxiv.org/pdf/2505.16932
-    by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
-    """
+@torch.compile(dynamic=False, fullgraph=True)
+def zeropower_via_newtonschulz5(G: torch.Tensor, epsilon: float = 1e-7):
+    """Newton-Schulz iteration to approximate the matrix sign function (nearest orthogonal matrix)."""
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
         X = X.mT
-
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
-
-    # Allocate buffers
-    X = X.contiguous()
-    A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
-    B = torch.empty_like(A)
-    C = torch.empty_like(X)
-
-    # Select batched vs unbatched
-    if split_baddbmm:
-        BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
-    else:
-        aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
-
-    # Perform the iterations
-    for a, b, c in polar_express_coeffs:
-        XXT(X, out=A)  # A = X @ X.mT
-        ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
-
-        # Referencing X twice causes pytorch to make a defensive copy,
-        # resulting in a cudaMemcpyAsync in baddbmm.
-        # For large matrices (i.e., the mlp weights), it's faster to split
-        # the operation into two kernels to avoid this.
-        if split_baddbmm:
-            BX_matmul(B, X, out=C)  # C = B @ X
-            C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
-        else:
-            aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
-
-        X, C = C, X  # Swap references to avoid unnecessary copies
-
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + epsilon)
+    for a, b, c in _ns_coeffs:
+        A = X @ X.mT
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
 
 
 # -----------------------------------------------------------------------------
-# Combined NorMuon + Adam Optimizer
+# Combined Dion2 + Adam Optimizer
 
 @dataclass
 class ParamConfig:
-    """Per-parameter configuration for NorMuonAndAdam optimizer."""
+    """Per-parameter configuration for Dion2AndAdam optimizer."""
     label: str
-    optim: str  # "adam" or "normuon"
+    optim: str  # "adam" or "dion2"
     comms: str  # "none", "replicated", or "sharded"
     adam_betas: tuple[float, float] | None
     lr_mul: float
@@ -226,36 +194,35 @@ class ParamConfig:
     weight_decay: float
     # Adam-specific
     eps: float | None = None
-    # NorMuon-specific
+    # Dion2-specific
     reshape: tuple | None = None
     chunk_size: int | None = None
-    momentum: float | None = None
-    beta2: float | None = None
+    fraction: float | None = None  # submatrix selection fraction (e.g. 0.25)
+    ef_decay: float | None = None  # error-feedback decay (e.g. 0.95)
     per_matrix_lr_mul: list[float] | None = None
 
 
-class NorMuonAndAdam:
+class Dion2AndAdam:
     """
-    Combined optimizer that handles both NorMuon (for projection matrices) and
+    Combined optimizer that handles both Dion2 (for projection matrices) and
     Adam (for embeddings/scalars/gate weights).
 
-    Muon - MomentUm Orthogonalized by Newton-schulz
+    Dion2 - Distributed Orthonormalized updates with submatrix selection
+    https://github.com/microsoft/dion
+    https://arxiv.org/html/2512.16928
 
-    https://kellerjordan.github.io/posts/muon/
+    Dion2 accumulates gradients into a momentum buffer, selects a fraction of
+    rows/columns by L1 norm, orthogonalizes only the selected submatrix via
+    Newton-Schulz iteration, and applies a sparse update. Error-feedback decay
+    on selected momentum entries preserves information for future steps.
 
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, Muon uses a Newton-Schulz iteration (replaced
-    here with Polar Express), which has the advantage that it can be stably run in bfloat16 on the GPU.
+    Dion2 is applied only to the projection matrices in the attention and MLP
+    layers, and is not recommended for embeddings, scalars, or individual
+    weight vectors (e.g., bias terms or gate weights).
 
-    Muon is applied only to the projection matrices in the attention and MLP layers, and is not recommended
-    for embeddings, scalars, or individual weight vectors (e.g., bias terms or gate weights).
-
-    Differences from standard Muon:
-    - Newton-Shulz is replaced with Polar Express for the orthogonalization step
-    - NorMuon adds a low-rank variance estimator similar to Adafactor. https://arxiv.org/pdf/2510.05491
+    Additional techniques (from modded-nanogpt NorMuon):
     - Cautious weight decay, a gated version of decoupled weight decay
-    - Mantissa tracking for precision
+    - Mantissa tracking for bfloat16 precision
 
     Adam (for embeddings/scalars/gates):
     - Standard Adam with bias correction
@@ -277,21 +244,18 @@ class NorMuonAndAdam:
     - 'sharded': Gradients are reduce-scattered, each rank updates its shard,
       and results are all-gathered.
 
-    Adam parameters may be freely sharded. NorMuon operates on full matrices; sharding is
-    supported by grouping matrices into parameter banks. NorMuon parameters must have a
+    Adam parameters may be freely sharded. Dion2 operates on full matrices; sharding is
+    supported by grouping matrices into parameter banks. Dion2 parameters must have a
     `.reshape` attribute that reshapes the bank so that the leading dimension is divisible
     by world_size.
-
-    # Contributors include @YouJiacheng, @KonstantinWilleke, @alexrgilbert, @adricarda,
-    # @tuttyfrutyee, @vdlad, @ryanyang0, @vagrawal, @varunneal, @chrisjmccormick
     """
     def __init__(self, named_params, param_table: dict, scatter_order: list, work_order: list,
-                 adam_defaults: dict, normuon_defaults: dict):
+                 adam_defaults: dict, dion2_defaults: dict):
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
 
         # Store defaults for each optimizer type
         self.adam_defaults = adam_defaults
-        self.normuon_defaults = normuon_defaults
+        self.dion2_defaults = dion2_defaults
         self.param_table = param_table
         self.scatter_order = scatter_order
         self.work_order = work_order
@@ -356,16 +320,16 @@ class NorMuonAndAdam:
                 eps=self.adam_defaults["eps"],
                 chunk_size=chunk_size,
             )
-        elif optim == "normuon":
+        elif optim == "dion2":
             reshape = getattr(param, "reshape", None)
             if reshape is None:
-                raise ValueError(f"NorMuon param {label} must have .reshape attribute")
+                raise ValueError(f"Dion2 param {label} must have .reshape attribute")
             if reshape[0] % self.world_size != 0:
                 raise ValueError(f"reshape[0]={reshape[0]} must be divisible by world_size")
 
             chunk_size = reshape[0] // self.world_size
             chunk_shape = (chunk_size, *reshape[1:])
-            # Shape-based LR multiplier for NorMuon
+            # Spectral norm LR scaling: sqrt(fan_out / fan_in)
             shape_mult = max(1.0, chunk_shape[-2] / chunk_shape[-1]) ** 0.5 if len(chunk_shape) >= 2 else 1.0
             lr_mul = shape_mult * lr_mul
 
@@ -387,13 +351,13 @@ class NorMuonAndAdam:
                 adam_betas=tuple(adam_betas) if adam_betas else None,
                 lr_mul=lr_mul,
                 wd_mul=wd_mul,
-                lr=self.normuon_defaults["lr"],
-                initial_lr=self.normuon_defaults["lr"],
-                weight_decay=self.normuon_defaults["weight_decay"],
+                lr=self.dion2_defaults["lr"],
+                initial_lr=self.dion2_defaults["lr"],
+                weight_decay=self.dion2_defaults["weight_decay"],
                 reshape=reshape,
                 chunk_size=chunk_size,
-                momentum=self.normuon_defaults["momentum"],
-                beta2=self.normuon_defaults["beta2"],
+                fraction=self.dion2_defaults["fraction"],
+                ef_decay=self.dion2_defaults["ef_decay"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
             )
         else:
@@ -413,31 +377,21 @@ class NorMuonAndAdam:
                 exp_avg = torch.zeros_like(chunk, dtype=torch.float32, device=param.device)
                 self.param_states[param] = dict(step=0, exp_avg=exp_avg, exp_avg_sq=torch.zeros_like(exp_avg))
 
-            elif p_cfg.optim == "normuon":
+            elif p_cfg.optim == "dion2":
                 chunk_shape = (p_cfg.chunk_size, *p_cfg.reshape[1:])
 
-                # Momentum buffer (FP32 for precision)
+                # Momentum buffer (additive accumulation, FP32)
                 momentum_buffer = torch.zeros(
                     chunk_shape, dtype=torch.float32, device=param.device
                 )
 
-                # Second momentum buffer - reduced along one dimension
-                if chunk_shape[-2] >= chunk_shape[-1]:
-                    second_mom_shape = (*chunk_shape[:-1], 1)
-                else:
-                    second_mom_shape = (*chunk_shape[:-2], 1, chunk_shape[-1])
-                second_momentum_buffer = torch.zeros(
-                    second_mom_shape, dtype=torch.float32, device=param.device
-                )
-
-                # Mantissa buffer for precision tracking
+                # Mantissa buffer for bfloat16 precision tracking
                 mantissa = torch.zeros(
                     chunk_shape, dtype=torch.uint16, device=param.device
                 )
 
                 self.param_states[param] = dict(
                     momentum_buffer=momentum_buffer,
-                    second_momentum_buffer=second_momentum_buffer,
                     mantissa=mantissa,
                 )
 
@@ -449,16 +403,16 @@ class NorMuonAndAdam:
         p_cfg = self.param_cfgs[param]
 
         if p_cfg.comms == "none":
-            if p_cfg.optim == "normuon":
-                # NorMuon needs reshaped gradient even without communication
+            if p_cfg.optim == "dion2":
+                # Dion2 needs reshaped gradient even without communication
                 grad = grad.view(p_cfg.reshape)
             self._reduce_futures[param] = (None, grad)
         elif p_cfg.comms == "replicated":
             future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
             self._reduce_futures[param] = (future, grad)
         elif p_cfg.comms == "sharded":
-            if p_cfg.optim == "normuon":
-                # NorMuon: reshape before reduce_scatter
+            if p_cfg.optim == "dion2":
+                # Dion2: reshape before reduce_scatter
                 grad_reshaped = grad.view(p_cfg.reshape)
                 grad_chunk = torch.empty(
                     (p_cfg.chunk_size, *grad_reshaped.shape[1:]),
@@ -480,7 +434,7 @@ class NorMuonAndAdam:
     def _launch_gather(self, param: nn.Parameter, p_slice: Tensor) -> "torch.futures.Future":
         """Launch async all_gather for a sharded parameter."""
         p_cfg = self.param_cfgs[param]
-        if p_cfg.optim == "normuon":
+        if p_cfg.optim == "dion2":
             full_param = param.data.view(p_cfg.reshape)
             assert full_param.is_contiguous()
             return dist.all_gather_into_tensor(
@@ -495,14 +449,13 @@ class NorMuonAndAdam:
     # State management
 
     def reset(self):
-        """Reset NorMuon momentum buffers and split_embed state (called on training reset)."""
+        """Reset Dion2 momentum buffers and split_embed state (called on training reset)."""
         self.split_embed = False
         for param, p_cfg in self.param_cfgs.items():
-            if p_cfg.optim == "normuon":
+            if p_cfg.optim == "dion2":
                 p_state = self.param_states[param]
                 p_state["momentum_buffer"].zero_()
                 p_state["mantissa"].zero_()
-                p_state["second_momentum_buffer"].zero_()
 
     def copy_lm_state_to_embed(self):
         """
@@ -576,7 +529,7 @@ class NorMuonAndAdam:
         Combined optimizer step with explicit ordering.
 
         Args:
-            do_adam: If True, update Adam params. NorMuon params always updated.
+            do_adam: If True, update Adam params. Dion2 params always updated.
 
         Flow:
         1. Scatter phase: Launch reduces in scatter_order
@@ -633,7 +586,7 @@ class NorMuonAndAdam:
             if p_cfg.optim == "adam":
                 p_slice = self._adam_update(param, grad_chunk, p_cfg, rank)
             else:
-                p_slice = self._normuon_update(param, grad_chunk, p_cfg, rank)
+                p_slice = self._dion2_update(param, grad_chunk, p_cfg, rank)
             # Launch gather for sharded params
             if p_cfg.comms == "sharded" and self.world_size > 1:
                 gather_fut = self._launch_gather(param, p_slice)
@@ -685,7 +638,7 @@ class NorMuonAndAdam:
         self._step_size_t.fill_(lr * (bias2 ** 0.5 / bias1))
         self._eff_wd_t.fill_(lr * lr * p_cfg.weight_decay * p_cfg.wd_mul)
 
-        NorMuonAndAdam._adam_update_step(
+        Dion2AndAdam._adam_update_step(
             p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"],
             beta1, beta2, p_cfg.eps, self._step_size_t, self._eff_wd_t
         )
@@ -705,34 +658,45 @@ class NorMuonAndAdam:
         p_slice.add_(other=update, alpha=-1.0)
 
     # -----------------------------------
-    # NorMuon update
+    # Dion2 update
 
-    def _normuon_update(self, param: nn.Parameter, grad_chunk: Tensor, p_cfg: ParamConfig, rank: int) -> Tensor:
-        """Apply NorMuon update to a parameter. Returns the updated p_slice."""
-        chunk_shape = grad_chunk.shape
-
+    def _dion2_update(self, param: nn.Parameter, grad_chunk: Tensor, p_cfg: ParamConfig, rank: int) -> Tensor:
+        """Apply Dion2 update to a parameter. Returns the updated p_slice."""
         p_state = self.param_states[param]
-        grad_chunk = grad_chunk.float()  # FP32 for momentum
+        M = p_state["momentum_buffer"]
+        mantissa = p_state["mantissa"]
 
-        # Momentum update
-        momentum_buffer = p_state["momentum_buffer"]
-        momentum_buffer.lerp_(grad_chunk, 1 - p_cfg.momentum)
-        updated_grads = grad_chunk.lerp_(momentum_buffer, p_cfg.momentum)
+        # 1. Accumulate gradient into momentum (additive, not EMA)
+        M.add_(grad_chunk.float())
 
-        self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
-        self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
+        # 2. Determine selection dimension (select shorter dim, or rows if square)
+        select_dim = -2 if M.shape[-2] <= M.shape[-1] else -1
+        norm_dim = -1 if select_dim == -2 else -2
+        k = math.ceil(p_cfg.fraction * M.shape[select_dim])
 
-        # Polar Express orthogonalization
-        is_large_matrix = chunk_shape[-2] > 1024
-        v_chunk = polar_express(updated_grads, split_baddbmm=is_large_matrix)
+        # 3. Compute L1 norms and select top-k indices per matrix in the bank
+        norms = M.abs().sum(dim=norm_dim)  # (chunk_size, dim_to_select)
+        _, indices = norms.topk(k, dim=-1)  # (chunk_size, k)
 
-        # Variance reduction
-        red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
-        v_chunk = NorMuonAndAdam._apply_normuon_variance_reduction(
-            v_chunk, p_state["second_momentum_buffer"], p_cfg.beta2, red_dim
-        )
+        # 4. Gather selected submatrix from momentum and expand indices
+        if select_dim == -2:
+            idx_expanded = indices.unsqueeze(-1).expand(-1, -1, M.shape[-1])
+            selected = torch.gather(M, -2, idx_expanded)  # (chunk_size, k, N)
+        else:
+            idx_expanded = indices.unsqueeze(-2).expand(-1, M.shape[-2], -1)
+            selected = torch.gather(M, -1, idx_expanded)  # (chunk_size, M, k)
 
-        # Update parameter, in place, with cautious weight decay
+        # 5. Error-feedback decay on selected entries in momentum
+        M.scatter_(select_dim, idx_expanded, selected * p_cfg.ef_decay)
+
+        # 6. Orthogonalize selected submatrix via Newton-Schulz
+        ortho = zeropower_via_newtonschulz5(selected)
+
+        # 7. Build full-size sparse update (zeros at non-selected, ortho at selected)
+        full_update = torch.zeros_like(M)
+        full_update.scatter_(select_dim, idx_expanded, ortho.float())
+
+        # 8. Apply update with cautious weight decay + mantissa tracking
         param_view = param.data.view(p_cfg.reshape)
         p_slice = param_view[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size]
 
@@ -741,13 +705,15 @@ class NorMuonAndAdam:
             for mat_idx in range(p_cfg.chunk_size):
                 self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.per_matrix_lr_mul[mat_idx] * p_cfg.lr)
                 self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
-                NorMuonAndAdam._cautious_wd_and_update_inplace(
-                    p_slice[mat_idx].view(torch.uint16), p_state["mantissa"][mat_idx], v_chunk[mat_idx],
+                Dion2AndAdam._cautious_wd_and_update_inplace(
+                    p_slice[mat_idx].view(torch.uint16), mantissa[mat_idx], full_update[mat_idx],
                     self._eff_wd_t, self._eff_lr_t
                 )
         else:
-            NorMuonAndAdam._cautious_wd_and_update_inplace(
-                p_slice.view(torch.uint16), p_state["mantissa"], v_chunk,
+            self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
+            self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
+            Dion2AndAdam._cautious_wd_and_update_inplace(
+                p_slice.view(torch.uint16), mantissa, full_update,
                 self._eff_wd_t, self._eff_lr_t
             )
 
@@ -773,20 +739,6 @@ class NorMuonAndAdam:
         p.copy_((p_precise_raw >> 16).to(torch.uint16))
         mantissa.copy_(p_precise_raw.to(torch.uint16))
 
-    @staticmethod
-    @torch.compile(dynamic=False, fullgraph=True)
-    def _apply_normuon_variance_reduction(v_chunk, second_momentum_buffer, beta2, red_dim):
-        """NorMuon variance reduction. Algebraically fuses the normalization steps to minimize memory ops."""
-        v_mean = v_chunk.float().square().mean(dim=red_dim, keepdim=True)
-        red_dim_size = v_chunk.size(red_dim)
-        v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True).mul_(red_dim_size)
-        v_norm = v_norm_sq.sqrt_()
-        second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
-        step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt_()
-        scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-        v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt_()
-        final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
-        return v_chunk.mul_(final_scale.type_as(v_chunk))
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -1516,29 +1468,14 @@ TRAINING_STAGES = [
 
 training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
 
-def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
-    # warmup phase: linearly increase momentum from min to max
-    # cooldown phase: linearly decrease momentum from max to min
-    momentum_cd_start = training_schedule.total_steps - muon_cooldown_steps
-    if step < muon_warmup_steps:
-        frac = step / muon_warmup_steps
-        momentum = momentum_min + frac * (momentum_max - momentum_min)
-    elif step > momentum_cd_start:
-        frac = (step - momentum_cd_start) / muon_cooldown_steps
-        momentum = momentum_max - frac * (momentum_max - momentum_min)
-    else:
-        momentum = momentum_max
-    return momentum
-
 class TrainingManager():
     """
-    Manages the NorMuonAndAdam for all parameters with explicit ordering.
+    Manages the Dion2AndAdam for all parameters with explicit ordering.
         1. Scalars are given higher momentum terms to smooth learning @ChrisJMcCormick
         2. Adam optimizers are only stepped on odd steps @classiclarryd
         3. Explicit scatter_order and work_order for communication scheduling (no backward hooks)
-        4. Muon has a linear momentum warmup and cooldown schedule
-        5. Learning rates follow a linear decay schedule
-        6. Embed is tied to lm_head until split step (2/3 of training), then untied @classiclarryd
+        4. Learning rates follow a linear decay schedule
+        5. Embed is tied to lm_head until split step (2/3 of training), then untied @classiclarryd
     """
     def __init__(self, model):
         self.model = model
@@ -1548,8 +1485,8 @@ class TrainingManager():
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
         self.param_table = {
-            "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
-            "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "attn":           {"optim": "dion2",   "comms": "sharded",    "adam_betas": None},
+            "mlp":            {"optim": "dion2",   "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
@@ -1568,7 +1505,7 @@ class TrainingManager():
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
             "value_embed", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
-            "attn", "mlp",        # Large, polar express - process last to maximize overlap
+            "attn", "mlp",        # Large, dion2 - process last to maximize overlap
         ]
 
         adam_defaults = dict(
@@ -1577,20 +1514,20 @@ class TrainingManager():
             weight_decay=0.005,
         )
 
-        normuon_defaults = dict(
-            lr=0.023,
-            momentum=0.95,
-            beta2=0.95,
-            weight_decay=1.2,
+        dion2_defaults = dict(
+            lr=0.02,
+            fraction=0.25,
+            ef_decay=0.95,
+            weight_decay=0.01,
         )
 
-        self.optimizer = NorMuonAndAdam(
+        self.optimizer = Dion2AndAdam(
             model.named_parameters(),
             param_table=self.param_table,
             scatter_order=list(self.param_table.keys()),  # Dict order defines scatter priority
             work_order=self.work_order,
             adam_defaults=adam_defaults,
-            normuon_defaults=normuon_defaults,
+            dion2_defaults=dion2_defaults,
         )
 
         # Split embed from lm_head at 2/3 of training (on an odd step so Adam updates)
@@ -1634,14 +1571,11 @@ class TrainingManager():
 
     def step_optimizers(self, step: int):
         step_lr = training_schedule.get_lr(step)
-        muon_momentum = get_muon_momentum(step)
         do_adam = self._is_adam_step(step)
 
-        # Update learning rates and momentum for all params
+        # Update learning rates for all params
         for param, p_cfg in self.optimizer.param_cfgs.items():
             p_cfg.lr = p_cfg.initial_lr * step_lr
-            if p_cfg.optim == "normuon":
-                p_cfg.momentum = muon_momentum
 
         # Step optimizer with do_adam flag
         self.optimizer.step(do_adam=do_adam)
@@ -1654,7 +1588,7 @@ class TrainingManager():
         if state is not None:
             self.optimizer.load_state_dict(state)
 
-        # Reset NorMuon momentum buffers and split_embed state
+        # Reset Dion2 momentum buffers and split_embed state
         self.optimizer.reset()
 
         stage, _ = training_schedule.lookup(0)
