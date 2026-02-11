@@ -1136,13 +1136,16 @@ class GPT(nn.Module):
 
     @staticmethod
     @torch.compile(dynamic=False, fullgraph=True)
-    def _compute_bigram_hash(x: Tensor, mod: int) -> Tensor:
+    def _compute_bigram_hash(x: Tensor) -> Tensor:
         """
-        Computes bigram hash on GPU for each position using [prev_token, curr_token].
-        Mathematically identical to the CPU version but computed on device.
+        Computes bigram hash for each position using [prev_token, curr_token].
+        Multiply by arbitary large ints to get even spread over int32 range.
+        Position 0 is mapped to the reserved index (vocab_size - 1).
+        BOS_tokens within the batch will hash based on last token of prior doc. Masking this ran slower and showed no improvement.
         """
         rand_int_1 = 36313
         rand_int_2 = 27191
+        mod = args.bigram_vocab_size-1
         result = torch.empty_like(x)
         result[0] = mod
         result[1:] = torch.bitwise_xor(rand_int_1 * x[1:], rand_int_2 * x[:-1]) % mod
@@ -1177,8 +1180,8 @@ class GPT(nn.Module):
 
         # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
         x = self.embed(input_seq)
-        # Compute bigram hash on GPU (moved from CPU data loader)
-        bigram_seq = self._compute_bigram_hash(input_seq, args.bigram_vocab_size - 1)
+        
+        bigram_seq = self._compute_bigram_hash(input_seq)
         x0_bigram = self.bigram_embed(bigram_seq)[None]
 
         # Value embeddings - always computed (not precomputed)
@@ -1398,7 +1401,6 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         _inputs = _inputs.to(dtype=torch.int32)
         _targets = _targets.to(dtype=torch.int64)
         _cum_lengths = _cum_lengths.to(dtype=torch.int32)
-        # Bigram hash computation moved to GPU in forward()
 
         new_params = yield (
             _inputs.to(device="cuda", non_blocking=True),
