@@ -1756,7 +1756,34 @@ model.train()
 ########################################
 #        Training and validation       #
 ########################################
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+class PrefetchLoader:
+    """Overlaps CPU data preparation with GPU compute by prefetching the next batch in a background thread."""
+    def __init__(self, gen):
+        self.gen = gen
+        self._thread = None
+        self._result = None
+        self._device = torch.cuda.current_device()
+
+    def _run(self):
+        torch.cuda.set_device(self._device)
+        self._result = self.gen.send(None)
+
+    def send(self, value):
+        if self._thread is not None:
+            self._thread.join()
+            if value is not None:
+                # Stage transition: prefetched batch has wrong params, discard and re-fetch
+                result = self.gen.send(value)
+            else:
+                result = self._result
+        else:
+            result = self.gen.send(value)
+        # Prefetch next batch in background
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return result
+
+train_loader = PrefetchLoader(distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps))
 
 gc.collect()
 
