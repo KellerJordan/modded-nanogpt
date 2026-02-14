@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
+from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
 
 dynamo.config.recompile_limit = 64
 
@@ -170,66 +170,43 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
     by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
     """
     X = G.bfloat16()
-    is_tall = G.size(-2) > G.size(-1)
+    if G.size(-2) > G.size(-1):
+        X = X.mT
 
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
 
+    # Allocate buffers
     X = X.contiguous()
+    A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
+    B = torch.empty_like(A)
+    C = torch.empty_like(X)
 
-    if is_tall:
-        # Tall: use Triton kernels with X^T @ X (small) and right multiplication
-        A = torch.empty((*X.shape[:-2], X.size(-1), X.size(-1)), device=X.device, dtype=X.dtype)
-        B = torch.empty_like(A)
-        C = torch.empty_like(X)
-
-        # Select batched vs unbatched
-        if split_baddbmm:
-            XB_matmul = torch.bmm if X.ndim > 2 else torch.mm
-        else:
-            aX_plus_XB = torch.baddbmm if X.ndim > 2 else torch.addmm
-
-        # Perform the iterations
-        for a, b, c in polar_express_coeffs:
-            XTX(X, out=A)  # A = X.T @ X
-            ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b*A + c*(A@A)
-
-            # Referencing X twice causes pytorch to make a defensive copy,
-            # resulting in a cudaMemcpyAsync in baddbmm.
-            # For large matrices (i.e., the mlp weights), it's faster to split
-            # the operation into two kernels to avoid this.
-            if split_baddbmm:
-                XB_matmul(X, B, out=C)  # C = X @ B
-                C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
-            else:
-                aX_plus_XB(X, X, B, beta=a, out=C)  # C = a * X + X @ B
-
-            X, C = C, X  # Swap references to avoid unnecessary copies
+    # Select batched vs unbatched
+    if split_baddbmm:
+        BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
     else:
-        # Wide: use Triton kernels with X @ X^T (small) and left multiplication
-        A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
-        B = torch.empty_like(A)
-        C = torch.empty_like(X)
+        aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
 
-        # Select batched vs unbatched
+    # Perform the iterations
+    for a, b, c in polar_express_coeffs:
+        XXT(X, out=A)  # A = X @ X.mT
+        ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
+
+        # Referencing X twice causes pytorch to make a defensive copy,
+        # resulting in a cudaMemcpyAsync in baddbmm.
+        # For large matrices (i.e., the mlp weights), it's faster to split
+        # the operation into two kernels to avoid this.
         if split_baddbmm:
-            BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
+            BX_matmul(B, X, out=C)  # C = B @ X
+            C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
         else:
-            aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
+            aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
 
-        # Perform the iterations
-        for a, b, c in polar_express_coeffs:
-            XXT(X, out=A)  # A = X @ X.mT
-            ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
+        X, C = C, X  # Swap references to avoid unnecessary copies
 
-            if split_baddbmm:
-                BX_matmul(B, X, out=C)  # C = B @ X
-                C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
-            else:
-                aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
-
-            X, C = C, X  # Swap references to avoid unnecessary copies
-
+    if G.size(-2) > G.size(-1):
+        X = X.mT
     return X
 
 # -----------------------------------------------------------------------------
@@ -729,10 +706,10 @@ class NorMuonAndAdam:
             if param.grad is None:
                 continue
 
-            # lm_head when tied: aggregate embed.grad.T (tiled Triton transpose-add)
+            # lm_head when tied: aggregate embed.grad.T (transposed shapes)
             if label == "lm_head" and do_adam and not self.split_embed:
                 if embed_param is not None and embed_param.grad is not None:
-                    transpose_add(embed_param.grad, param.grad)
+                    param.grad.add_(embed_param.grad.T)
 
             # Skip embed when tied (copied from lm_head after gather)
             if label == "embed" and not self.split_embed:
@@ -782,9 +759,9 @@ class NorMuonAndAdam:
         if lm_head_gather_future is not None:
             lm_head_gather_future.wait()
 
-        # When tied: copy lm_head.T to embed (tiled Triton transpose for coalesced writes)
+        # When tied: copy lm_head.T to embed
         if do_adam and not self.split_embed and embed_param is not None and lm_param is not None:
-            transpose_copy(lm_param.data, embed_param.data)
+            embed_param.data.copy_(lm_param.data.T)
 
         # Wait for remaining gathers
         for fut in gather_futures:
@@ -1371,11 +1348,8 @@ class GPT(nn.Module):
 
         # unbind weight banks to avoid select_backwards kernel
         attn_weights = self.attn_bank.unbind(0)  # tuple of [4*dim, hdim] tensors
-        # reshape (12, 2, H, D) -> (24, H, D) then unbind; backward is reshape (free) + stack
-        # avoids select_backward on dim 1 that [:, 0, :, :] / [:, 1, :, :] would produce
-        mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
-        mlp_fcs = mlp_all[0::2]    # even indices: c_fc
-        mlp_projs = mlp_all[1::2]  # odd indices: c_proj
+        mlp_fcs = self.mlp_bank[:, 0, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
+        mlp_projs = self.mlp_bank[:, 1, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
 
         for i in range(self.num_layers):
             yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
