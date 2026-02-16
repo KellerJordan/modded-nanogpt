@@ -1019,6 +1019,7 @@ class AttnArgs:
     key_offset: bool
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
+    train_max_seq_len: torch.Tensor
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
@@ -1044,9 +1045,10 @@ class CausalSelfAttention(nn.Module):
         # sparse gated attention to enable context based no-op by @classiclarryd
         # only include gates on layers with value embeds used on forward pass
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
+        train_max_seq_len = attn_args.train_max_seq_len
 
         q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
+        max_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         q, k = norm(q), norm(k) # QK norm @Grad62304977
 
@@ -1130,6 +1132,7 @@ class ForwardScheduleConfig:
     mtp_weights: torch.Tensor
     ws_short: int
     ws_long: int
+    train_max_seq_len: int
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
@@ -1253,7 +1256,8 @@ class GPT(nn.Module):
         assert input_seq.ndim == 1
 
         # unpack schedule_cfg
-        mtp_weights, ws_short, ws_long = schedule_cfg.mtp_weights, schedule_cfg.ws_short, schedule_cfg.ws_long
+        mtp_weights, train_max_seq_len = schedule_cfg.mtp_weights, schedule_cfg.train_max_seq_len
+        ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
 
         # set configs
         skip_connections = []
@@ -1315,7 +1319,8 @@ class GPT(nn.Module):
                 yarn=yarn,
                 key_offset=key_offset[i],
                 attn_gate_w=attn_gates[i],
-                ve_gate_w=ve_gates[i]
+                ve_gate_w=ve_gates[i],
+                train_max_seq_len=train_max_seq_len
             )
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
@@ -1543,10 +1548,9 @@ class Hyperparameters:
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin") # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1507  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1490  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1564,6 +1568,7 @@ class TrainingStage:
     window_sizes: tuple[int, int]  # (short, long) in block units
     mtp_weights_start: list[float]
     mtp_weights_end: list[float]
+    train_max_seq_len: int
     duration: float = None
 
 class TrainingSchedule:
@@ -1575,6 +1580,7 @@ class TrainingSchedule:
         4. Split embed and lm head at 2/3 of training
         5. Batch size schedule of 8 -> 16 -> 24
         6. Post training extension of long windows from 13 to 20
+        7. Seq len updates from 896 to 2048 at 1/3 of training
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
@@ -1616,21 +1622,20 @@ class TrainingSchedule:
         lr = stage.lr_mul
         cd_start = int(self.scheduled_iterations * (1 - self.cooldown_frac))
         if step >= cd_start:
-            denom = (self.scheduled_iterations - cd_start)
-            t = 1.0 if denom <= 0 else min(1.0, (step - cd_start) / denom)
+            t = min(1.0, (step - cd_start) / (self.scheduled_iterations - cd_start))
             lr = lr * (1 - t) + 0.15 * t
         return lr
 
 # window_sizes are in units of `block_size` tokens (defined in TrainingManager)
 TRAINING_STAGES = [
-    TrainingStage(duration=1/3, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
+    TrainingStage(duration=1/3, train_max_seq_len=896, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
                   mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0]),
-    TrainingStage(duration=1/3, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
+    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
                   mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0]),
-    TrainingStage(duration=1/3, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
+    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
     # extension stage
-    TrainingStage(batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
+    TrainingStage(train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
 
@@ -1663,10 +1668,6 @@ class TrainingManager():
     def __init__(self, model):
         self.model = model
         self.block_size = 128
-        self._FULL_SEQ = 2048
-        self._STAGE1_SEQ = 896
-        # ws_* are in block units (block_size=128)
-        self._WS_SHORT_STAGE3 = 2
 
         # - Ordering dictates when to launch reduce/reduce_scatter operations
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
@@ -1731,7 +1732,8 @@ class TrainingManager():
         return ForwardScheduleConfig(
             mtp_weights = self.mtp_weights,
             ws_short = self.ws_short * self.block_size,
-            ws_long = self.ws_long * self.block_size
+            ws_long = self.ws_long * self.block_size,
+            train_max_seq_len = self.train_max_seq_len
         )
 
     def _is_adam_step(self, step: int):
@@ -1744,28 +1746,18 @@ class TrainingManager():
     def advance_schedule(self, step: int):
         stage, _ = training_schedule.lookup(step)
         self.ws_short, new_ws_long = stage.window_sizes
-        if step == 1:
-            args.train_max_seq_len = self._STAGE1_SEQ
-        elif step == 505:
-            args.train_max_seq_len = self._FULL_SEQ
-
-        # Apply the stage3-only compute cut here.
-        if 1010 <= step < 1515:
-            self.ws_short = self._WS_SHORT_STAGE3
         if new_ws_long != self.ws_long:
             self.model.yarn.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
             self.model.yarn_paired_head.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
 
         new_batch_size = stage.batch_size
-        if new_batch_size != self.batch_size:
-            self.train_loader_send_args = (new_batch_size, args.train_max_seq_len, grad_accum_steps)
+        new_train_max_seq_len = stage.train_max_seq_len
+        if new_batch_size != self.batch_size or new_train_max_seq_len != self.train_max_seq_len:
+            self.train_loader_send_args = (new_batch_size, new_train_max_seq_len, grad_accum_steps)
             self.batch_size = new_batch_size
+            self.train_max_seq_len = new_train_max_seq_len
         else:
             self.train_loader_send_args = None
-
-        # Force loader update at step 1 (batch size unchanged, but seq-len changed).
-        if step == 1:
-            self.train_loader_send_args = (self.batch_size, args.train_max_seq_len, grad_accum_steps)
 
         self.ws_long = new_ws_long
         self.mtp_weights = training_schedule.mtp_weights[step]
@@ -1798,6 +1790,7 @@ class TrainingManager():
         stage, _ = training_schedule.lookup(0)
         self.ws_short, self.ws_long = stage.window_sizes
         self.batch_size = stage.batch_size
+        self.train_max_seq_len = stage.train_max_seq_len
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
         if _sparse_comms_active():
@@ -1901,7 +1894,7 @@ print0("Compiling model and warming up kernels (~7 minutes on first execution)",
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizer=training_manager.get_state()) # save the initial state
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
 val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
 
 transition_steps = training_manager.get_transition_steps()
@@ -1934,7 +1927,7 @@ model.train()
 ########################################
 #        Training and validation       #
 ########################################
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
 
 gc.collect()
 
