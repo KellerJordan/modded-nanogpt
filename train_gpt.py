@@ -1616,8 +1616,9 @@ class TrainingSchedule:
         lr = stage.lr_mul
         cd_start = int(self.scheduled_iterations * (1 - self.cooldown_frac))
         if step >= cd_start:
-            t = min(1.0, (step - cd_start) / (self.scheduled_iterations - cd_start))
-            lr = lr * (1 - t) + 0.1 * t
+            denom = (self.scheduled_iterations - cd_start)
+            t = 1.0 if denom <= 0 else min(1.0, (step - cd_start) / denom)
+            lr = lr * (1 - t) + 0.15 * t
         return lr
 
 # window_sizes are in units of `block_size` tokens (defined in TrainingManager)
@@ -1662,6 +1663,10 @@ class TrainingManager():
     def __init__(self, model):
         self.model = model
         self.block_size = 128
+        self._FULL_SEQ = 2048
+        self._STAGE1_SEQ = 896
+        # ws_* are in block units (block_size=128)
+        self._WS_SHORT_STAGE3 = 2
 
         # - Ordering dictates when to launch reduce/reduce_scatter operations
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
@@ -1739,6 +1744,14 @@ class TrainingManager():
     def advance_schedule(self, step: int):
         stage, _ = training_schedule.lookup(step)
         self.ws_short, new_ws_long = stage.window_sizes
+        if step == 1:
+            args.train_max_seq_len = self._STAGE1_SEQ
+        elif step == 505:
+            args.train_max_seq_len = self._FULL_SEQ
+
+        # Apply the stage3-only compute cut here.
+        if 1010 <= step < 1515:
+            self.ws_short = self._WS_SHORT_STAGE3
         if new_ws_long != self.ws_long:
             self.model.yarn.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
             self.model.yarn_paired_head.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
@@ -1749,6 +1762,10 @@ class TrainingManager():
             self.batch_size = new_batch_size
         else:
             self.train_loader_send_args = None
+
+        # Force loader update at step 1 (batch size unchanged, but seq-len changed).
+        if step == 1:
+            self.train_loader_send_args = (self.batch_size, args.train_max_seq_len, grad_accum_steps)
 
         self.ws_long = new_ws_long
         self.mtp_weights = training_schedule.mtp_weights[step]
