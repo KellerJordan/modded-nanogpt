@@ -22,6 +22,7 @@ import gc
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import triton
+import numpy as np
 
 torch.empty(
     1, device=f"cuda:{os.environ['LOCAL_RANK']}", requires_grad=True
@@ -48,7 +49,7 @@ grad_scale = 1 / grad_accum_steps # consistent grad magnitudes between different
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
+dist.init_process_group(backend="cuda:nccl,cpu:gloo", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
@@ -208,6 +209,97 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
         X = X.mT
     return X
 
+# -----------------------------------------------------------------------------
+# Sparse Comms for bigram embedding gradient reduce-scatter
+def _sparse_comms_active():
+    # we count on this in order for sparse communication to be worthwhile
+    return world_size == 8 and grad_accum_steps == 1
+
+@torch.no_grad
+def sparse_comms_start(idxes_np, N, rank, world, send_idxes_buffer):
+    rows_per_rank = N // world
+
+    # queue upload of indexes to gpu
+    send_idxes = send_idxes_buffer[:idxes_np.shape[0]]
+    send_idxes.copy_(torch.from_numpy(idxes_np))
+    send_idxes = send_idxes.to(device, non_blocking=True)
+
+    # calculate how many gradient rows we will send to every rank
+    insertion_points = np.searchsorted(
+        idxes_np,
+        np.arange(0, rows_per_rank * (world + 1), rows_per_rank, dtype=np.int32),
+    )
+    send_counts = torch.from_numpy(insertion_points[1:] - insertion_points[:-1])
+    # zero-out own send-count - we won't send our own gradient rows to ourselves as it's a waste:
+    # in sparse_comms_merge_gradients, we'll use the slice of the gradient that already includes them as the base tensor
+    send_counts[rank] = 0
+
+    # remove indexes owned by our rank from the send list
+    send_idxes = torch.cat([send_idxes[: insertion_points[rank]], send_idxes[insertion_points[rank + 1] :]])
+
+    # share the send counts so that each rank will know how many rows
+    # to expect from every other rank
+    recv_counts = torch.empty_like(send_counts)
+    recv_counts_fut = dist.all_to_all_single(recv_counts, send_counts, async_op=True).get_future()
+    return send_idxes, send_counts, recv_counts, recv_counts_fut
+
+@torch.no_grad
+def sparse_comms_share_indexes(send_idxes, send_counts, recv_counts):
+    # cpu tensors, so these ops are cheap and don't force a host<->device sync
+    total_recv_count = recv_counts.sum().item()
+    recv_counts = recv_counts.tolist()
+    send_counts = send_counts.tolist()
+
+    # queue sharing of row indexes
+    recv_idxes = torch.empty(total_recv_count, dtype=torch.int32, device=device)
+    idxes_fut = dist.all_to_all_single(
+        recv_idxes,
+        send_idxes,
+        output_split_sizes=recv_counts,
+        input_split_sizes=send_counts,
+        async_op=True,
+    ).get_future()
+
+    sparse_state = {
+        "send_idxes": send_idxes,
+        "send_counts": send_counts,
+        "recv_counts": recv_counts, # list for sharing
+    }
+    return recv_idxes, sparse_state, idxes_fut
+
+@torch.compile
+@torch.no_grad
+def sparse_comms_share_gradients(grad, idxes, send_counts, recv_counts):
+    # gather the rows that we want to send
+    send_vals = grad[idxes]
+
+    d = grad.shape[1]
+
+    send_sizes = [i*d for i in send_counts]
+    recv_sizes = [i*d for i in recv_counts]
+
+    recv_vals = torch.empty(sum(recv_sizes), device=send_vals.device, dtype=grad.dtype)
+
+    val_fut = dist.all_to_all_single(
+        recv_vals,
+        send_vals.view(-1),
+        input_split_sizes=send_sizes,
+        output_split_sizes=recv_sizes,
+        async_op=True,
+    ).get_future()
+
+    return recv_vals, val_fut
+
+@torch.no_grad
+def sparse_comms_merge_gradients(grad, recv_idx, recv_vals, rank, world):
+    d = grad.shape[1]
+    rows_per_rank = grad.shape[0] // world
+
+    grad.index_add_(0, recv_idx, recv_vals.view(-1, d))
+
+    # return the slice of the gradient for parameters our rank updates
+    return grad[rows_per_rank * rank : rows_per_rank * (rank + 1)].mul_((1 / world))
+
 
 # -----------------------------------------------------------------------------
 # Combined NorMuon + Adam Optimizer
@@ -217,7 +309,7 @@ class ParamConfig:
     """Per-parameter configuration for NorMuonAndAdam optimizer."""
     label: str
     optim: str  # "adam" or "normuon"
-    comms: str  # "none", "replicated", or "sharded"
+    comms: str  # "none", "replicated", "sharded" or "sharded_sparse"
     adam_betas: tuple[float, float] | None
     lr_mul: float
     wd_mul: float
@@ -326,6 +418,7 @@ class NorMuonAndAdam:
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
+        self._sparse_async_data: dict[nn.Parameter, list] = {}
 
         # Embed/lm_head tying state
         self.split_embed = False
@@ -337,12 +430,14 @@ class NorMuonAndAdam:
         table_entry = self.param_table[label]
         optim = table_entry["optim"]
         comms = table_entry["comms"]
+        if comms == "sharded_sparse" and not _sparse_comms_active():
+            comms = "sharded"
         adam_betas = table_entry.get("adam_betas")
         lr_mul = table_entry.get("lr_mul", 1.0)
         wd_mul = table_entry.get("wd_mul", 1.0)
 
         if optim == "adam":
-            chunk_size = param.shape[0] // self.world_size if comms == "sharded" else None
+            chunk_size = param.shape[0] // self.world_size if comms.startswith("sharded") else None
             p_cfg = ParamConfig(
                 label=label,
                 optim=optim,
@@ -406,7 +501,7 @@ class NorMuonAndAdam:
         for param, p_cfg in self.param_cfgs.items():
             if p_cfg.optim == "adam":
                 # Sharded params use chunk state, replicated use full state
-                if p_cfg.comms == "sharded":
+                if p_cfg.comms.startswith("sharded"):
                     chunk = param[:p_cfg.chunk_size]
                 else:
                     chunk = param
@@ -476,6 +571,15 @@ class NorMuonAndAdam:
                     grad_chunk, grad, op=dist.ReduceOp.AVG, async_op=True
                 ).get_future()
                 self._reduce_futures[param] = (future, grad_chunk)
+        elif p_cfg.comms == "sharded_sparse":
+            sparse_state = self._sparse_async_data[param]
+            send_idxes = sparse_state["send_idxes"]
+            send_counts = sparse_state["send_counts"]
+            recv_counts = sparse_state["recv_counts"]
+            recv_vals, val_fut = sparse_comms_share_gradients(
+                grad, send_idxes, send_counts, recv_counts
+            )
+            self._reduce_futures[param].extend((val_fut, recv_vals))
 
     def _launch_gather(self, param: nn.Parameter, p_slice: Tensor) -> "torch.futures.Future":
         """Launch async all_gather for a sharded parameter."""
@@ -626,16 +730,24 @@ class NorMuonAndAdam:
             if p_cfg.optim == "adam" and not do_adam:
                 continue
             # Wait for reduce
-            future, grad_chunk = self._reduce_futures[param]
-            if future is not None:
-                future.wait()
+            if p_cfg.comms != "sharded_sparse":
+                future, grad_chunk = self._reduce_futures[param]
+                if future is not None:
+                    future.wait()
+            else:
+                idxes_fut, recv_idxes, recv_fut, recv_vals = self._reduce_futures[param]
+                idxes_fut.wait()
+                recv_fut.wait()
+
+                grad_chunk = sparse_comms_merge_gradients(param.grad, recv_idxes, recv_vals, rank, world_size)
+
             # Apply update based on optim type
             if p_cfg.optim == "adam":
                 p_slice = self._adam_update(param, grad_chunk, p_cfg, rank)
             else:
                 p_slice = self._normuon_update(param, grad_chunk, p_cfg, rank)
             # Launch gather for sharded params
-            if p_cfg.comms == "sharded" and self.world_size > 1:
+            if p_cfg.comms.startswith("sharded") and self.world_size > 1:
                 gather_fut = self._launch_gather(param, p_slice)
                 if label == "lm_head":
                     lm_head_gather_future = gather_fut
@@ -656,6 +768,7 @@ class NorMuonAndAdam:
             fut.wait()
 
         self._reduce_futures.clear()
+        self._sparse_async_data.clear()
 
         # Clear grads for updated params
         for param, p_cfg in self.param_cfgs.items():
@@ -672,7 +785,7 @@ class NorMuonAndAdam:
         lr = p_cfg.lr * p_cfg.lr_mul
 
         # Get parameter slice
-        if p_cfg.comms == "sharded":
+        if p_cfg.comms.startswith("sharded"):
             p_slice = param[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size]
         else:
             p_slice = param
@@ -1339,6 +1452,23 @@ class Shard:
             return result['shard']
         return get
 
+def get_bigram_hash(x):
+    """
+    Computes bigram hash for each position using [prev_token, curr_token].
+    Multiply by arbitary large ints to get even spread over int32 range.
+    Position 0 is mapped to the reserved index (vocab_size - 1).
+    BOS_tokens within the batch will hash based on last token of prior doc. Masking this ran slower and showed no improvement.
+    """
+    rand_int_1 = 36313
+    rand_int_2 = 27191
+    mod = args.bigram_vocab_size-1
+    x = x.to(torch.int32)
+    out = torch.empty_like(x, pin_memory=True)
+    out.copy_(x)
+    out[0] = mod
+    out[1:] = torch.bitwise_xor(rand_int_1 * out[1:], rand_int_2 * out[:-1]) % mod
+    return out
+
 def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -1408,6 +1538,8 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             _inputs.to(device="cuda", non_blocking=True),
             _targets.to(device="cuda", non_blocking=True),
             _cum_lengths.to(device="cuda", non_blocking=True),
+            _bigram_inputs.to(device="cuda", non_blocking=True),
+            _bigram_inputs.numpy(),
         )
 
         if new_params is not None:
@@ -1555,14 +1687,14 @@ class TrainingManager():
             "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
-            "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.65, 0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
+            "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
 
@@ -1570,8 +1702,10 @@ class TrainingManager():
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
-            "value_embed", "bigram_embed",  # Medium
-            "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
+            "lm_head",
+            "bigram_embed",  # Medium
+            "value_embed",
+            "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
         ]
 
@@ -1666,9 +1800,46 @@ class TrainingManager():
         self.batch_size = stage.batch_size
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
+        if _sparse_comms_active():
+            self.row_update_mask = np.zeros(args.bigram_vocab_size, dtype=np.uint8)
+            self.sparse_counts_state = None
+            # buffer we use for fast GPU uploads of send indexes
+            self.send_idxes_buffer = torch.empty(args.bigram_vocab_size, dtype=torch.int32, pin_memory=True)
+
 
     def get_state(self):
         return copy.deepcopy(self.optimizer.state_dict())
+
+    def sparse_index_update(self, step, bigram_indexes):
+        if not _sparse_comms_active():
+            return
+
+        self.row_update_mask[bigram_indexes] = 1
+
+        if self._is_adam_step(step):
+            with torch.no_grad():
+                bigram_idx_np = np.flatnonzero(self.row_update_mask).astype(np.int32)
+                send_idxes, send_counts, recv_counts, recv_counts_fut = sparse_comms_start(
+                    bigram_idx_np, args.bigram_vocab_size, rank, world_size, self.send_idxes_buffer
+                )
+                self.sparse_counts_state = (send_idxes, send_counts, recv_counts, recv_counts_fut)
+
+    def sparse_index_share(self, step):
+        if not _sparse_comms_active() or not self._is_adam_step(step):
+            return
+
+        send_idxes, send_counts, recv_counts, recv_counts_fut = self.sparse_counts_state
+        self.sparse_counts_state = None
+
+        recv_counts_fut.wait()
+        recv_idxes, sparse_state, idxes_fut = sparse_comms_share_indexes(send_idxes, send_counts, recv_counts)
+        self.optimizer._reduce_futures[model.bigram_embed.weight] = [idxes_fut, recv_idxes]
+        self.optimizer._sparse_async_data[model.bigram_embed.weight] = sparse_state
+
+        self.row_update_mask.fill(0)
+
+
+        
 
 # -----------------------------------------------------------------------------
 # int main
@@ -1722,6 +1893,7 @@ for param in model.parameters():
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
+
 ########################################
 #            Warmup kernels            #
 ########################################
@@ -1733,20 +1905,24 @@ train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].b
 val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
 
 transition_steps = training_manager.get_transition_steps()
-# first few steps plus transitions
-warmup_steps = sorted({0, 1, 2} | set(s + offset for s in transition_steps for offset in [-1, 0, 1] if s + offset >= 0))
+# first and last pair of steps in each transition
+warmup_steps = sorted({0, 1 } | set(s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 0))
 print0(f"Sampling steps {warmup_steps} for warmup", console=True)
 for step in warmup_steps:
     training_manager.advance_schedule(step)
     model.eval()
     with torch.no_grad():
-        inputs, targets, cum_seqlens = next(val_loader)
-        model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+        inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
     model.train()
     for idx in range(grad_accum_steps):
         send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) * grad_scale).backward()
+        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
+        training_manager.sparse_index_update(step, bigram_cpu)
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
+        training_manager.sparse_index_share(step)
+        loss.backward()
+        del loss
     training_manager.step_optimizers(step)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
@@ -1785,8 +1961,8 @@ for step in range(train_steps + 1):
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
-                inputs, targets, cum_seqlens = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+                inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
@@ -1806,8 +1982,12 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
-        inputs, targets, cum_seqlens = train_loader.send(training_manager.train_loader_send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) * grad_scale).backward()
+        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
+        training_manager.sparse_index_update(step, bigram_cpu)
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
+        training_manager.sparse_index_share(step)
+        loss.backward()
+        del loss
     training_manager.step_optimizers(step)
 
     # logging
