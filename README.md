@@ -48,7 +48,8 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@akash5474](https://github.com/akash5474), [@snimu](https://x.com/omouamoua), [@roeeshenberg](https://x.com/roeeshenberg),
 [@ChrisJMcCormick](https://x.com/ChrisJMcCormick), [@dominikkallusky](https://github.com/dominikkallusky), [@acutkosky](https://github.com/acutkosky), 
 [@manikbhandari](https://github.com/manikbhandari), [@andrewbriand](https://x.com/andrewbriand8), [@jrauvola](https://x.com/Joshrav21),
-[@soren_dunn_](https://x.com/soren_dunn_), [@photon_mz](https://x.com/photon_mz), [@srashedll](https://x.com/srashedll), [@dhrvji](https://x.com/dhrvji)
+[@soren_dunn_](https://x.com/soren_dunn_), [@photon_mz](https://x.com/photon_mz), [@srashedll](https://x.com/srashedll), [@dhrvji](https://x.com/dhrvji),
+[@EmmettBicker](https://github.com/EmmettBicker), [@dualverse-ai](https://github.com/dualverse-ai)
 
 
 ---
@@ -168,7 +169,11 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 65 | 1.613 minutes | [Group Value Embeds into single parameter](https://x.com/classiclarryd/status/2018057653742920016) | 01/30/26 | [log](records/track_1_short/2026-01-30_VeFused/0ba09d92-4ef1-440f-85e3-9d2766294db4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/215) | @varunneal
 66 | 1.595 minutes | Torch 2.10 | 01/31/26 | - | -
 67 | 1.540 minutes | [Tune fused softcap kernels and fuse fp8 quantization in LM head](https://x.com/classiclarryd/status/2021015642472869978) | 01/31/26 | [log](records/track_1_short/2026-01-24_ImprovedLMHead/record/73a071ac-522d-4ce0-a4d6-cf3955a376e4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/207) | @andrewbriand8
-68 | 1.535 minutes | Move bigram hash to GPU | 01/31/26 | [log](records/track_1_short/2026-01-31-BigramHashH2D/112c686e-b0d6-4dc8-814a-1ad1f5d5b274.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/216) | @dhrvji
+68 | 1.535 minutes | [Move bigram hash to GPU](https://x.com/classiclarryd/status/2021450730117460439) | 01/31/26 | [log](records/track_1_short/2026-01-31-BigramHashH2D/112c686e-b0d6-4dc8-814a-1ad1f5d5b274.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/216) | @dhrvji
+69 | 1.528 minutes | Kernel Optimizations | 02/02/26 | [log](records/track_1_short/2026-02-02_KernelTuning/25afb73a-332f-4d69-b9ab-f6261497f2d8.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/217) | @EmmettBicker & AI System [Aster](https://www.asterlab.ai/)
+70 | 1.521 minutes | Tune value embed layout and ve_gates | 02/03/26 | [log](records/track_1_short/2026-02-03_VeTuned/42cbebac-0599-4a89-a00e-26d1c4cad140.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/218) | @photo_mz
+71 | 1.516 minutes | Sparse bigram gradient comms and optimized loading on CPU | 02/06/26 | [log](records/track_1_short/2026-02-06_SparseBigramGradient/02fee7bd-cd22-478b-9e8e-12e857ff3152.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/221) | @roeeshenberg
+71 | 1.496 minutes | Increase minimal lr and add max_seq_len schedule | 02/10/26 | [log](records/track_1_short/2026-02-10_ShortWindow/Short-Window_1_1.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/224) | @dualverse-ai & AI System [Station](https://github.com/dualverse-ai/station)
 ## Rules
 
 New records must:
