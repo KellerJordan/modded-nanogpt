@@ -1337,7 +1337,7 @@ class Shard:
             return result['shard']
         return get
 
-def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
+def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True, yield_cpu: bool = False):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -1402,11 +1402,18 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         _targets = _targets.to(dtype=torch.int64)
         _cum_lengths = _cum_lengths.to(dtype=torch.int32)
 
-        new_params = yield (
-            _inputs.to(device="cuda", non_blocking=True),
-            _targets.to(device="cuda", non_blocking=True),
-            _cum_lengths.to(device="cuda", non_blocking=True),
-        )
+        if yield_cpu:
+            new_params = yield (
+                _inputs.pin_memory(),
+                _targets.pin_memory(),
+                _cum_lengths.pin_memory(),
+            )
+        else:
+            new_params = yield (
+                _inputs.to(device="cuda", non_blocking=True),
+                _targets.to(device="cuda", non_blocking=True),
+                _cum_lengths.to(device="cuda", non_blocking=True),
+            )
 
         if new_params is not None:
             # makes it possible for generator to receive new (num_tokens, max_seq_len, grad_accum_steps) via .send()
@@ -1414,7 +1421,6 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             assert new_num_tokens % (world_size * new_grad_accum_steps) == 0, "Num tokens must be divisible by world size"
             num_tokens = new_num_tokens // new_grad_accum_steps
             max_seq_len = new_max_seq_len
-
 # -----------------------------------------------------------------------------
 # Training Management
 
@@ -1757,7 +1763,7 @@ model.train()
 #        Training and validation       #
 ########################################
 class PrefetchLoader:
-    """Overlaps CPU data preparation with GPU compute using a persistent background thread."""
+    """Overlaps CPU data preparation with GPU compute using a persistent background thread and dedicated CUDA stream."""
     def __init__(self, gen):
         self.gen = gen
         self._result = None
@@ -1765,34 +1771,56 @@ class PrefetchLoader:
         self._ready = threading.Event()
         self._go = threading.Event()
         self._device = torch.cuda.current_device()
+        self._stream = torch.cuda.Stream(device=self._device)
+        self._event = torch.cuda.Event()
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
+
+    @staticmethod
+    def _h2d(cpu_tensors):
+        """Transfer a tuple of CPU pinned tensors to GPU. Returns (gpu_tensors, cpu_tensors)."""
+        gpu = tuple(t.to(device="cuda", non_blocking=True) for t in cpu_tensors)
+        return gpu, cpu_tensors  # keep cpu refs alive until H2D completes
 
     def _worker(self):
         torch.cuda.set_device(self._device)
         while True:
             self._go.wait()
             self._go.clear()
-            self._result = self.gen.send(None)
+            cpu_tensors = self.gen.send(None)        # CPU data prep (no CUDA ops)
+            with torch.cuda.stream(self._stream):
+                gpu, self._cpu_hold = self._h2d(cpu_tensors) # H2D on prefetch stream
+            self._result = gpu
+            self._event.record(self._stream)
             self._ready.set()
 
     def send(self, value):
         if self._started:
             self._ready.wait()
             self._ready.clear()
+            torch.cuda.current_stream().wait_event(self._event)
             if value is not None:
-                # Stage transition: prefetched batch has wrong params, discard and re-fetch
-                result = self.gen.send(value)
+                # Stage transition: discard prefetched batch, re-fetch with new params.
+                # Worker is idle (finished and waiting on _go), so gen is safe to use.
+                cpu_tensors = self.gen.send(value)
+                with torch.cuda.stream(self._stream):
+                    result, self._cpu_hold = self._h2d(cpu_tensors)
+                self._event.record(self._stream)
+                torch.cuda.current_stream().wait_event(self._event)
             else:
                 result = self._result
         else:
             self._started = True
-            result = self.gen.send(value)
+            cpu_tensors = self.gen.send(value)
+            with torch.cuda.stream(self._stream):
+                result, self._cpu_hold = self._h2d(cpu_tensors)
+            self._event.record(self._stream)
+            torch.cuda.current_stream().wait_event(self._event)
         # Kick off next prefetch
         self._go.set()
         return result
 
-train_loader = PrefetchLoader(distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps))
+train_loader = PrefetchLoader(distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps, yield_cpu=True))
 
 gc.collect()
 
@@ -1838,11 +1866,11 @@ for step in range(train_steps + 1):
         # the last step only has the validation loop, so break to avoid training
         break
 
-    # --------------- TRAINING SECTION -----------------
+    # --------------- TRAINING SECTION ----------------
     for idx in range(grad_accum_steps):
-        inputs, targets, cum_seqlens = train_loader.send(training_manager.train_loader_send_args)
+        send_args = training_manager.train_loader_send_args if idx == 0 else None
+        inputs, targets, cum_seqlens = train_loader.send(send_args)
         (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) * grad_scale).backward()
-    training_manager.step_optimizers(step)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
