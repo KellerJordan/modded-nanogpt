@@ -26,6 +26,7 @@ This improvement in training speed has been brought about by the following techn
 * Cautious Weight Decay w/ schedule tied to LR
 * Exponential decay of residual stream
 * Batch size schedule
+* Max seq length schedule
 * Partial Key Offset
 * Multi token prediction
 * Untie embed and lm_head at 2/3 of training
