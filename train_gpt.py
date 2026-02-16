@@ -1249,24 +1249,7 @@ class GPT(nn.Module):
         )
         self.scalars.label = 'scalars'
 
-    @staticmethod
-    @torch.compile(dynamic=False, fullgraph=True)
-    def _compute_bigram_hash(x: Tensor) -> Tensor:
-        """
-        Computes bigram hash for each position using [prev_token, curr_token].
-        Multiply by arbitary large ints to get even spread over int32 range.
-        Position 0 is mapped to the reserved index (vocab_size - 1).
-        BOS_tokens within the batch will hash based on last token of prior doc. Masking this ran slower and showed no improvement.
-        """
-        rand_int_1 = 36313
-        rand_int_2 = 27191
-        mod = args.bigram_vocab_size-1
-        result = torch.empty_like(x)
-        result[0] = mod
-        result[1:] = torch.bitwise_xor(rand_int_1 * x[1:], rand_int_2 * x[:-1]) % mod
-        return result
-
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, schedule_cfg: ForwardScheduleConfig):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
         # unpack schedule_cfg
@@ -1296,13 +1279,12 @@ class GPT(nn.Module):
         # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
         x = self.embed(input_seq)
         
-        bigram_seq = self._compute_bigram_hash(input_seq)
-        x0_bigram = self.bigram_embed(bigram_seq)[None]
+        x0_bigram = self.bigram_embed(bigram_input_seq)[None]
 
         # Value embeddings - always computed (not precomputed)
         ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
         # Shifted .01 ... 234 structure on token value embeddings by @photomz
-        ve = [None] + [ve[0], ve[1]] + [None] * (self.num_layers - 6) + [ve[2], ve[3], ve[4]]
+        ve = [None, ve[0], ve[1]] + [None] * (self.num_layers - 6) + [ve[2], ve[3], ve[4]]
         assert len(ve) == self.num_layers
 
         # smear token embed forward 1 position @classiclarryd
@@ -1314,7 +1296,7 @@ class GPT(nn.Module):
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
         attn_gates = ag[:6] + [None] + ag[6:]
-        ve_gates = [None] + [veg[0], veg[1]] + [None] * (self.num_layers - 6) + [veg[2], veg[3], veg[4]]
+        ve_gates = [None, veg[0], veg[1]] + [None] * (self.num_layers - 6) + [veg[2], veg[3], veg[4]]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
 
@@ -1533,6 +1515,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         _inputs = _inputs.to(dtype=torch.int32)
         _targets = _targets.to(dtype=torch.int64)
         _cum_lengths = _cum_lengths.to(dtype=torch.int32)
+        _bigram_inputs = get_bigram_hash(_inputs)
 
         new_params = yield (
             _inputs.to(device="cuda", non_blocking=True),
