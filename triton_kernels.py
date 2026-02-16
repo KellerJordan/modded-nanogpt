@@ -62,15 +62,22 @@ def XXT_kernel(
     offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
     offs_k = tl.arange(0, BLOCK_SIZE_K)
+    
+    # Load A blocks for C[m,n] = A[m,:] @ A[n,:].T
+    # Load A[m, k] -> shape (BM, BK)
     a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
-    at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
+    # Load A[n, k] -> shape (BN, BK). Transpose to get (BK, BN) for accumulation.
+    # Loading (BN, BK) is coalesced because stride_c is 1 (contiguous dim is k).
+    at_ptrs = A_ptr + (offs_n[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     # Accumulate over blocks of K
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        at = tl.load(at_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        k_remaining = K - k * BLOCK_SIZE_K
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        at_temp = tl.load(at_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        at = tl.trans(at_temp)
         accumulator = tl.dot(a, at, accumulator)
         a_ptrs += BLOCK_SIZE_K * a_stride_c
         at_ptrs += BLOCK_SIZE_K * a_stride_c
@@ -106,10 +113,10 @@ def XXT(A: torch.Tensor, out: torch.Tensor):
     # Hardcoded configs based on H100 autotuning
     if K == 768:
         BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
-        num_stages, num_warps = 4, 4
+        num_stages, num_warps = 4, 8
     else:
         BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 128, 128
-        num_stages, num_warps = 4, 4
+        num_stages, num_warps = 4, 8
 
     grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
     XXT_kernel[grid](
@@ -167,15 +174,19 @@ def ba_plus_cAA_kernel(
     offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
     offs_k = tl.arange(0, BLOCK_SIZE_K)
+    
+    # Coalesced loads similar to XXT_kernel
     a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
-    at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
+    at_ptrs = A_ptr + (offs_n[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     # Accumulate over blocks of K
     for k in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < M - k * BLOCK_SIZE_K, other=0.0)
-        at = tl.load(at_ptrs, mask=offs_k[:, None] < M - k * BLOCK_SIZE_K, other=0.0)
+        k_remaining = M - k * BLOCK_SIZE_K
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        at_temp = tl.load(at_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        at = tl.trans(at_temp)
         accumulator = tl.dot(a, at, accumulator)
         a_ptrs += BLOCK_SIZE_K * a_stride_c
         at_ptrs += BLOCK_SIZE_K * a_stride_c
@@ -222,7 +233,7 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
 
     # Hardcoded config based on H100 autotuning (M=768)
     BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
-    num_stages, num_warps = 4, 4
+    num_stages, num_warps = 4, 8
 
     grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
     ba_plus_cAA_kernel[grid](
@@ -402,11 +413,14 @@ def fused_softcapped_entropy_fwd_kernel(
     max_val = -float('inf')
     sum_exp = 0.0
 
+    inv_C = 1.0 / C
+    B_div_C = B * inv_C
+
     for off in range(0, n_cols, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
         val = tl.load(logits_row_ptr + cols, mask=mask, other=-float('inf')).to(tl.float32)
-        z = A * tl.sigmoid((val + B) / C)
+        z = A * tl.sigmoid(val * inv_C + B_div_C)
         z = tl.where(mask, z, -float('inf'))
         curr_max = tl.max(z, axis=0)
         new_max = tl.maximum(max_val, curr_max)
@@ -425,7 +439,7 @@ def fused_softcapped_entropy_fwd_kernel(
                 target = tl.load(targets_ptr + target_idx).to(tl.int32)
                 if target >= 0 and target < n_cols:
                     val_target = tl.load(logits_row_ptr + target).to(tl.float32)
-                    z_target = A * tl.sigmoid((val_target + B) / C)
+                    z_target = A * tl.sigmoid(val_target * inv_C + B_div_C)
                     total_loss += weight * (lse - z_target)
 
     tl.store(losses_ptr + row_idx, total_loss)
@@ -436,6 +450,7 @@ def fused_softcapped_entropy_bwd_kernel(
     stride_logits_n, stride_logits_v, stride_grad_n, stride_grad_v,
     n_rows, n_cols, n_predict,
     A, B, C,
+    grad_s,
     BLOCK_SIZE: tl.constexpr
 ):
     row_idx = tl.program_id(0).to(tl.int64)
@@ -451,11 +466,15 @@ def fused_softcapped_entropy_bwd_kernel(
         if row_idx + k < n_rows:
             S_w += tl.load(mtp_weights_ptr + k)
 
+    inv_C = 1.0 / C
+    B_div_C = B * inv_C
+    inv_C_A = inv_C * A
+
     for off in range(0, n_cols, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
         val = tl.load(logits_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        u = (val + B) / C
+        u = val * inv_C + B_div_C
         sigmoid_u = tl.sigmoid(u)
         z = A * sigmoid_u
         p = tl.exp(z - lse)
@@ -469,13 +488,30 @@ def fused_softcapped_entropy_bwd_kernel(
                 term2 += tl.where(cols == target, weight, 0.0)
 
         grad_z = grad_loss * (term1 - term2)
-        dz_dx = (1.0 / C) * z * (1.0 - sigmoid_u)
+        dz_dx = inv_C_A * sigmoid_u * (1.0 - sigmoid_u)
         grad_x = grad_z * dz_dx
-        tl.store(grad_row_ptr + cols, grad_x.to(tl.bfloat16), mask=mask)
+        grad_x = grad_x / grad_s
+        grad_x = grad_x.to(tl.float8e5)
+        tl.store(grad_row_ptr + cols, grad_x, mask=mask)
 
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, targets, mtp_weights, A=23.0, B=5.0, C=7.5):
+    def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, A=23.0, B=5.0, C=7.5):
+
+        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+        w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
+
+        w_f8_col_major = w_f8.T.contiguous().T
+
+        logits = torch._scaled_mm(
+            x_f8,
+            w_f8_col_major,
+            out_dtype=torch.bfloat16,
+            scale_a=x.new_tensor(x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(w_s, dtype=torch.float32),
+            use_fast_accum=True,
+        )
+
         n_rows, n_cols = logits.shape
         if mtp_weights is None:
              mtp_weights = torch.tensor([1.0], device=logits.device, dtype=torch.float32)
@@ -495,22 +531,21 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             n_rows, n_cols, n_predict,
             A, B, C,
             BLOCK_SIZE=1024,
-            num_warps=8,
-            num_stages=4
+            num_warps=2
         )
 
-        ctx.save_for_backward(logits, targets, mtp_weights, lse)
-        ctx.params = (A, B, C)
+        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8)
+        ctx.params = (A, B, C, x_s, w_s, grad_s)
         return losses
 
     @staticmethod
     def backward(ctx, grad_output):
-        logits, targets, mtp_weights, lse = ctx.saved_tensors
-        A, B, C = ctx.params
+        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8 = ctx.saved_tensors
+        A, B, C, x_s, w_s, grad_s = ctx.params
         n_rows, n_cols = logits.shape
         n_predict = mtp_weights.shape[0]
 
-        grad_input = torch.empty((n_rows, n_cols), dtype=torch.bfloat16, device=logits.device)
+        grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
         grad_output = grad_output.contiguous()
 
         grid = (n_rows,)
@@ -519,8 +554,31 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
             n_rows, n_cols, n_predict,
             A, B, C,
+            grad_s,
             BLOCK_SIZE=1024,
-            num_warps=8,
-            num_stages=4
+            num_warps=2
         )
-        return grad_input, None, None, None, None, None
+
+        x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
+        w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)
+        grad_scale = grad_input.new_tensor(grad_s, dtype=torch.float32)
+
+        grad_x = torch._scaled_mm(
+            grad_input,
+            w_f8.T,
+            out_dtype=torch.bfloat16,
+            scale_a=grad_scale,
+            scale_b=w_scale,
+            use_fast_accum=False,
+        )
+
+        grad_w = torch._scaled_mm(
+            x_f8.T.contiguous(),
+            grad_input.T.contiguous().T,
+            out_dtype=torch.float32,
+            scale_a=x_scale,
+            scale_b=grad_scale,
+            use_fast_accum=False,
+        )
+
+        return grad_x, None, None, grad_w, None, None, None

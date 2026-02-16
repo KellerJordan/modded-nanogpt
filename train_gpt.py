@@ -45,7 +45,7 @@ rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 assert 8 % world_size == 0, "world_size must be a divisor of 8"
 grad_accum_steps = 8 // world_size
-grad_scale = 2 / grad_accum_steps # consistent grad magnitudes between different num_devices
+grad_scale = 1 / grad_accum_steps # consistent grad magnitudes between different num_devices
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -1058,7 +1058,8 @@ class CausalSelfAttention(nn.Module):
                 k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:]
 
             if ve is not None:
-                ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T, self.num_heads, 1)
+                # gate pattern g(x[:6] + ve[:6]) by @photomz
+                ve_gate_out = 2 * torch.sigmoid(F.linear(torch.cat([x[..., :6], ve[None, ..., :6]], dim=-1), ve_gate_w)).view(B, T, self.num_heads, 1)
                 v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
 
         else:
@@ -1146,7 +1147,8 @@ class GPT(nn.Module):
 
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
-        self.value_embeds = nn.Parameter(torch.zeros(5 * self.vocab_size, model_dim, dtype=torch.bfloat16))
+        # spherical gaussian init by @photomz
+        self.value_embeds = nn.Parameter(0.01 * torch.randn(5 * self.vocab_size, model_dim, dtype=torch.bfloat16))
         self.value_embeds.label = 'value_embed'
 
         # parameter banks for attention and value embedding gate weights
@@ -1247,7 +1249,24 @@ class GPT(nn.Module):
         )
         self.scalars.label = 'scalars'
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _compute_bigram_hash(x: Tensor) -> Tensor:
+        """
+        Computes bigram hash for each position using [prev_token, curr_token].
+        Multiply by arbitary large ints to get even spread over int32 range.
+        Position 0 is mapped to the reserved index (vocab_size - 1).
+        BOS_tokens within the batch will hash based on last token of prior doc. Masking this ran slower and showed no improvement.
+        """
+        rand_int_1 = 36313
+        rand_int_2 = 27191
+        mod = args.bigram_vocab_size-1
+        result = torch.empty_like(x)
+        result[0] = mod
+        result[1:] = torch.bitwise_xor(rand_int_1 * x[1:], rand_int_2 * x[:-1]) % mod
+        return result
+
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
         # unpack schedule_cfg
@@ -1276,12 +1295,14 @@ class GPT(nn.Module):
 
         # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
         x = self.embed(input_seq)
-        x0_bigram = self.bigram_embed(bigram_input_seq)[None]
+        
+        bigram_seq = self._compute_bigram_hash(input_seq)
+        x0_bigram = self.bigram_embed(bigram_seq)[None]
 
         # Value embeddings - always computed (not precomputed)
         ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
-        # 01 ... 234 structure on token value embeddings by @photomz
-        ve = [ve[0], ve[1]] + [None] * (self.num_layers - 5) + [ve[2], ve[3], ve[4]]
+        # Shifted .01 ... 234 structure on token value embeddings by @photomz
+        ve = [None] + [ve[0], ve[1]] + [None] * (self.num_layers - 6) + [ve[2], ve[3], ve[4]]
         assert len(ve) == self.num_layers
 
         # smear token embed forward 1 position @classiclarryd
@@ -1293,7 +1314,7 @@ class GPT(nn.Module):
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
         attn_gates = ag[:6] + [None] + ag[6:]
-        ve_gates = [veg[0], veg[1]] + [None] * (self.num_layers - 5) + [veg[2], veg[3], veg[4]]
+        ve_gates = [None] + [veg[0], veg[1]] + [None] * (self.num_layers - 6) + [veg[2], veg[3], veg[4]]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
 
@@ -1336,13 +1357,13 @@ class GPT(nn.Module):
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
         x -= backout_lambda * x_backout
         x = norm(x)
-        logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
-            losses = FusedSoftcappedCrossEntropy.apply(logits.view(-1, logits.size(-1)), target_seq, mtp_weights, 23.0, 5.0, 7.5)
+            losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s)
             loss = losses.sum()
         else:
+            logits = self.lm_head(x)
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
             logits_for_loss = logits.float()
             loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
@@ -1512,7 +1533,6 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         _inputs = _inputs.to(dtype=torch.int32)
         _targets = _targets.to(dtype=torch.int64)
         _cum_lengths = _cum_lengths.to(dtype=torch.int32)
-        _bigram_inputs = get_bigram_hash(_inputs)
 
         new_params = yield (
             _inputs.to(device="cuda", non_blocking=True),
@@ -1543,7 +1563,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1515  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1507  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
