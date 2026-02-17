@@ -36,6 +36,9 @@ from kernels import get_kernel
 from torch import Tensor, nn
 
 from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
+# Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
+# https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
 
 dynamo.config.recompile_limit = 64
 
@@ -164,13 +167,25 @@ polar_express_coeffs = [
 ]
 
 @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
-def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
+def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momentum_t: torch.Tensor,
+                  split_baddbmm: bool = False):
     """
-    Polar Express Sign Method: https://arxiv.org/pdf/2505.16932
+    Fused Nesterov momentum + Polar Express Sign Method.
+    Nesterov momentum is applied in FP32, then the result is cast to BF16 for polar express
+    orthogonalization, avoiding materialization of the FP32 intermediate between graph breaks.
+
+    Polar Express: https://arxiv.org/pdf/2505.16932
     by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
+
+    momentum_t is a 0-D CPU tensor to avoid triggering graph recompilations when the value changes.
     """
-    X = G.bfloat16()
-    is_tall = G.size(-2) > G.size(-1)
+    # Nesterov momentum (in FP32)
+    momentum = momentum_t.to(grad_chunk.dtype)
+    momentum_buffer.lerp_(grad_chunk, 1 - momentum)
+    g = grad_chunk.lerp_(momentum_buffer, momentum)
+
+    X = g.bfloat16()
+    is_tall = g.size(-2) > g.size(-1)
 
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
@@ -438,6 +453,7 @@ class NorMuonAndAdam:
         self._step_size_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
@@ -850,17 +866,16 @@ class NorMuonAndAdam:
         p_state = self.param_states[param]
         grad_chunk = grad_chunk.float()  # FP32 for momentum
 
-        # Momentum update
-        momentum_buffer = p_state["momentum_buffer"]
-        momentum_buffer.lerp_(grad_chunk, 1 - p_cfg.momentum)
-        updated_grads = grad_chunk.lerp_(momentum_buffer, p_cfg.momentum)
-
+        self._momentum_t.fill_(p_cfg.momentum)
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
-        # Polar Express orthogonalization
+        # Fused Nesterov momentum + Polar Express orthogonalization
         is_large_matrix = chunk_shape[-2] > 1024
-        v_chunk = polar_express(updated_grads, split_baddbmm=is_large_matrix)
+        v_chunk = polar_express(
+            grad_chunk, p_state["momentum_buffer"], self._momentum_t,
+            split_baddbmm=is_large_matrix,
+        )
 
         # Variance reduction
         red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
@@ -1042,6 +1057,7 @@ class AttnArgs:
     key_offset: bool
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
+    train_max_seq_len: torch.Tensor
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
@@ -1067,9 +1083,10 @@ class CausalSelfAttention(nn.Module):
         # sparse gated attention to enable context based no-op by @classiclarryd
         # only include gates on layers with value embeds used on forward pass
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
+        train_max_seq_len = attn_args.train_max_seq_len
 
         q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
+        max_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         q, k = norm(q), norm(k) # QK norm @Grad62304977
 
@@ -1116,31 +1133,6 @@ class CausalSelfAttention(nn.Module):
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
 
-class MLP(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # Weights are stored in parameter banks and passed via forward()
-
-    def forward(self, x: Tensor, c_fc: Tensor, c_proj: Tensor):
-        # relu(x)^2:
-        # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        # Fused triton kernel for relu(x @ W1.T)^2 @ W2.T
-        return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
-
-class Block(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, has_attn: bool, has_mlp: bool, use_paired_head: bool):
-        super().__init__()
-        # skip attention of blocks.6 (the 7th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, head_dim, num_heads, paired=use_paired_head) if has_attn else None
-        # skip MLP blocks for first MLP layer by @EmelyanenkoK
-        self.mlp = MLP() if has_mlp else None
-
-    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor = None, c_fc: Tensor = None, c_proj: Tensor = None):
-        if self.attn is not None:
-            x = x + self.attn(norm(x), attn_args, qkvo_w)
-        if self.mlp is not None:
-            x = x + self.mlp(norm(x), c_fc, c_proj)
-        return x
 
 # -----------------------------------------------------------------------------
 # The main model
@@ -1153,6 +1145,7 @@ class ForwardScheduleConfig:
     mtp_weights: torch.Tensor
     ws_short: int
     ws_long: int
+    train_max_seq_len: int
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
@@ -1185,35 +1178,26 @@ class GPT(nn.Module):
 
         # Identify which layers have attention/MLP
         # Attention is skipped in layer 6 by @YouJiacheng
-        self.attn_layer_indices = [i for i in range(num_layers) if i != 6]
+        num_attn_layers = num_layers - 1
         # All layers have MLP (At 11 layers--dropped first layer @EmelyanenkoK)
-        self.mlp_layer_indices = list(range(num_layers))
+        num_mlp_layers = num_layers
 
         hdim = num_heads * head_dim
         mlp_hdim = 4 * model_dim
-
-        # Create index mappings: layer_idx -> bank_idx
-        self.layer_to_attn_idx = {layer_idx: bank_idx for bank_idx, layer_idx in enumerate(self.attn_layer_indices)}
-        self.layer_to_mlp_idx = {layer_idx: bank_idx for bank_idx, layer_idx in enumerate(self.mlp_layer_indices)}
 
         # Attention bank: stores QKVO weights for all attention layers
         # merged QKVO weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
         # Simplified layout by @chrisjmccormick
-        # Shape: (num_attn_layers, 4*model_dim, hdim) = (10, 3072, 768)
-        # Reshape for sharding: (40, 768, 768) for even distribution across 8 GPUs
-        self.attn_bank = nn.Parameter(torch.empty(len(self.attn_layer_indices), 4 * model_dim, hdim))
+        self.attn_bank = nn.Parameter(torch.empty(num_attn_layers, 4 * model_dim, hdim)) # (10, 3072, 768)
+        self.attn_bank.reshape = (num_attn_layers * 4, hdim, hdim)   # Shape for sharding: (40, 768, 768)
         self.attn_bank.label = 'attn'
-        self.attn_bank.reshape = (len(self.attn_layer_indices) * 4, hdim, hdim)  # (40, 768, 768)
 
         # MLP bank: stores c_fc and c_proj for all MLP layers
-        # Shape: (num_mlp_layers + padding, 2, mlp_hdim, model_dim) = (12, 2, 3072, 768)
         # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
-        # Reshape for sharding: (24, 3072, 768)
-        num_mlp_with_padding = len(self.mlp_layer_indices) + 1  # 11 + 1 = 12
-        self.mlp_bank = nn.Parameter(torch.empty(num_mlp_with_padding, 2, mlp_hdim, model_dim))
+        self.mlp_bank = nn.Parameter(torch.empty(12, 2, mlp_hdim, model_dim))  # (12, 2, 3072, 768)
+        self.mlp_bank.reshape = (24, mlp_hdim, model_dim)  # Shape for sharding: (24, 3072, 768)
         self.mlp_bank.label = 'mlp'
-        self.mlp_bank.reshape = (num_mlp_with_padding * 2, mlp_hdim, model_dim)  # (24, 3072, 768)
 
         # improved init scale by @YouJiacheng and @srashedll
         std = 0.5 * model_dim ** -0.5
@@ -1223,15 +1207,10 @@ class GPT(nn.Module):
             self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
 
-        # Create blocks with has_attn/has_mlp flags
+        # Attention modules (no learned params -- weights come from attn_bank)
         self.paired_head_layers = [0, 2, 5, 9]
-        self.blocks = nn.ModuleList([
-            Block(model_dim, head_dim, num_heads,
-                  has_attn=(i in self.layer_to_attn_idx),
-                  has_mlp=(i in self.layer_to_mlp_idx),
-                  use_paired_head=(i in self.paired_head_layers))
-            for i in range(num_layers)
-        ])
+        self.attn = CausalSelfAttention(model_dim, head_dim, num_heads, paired=False)
+        self.attn_paired = CausalSelfAttention(model_dim, head_dim, num_heads, paired=True)
         self.yarn = Yarn(head_dim, max_seq_len)
         self.yarn_paired_head = Yarn(head_dim, max_seq_len, paired=True)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
@@ -1252,28 +1231,28 @@ class GPT(nn.Module):
         self.bigram_embed.weight.label = 'bigram_embed'
         nn.init.zeros_(self.bigram_embed.weight)
 
-        n_sublayers = 2 * num_layers
-
         # Parallel-connections: 2-lane residual stream (attn reads lane0, MLP reads lane1)
-        self.parallel_start = 7
-        w_post_init = torch.ones(n_sublayers, 2, 1)
-        for layer in range(num_layers):
-            if layer >= self.parallel_start:
-                si_attn = 2 * layer
-                w_post_init[si_attn, 1, 0] = 1.5  # attn w_post1
-        self.w_post = nn.Parameter(w_post_init)
-        self.w_post.label = 'w_post'
+        self.parallel_start = 7 # Layers 7-10 are 2-lane
 
-        self.x0_lambda = nn.Parameter(torch.zeros(n_sublayers))
-        self.x0_lambda.label = 'x0_lambda'
+        # Post-write scaling: [num_layers, 2, 2] = [layer, attn/mlp, lane0/lane1]
+        post_lambdas_init = torch.ones(num_layers, 2, 2)
+        for layer in range(self.parallel_start, num_layers):
+            post_lambdas_init[layer, 0, 1] = 1.5  # attn -> lane1 amplified for parallel layers
+        self.post_lambdas = nn.Parameter(post_lambdas_init)
+        self.post_lambdas.label = 'post_lambdas'
 
-        self.bigram_lambda = nn.Parameter(0.05 * torch.ones(n_sublayers))
-        self.bigram_lambda.label = 'bigram_lambda'
+        # Per-layer injection coefficients for x0 and bigram
+        self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
+        self.x0_lambdas.label = 'x0_lambdas'
+        self.bigram_lambdas = nn.Parameter(0.05 * torch.ones(num_layers))
+        self.bigram_lambdas.label = 'bigram_lambdas'
 
-        self.resid_lambda = nn.Parameter(1.1**0.5 * torch.ones(n_sublayers))
-        self.resid_lambda.label = 'resid_lambda'
+        # Per-sublayer residual scaling: [num_layers, 2] where [:,0]=attn, [:,1]=mlp
+        # sqrt(1.1) per sublayer so cumulative per-layer scaling is 1.1
+        self.resid_lambdas = nn.Parameter(torch.full((num_layers, 2), 1.1**0.5))
+        self.resid_lambdas.label = 'resid_lambdas'
 
-        pad = (-num_layers * 2 - 3) % dist.get_world_size()  # updated: 2*num_layers (SA lambdas only)
+        pad = (-num_layers * 2 - 3) % dist.get_world_size()
         self.scalars = nn.Parameter(
             torch.cat(
                 [
@@ -1287,63 +1266,55 @@ class GPT(nn.Module):
         )
         self.scalars.label = 'scalars'
 
-    @staticmethod
-    @torch.compile(dynamic=False, fullgraph=True)
-    def _compute_bigram_hash(x: Tensor) -> Tensor:
-        """
-        Computes bigram hash for each position using [prev_token, curr_token].
-        Multiply by arbitary large ints to get even spread over int32 range.
-        Position 0 is mapped to the reserved index (vocab_size - 1).
-        BOS_tokens within the batch will hash based on last token of prior doc. Masking this ran slower and showed no improvement.
-        """
-        rand_int_1 = 36313
-        rand_int_2 = 27191
-        mod = args.bigram_vocab_size-1
-        result = torch.empty_like(x)
-        result[0] = mod
-        result[1:] = torch.bitwise_xor(rand_int_1 * x[1:], rand_int_2 * x[:-1]) % mod
-        return result
-
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
-        # unpack schedule_cfg
-        mtp_weights, ws_short, ws_long = schedule_cfg.mtp_weights, schedule_cfg.ws_short, schedule_cfg.ws_long
-
-        # set configs
+        # ---- Schedule and layer topology ----
+        mtp_weights, train_max_seq_len = schedule_cfg.mtp_weights, schedule_cfg.train_max_seq_len
+        ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
         skip_connections = []
         skip_in = [3] # long attention window on layer 3
         skip_out = [6] # no attn op on layer 6
         x_backout = None
         backout_layer = 7
-
-        # set lambdas
-        sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
-        smear_lambda = self.scalars[2 * self.num_layers]
-        backout_lambda = self.scalars[2 * self.num_layers + 1]
-        skip_lambda = self.scalars[2 * self.num_layers + 2]
-
-        # Unbind scalars per-sublayer per-lane (avoids select_backwards kernel)
-        w_post0 = self.w_post[:, 0, 0].bfloat16().unbind(0)
-        w_post1 = self.w_post[:, 1, 0].bfloat16().unbind(0)
-        x0_lambda = self.x0_lambda.bfloat16().unbind(0)
-        bigram_lambda = self.bigram_lambda.bfloat16().unbind(0)
-        resid_lambda = self.resid_lambda.bfloat16().unbind(0)
-
         # set block masks and key shift
         bm_sizes = [ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, None, ws_short, ws_short, ws_short, ws_long]
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==ws_long for b in bm_sizes] # apply partial key offset to long windows
 
-        # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
-        x = self.embed(input_seq)
+        # ---- Unbind parameters (avoid select_backward kernels) ----
+        sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
+        smear_lambda = self.scalars[2 * self.num_layers]
+        backout_lambda = self.scalars[2 * self.num_layers + 1]
+        skip_lambda = self.scalars[2 * self.num_layers + 2]
+        resid_lambdas_attn = self.resid_lambdas[:, 0].bfloat16().unbind(0)
+        resid_lambdas_mlp  = self.resid_lambdas[:, 1].bfloat16().unbind(0)
+        post_lambdas_attn_ln0 = self.post_lambdas[:, 0, 0].bfloat16().unbind(0)
+        post_lambdas_attn_ln1 = self.post_lambdas[:, 0, 1].bfloat16().unbind(0)
+        post_lambdas_mlp_ln0  = self.post_lambdas[:, 1, 0].bfloat16().unbind(0)
+        post_lambdas_mlp_ln1  = self.post_lambdas[:, 1, 1].bfloat16().unbind(0)
+        x0_lambdas = self.x0_lambdas.bfloat16().unbind(0)
+        bigram_lambdas = self.bigram_lambdas.bfloat16().unbind(0)
+        ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
+        veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
+        attn_gates = ag[:6] + [None] + ag[6:]
+        ve_gates = [None] + [veg[0], veg[1]] + [None] * (self.num_layers - 6) + [veg[2], veg[3], veg[4]]
+        assert len(attn_gates) == self.num_layers
+        assert len(ve_gates) == self.num_layers
+        attn_weights = self.attn_bank.unbind(0)  # tuple of [4*dim, hdim] tensors
+        mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
+        mlp_fcs = mlp_all[0::2]    # even indices: c_fc
+        mlp_projs = mlp_all[1::2]  # odd indices: c_proj
+
+        # ---- Embeddings and input preparation ----
+        x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
         
         x0_bigram = self.bigram_embed(bigram_input_seq)[None]
 
         # Value embeddings - always computed (not precomputed)
         ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
         # Shifted .01 ... 234 structure on token value embeddings by @photomz
-        ve = [None] + [ve[0], ve[1]] + [None] * (self.num_layers - 6) + [ve[2], ve[3], ve[4]]
+        ve = [None, ve[0], ve[1]] + [None] * (self.num_layers - 6) + [ve[2], ve[3], ve[4]]
         assert len(ve) == self.num_layers
 
         # smear token embed forward 1 position @classiclarryd
@@ -1352,31 +1323,15 @@ class GPT(nn.Module):
         x = x0 = norm(x[None])
 
         # Initialize residual stream with pre-layer-0 bigram injection
-        # lane1 introduced at parallel_start block (single-stream before that)
-        lane0 = x0 + x0_bigram * bigram_lambda[0]
+        # lane1 introduced at parallel_start (single-stream before that)
+        lane0 = x0 + x0_bigram * bigram_lambdas[0]
         lane1 = None
-        # Zero out sublayer-0 bigram to avoid double injection in the loop
-        zero = bigram_lambda[0] * 0
-        bigram_lambda = (zero,) + bigram_lambda[1:]
 
-        # Precompute skip contributions outside loop 
-        skip_bias = tuple(x0 * x0_lambda[2*i] + x0_bigram * bigram_lambda[2*i] for i in range(self.num_layers))
+        # Precompute x0/bigram injection (added to attention output each layer)
+        # Layer 0: bigram already injected above, so only x0 component
+        x0_inject = (x0 * x0_lambdas[0],) + tuple(x0 * x0_lambdas[i] + x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
 
-        ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
-        veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
-        attn_gates = ag[:6] + [None] + ag[6:]
-        ve_gates = [None] + [veg[0], veg[1]] + [None] * (self.num_layers - 6) + [veg[2], veg[3], veg[4]]
-        assert len(attn_gates) == self.num_layers
-        assert len(ve_gates) == self.num_layers
-
-        # unbind weight banks to avoid select_backwards kernel
-        attn_weights = self.attn_bank.unbind(0)  # tuple of [4*dim, hdim] tensors
-        # reshape (12, 2, H, D) -> (24, H, D) then unbind; backward is reshape (free) + stack
-        # avoids select_backward on dim 1 that [:, 0, :, :] / [:, 1, :, :] would produce
-        mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
-        mlp_fcs = mlp_all[0::2]    # even indices: c_fc
-        mlp_projs = mlp_all[1::2]  # odd indices: c_proj
-
+        # ---- Transformer layers ----
         for i in range(self.num_layers):
             yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
             attn_args = AttnArgs(
@@ -1387,19 +1342,19 @@ class GPT(nn.Module):
                 yarn=yarn,
                 key_offset=key_offset[i],
                 attn_gate_w=attn_gates[i],
-                ve_gate_w=ve_gates[i]
+                ve_gate_w=ve_gates[i],
+                train_max_seq_len=train_max_seq_len
             )
-            qkvo_w = attn_weights[self.layer_to_attn_idx[i]] if i in self.layer_to_attn_idx else None
-            c_fc = mlp_fcs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
-            c_proj = mlp_projs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
-
-            block = self.blocks[i]
-            si = 2 * i  # sublayer index for attn
+            # Select weights from banks
+            qkvo_w = attn_weights[i - (i > 6)] if i != 6 else None
+            c_fc = mlp_fcs[i]
+            c_proj = mlp_projs[i]
 
             # Introduce lane1 at parallel_start by copying lane0
             if i == self.parallel_start:
                 lane1 = lane0
 
+            # Skip connection injection
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
                 skip_val = skip_connections.pop()
@@ -1407,33 +1362,38 @@ class GPT(nn.Module):
                 if lane1 is not None:
                     lane1 = lane1 + skip_gate_out * skip_val
 
-            if i < self.parallel_start:
-                # Single-stream: only lane0, MLP also reads lane0
-                if block.attn is not None:
-                    layer_out = block.attn(norm(lane0), attn_args, qkvo_w)
-                    layer_out = layer_out + skip_bias[i]
-                    lane0 = resid_lambda[si] * lane0 + layer_out * w_post0[si]
-                if i in skip_in:
-                    skip_connections.append(lane0)
-                if block.mlp is not None:
-                    layer_out = block.mlp(norm(lane0), c_fc, c_proj)
-                    lane0 = resid_lambda[si+1] * lane0 + layer_out * w_post0[si+1]
+            # Select attention variant for this layer
+            attn = self.attn_paired if i in self.paired_head_layers else self.attn
+
+            # Dispatch based on layer type
+            post_attn = None
+            if i == 6:
+                # MLP-only layer (no attention) @YouJiacheng
+                post_attn = lane0
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
+            elif i < self.parallel_start:
+                # Single-stream: attn and mlp both read/write lane0
+                attn_out = attn(norm(lane0), attn_args, qkvo_w)
+                lane0 = resid_lambdas_attn[i] * lane0 + attn_out + x0_inject[i]
+                post_attn = lane0
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
             else:
-                # Full 2-lane parallel connections
-                if block.attn is not None:
-                    layer_out = block.attn(norm(lane0), attn_args, qkvo_w)
-                    layer_out = layer_out + skip_bias[i]
-                    lane0 = resid_lambda[si] * lane0 + layer_out * w_post0[si]
-                    lane1 = resid_lambda[si] * lane1 + layer_out * w_post1[si]
-                if i in skip_in:
-                    skip_connections.append(lane0)
-                if block.mlp is not None:
-                    layer_out = block.mlp(norm(lane1), c_fc, c_proj)
-                    lane0 = resid_lambda[si+1] * lane0 + layer_out * w_post0[si+1]
-                    lane1 = resid_lambda[si+1] * lane1 + layer_out * w_post1[si+1]
+                # Parallel: attn reads lane0, mlp reads lane1, both write to both lanes
+                attn_out = attn(norm(lane0), attn_args, qkvo_w)
+                lane0 = resid_lambdas_attn[i] * lane0 + post_lambdas_attn_ln0[i] * attn_out + x0_inject[i]
+                lane1 = resid_lambdas_attn[i] * lane1 + post_lambdas_attn_ln1[i] * attn_out
+                post_attn = lane0
+                mlp_out = ReLUSqrdMLP(norm(lane1), c_fc, c_proj)
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * mlp_out
+                lane1 = resid_lambdas_mlp[i] * lane1 + post_lambdas_mlp_ln1[i] * mlp_out
+
+            # Skip connection and backout bookkeeping
+            if i in skip_in:
+                skip_connections.append(post_attn)
             if i == backout_layer:
                 x_backout = lane0
 
+        # ---- Output and loss ----
         x = (lane0 + lane1) * 0.5
 
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
@@ -1643,10 +1603,9 @@ class Hyperparameters:
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin") # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1470  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1450  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1664,6 +1623,7 @@ class TrainingStage:
     window_sizes: tuple[int, int]  # (short, long) in block units
     mtp_weights_start: list[float]
     mtp_weights_end: list[float]
+    train_max_seq_len: int
     duration: float = None
 
 class TrainingSchedule:
@@ -1675,6 +1635,7 @@ class TrainingSchedule:
         4. Split embed and lm head at 2/3 of training
         5. Batch size schedule of 8 -> 16 -> 24
         6. Post training extension of long windows from 13 to 20
+        7. Seq len updates from 896 to 2048 at 1/3 of training
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
@@ -1716,25 +1677,26 @@ class TrainingSchedule:
         lr = stage.lr_mul
         cd_start = int(self.scheduled_iterations * (1 - self.cooldown_frac))
         if step >= cd_start:
-            denom = (self.scheduled_iterations - cd_start)
-            t = 1.0 if denom <= 0 else min(1.0, (step - cd_start) / denom)
+            t = min(1.0, (step - cd_start) / (self.scheduled_iterations - cd_start))
             lr = lr * (1 - t) + 0.15 * t
         return lr
 
 # window_sizes are in units of `block_size` tokens (defined in TrainingManager)
 TRAINING_STAGES = [
-    TrainingStage(duration=1/3, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
+    TrainingStage(duration=1/3, train_max_seq_len=896, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
                   mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0]),
-    TrainingStage(duration=1/3, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
+    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
                   mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0]),
-    TrainingStage(duration=1/3, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
+    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
     # extension stage
-    TrainingStage(batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
+    TrainingStage(train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
 
-training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
+# TODO - Confirm.
+training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.60)
+#training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
 
 def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
     # warmup phase: linearly increase momentum from min to max
@@ -1763,16 +1725,6 @@ class TrainingManager():
     def __init__(self, model):
         self.model = model
         self.block_size = 128
-        self._FULL_SEQ = 2048
-        self._STAGE1_SEQ = 896
-        # ws_* are in block units (block_size=128)
-        self._WS_SHORT_STAGE3 = 2
-        # Derive schedule boundary steps (station schedule was written for 1515+40;
-        # these adapt automatically to current step count)
-        b = training_schedule.boundaries
-        self._stage2_start = b[1][0]  # seq-len restores to full here
-        self._stage3_start = b[2][0]  # ws_short override begins
-        self._ext_start = b[3][0]     # ws_short override ends (extension begins)
 
         # - Ordering dictates when to launch reduce/reduce_scatter operations
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
@@ -1785,12 +1737,12 @@ class TrainingManager():
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
-            "w_post":         {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "x0_lambda":      {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "bigram_lambda":  {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "resid_lambda":   {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
-            "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "post_lambdas":   {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "x0_lambdas":     {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "bigram_lambdas": {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "resid_lambdas":  {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
             "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
@@ -1798,11 +1750,9 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "w_post", "x0_lambda", "bigram_lambda", "resid_lambda",  # Small, fast
-            "lm_head",
-            "bigram_embed",  # Medium
-            "value_embed",
-            "embed",   # lm_head must complete before embed sync (when tied)
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+            "value_embed", "bigram_embed",  # Medium
+            "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
         ]
 
@@ -1840,7 +1790,8 @@ class TrainingManager():
         return ForwardScheduleConfig(
             mtp_weights = self.mtp_weights,
             ws_short = self.ws_short * self.block_size,
-            ws_long = self.ws_long * self.block_size
+            ws_long = self.ws_long * self.block_size,
+            train_max_seq_len = self.train_max_seq_len
         )
 
     def _is_adam_step(self, step: int):
@@ -1853,28 +1804,18 @@ class TrainingManager():
     def advance_schedule(self, step: int):
         stage, _ = training_schedule.lookup(step)
         self.ws_short, new_ws_long = stage.window_sizes
-        if step == 1:
-            args.train_max_seq_len = self._STAGE1_SEQ
-        elif step == self._stage2_start:
-            args.train_max_seq_len = self._FULL_SEQ
-
-        # Apply the stage3-only compute cut here.
-        if self._stage3_start <= step < self._ext_start:
-            self.ws_short = self._WS_SHORT_STAGE3
         if new_ws_long != self.ws_long:
             self.model.yarn.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
             self.model.yarn_paired_head.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
 
         new_batch_size = stage.batch_size
-        if new_batch_size != self.batch_size:
-            self.train_loader_send_args = (new_batch_size, args.train_max_seq_len, grad_accum_steps)
+        new_train_max_seq_len = stage.train_max_seq_len
+        if new_batch_size != self.batch_size or new_train_max_seq_len != self.train_max_seq_len:
+            self.train_loader_send_args = (new_batch_size, new_train_max_seq_len, grad_accum_steps)
             self.batch_size = new_batch_size
+            self.train_max_seq_len = new_train_max_seq_len
         else:
             self.train_loader_send_args = None
-
-        # Force loader update at step 1 (batch size unchanged, but seq-len changed).
-        if step == 1:
-            self.train_loader_send_args = (self.batch_size, args.train_max_seq_len, grad_accum_steps)
 
         self.ws_long = new_ws_long
         self.mtp_weights = training_schedule.mtp_weights[step]
@@ -1907,6 +1848,7 @@ class TrainingManager():
         stage, _ = training_schedule.lookup(0)
         self.ws_short, self.ws_long = stage.window_sizes
         self.batch_size = stage.batch_size
+        self.train_max_seq_len = stage.train_max_seq_len
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
         if _sparse_comms_active():
@@ -2002,6 +1944,7 @@ for param in model.parameters():
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
+
 ########################################
 #            Warmup kernels            #
 ########################################
@@ -2009,12 +1952,12 @@ print0("Compiling model and warming up kernels (~7 minutes on first execution)",
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizer=training_manager.get_state()) # save the initial state
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
 val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
 
 transition_steps = training_manager.get_transition_steps()
-# first few steps plus first and last pair of steps in each transition
-warmup_steps = sorted({0, 1, 2} | set(s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 0))
+# first and last pair of steps in each transition
+warmup_steps = sorted({0, 1 } | set(s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 0))
 print0(f"Sampling steps {warmup_steps} for warmup", console=True)
 for step in warmup_steps:
     training_manager.advance_schedule(step)
@@ -2042,7 +1985,7 @@ model.train()
 ########################################
 #        Training and validation       #
 ########################################
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
 
 gc.collect()
 
