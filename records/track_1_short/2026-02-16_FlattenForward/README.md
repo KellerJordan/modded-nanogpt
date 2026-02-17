@@ -11,9 +11,15 @@ There are three main changes included:
                         Runs  Steps    Time μ   Time σ  Time +/-   Loss μ   Loss σ  Loss +/-        p
 Baseline                   4   1490   89.7995   0.0621    0.0000   3.2782   0.0016    0.0000   0.0601
 This PR                    4   1490   88.8340   0.0445   -0.9655   3.2788   0.0005    0.0006   0.0097
-```
 
-TODO - Add list of times
+Baseline:
+  losses = [3.2764, 3.2799, 3.2773, 3.2793]
+  times  = [89.8030, 89.7110, 89.8350, 89.8490]
+
+This PR:
+  losses = [3.2783, 3.2789, 3.2795, 3.2786]
+  times  = [88.8210, 88.8090, 88.8060, 88.9000]
+```
 
 ## Flattened GPT.forward
 
@@ -65,7 +71,7 @@ My rationale at the time was that this was fine because it would be overlapped w
 
 Claude was able to write efficient "transpose add" and "transpose copy" kernels which reduced the cost of these steps significantly. 
 
-<img width="1912" height="671" alt="image" src="https://github.com/user-attachments/assets/abc1465d-bfe0-4bf0-a9a3-885a6ecac495" />
+<img width="1912" height="671" alt="image" src="transpose_kernels.png" />
 
 Side note--I finally got around to making a tutorial for my trace-reading workflow:
 https://www.youtube.com/watch?v=vTdLpaI5gMQ
