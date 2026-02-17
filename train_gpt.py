@@ -505,7 +505,7 @@ class NorMuonAndAdam:
 
             # Per-matrix LR multipliers for MLP c_proj (2x LR on odd indices)
             per_matrix_lr_mul = None
-            if label == "mlp":
+            if label == "mlp_bank":
                 rank = dist.get_rank() if dist.is_initialized() else 0
                 start_idx = rank * chunk_size
                 per_matrix_lr_mul = []
@@ -1155,23 +1155,18 @@ class GPT(nn.Module):
 
         self.smear_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.smear_gate.weight)
-        self.smear_gate.weight.label = 'smear_gate'
 
         self.skip_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.skip_gate.weight)
-        self.skip_gate.weight.label = 'skip_gate'
 
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         # spherical gaussian init by @photomz
         self.value_embeds = nn.Parameter(0.01 * torch.randn(5 * self.vocab_size, model_dim, dtype=torch.bfloat16))
-        self.value_embeds.label = 'value_embed'
 
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
-        self.attn_gate_bank.label = 'attn_gate_bank'
         self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 unique gates
-        self.ve_gate_bank.label = 've_gate_bank'
 
         # -----------------------------------
         # Parameter banks for sharded optimization, by @chrisjmccormick
@@ -1191,13 +1186,11 @@ class GPT(nn.Module):
         # Simplified layout by @chrisjmccormick
         self.attn_bank = nn.Parameter(torch.empty(num_attn_layers, 4 * model_dim, hdim)) # (10, 3072, 768)
         self.attn_bank.reshape = (num_attn_layers * 4, hdim, hdim)   # Shape for sharding: (40, 768, 768)
-        self.attn_bank.label = 'attn'
 
         # MLP bank: stores c_fc and c_proj for all MLP layers
         # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
         self.mlp_bank = nn.Parameter(torch.empty(12, 2, mlp_hdim, model_dim))  # (12, 2, 3072, 768)
         self.mlp_bank.reshape = (24, mlp_hdim, model_dim)  # Shape for sharding: (24, 3072, 768)
-        self.mlp_bank.label = 'mlp'
 
         # improved init scale by @YouJiacheng and @srashedll
         std = 0.5 * model_dim ** -0.5
@@ -1220,15 +1213,12 @@ class GPT(nn.Module):
         self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
 
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
-        self.lm_head.weight.label = 'lm_head'
 
         self.embed = nn.Embedding(self.vocab_size, model_dim)
-        self.embed.weight.label = 'embed'
         with torch.no_grad():
             self.embed.weight.copy_(self.lm_head.weight.T)
 
         self.bigram_embed = nn.Embedding(args.bigram_vocab_size, model_dim)
-        self.bigram_embed.weight.label = 'bigram_embed'
         nn.init.zeros_(self.bigram_embed.weight)
 
         # Parallel-connections: 2-lane residual stream (attn reads lane0, MLP reads lane1)
@@ -1239,18 +1229,14 @@ class GPT(nn.Module):
         for layer in range(self.parallel_start, num_layers):
             post_lambdas_init[layer, 0, 1] = 1.5  # attn -> lane1 amplified for parallel layers
         self.post_lambdas = nn.Parameter(post_lambdas_init)
-        self.post_lambdas.label = 'post_lambdas'
 
         # Per-layer injection coefficients for x0 and bigram
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
-        self.x0_lambdas.label = 'x0_lambdas'
         self.bigram_lambdas = nn.Parameter(0.05 * torch.ones(num_layers))
-        self.bigram_lambdas.label = 'bigram_lambdas'
 
         # Per-sublayer residual scaling: [num_layers, 2] where [:,0]=attn, [:,1]=mlp
         # sqrt(1.1) per sublayer so cumulative per-layer scaling is 1.1
         self.resid_lambdas = nn.Parameter(torch.full((num_layers, 2), 1.1**0.5))
-        self.resid_lambdas.label = 'resid_lambdas'
 
         pad = (-num_layers * 2 - 3) % dist.get_world_size()
         self.scalars = nn.Parameter(
@@ -1264,7 +1250,9 @@ class GPT(nn.Module):
                 ]
             )
         )
-        self.scalars.label = 'scalars'
+        # Auto-label parameters
+        for name, param in self.named_parameters():
+            param.label = name.replace('.weight', '')
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
@@ -1730,8 +1718,8 @@ class TrainingManager():
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
         self.param_table = {
-            "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
-            "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "attn_bank":      {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
@@ -1743,7 +1731,7 @@ class TrainingManager():
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "bigram_lambdas": {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "resid_lambdas":  {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
-            "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
 
@@ -1751,9 +1739,9 @@ class TrainingManager():
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
-            "value_embed", "bigram_embed",  # Medium
+            "value_embeds", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
-            "attn", "mlp",        # Large, polar express - process last to maximize overlap
+            "attn_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
         ]
 
         adam_defaults = dict(
