@@ -22,6 +22,7 @@ import gc
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import triton
+import numpy as np
 
 torch.empty(
     1, device=f"cuda:{os.environ['LOCAL_RANK']}", requires_grad=True
@@ -48,7 +49,7 @@ grad_scale = 1 / grad_accum_steps # consistent grad magnitudes between different
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
+dist.init_process_group(backend="cuda:nccl,cpu:gloo", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
@@ -208,6 +209,97 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
         X = X.mT
     return X
 
+# -----------------------------------------------------------------------------
+# Sparse Comms for bigram embedding gradient reduce-scatter
+def _sparse_comms_active():
+    # we count on this in order for sparse communication to be worthwhile
+    return world_size == 8 and grad_accum_steps == 1
+
+@torch.no_grad
+def sparse_comms_start(idxes_np, N, rank, world, send_idxes_buffer):
+    rows_per_rank = N // world
+
+    # queue upload of indexes to gpu
+    send_idxes = send_idxes_buffer[:idxes_np.shape[0]]
+    send_idxes.copy_(torch.from_numpy(idxes_np))
+    send_idxes = send_idxes.to(device, non_blocking=True)
+
+    # calculate how many gradient rows we will send to every rank
+    insertion_points = np.searchsorted(
+        idxes_np,
+        np.arange(0, rows_per_rank * (world + 1), rows_per_rank, dtype=np.int32),
+    )
+    send_counts = torch.from_numpy(insertion_points[1:] - insertion_points[:-1])
+    # zero-out own send-count - we won't send our own gradient rows to ourselves as it's a waste:
+    # in sparse_comms_merge_gradients, we'll use the slice of the gradient that already includes them as the base tensor
+    send_counts[rank] = 0
+
+    # remove indexes owned by our rank from the send list
+    send_idxes = torch.cat([send_idxes[: insertion_points[rank]], send_idxes[insertion_points[rank + 1] :]])
+
+    # share the send counts so that each rank will know how many rows
+    # to expect from every other rank
+    recv_counts = torch.empty_like(send_counts)
+    recv_counts_fut = dist.all_to_all_single(recv_counts, send_counts, async_op=True).get_future()
+    return send_idxes, send_counts, recv_counts, recv_counts_fut
+
+@torch.no_grad
+def sparse_comms_share_indexes(send_idxes, send_counts, recv_counts):
+    # cpu tensors, so these ops are cheap and don't force a host<->device sync
+    total_recv_count = recv_counts.sum().item()
+    recv_counts = recv_counts.tolist()
+    send_counts = send_counts.tolist()
+
+    # queue sharing of row indexes
+    recv_idxes = torch.empty(total_recv_count, dtype=torch.int32, device=device)
+    idxes_fut = dist.all_to_all_single(
+        recv_idxes,
+        send_idxes,
+        output_split_sizes=recv_counts,
+        input_split_sizes=send_counts,
+        async_op=True,
+    ).get_future()
+
+    sparse_state = {
+        "send_idxes": send_idxes,
+        "send_counts": send_counts,
+        "recv_counts": recv_counts, # list for sharing
+    }
+    return recv_idxes, sparse_state, idxes_fut
+
+@torch.compile
+@torch.no_grad
+def sparse_comms_share_gradients(grad, idxes, send_counts, recv_counts):
+    # gather the rows that we want to send
+    send_vals = grad[idxes]
+
+    d = grad.shape[1]
+
+    send_sizes = [i*d for i in send_counts]
+    recv_sizes = [i*d for i in recv_counts]
+
+    recv_vals = torch.empty(sum(recv_sizes), device=send_vals.device, dtype=grad.dtype)
+
+    val_fut = dist.all_to_all_single(
+        recv_vals,
+        send_vals.view(-1),
+        input_split_sizes=send_sizes,
+        output_split_sizes=recv_sizes,
+        async_op=True,
+    ).get_future()
+
+    return recv_vals, val_fut
+
+@torch.no_grad
+def sparse_comms_merge_gradients(grad, recv_idx, recv_vals, rank, world):
+    d = grad.shape[1]
+    rows_per_rank = grad.shape[0] // world
+
+    grad.index_add_(0, recv_idx, recv_vals.view(-1, d))
+
+    # return the slice of the gradient for parameters our rank updates
+    return grad[rows_per_rank * rank : rows_per_rank * (rank + 1)].mul_((1 / world))
+
 
 # -----------------------------------------------------------------------------
 # Combined NorMuon + Adam Optimizer
@@ -217,7 +309,7 @@ class ParamConfig:
     """Per-parameter configuration for NorMuonAndAdam optimizer."""
     label: str
     optim: str  # "adam" or "normuon"
-    comms: str  # "none", "replicated", or "sharded"
+    comms: str  # "none", "replicated", "sharded" or "sharded_sparse"
     adam_betas: tuple[float, float] | None
     lr_mul: float
     wd_mul: float
@@ -326,6 +418,7 @@ class NorMuonAndAdam:
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
+        self._sparse_async_data: dict[nn.Parameter, list] = {}
 
         # Embed/lm_head tying state
         self.split_embed = False
@@ -337,12 +430,14 @@ class NorMuonAndAdam:
         table_entry = self.param_table[label]
         optim = table_entry["optim"]
         comms = table_entry["comms"]
+        if comms == "sharded_sparse" and not _sparse_comms_active():
+            comms = "sharded"
         adam_betas = table_entry.get("adam_betas")
         lr_mul = table_entry.get("lr_mul", 1.0)
         wd_mul = table_entry.get("wd_mul", 1.0)
 
         if optim == "adam":
-            chunk_size = param.shape[0] // self.world_size if comms == "sharded" else None
+            chunk_size = param.shape[0] // self.world_size if comms.startswith("sharded") else None
             p_cfg = ParamConfig(
                 label=label,
                 optim=optim,
@@ -406,7 +501,7 @@ class NorMuonAndAdam:
         for param, p_cfg in self.param_cfgs.items():
             if p_cfg.optim == "adam":
                 # Sharded params use chunk state, replicated use full state
-                if p_cfg.comms == "sharded":
+                if p_cfg.comms.startswith("sharded"):
                     chunk = param[:p_cfg.chunk_size]
                 else:
                     chunk = param
@@ -476,6 +571,15 @@ class NorMuonAndAdam:
                     grad_chunk, grad, op=dist.ReduceOp.AVG, async_op=True
                 ).get_future()
                 self._reduce_futures[param] = (future, grad_chunk)
+        elif p_cfg.comms == "sharded_sparse":
+            sparse_state = self._sparse_async_data[param]
+            send_idxes = sparse_state["send_idxes"]
+            send_counts = sparse_state["send_counts"]
+            recv_counts = sparse_state["recv_counts"]
+            recv_vals, val_fut = sparse_comms_share_gradients(
+                grad, send_idxes, send_counts, recv_counts
+            )
+            self._reduce_futures[param].extend((val_fut, recv_vals))
 
     def _launch_gather(self, param: nn.Parameter, p_slice: Tensor) -> "torch.futures.Future":
         """Launch async all_gather for a sharded parameter."""
@@ -626,16 +730,24 @@ class NorMuonAndAdam:
             if p_cfg.optim == "adam" and not do_adam:
                 continue
             # Wait for reduce
-            future, grad_chunk = self._reduce_futures[param]
-            if future is not None:
-                future.wait()
+            if p_cfg.comms != "sharded_sparse":
+                future, grad_chunk = self._reduce_futures[param]
+                if future is not None:
+                    future.wait()
+            else:
+                idxes_fut, recv_idxes, recv_fut, recv_vals = self._reduce_futures[param]
+                idxes_fut.wait()
+                recv_fut.wait()
+
+                grad_chunk = sparse_comms_merge_gradients(param.grad, recv_idxes, recv_vals, rank, world_size)
+
             # Apply update based on optim type
             if p_cfg.optim == "adam":
                 p_slice = self._adam_update(param, grad_chunk, p_cfg, rank)
             else:
                 p_slice = self._normuon_update(param, grad_chunk, p_cfg, rank)
             # Launch gather for sharded params
-            if p_cfg.comms == "sharded" and self.world_size > 1:
+            if p_cfg.comms.startswith("sharded") and self.world_size > 1:
                 gather_fut = self._launch_gather(param, p_slice)
                 if label == "lm_head":
                     lm_head_gather_future = gather_fut
@@ -656,6 +768,7 @@ class NorMuonAndAdam:
             fut.wait()
 
         self._reduce_futures.clear()
+        self._sparse_async_data.clear()
 
         # Clear grads for updated params
         for param, p_cfg in self.param_cfgs.items():
@@ -672,7 +785,7 @@ class NorMuonAndAdam:
         lr = p_cfg.lr * p_cfg.lr_mul
 
         # Get parameter slice
-        if p_cfg.comms == "sharded":
+        if p_cfg.comms.startswith("sharded"):
             p_slice = param[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size]
         else:
             p_slice = param
@@ -906,6 +1019,7 @@ class AttnArgs:
     key_offset: bool
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
+    train_max_seq_len: torch.Tensor
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
@@ -931,9 +1045,10 @@ class CausalSelfAttention(nn.Module):
         # sparse gated attention to enable context based no-op by @classiclarryd
         # only include gates on layers with value embeds used on forward pass
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
+        train_max_seq_len = attn_args.train_max_seq_len
 
         q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
+        max_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         q, k = norm(q), norm(k) # QK norm @Grad62304977
 
@@ -945,7 +1060,8 @@ class CausalSelfAttention(nn.Module):
                 k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:]
 
             if ve is not None:
-                ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T, self.num_heads, 1)
+                # gate pattern g(x[:6] + ve[:6]) by @photomz
+                ve_gate_out = 2 * torch.sigmoid(F.linear(torch.cat([x[..., :6], ve[None, ..., :6]], dim=-1), ve_gate_w)).view(B, T, self.num_heads, 1)
                 v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
 
         else:
@@ -1016,6 +1132,7 @@ class ForwardScheduleConfig:
     mtp_weights: torch.Tensor
     ws_short: int
     ws_long: int
+    train_max_seq_len: int
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
@@ -1033,7 +1150,8 @@ class GPT(nn.Module):
 
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
-        self.value_embeds = nn.Parameter(torch.zeros(5 * self.vocab_size, model_dim, dtype=torch.bfloat16))
+        # spherical gaussian init by @photomz
+        self.value_embeds = nn.Parameter(0.01 * torch.randn(5 * self.vocab_size, model_dim, dtype=torch.bfloat16))
         self.value_embeds.label = 'value_embed'
 
         # parameter banks for attention and value embedding gate weights
@@ -1134,28 +1252,12 @@ class GPT(nn.Module):
         )
         self.scalars.label = 'scalars'
 
-    @staticmethod
-    @torch.compile(dynamic=False, fullgraph=True)
-    def _compute_bigram_hash(x: Tensor) -> Tensor:
-        """
-        Computes bigram hash for each position using [prev_token, curr_token].
-        Multiply by arbitary large ints to get even spread over int32 range.
-        Position 0 is mapped to the reserved index (vocab_size - 1).
-        BOS_tokens within the batch will hash based on last token of prior doc. Masking this ran slower and showed no improvement.
-        """
-        rand_int_1 = 36313
-        rand_int_2 = 27191
-        mod = args.bigram_vocab_size-1
-        result = torch.empty_like(x)
-        result[0] = mod
-        result[1:] = torch.bitwise_xor(rand_int_1 * x[1:], rand_int_2 * x[:-1]) % mod
-        return result
-
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, schedule_cfg: ForwardScheduleConfig):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
         # unpack schedule_cfg
-        mtp_weights, ws_short, ws_long = schedule_cfg.mtp_weights, schedule_cfg.ws_short, schedule_cfg.ws_long
+        mtp_weights, train_max_seq_len = schedule_cfg.mtp_weights, schedule_cfg.train_max_seq_len
+        ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
 
         # set configs
         skip_connections = []
@@ -1181,13 +1283,12 @@ class GPT(nn.Module):
         # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
         x = self.embed(input_seq)
         
-        bigram_seq = self._compute_bigram_hash(input_seq)
-        x0_bigram = self.bigram_embed(bigram_seq)[None]
+        x0_bigram = self.bigram_embed(bigram_input_seq)[None]
 
         # Value embeddings - always computed (not precomputed)
         ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
-        # 01 ... 234 structure on token value embeddings by @photomz
-        ve = [ve[0], ve[1]] + [None] * (self.num_layers - 5) + [ve[2], ve[3], ve[4]]
+        # Shifted .01 ... 234 structure on token value embeddings by @photomz
+        ve = [None, ve[0], ve[1]] + [None] * (self.num_layers - 6) + [ve[2], ve[3], ve[4]]
         assert len(ve) == self.num_layers
 
         # smear token embed forward 1 position @classiclarryd
@@ -1199,7 +1300,7 @@ class GPT(nn.Module):
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
         attn_gates = ag[:6] + [None] + ag[6:]
-        ve_gates = [veg[0], veg[1]] + [None] * (self.num_layers - 5) + [veg[2], veg[3], veg[4]]
+        ve_gates = [None, veg[0], veg[1]] + [None] * (self.num_layers - 6) + [veg[2], veg[3], veg[4]]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
 
@@ -1218,7 +1319,8 @@ class GPT(nn.Module):
                 yarn=yarn,
                 key_offset=key_offset[i],
                 attn_gate_w=attn_gates[i],
-                ve_gate_w=ve_gates[i]
+                ve_gate_w=ve_gates[i],
+                train_max_seq_len=train_max_seq_len
             )
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
@@ -1337,6 +1439,23 @@ class Shard:
             return result['shard']
         return get
 
+def get_bigram_hash(x):
+    """
+    Computes bigram hash for each position using [prev_token, curr_token].
+    Multiply by arbitary large ints to get even spread over int32 range.
+    Position 0 is mapped to the reserved index (vocab_size - 1).
+    BOS_tokens within the batch will hash based on last token of prior doc. Masking this ran slower and showed no improvement.
+    """
+    rand_int_1 = 36313
+    rand_int_2 = 27191
+    mod = args.bigram_vocab_size-1
+    x = x.to(torch.int32)
+    out = torch.empty_like(x, pin_memory=True)
+    out.copy_(x)
+    out[0] = mod
+    out[1:] = torch.bitwise_xor(rand_int_1 * out[1:], rand_int_2 * out[:-1]) % mod
+    return out
+
 def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True, yield_cpu: bool = False):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -1401,18 +1520,23 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         _inputs = _inputs.to(dtype=torch.int32)
         _targets = _targets.to(dtype=torch.int64)
         _cum_lengths = _cum_lengths.to(dtype=torch.int32)
+        _bigram_inputs = get_bigram_hash(_inputs)
 
         if yield_cpu:
             new_params = yield (
                 _inputs.pin_memory(),
                 _targets.pin_memory(),
                 _cum_lengths.pin_memory(),
+                _bigram_inputs.pin_memory(),
+                _bigram_inputs.numpy(),
             )
         else:
             new_params = yield (
                 _inputs.to(device="cuda", non_blocking=True),
                 _targets.to(device="cuda", non_blocking=True),
                 _cum_lengths.to(device="cuda", non_blocking=True),
+                _bigram_inputs.to(device="cuda", non_blocking=True),
+                _bigram_inputs.numpy(),
             )
 
         if new_params is not None:
@@ -1432,15 +1556,17 @@ class Hyperparameters:
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin") # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1515  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1490  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
+    # profilingi 
+    profile: bool = True
+    profile_steps: int = 14
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
 
@@ -1453,6 +1579,7 @@ class TrainingStage:
     window_sizes: tuple[int, int]  # (short, long) in block units
     mtp_weights_start: list[float]
     mtp_weights_end: list[float]
+    train_max_seq_len: int
     duration: float = None
 
 class TrainingSchedule:
@@ -1464,6 +1591,7 @@ class TrainingSchedule:
         4. Split embed and lm head at 2/3 of training
         5. Batch size schedule of 8 -> 16 -> 24
         6. Post training extension of long windows from 13 to 20
+        7. Seq len updates from 896 to 2048 at 1/3 of training
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
@@ -1506,19 +1634,19 @@ class TrainingSchedule:
         cd_start = int(self.scheduled_iterations * (1 - self.cooldown_frac))
         if step >= cd_start:
             t = min(1.0, (step - cd_start) / (self.scheduled_iterations - cd_start))
-            lr = lr * (1 - t) + 0.1 * t
+            lr = lr * (1 - t) + 0.15 * t
         return lr
 
 # window_sizes are in units of `block_size` tokens (defined in TrainingManager)
 TRAINING_STAGES = [
-    TrainingStage(duration=1/3, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
+    TrainingStage(duration=1/3, train_max_seq_len=896, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
                   mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0]),
-    TrainingStage(duration=1/3, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
+    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
                   mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0]),
-    TrainingStage(duration=1/3, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
+    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
     # extension stage
-    TrainingStage(batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
+    TrainingStage(train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
 
@@ -1559,14 +1687,14 @@ class TrainingManager():
             "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
-            "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.65, 0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
+            "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
 
@@ -1574,8 +1702,10 @@ class TrainingManager():
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
-            "value_embed", "bigram_embed",  # Medium
-            "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
+            "lm_head",
+            "bigram_embed",  # Medium
+            "value_embed",
+            "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
         ]
 
@@ -1613,7 +1743,8 @@ class TrainingManager():
         return ForwardScheduleConfig(
             mtp_weights = self.mtp_weights,
             ws_short = self.ws_short * self.block_size,
-            ws_long = self.ws_long * self.block_size
+            ws_long = self.ws_long * self.block_size,
+            train_max_seq_len = self.train_max_seq_len
         )
 
     def _is_adam_step(self, step: int):
@@ -1631,9 +1762,11 @@ class TrainingManager():
             self.model.yarn_paired_head.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
 
         new_batch_size = stage.batch_size
-        if new_batch_size != self.batch_size:
-            self.train_loader_send_args = (new_batch_size, args.train_max_seq_len, grad_accum_steps)
+        new_train_max_seq_len = stage.train_max_seq_len
+        if new_batch_size != self.batch_size or new_train_max_seq_len != self.train_max_seq_len:
+            self.train_loader_send_args = (new_batch_size, new_train_max_seq_len, grad_accum_steps)
             self.batch_size = new_batch_size
+            self.train_max_seq_len = new_train_max_seq_len
         else:
             self.train_loader_send_args = None
 
@@ -1668,11 +1801,49 @@ class TrainingManager():
         stage, _ = training_schedule.lookup(0)
         self.ws_short, self.ws_long = stage.window_sizes
         self.batch_size = stage.batch_size
+        self.train_max_seq_len = stage.train_max_seq_len
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
+        if _sparse_comms_active():
+            self.row_update_mask = np.zeros(args.bigram_vocab_size, dtype=np.uint8)
+            self.sparse_counts_state = None
+            # buffer we use for fast GPU uploads of send indexes
+            self.send_idxes_buffer = torch.empty(args.bigram_vocab_size, dtype=torch.int32, pin_memory=True)
+
 
     def get_state(self):
         return copy.deepcopy(self.optimizer.state_dict())
+
+    def sparse_index_update(self, step, bigram_indexes):
+        if not _sparse_comms_active():
+            return
+
+        self.row_update_mask[bigram_indexes] = 1
+
+        if self._is_adam_step(step):
+            with torch.no_grad():
+                bigram_idx_np = np.flatnonzero(self.row_update_mask).astype(np.int32)
+                send_idxes, send_counts, recv_counts, recv_counts_fut = sparse_comms_start(
+                    bigram_idx_np, args.bigram_vocab_size, rank, world_size, self.send_idxes_buffer
+                )
+                self.sparse_counts_state = (send_idxes, send_counts, recv_counts, recv_counts_fut)
+
+    def sparse_index_share(self, step):
+        if not _sparse_comms_active() or not self._is_adam_step(step):
+            return
+
+        send_idxes, send_counts, recv_counts, recv_counts_fut = self.sparse_counts_state
+        self.sparse_counts_state = None
+
+        recv_counts_fut.wait()
+        recv_idxes, sparse_state, idxes_fut = sparse_comms_share_indexes(send_idxes, send_counts, recv_counts)
+        self.optimizer._reduce_futures[model.bigram_embed.weight] = [idxes_fut, recv_idxes]
+        self.optimizer._sparse_async_data[model.bigram_embed.weight] = sparse_state
+
+        self.row_update_mask.fill(0)
+
+
+        
 
 # -----------------------------------------------------------------------------
 # int main
@@ -1726,6 +1897,7 @@ for param in model.parameters():
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
+
 ########################################
 #            Warmup kernels            #
 ########################################
@@ -1733,24 +1905,28 @@ print0("Compiling model and warming up kernels (~7 minutes on first execution)",
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizer=training_manager.get_state()) # save the initial state
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
 val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
 
 transition_steps = training_manager.get_transition_steps()
-# first few steps plus transitions
-warmup_steps = sorted({0, 1, 2} | set(s + offset for s in transition_steps for offset in [-1, 0, 1] if s + offset >= 0))
+# first and last pair of steps in each transition
+warmup_steps = sorted({0, 1 } | set(s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 0))
 print0(f"Sampling steps {warmup_steps} for warmup", console=True)
 for step in warmup_steps:
     training_manager.advance_schedule(step)
     model.eval()
     with torch.no_grad():
-        inputs, targets, cum_seqlens = next(val_loader)
-        model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+        inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
     model.train()
     for idx in range(grad_accum_steps):
         send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) * grad_scale).backward()
+        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
+        training_manager.sparse_index_update(step, bigram_cpu)
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
+        training_manager.sparse_index_share(step)
+        loss.backward()
+        del loss
     training_manager.step_optimizers(step)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
@@ -1763,64 +1939,57 @@ model.train()
 #        Training and validation       #
 ########################################
 class PrefetchLoader:
-    """Overlaps CPU data preparation with GPU compute using a persistent background thread and dedicated CUDA stream."""
+    """Overlaps CPU data preparation with GPU compute using a background thread.
+    The worker thread handles CPU-only data loading while the main thread does GPU compute.
+    H2D transfers happen on the default stream to avoid multi-stream sync issues."""
     def __init__(self, gen):
         self.gen = gen
         self._result = None
+        self._error = None
         self._started = False
         self._ready = threading.Event()
         self._go = threading.Event()
         self._device = torch.cuda.current_device()
-        self._stream = torch.cuda.Stream(device=self._device)
-        self._event = torch.cuda.Event()
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
-    @staticmethod
-    def _h2d(cpu_tensors):
-        """Transfer a tuple of CPU pinned tensors to GPU. Returns (gpu_tensors, cpu_tensors)."""
-        gpu = tuple(t.to(device="cuda", non_blocking=True) for t in cpu_tensors)
-        return gpu, cpu_tensors  # keep cpu refs alive until H2D completes
-
     def _worker(self):
-        torch.cuda.set_device(self._device)
+        """Background thread: only does CPU data prep, no CUDA ops."""
         while True:
             self._go.wait()
             self._go.clear()
-            cpu_tensors = self.gen.send(None)        # CPU data prep (no CUDA ops)
-            with torch.cuda.stream(self._stream):
-                gpu, self._cpu_hold = self._h2d(cpu_tensors) # H2D on prefetch stream
-            self._result = gpu
-            self._event.record(self._stream)
+            try:
+                self._result = self.gen.send(None)
+            except Exception as e:
+                self._error = e
             self._ready.set()
 
-    def send(self, value):
-        if self._started:
-            self._ready.wait()
-            self._ready.clear()
-            torch.cuda.current_stream().wait_event(self._event)
-            if value is not None:
-                # Stage transition: discard prefetched batch, re-fetch with new params.
-                # Worker is idle (finished and waiting on _go), so gen is safe to use.
-                cpu_tensors = self.gen.send(value)
-                with torch.cuda.stream(self._stream):
-                    result, self._cpu_hold = self._h2d(cpu_tensors)
-                self._event.record(self._stream)
-                torch.cuda.current_stream().wait_event(self._event)
-            else:
-                result = self._result
-        else:
-            self._started = True
-            cpu_tensors = self.gen.send(value)
-            with torch.cuda.stream(self._stream):
-                result, self._cpu_hold = self._h2d(cpu_tensors)
-            self._event.record(self._stream)
-            torch.cuda.current_stream().wait_event(self._event)
-        # Kick off next prefetch
-        self._go.set()
-        return result
+    @staticmethod
+    def _h2d(cpu_tensors):
+        """Transfer pinned CPU tensors to GPU on the current (default) stream. Numpy arrays kept as-is."""
+        with torch.profiler.record_function("PrefetchLoader::_h2d"):
+            return tuple(t if isinstance(t, np.ndarray) else t.to(device="cuda", non_blocking=True) for t in cpu_tensors)
 
-train_loader = PrefetchLoader(distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps, yield_cpu=True))
+    def send(self, value):
+        with torch.profiler.record_function("PrefetchLoader::send"):
+            if self._started:
+                with torch.profiler.record_function("PrefetchLoader::wait_for_worker"):
+                    self._ready.wait()
+                self._ready.clear()
+                if self._error is not None:
+                    raise RuntimeError("PrefetchLoader worker died") from self._error
+                if value is not None:
+                    result = self._h2d(self.gen.send(value))
+                else:
+                    result = self._h2d(self._result)
+            else:
+                self._started = True
+                result = self._h2d(self.gen.send(value))
+            # Kick off next CPU prefetch (overlaps with GPU compute)
+            self._go.set()
+            return result
+
+train_loader = PrefetchLoader(distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps, yield_cpu=True))
 
 gc.collect()
 
@@ -1830,6 +1999,25 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = training_schedule.total_steps
+
+# ---- Perfetto / Chrome tracing profiler ----
+if args.profile:
+    def trace_handler(prof: torch.profiler.profile):
+        os.makedirs("/modded-nanogpt/profiles", exist_ok=True)
+        prof.export_chrome_trace(f"/modded-nanogpt/profiles/rank-{rank}-chrome-trace.json.gz")
+    prof_ctx = torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(wait=5, warmup=5, active=args.profile_steps - 10),
+        on_trace_ready=trace_handler,
+        with_stack=False,
+        record_shapes=True,
+    )
+    prof_ctx.__enter__()
+    train_steps = args.profile_steps  # override to exit early
+
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
@@ -1847,8 +2035,8 @@ for step in range(train_steps + 1):
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
-                inputs, targets, cum_seqlens = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+                inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
@@ -1869,12 +2057,23 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION ----------------
     for idx in range(grad_accum_steps):
         send_args = training_manager.train_loader_send_args if idx == 0 else None
-        inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) * grad_scale).backward()
+        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
+        training_manager.sparse_index_update(step, bigram_cpu)
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
+        training_manager.sparse_index_share(step)
+        loss.backward()
+        del loss
+    training_manager.step_optimizers(step)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+
+    if args.profile:
+        prof_ctx.step()
+
+if args.profile:
+    prof_ctx.__exit__(None, None, None)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
