@@ -1565,7 +1565,7 @@ class Hyperparameters:
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # profilingi 
-    profile: bool = True
+    profile: bool = False
     profile_steps: int = 14
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
