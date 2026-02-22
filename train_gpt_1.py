@@ -231,7 +231,7 @@ def sparse_comms_start(idxes_np, N, rank, world, send_idxes_buffer):
     )
     send_counts = torch.from_numpy(insertion_points[1:] - insertion_points[:-1])
     # zero-out own send-count - we won't send our own gradient rows to ourselves as it's a waste:
-    # in sparse_comms_merge_gradients, we'll use the slice of the gradient that already includes them as the base tensorwhy
+    # in sparse_comms_merge_gradients, we'll use the slice of the gradient that already includes them as the base tensor
     send_counts[rank] = 0
 
     # remove indexes owned by our rank from the send list
@@ -1803,6 +1803,7 @@ class TrainingManager():
         self.model.yarn_paired_head.reset()
         if _sparse_comms_active():
             self.row_update_mask = np.zeros(args.bigram_vocab_size, dtype=np.uint8)
+            self._mask_lock = threading.Lock()
             self.sparse_counts_state = None
             # buffer we use for fast GPU uploads of send indexes
             self.send_idxes_buffer = torch.empty(args.bigram_vocab_size, dtype=torch.int32, pin_memory=True)
@@ -1811,15 +1812,22 @@ class TrainingManager():
     def get_state(self):
         return copy.deepcopy(self.optimizer.state_dict())
 
-    def sparse_index_update(self, step, bigram_indexes):
+    def sparse_index_precompute(self, bigram_indexes):
+        """CPU-only pre-computation for sparse comms. Safe to call from worker thread."""
+        if not _sparse_comms_active():
+            return None
+        with self._mask_lock:
+            self.row_update_mask[bigram_indexes] = 1
+            mask_snapshot = self.row_update_mask.copy()
+        return np.flatnonzero(mask_snapshot).astype(np.int32)
+
+    def sparse_index_update(self, step, bigram_idx_np):
+        """Comms-only sparse index update. Takes pre-computed bigram_idx_np from worker thread."""
         if not _sparse_comms_active():
             return
 
-        self.row_update_mask[bigram_indexes] = 1
-
         if self._is_adam_step(step):
             with torch.no_grad():
-                bigram_idx_np = np.flatnonzero(self.row_update_mask).astype(np.int32)
                 send_idxes, send_counts, recv_counts, recv_counts_fut = sparse_comms_start(
                     bigram_idx_np, args.bigram_vocab_size, rank, world_size, self.send_idxes_buffer
                 )
@@ -1837,7 +1845,8 @@ class TrainingManager():
         self.optimizer._reduce_futures[model.bigram_embed.weight] = [idxes_fut, recv_idxes]
         self.optimizer._sparse_async_data[model.bigram_embed.weight] = sparse_state
 
-        self.row_update_mask.fill(0)
+        with self._mask_lock:
+            self.row_update_mask.fill(0)
 
 
         
@@ -1917,9 +1926,11 @@ for step in warmup_steps:
         model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
     model.train()
     for idx in range(grad_accum_steps):
-        send_args = training_manager.train_loader_send_args
+        send_args = training_manager.train_loader_send_args if idx == 0 else None
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
-        training_manager.sparse_index_update(step, bigram_cpu)
+        bigram_idx_np = training_manager.sparse_index_precompute(bigram_cpu)
+        if bigram_idx_np is not None:
+            training_manager.sparse_index_update(step, bigram_idx_np)
         loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
@@ -1936,111 +1947,88 @@ model.train()
 #        Training and validation       #
 ########################################
 class PrefetchLoader:
-    """Overlaps CPU data prep AND H2D transfers with GPU compute via double-buffering.
-    - Background thread: CPU-only data loading (no CUDA ops, avoids NCCL conflicts)
-    - Main thread: H2D on a dedicated copy stream with GPU-side event sync
-    - Pipeline: H2D for batch N+1 runs on copy stream while compute for batch N
-      runs on default stream, using separate DMA and compute engines."""
-    def __init__(self, gen):
+    """Overlaps CPU data preparation with GPU compute using a background thread.
+    The worker thread handles CPU-only data loading and sparse index pre-computation.
+    H2D transfers use a separate CUDA stream to overlap with GPU compute.
+    At stage transitions, falls back to the default stream to avoid sync issues."""
+    def __init__(self, gen, sparse_precompute_fn=None):
         self.gen = gen
-        self._cpu_result = None
+        self._result = None
+        self._sparse_result = None
+        self._sparse_precompute_fn = sparse_precompute_fn
         self._error = None
+        self._started = False
         self._ready = threading.Event()
         self._go = threading.Event()
         self._device = torch.cuda.current_device()
-        self._copy_stream = torch.cuda.Stream(device=self._device)
-        self._copy_event = torch.cuda.Event()
-        self._pending_gpu = None  # GPU tensors with H2D in flight on copy stream
-        self._worker_running = False
+        self._h2d_stream = torch.cuda.Stream(device=self._device)
+        # Keep a reference to CPU tensors being transferred on _h2d_stream
+        # so they don't get GC'd before the transfer completes.
+        self._inflight_cpu = None
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
     def _worker(self):
-        """Background thread: CPU data prep only, no CUDA ops."""
+        """Background thread: does CPU data prep + sparse index pre-computation."""
         while True:
             self._go.wait()
             self._go.clear()
             try:
-                self._cpu_result = self.gen.send(None)
+                self._result = self.gen.send(None)
+                if self._sparse_precompute_fn is not None:
+                    bigram_cpu = self._result[-1]  # numpy array is last element
+                    self._sparse_result = self._sparse_precompute_fn(bigram_cpu)
+                else:
+                    self._sparse_result = None
             except Exception as e:
                 self._error = e
             self._ready.set()
 
-    def _h2d_async(self, cpu_tensors):
-        """Start H2D on copy stream from main thread. Returns GPU tensor refs immediately."""
-        with torch.cuda.stream(self._copy_stream):
-            gpu = tuple(
-                t if isinstance(t, np.ndarray)
-                else t.to(device="cuda", non_blocking=True)
-                for t in cpu_tensors
-            )
-        self._copy_event.record(self._copy_stream)
-        return gpu
-
     @staticmethod
-    def _mark_stream(gpu_tensors, stream):
-        """Tell caching allocator these tensors are used on stream (prevents premature reuse)."""
-        for t in gpu_tensors:
-            if isinstance(t, torch.Tensor):
-                t.record_stream(stream)
-
-    def _drain_worker(self):
-        """Wait for and consume worker result if running."""
-        if self._worker_running:
-            with torch.profiler.record_function("PrefetchLoader::wait_worker"):
-                self._ready.wait()
-            self._ready.clear()
-            self._worker_running = False
-            if self._error is not None:
-                raise RuntimeError("PrefetchLoader worker died") from self._error
-
-    def _kick_worker(self):
-        """Start background CPU prep for next batch."""
-        self._go.set()
-        self._worker_running = True
-
-    def _enter_pipeline(self):
-        """Wait for next CPU batch and start its H2D on copy stream (pipeline fill)."""
-        self._drain_worker()
-        self._pending_gpu = self._h2d_async(self._cpu_result)
-        self._kick_worker()
+    def _h2d(cpu_tensors, stream=None):
+        """Transfer pinned CPU tensors to GPU. Uses given stream or default stream.
+        Numpy arrays kept as-is."""
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                return tuple(t if isinstance(t, np.ndarray) else t.to(device="cuda", non_blocking=True) for t in cpu_tensors)
+        else:
+            return tuple(t if isinstance(t, np.ndarray) else t.to(device="cuda", non_blocking=True) for t in cpu_tensors)
 
     def send(self, value):
-        with torch.profiler.record_function("PrefetchLoader::send"):
-            default_stream = torch.cuda.current_stream()
-
+        if self._started:
+            self._ready.wait()
+            self._ready.clear()
+            if self._error is not None:
+                raise RuntimeError("PrefetchLoader worker died") from self._error
             if value is not None:
-                # Stage change: discard pipeline, synchronous path
-                self._pending_gpu = None
-                self._drain_worker()
-                result = self._h2d_async(self.gen.send(value))
-                default_stream.wait_event(self._copy_event)
-                self._mark_stream(result, default_stream)
-                self._kick_worker()
-                self._enter_pipeline()
-                return result
+                # Stage transition: sync the H2D stream, then use default stream.
+                # This avoids multi-stream issues when batch_size/seq_len changes.
+                self._h2d_stream.synchronize()
+                self._inflight_cpu = None
+                result = self._h2d(self.gen.send(value))
+                sparse_result = None
+            else:
+                # Normal step: use separate stream for H2D, overlapping with
+                # previous step's backward pass on the default stream.
+                # Hold reference to CPU tensors so they aren't GC'd during async H2D.
+                self._inflight_cpu = self._result
+                result = self._h2d(self._result, self._h2d_stream)
+                # Make default stream wait for H2D to finish before using tensors
+                torch.cuda.current_stream().wait_stream(self._h2d_stream)
+                sparse_result = self._sparse_result
+        else:
+            # First call: use default stream (no overlap possible yet)
+            self._started = True
+            result = self._h2d(self.gen.send(value))
+            sparse_result = None
+        # Kick off next CPU prefetch (overlaps with GPU compute)
+        self._go.set()
+        return (result, sparse_result)
 
-            if self._pending_gpu is not None:
-                # Steady state: H2D for this batch already in flight on copy stream
-                with torch.profiler.record_function("PrefetchLoader::wait_h2d"):
-                    default_stream.wait_event(self._copy_event)
-                result = self._pending_gpu
-                self._pending_gpu = None
-                # Tell allocator default stream uses these (allocated on copy stream)
-                self._mark_stream(result, default_stream)
-                # Start H2D for next batch (overlaps with caller's GPU compute)
-                self._enter_pipeline()
-                return result
-
-            # Bootstrap (very first call)
-            result = self._h2d_async(self.gen.send(None))
-            default_stream.wait_event(self._copy_event)
-            self._mark_stream(result, default_stream)
-            self._kick_worker()
-            self._enter_pipeline()
-            return result
-
-train_loader = PrefetchLoader(distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps, yield_cpu=True))
+train_loader = PrefetchLoader(
+    distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps, yield_cpu=True),
+    sparse_precompute_fn=training_manager.sparse_index_precompute,
+)
 
 gc.collect()
 
@@ -2090,8 +2078,13 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION ----------------
     for idx in range(grad_accum_steps):
         send_args = training_manager.train_loader_send_args if idx == 0 else None
-        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
-        training_manager.sparse_index_update(step, bigram_cpu)
+        (inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu), sparse_precomputed = train_loader.send(send_args)
+        if sparse_precomputed is not None:
+            training_manager.sparse_index_update(step, sparse_precomputed)
+        else:
+            bigram_idx_np = training_manager.sparse_index_precompute(bigram_cpu)
+            if bigram_idx_np is not None:
+                training_manager.sparse_index_update(step, bigram_idx_np)
         loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
