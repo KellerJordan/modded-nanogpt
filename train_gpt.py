@@ -35,7 +35,10 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
+from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
+# Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
+# https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
 
 dynamo.config.recompile_limit = 64
 
@@ -164,49 +167,84 @@ polar_express_coeffs = [
 ]
 
 @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
-def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
+def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momentum_t: torch.Tensor,
+                  split_baddbmm: bool = False):
     """
-    Polar Express Sign Method: https://arxiv.org/pdf/2505.16932
+    Fused Nesterov momentum + Polar Express Sign Method.
+    Nesterov momentum is applied in FP32, then the result is cast to BF16 for polar express
+    orthogonalization, avoiding materialization of the FP32 intermediate between graph breaks.
+
+    Polar Express: https://arxiv.org/pdf/2505.16932
     by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
+
+    momentum_t is a 0-D CPU tensor to avoid triggering graph recompilations when the value changes.
     """
-    X = G.bfloat16()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
+    # Nesterov momentum (in FP32)
+    momentum = momentum_t.to(grad_chunk.dtype)
+    momentum_buffer.lerp_(grad_chunk, 1 - momentum)
+    g = grad_chunk.lerp_(momentum_buffer, momentum)
+
+    X = g.bfloat16()
+    is_tall = g.size(-2) > g.size(-1)
 
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
 
-    # Allocate buffers
     X = X.contiguous()
-    A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
-    B = torch.empty_like(A)
-    C = torch.empty_like(X)
 
-    # Select batched vs unbatched
-    if split_baddbmm:
-        BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
-    else:
-        aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
+    if is_tall:
+        # Tall: use Triton kernels with X^T @ X (small) and right multiplication
+        A = torch.empty((*X.shape[:-2], X.size(-1), X.size(-1)), device=X.device, dtype=X.dtype)
+        B = torch.empty_like(A)
+        C = torch.empty_like(X)
 
-    # Perform the iterations
-    for a, b, c in polar_express_coeffs:
-        XXT(X, out=A)  # A = X @ X.mT
-        ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
-
-        # Referencing X twice causes pytorch to make a defensive copy,
-        # resulting in a cudaMemcpyAsync in baddbmm.
-        # For large matrices (i.e., the mlp weights), it's faster to split
-        # the operation into two kernels to avoid this.
+        # Select batched vs unbatched
         if split_baddbmm:
-            BX_matmul(B, X, out=C)  # C = B @ X
-            C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
+            XB_matmul = torch.bmm if X.ndim > 2 else torch.mm
         else:
-            aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
+            aX_plus_XB = torch.baddbmm if X.ndim > 2 else torch.addmm
 
-        X, C = C, X  # Swap references to avoid unnecessary copies
+        # Perform the iterations
+        for a, b, c in polar_express_coeffs:
+            XTX(X, out=A)  # A = X.T @ X
+            ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b*A + c*(A@A)
 
-    if G.size(-2) > G.size(-1):
-        X = X.mT
+            # Referencing X twice causes pytorch to make a defensive copy,
+            # resulting in a cudaMemcpyAsync in baddbmm.
+            # For large matrices (i.e., the mlp weights), it's faster to split
+            # the operation into two kernels to avoid this.
+            if split_baddbmm:
+                XB_matmul(X, B, out=C)  # C = X @ B
+                C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
+            else:
+                aX_plus_XB(X, X, B, beta=a, out=C)  # C = a * X + X @ B
+
+            X, C = C, X  # Swap references to avoid unnecessary copies
+    else:
+        # Wide: use Triton kernels with X @ X^T (small) and left multiplication
+        A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
+        B = torch.empty_like(A)
+        C = torch.empty_like(X)
+
+        # Select batched vs unbatched
+        if split_baddbmm:
+            BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
+        else:
+            aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
+
+        # Perform the iterations
+        for a, b, c in polar_express_coeffs:
+            XXT(X, out=A)  # A = X @ X.mT
+            ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
+
+            if split_baddbmm:
+                BX_matmul(B, X, out=C)  # C = B @ X
+                C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
+            else:
+                aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
+
+            X, C = C, X  # Swap references to avoid unnecessary copies
+
     return X
 
 # -----------------------------------------------------------------------------
@@ -415,6 +453,7 @@ class NorMuonAndAdam:
         self._step_size_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
@@ -466,7 +505,7 @@ class NorMuonAndAdam:
 
             # Per-matrix LR multipliers for MLP c_proj (2x LR on odd indices)
             per_matrix_lr_mul = None
-            if label == "mlp":
+            if label == "mlp_bank":
                 rank = dist.get_rank() if dist.is_initialized() else 0
                 start_idx = rank * chunk_size
                 per_matrix_lr_mul = []
@@ -706,10 +745,10 @@ class NorMuonAndAdam:
             if param.grad is None:
                 continue
 
-            # lm_head when tied: aggregate embed.grad.T (transposed shapes)
+            # lm_head when tied: aggregate embed.grad.T (tiled Triton transpose-add)
             if label == "lm_head" and do_adam and not self.split_embed:
                 if embed_param is not None and embed_param.grad is not None:
-                    param.grad.add_(embed_param.grad.T)
+                    transpose_add(embed_param.grad, param.grad)
 
             # Skip embed when tied (copied from lm_head after gather)
             if label == "embed" and not self.split_embed:
@@ -759,9 +798,9 @@ class NorMuonAndAdam:
         if lm_head_gather_future is not None:
             lm_head_gather_future.wait()
 
-        # When tied: copy lm_head.T to embed
+        # When tied: copy lm_head.T to embed (tiled Triton transpose for coalesced writes)
         if do_adam and not self.split_embed and embed_param is not None and lm_param is not None:
-            embed_param.data.copy_(lm_param.data.T)
+            transpose_copy(lm_param.data, embed_param.data)
 
         # Wait for remaining gathers
         for fut in gather_futures:
@@ -827,17 +866,16 @@ class NorMuonAndAdam:
         p_state = self.param_states[param]
         grad_chunk = grad_chunk.float()  # FP32 for momentum
 
-        # Momentum update
-        momentum_buffer = p_state["momentum_buffer"]
-        momentum_buffer.lerp_(grad_chunk, 1 - p_cfg.momentum)
-        updated_grads = grad_chunk.lerp_(momentum_buffer, p_cfg.momentum)
-
+        self._momentum_t.fill_(p_cfg.momentum)
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
-        # Polar Express orthogonalization
+        # Fused Nesterov momentum + Polar Express orthogonalization
         is_large_matrix = chunk_shape[-2] > 1024
-        v_chunk = polar_express(updated_grads, split_baddbmm=is_large_matrix)
+        v_chunk = polar_express(
+            grad_chunk, p_state["momentum_buffer"], self._momentum_t,
+            split_baddbmm=is_large_matrix,
+        )
 
         # Variance reduction
         red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
@@ -1095,31 +1133,6 @@ class CausalSelfAttention(nn.Module):
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
 
-class MLP(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # Weights are stored in parameter banks and passed via forward()
-
-    def forward(self, x: Tensor, c_fc: Tensor, c_proj: Tensor):
-        # relu(x)^2:
-        # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        # Fused triton kernel for relu(x @ W1.T)^2 @ W2.T
-        return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
-
-class Block(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, has_attn: bool, has_mlp: bool, use_paired_head: bool):
-        super().__init__()
-        # skip attention of blocks.6 (the 7th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, head_dim, num_heads, paired=use_paired_head) if has_attn else None
-        # skip MLP blocks for first MLP layer by @EmelyanenkoK
-        self.mlp = MLP() if has_mlp else None
-
-    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor = None, c_fc: Tensor = None, c_proj: Tensor = None):
-        if self.attn is not None:
-            x = x + self.attn(norm(x), attn_args, qkvo_w)
-        if self.mlp is not None:
-            x = x + self.mlp(norm(x), c_fc, c_proj)
-        return x
 
 # -----------------------------------------------------------------------------
 # The main model
@@ -1142,58 +1155,42 @@ class GPT(nn.Module):
 
         self.smear_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.smear_gate.weight)
-        self.smear_gate.weight.label = 'smear_gate'
 
         self.skip_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.skip_gate.weight)
-        self.skip_gate.weight.label = 'skip_gate'
 
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         # spherical gaussian init by @photomz
         self.value_embeds = nn.Parameter(0.01 * torch.randn(5 * self.vocab_size, model_dim, dtype=torch.bfloat16))
-        self.value_embeds.label = 'value_embed'
 
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
-        self.attn_gate_bank.label = 'attn_gate_bank'
         self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 unique gates
-        self.ve_gate_bank.label = 've_gate_bank'
 
         # -----------------------------------
         # Parameter banks for sharded optimization, by @chrisjmccormick
 
         # Identify which layers have attention/MLP
         # Attention is skipped in layer 6 by @YouJiacheng
-        self.attn_layer_indices = [i for i in range(num_layers) if i != 6]
+        num_attn_layers = num_layers - 1
         # All layers have MLP (At 11 layers--dropped first layer @EmelyanenkoK)
-        self.mlp_layer_indices = list(range(num_layers))
+        num_mlp_layers = num_layers
 
         hdim = num_heads * head_dim
         mlp_hdim = 4 * model_dim
-
-        # Create index mappings: layer_idx -> bank_idx
-        self.layer_to_attn_idx = {layer_idx: bank_idx for bank_idx, layer_idx in enumerate(self.attn_layer_indices)}
-        self.layer_to_mlp_idx = {layer_idx: bank_idx for bank_idx, layer_idx in enumerate(self.mlp_layer_indices)}
 
         # Attention bank: stores QKVO weights for all attention layers
         # merged QKVO weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
         # Simplified layout by @chrisjmccormick
-        # Shape: (num_attn_layers, 4*model_dim, hdim) = (10, 3072, 768)
-        # Reshape for sharding: (40, 768, 768) for even distribution across 8 GPUs
-        self.attn_bank = nn.Parameter(torch.empty(len(self.attn_layer_indices), 4 * model_dim, hdim))
-        self.attn_bank.label = 'attn'
-        self.attn_bank.reshape = (len(self.attn_layer_indices) * 4, hdim, hdim)  # (40, 768, 768)
+        self.attn_bank = nn.Parameter(torch.empty(num_attn_layers, 4 * model_dim, hdim)) # (10, 3072, 768)
+        self.attn_bank.reshape = (num_attn_layers * 4, hdim, hdim)   # Shape for sharding: (40, 768, 768)
 
         # MLP bank: stores c_fc and c_proj for all MLP layers
-        # Shape: (num_mlp_layers + padding, 2, mlp_hdim, model_dim) = (12, 2, 3072, 768)
         # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
-        # Reshape for sharding: (24, 3072, 768)
-        num_mlp_with_padding = len(self.mlp_layer_indices) + 1  # 11 + 1 = 12
-        self.mlp_bank = nn.Parameter(torch.empty(num_mlp_with_padding, 2, mlp_hdim, model_dim))
-        self.mlp_bank.label = 'mlp'
-        self.mlp_bank.reshape = (num_mlp_with_padding * 2, mlp_hdim, model_dim)  # (24, 3072, 768)
+        self.mlp_bank = nn.Parameter(torch.empty(12, 2, mlp_hdim, model_dim))  # (12, 2, 3072, 768)
+        self.mlp_bank.reshape = (24, mlp_hdim, model_dim)  # Shape for sharding: (24, 3072, 768)
 
         # improved init scale by @YouJiacheng and @srashedll
         std = 0.5 * model_dim ** -0.5
@@ -1203,15 +1200,10 @@ class GPT(nn.Module):
             self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
 
-        # Create blocks with has_attn/has_mlp flags
+        # Attention modules (no learned params -- weights come from attn_bank)
         self.paired_head_layers = [0, 2, 5, 9]
-        self.blocks = nn.ModuleList([
-            Block(model_dim, head_dim, num_heads,
-                  has_attn=(i in self.layer_to_attn_idx),
-                  has_mlp=(i in self.layer_to_mlp_idx),
-                  use_paired_head=(i in self.paired_head_layers))
-            for i in range(num_layers)
-        ])
+        self.attn = CausalSelfAttention(model_dim, head_dim, num_heads, paired=False)
+        self.attn_paired = CausalSelfAttention(model_dim, head_dim, num_heads, paired=True)
         self.yarn = Yarn(head_dim, max_seq_len)
         self.yarn_paired_head = Yarn(head_dim, max_seq_len, paired=True)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
@@ -1221,39 +1213,32 @@ class GPT(nn.Module):
         self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
 
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
-        self.lm_head.weight.label = 'lm_head'
 
         self.embed = nn.Embedding(self.vocab_size, model_dim)
-        self.embed.weight.label = 'embed'
         with torch.no_grad():
             self.embed.weight.copy_(self.lm_head.weight.T)
 
         self.bigram_embed = nn.Embedding(args.bigram_vocab_size, model_dim)
-        self.bigram_embed.weight.label = 'bigram_embed'
         nn.init.zeros_(self.bigram_embed.weight)
 
-        n_sublayers = 2 * num_layers
-
         # Parallel-connections: 2-lane residual stream (attn reads lane0, MLP reads lane1)
-        self.parallel_start = 7
-        w_post_init = torch.ones(n_sublayers, 2, 1)
-        for layer in range(num_layers):
-            if layer >= self.parallel_start:
-                si_attn = 2 * layer
-                w_post_init[si_attn, 1, 0] = 1.5  # attn w_post1
-        self.w_post = nn.Parameter(w_post_init)
-        self.w_post.label = 'w_post'
+        self.parallel_start = 7 # Layers 7-10 are 2-lane
 
-        self.x0_lambda = nn.Parameter(torch.zeros(n_sublayers))
-        self.x0_lambda.label = 'x0_lambda'
+        # Post-write scaling: [num_layers, 2, 2] = [layer, attn/mlp, lane0/lane1]
+        post_lambdas_init = torch.ones(num_layers, 2, 2)
+        for layer in range(self.parallel_start, num_layers):
+            post_lambdas_init[layer, 0, 1] = 1.5  # attn -> lane1 amplified for parallel layers
+        self.post_lambdas = nn.Parameter(post_lambdas_init)
 
-        self.bigram_lambda = nn.Parameter(0.05 * torch.ones(n_sublayers))
-        self.bigram_lambda.label = 'bigram_lambda'
+        # Per-layer injection coefficients for x0 and bigram
+        self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
+        self.bigram_lambdas = nn.Parameter(0.05 * torch.ones(num_layers))
 
-        self.resid_lambda = nn.Parameter(1.1**0.5 * torch.ones(n_sublayers))
-        self.resid_lambda.label = 'resid_lambda'
+        # Per-sublayer residual scaling: [num_layers, 2] where [:,0]=attn, [:,1]=mlp
+        # sqrt(1.1) per sublayer so cumulative per-layer scaling is 1.1
+        self.resid_lambdas = nn.Parameter(torch.full((num_layers, 2), 1.1**0.5))
 
-        pad = (-num_layers * 2 - 3) % dist.get_world_size()  # updated: 2*num_layers (SA lambdas only)
+        pad = (-num_layers * 2 - 3) % dist.get_world_size()
         self.scalars = nn.Parameter(
             torch.cat(
                 [
@@ -1265,42 +1250,52 @@ class GPT(nn.Module):
                 ]
             )
         )
-        self.scalars.label = 'scalars'
+        # Auto-label parameters
+        for name, param in self.named_parameters():
+            param.label = name.replace('.weight', '')
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
-        # unpack schedule_cfg
+        # ---- Schedule and layer topology ----
         mtp_weights, train_max_seq_len = schedule_cfg.mtp_weights, schedule_cfg.train_max_seq_len
         ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
-
-        # set configs
         skip_connections = []
         skip_in = [3] # long attention window on layer 3
         skip_out = [6] # no attn op on layer 6
         x_backout = None
         backout_layer = 7
-
-        # set lambdas
-        sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
-        smear_lambda = self.scalars[2 * self.num_layers]
-        backout_lambda = self.scalars[2 * self.num_layers + 1]
-        skip_lambda = self.scalars[2 * self.num_layers + 2]
-
-        # Unbind scalars per-sublayer per-lane (avoids select_backwards kernel)
-        w_post0 = self.w_post[:, 0, 0].bfloat16().unbind(0)
-        w_post1 = self.w_post[:, 1, 0].bfloat16().unbind(0)
-        x0_lambda = self.x0_lambda.bfloat16().unbind(0)
-        bigram_lambda = self.bigram_lambda.bfloat16().unbind(0)
-        resid_lambda = self.resid_lambda.bfloat16().unbind(0)
-
         # set block masks and key shift
         bm_sizes = [ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, None, ws_short, ws_short, ws_short, ws_long]
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==ws_long for b in bm_sizes] # apply partial key offset to long windows
 
-        # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
-        x = self.embed(input_seq)
+        # ---- Unbind parameters (avoid select_backward kernels) ----
+        sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
+        smear_lambda = self.scalars[2 * self.num_layers]
+        backout_lambda = self.scalars[2 * self.num_layers + 1]
+        skip_lambda = self.scalars[2 * self.num_layers + 2]
+        resid_lambdas_attn = self.resid_lambdas[:, 0].bfloat16().unbind(0)
+        resid_lambdas_mlp  = self.resid_lambdas[:, 1].bfloat16().unbind(0)
+        post_lambdas_attn_ln0 = self.post_lambdas[:, 0, 0].bfloat16().unbind(0)
+        post_lambdas_attn_ln1 = self.post_lambdas[:, 0, 1].bfloat16().unbind(0)
+        post_lambdas_mlp_ln0  = self.post_lambdas[:, 1, 0].bfloat16().unbind(0)
+        post_lambdas_mlp_ln1  = self.post_lambdas[:, 1, 1].bfloat16().unbind(0)
+        x0_lambdas = self.x0_lambdas.bfloat16().unbind(0)
+        bigram_lambdas = self.bigram_lambdas.bfloat16().unbind(0)
+        ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
+        veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
+        attn_gates = ag[:6] + [None] + ag[6:]
+        ve_gates = [None] + [veg[0], veg[1]] + [None] * (self.num_layers - 6) + [veg[2], veg[3], veg[4]]
+        assert len(attn_gates) == self.num_layers
+        assert len(ve_gates) == self.num_layers
+        attn_weights = self.attn_bank.unbind(0)  # tuple of [4*dim, hdim] tensors
+        mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
+        mlp_fcs = mlp_all[0::2]    # even indices: c_fc
+        mlp_projs = mlp_all[1::2]  # odd indices: c_proj
+
+        # ---- Embeddings and input preparation ----
+        x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
         
         x0_bigram = self.bigram_embed(bigram_input_seq)[None]
 
@@ -1316,28 +1311,15 @@ class GPT(nn.Module):
         x = x0 = norm(x[None])
 
         # Initialize residual stream with pre-layer-0 bigram injection
-        # lane1 introduced at parallel_start block (single-stream before that)
-        lane0 = x0 + x0_bigram * bigram_lambda[0]
+        # lane1 introduced at parallel_start (single-stream before that)
+        lane0 = x0 + x0_bigram * bigram_lambdas[0]
         lane1 = None
-        # Zero out sublayer-0 bigram to avoid double injection in the loop
-        zero = bigram_lambda[0] * 0
-        bigram_lambda = (zero,) + bigram_lambda[1:]
 
-        # Precompute skip contributions outside loop 
-        skip_bias = tuple(x0 * x0_lambda[2*i] + x0_bigram * bigram_lambda[2*i] for i in range(self.num_layers))
+        # Precompute x0/bigram injection (added to attention output each layer)
+        # Layer 0: bigram already injected above, so only x0 component
+        x0_inject = (x0 * x0_lambdas[0],) + tuple(x0 * x0_lambdas[i] + x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
 
-        ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
-        veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
-        attn_gates = ag[:6] + [None] + ag[6:]
-        ve_gates = [None, veg[0], veg[1]] + [None] * (self.num_layers - 6) + [veg[2], veg[3], veg[4]]
-        assert len(attn_gates) == self.num_layers
-        assert len(ve_gates) == self.num_layers
-
-        # unbind weight banks to avoid select_backwards kernel
-        attn_weights = self.attn_bank.unbind(0)  # tuple of [4*dim, hdim] tensors
-        mlp_fcs = self.mlp_bank[:, 0, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
-        mlp_projs = self.mlp_bank[:, 1, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
-
+        # ---- Transformer layers ----
         for i in range(self.num_layers):
             yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
             attn_args = AttnArgs(
@@ -1351,17 +1333,16 @@ class GPT(nn.Module):
                 ve_gate_w=ve_gates[i],
                 train_max_seq_len=train_max_seq_len
             )
-            qkvo_w = attn_weights[self.layer_to_attn_idx[i]] if i in self.layer_to_attn_idx else None
-            c_fc = mlp_fcs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
-            c_proj = mlp_projs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
-
-            block = self.blocks[i]
-            si = 2 * i  # sublayer index for attn
+            # Select weights from banks
+            qkvo_w = attn_weights[i - (i > 6)] if i != 6 else None
+            c_fc = mlp_fcs[i]
+            c_proj = mlp_projs[i]
 
             # Introduce lane1 at parallel_start by copying lane0
             if i == self.parallel_start:
                 lane1 = lane0
 
+            # Skip connection injection
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
                 skip_val = skip_connections.pop()
@@ -1369,33 +1350,38 @@ class GPT(nn.Module):
                 if lane1 is not None:
                     lane1 = lane1 + skip_gate_out * skip_val
 
-            if i < self.parallel_start:
-                # Single-stream: only lane0, MLP also reads lane0
-                if block.attn is not None:
-                    layer_out = block.attn(norm(lane0), attn_args, qkvo_w)
-                    layer_out = layer_out + skip_bias[i]
-                    lane0 = resid_lambda[si] * lane0 + layer_out * w_post0[si]
-                if i in skip_in:
-                    skip_connections.append(lane0)
-                if block.mlp is not None:
-                    layer_out = block.mlp(norm(lane0), c_fc, c_proj)
-                    lane0 = resid_lambda[si+1] * lane0 + layer_out * w_post0[si+1]
+            # Select attention variant for this layer
+            attn = self.attn_paired if i in self.paired_head_layers else self.attn
+
+            # Dispatch based on layer type
+            post_attn = None
+            if i == 6:
+                # MLP-only layer (no attention) @YouJiacheng
+                post_attn = lane0
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
+            elif i < self.parallel_start:
+                # Single-stream: attn and mlp both read/write lane0
+                attn_out = attn(norm(lane0), attn_args, qkvo_w)
+                lane0 = resid_lambdas_attn[i] * lane0 + attn_out + x0_inject[i]
+                post_attn = lane0
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
             else:
-                # Full 2-lane parallel connections
-                if block.attn is not None:
-                    layer_out = block.attn(norm(lane0), attn_args, qkvo_w)
-                    layer_out = layer_out + skip_bias[i]
-                    lane0 = resid_lambda[si] * lane0 + layer_out * w_post0[si]
-                    lane1 = resid_lambda[si] * lane1 + layer_out * w_post1[si]
-                if i in skip_in:
-                    skip_connections.append(lane0)
-                if block.mlp is not None:
-                    layer_out = block.mlp(norm(lane1), c_fc, c_proj)
-                    lane0 = resid_lambda[si+1] * lane0 + layer_out * w_post0[si+1]
-                    lane1 = resid_lambda[si+1] * lane1 + layer_out * w_post1[si+1]
+                # Parallel: attn reads lane0, mlp reads lane1, both write to both lanes
+                attn_out = attn(norm(lane0), attn_args, qkvo_w)
+                lane0 = resid_lambdas_attn[i] * lane0 + post_lambdas_attn_ln0[i] * attn_out + x0_inject[i]
+                lane1 = resid_lambdas_attn[i] * lane1 + post_lambdas_attn_ln1[i] * attn_out
+                post_attn = lane0
+                mlp_out = ReLUSqrdMLP(norm(lane1), c_fc, c_proj)
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * mlp_out
+                lane1 = resid_lambdas_mlp[i] * lane1 + post_lambdas_mlp_ln1[i] * mlp_out
+
+            # Skip connection and backout bookkeeping
+            if i in skip_in:
+                skip_connections.append(post_attn)
             if i == backout_layer:
                 x_backout = lane0
 
+        # ---- Output and loss ----
         x = (lane0 + lane1) * 0.5
 
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
@@ -1696,7 +1682,9 @@ TRAINING_STAGES = [
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
 
+# TODO - Confirm.
 training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.60)
+#training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
 
 def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
     # warmup phase: linearly increase momentum from min to max
@@ -1730,30 +1718,30 @@ class TrainingManager():
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
         self.param_table = {
-            "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
-            "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "attn_bank":      {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
-            "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "w_post":          {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "x0_lambda":       {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "bigram_lambda":   {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "resid_lambda":  {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
-            "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "post_lambdas":   {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "x0_lambdas":     {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "bigram_lambdas": {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "resid_lambdas":  {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
+            "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "w_post", "x0_lambda", "bigram_lambda", "resid_lambda",  # Small, fast
-            "value_embed", "bigram_embed",  # Medium
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+            "value_embeds", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
-            "attn", "mlp",        # Large, polar express - process last to maximize overlap
+            "attn_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
         ]
 
         adam_defaults = dict(
