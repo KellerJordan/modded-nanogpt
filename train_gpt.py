@@ -1232,17 +1232,32 @@ class GPT(nn.Module):
         self.bigram_embed.weight.label = 'bigram_embed'
         nn.init.zeros_(self.bigram_embed.weight)
 
-        # x0_lambdas separated out for different optimizer treatment (no beta smoothing)
-        self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
-        self.x0_lambdas.label = 'x0_lambdas'
+        n_sublayers = 2 * num_layers
 
-        pad = (-num_layers * 3 - 3) % dist.get_world_size()  # updated: 3*num_layers instead of 4*
+        # Parallel-connections: 2-lane residual stream (attn reads lane0, MLP reads lane1)
+        self.parallel_start = 7
+        w_post_init = torch.ones(n_sublayers, 2, 1)
+        for layer in range(num_layers):
+            if layer >= self.parallel_start:
+                si_attn = 2 * layer
+                w_post_init[si_attn, 1, 0] = 1.5  # attn w_post1
+        self.w_post = nn.Parameter(w_post_init)
+        self.w_post.label = 'w_post'
+
+        self.x0_lambda = nn.Parameter(torch.zeros(n_sublayers))
+        self.x0_lambda.label = 'x0_lambda'
+
+        self.bigram_lambda = nn.Parameter(0.05 * torch.ones(n_sublayers))
+        self.bigram_lambda.label = 'bigram_lambda'
+
+        self.resid_lambda = nn.Parameter(1.1**0.5 * torch.ones(n_sublayers))
+        self.resid_lambda.label = 'resid_lambda'
+
+        pad = (-num_layers * 2 - 3) % dist.get_world_size()  # updated: 2*num_layers (SA lambdas only)
         self.scalars = nn.Parameter(
             torch.cat(
                 [
-                    1.1 * torch.ones(num_layers),  # resid lambdas. 1.1 init such that layer i weight is i^(num_layers-i).
                     *[torch.tensor([0.5, 1.0]) for _ in range(num_layers)],  # SA lambdas
-                    0.1 * torch.ones(num_layers), # bigram lambdas
                     torch.zeros(1), # smear_lambda
                     0.5*torch.ones(1), # backout_lambda
                     -1.5 * torch.ones(1),  # skip_lambda -> σ(-1.5) ≈ 0.18
@@ -1267,13 +1282,17 @@ class GPT(nn.Module):
         backout_layer = 7
 
         # set lambdas
-        resid_lambdas = self.scalars[: 1 * self.num_layers]
-        x0_lambdas = self.x0_lambdas
-        sa_lambdas = self.scalars[1 * self.num_layers: 3 * self.num_layers].view(-1, 2)
-        bigram_lambdas = self.scalars[3 * self.num_layers: 4 * self.num_layers]
-        smear_lambda = self.scalars[4 * self.num_layers]
-        backout_lambda = self.scalars[4 * self.num_layers+1]
-        skip_lambda = self.scalars[4 * self.num_layers+2]
+        sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
+        smear_lambda = self.scalars[2 * self.num_layers]
+        backout_lambda = self.scalars[2 * self.num_layers + 1]
+        skip_lambda = self.scalars[2 * self.num_layers + 2]
+
+        # Unbind scalars per-sublayer per-lane (avoids select_backwards kernel)
+        w_post0 = self.w_post[:, 0, 0].bfloat16().unbind(0)
+        w_post1 = self.w_post[:, 1, 0].bfloat16().unbind(0)
+        x0_lambda = self.x0_lambda.bfloat16().unbind(0)
+        bigram_lambda = self.bigram_lambda.bfloat16().unbind(0)
+        resid_lambda = self.resid_lambda.bfloat16().unbind(0)
 
         # set block masks and key shift
         bm_sizes = [ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, None, ws_short, ws_short, ws_short, ws_long]
@@ -1296,7 +1315,17 @@ class GPT(nn.Module):
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
-        # unbind gate banks to avoid select_backwards kernel
+        # Initialize residual stream with pre-layer-0 bigram injection
+        # lane1 introduced at parallel_start block (single-stream before that)
+        lane0 = x0 + x0_bigram * bigram_lambda[0]
+        lane1 = None
+        # Zero out sublayer-0 bigram to avoid double injection in the loop
+        zero = bigram_lambda[0] * 0
+        bigram_lambda = (zero,) + bigram_lambda[1:]
+
+        # Precompute skip contributions outside loop 
+        skip_bias = tuple(x0 * x0_lambda[2*i] + x0_bigram * bigram_lambda[2*i] for i in range(self.num_layers))
+
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
         attn_gates = ag[:6] + [None] + ag[6:]
@@ -1322,24 +1351,52 @@ class GPT(nn.Module):
                 ve_gate_w=ve_gates[i],
                 train_max_seq_len=train_max_seq_len
             )
-            if i in skip_out:
-                skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
-                x = x + skip_gate_out * skip_connections.pop()
-            if i == 0:
-                x = (resid_lambdas[0] + x0_lambdas[0]) * x + bigram_lambdas[0] * x0_bigram
-            else:
-                x = resid_lambdas[i] * x + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
-
-            # Get weights for this layer from banks
             qkvo_w = attn_weights[self.layer_to_attn_idx[i]] if i in self.layer_to_attn_idx else None
             c_fc = mlp_fcs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
             c_proj = mlp_projs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
 
-            x = self.blocks[i](x, attn_args, qkvo_w, c_fc, c_proj)
-            if i in skip_in:
-                skip_connections.append(x)
+            block = self.blocks[i]
+            si = 2 * i  # sublayer index for attn
+
+            # Introduce lane1 at parallel_start by copying lane0
+            if i == self.parallel_start:
+                lane1 = lane0
+
+            if i in skip_out:
+                skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
+                skip_val = skip_connections.pop()
+                lane0 = lane0 + skip_gate_out * skip_val
+                if lane1 is not None:
+                    lane1 = lane1 + skip_gate_out * skip_val
+
+            if i < self.parallel_start:
+                # Single-stream: only lane0, MLP also reads lane0
+                if block.attn is not None:
+                    layer_out = block.attn(norm(lane0), attn_args, qkvo_w)
+                    layer_out = layer_out + skip_bias[i]
+                    lane0 = resid_lambda[si] * lane0 + layer_out * w_post0[si]
+                if i in skip_in:
+                    skip_connections.append(lane0)
+                if block.mlp is not None:
+                    layer_out = block.mlp(norm(lane0), c_fc, c_proj)
+                    lane0 = resid_lambda[si+1] * lane0 + layer_out * w_post0[si+1]
+            else:
+                # Full 2-lane parallel connections
+                if block.attn is not None:
+                    layer_out = block.attn(norm(lane0), attn_args, qkvo_w)
+                    layer_out = layer_out + skip_bias[i]
+                    lane0 = resid_lambda[si] * lane0 + layer_out * w_post0[si]
+                    lane1 = resid_lambda[si] * lane1 + layer_out * w_post1[si]
+                if i in skip_in:
+                    skip_connections.append(lane0)
+                if block.mlp is not None:
+                    layer_out = block.mlp(norm(lane1), c_fc, c_proj)
+                    lane0 = resid_lambda[si+1] * lane0 + layer_out * w_post0[si+1]
+                    lane1 = resid_lambda[si+1] * lane1 + layer_out * w_post1[si+1]
             if i == backout_layer:
-                x_backout = x
+                x_backout = lane0
+
+        x = (lane0 + lane1) * 0.5
 
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
         x -= backout_lambda * x_backout
@@ -1550,7 +1607,7 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1490  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1450  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1639,7 +1696,7 @@ TRAINING_STAGES = [
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
 
-training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
+training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.60)
 
 def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
     # warmup phase: linearly increase momentum from min to max
@@ -1680,9 +1737,12 @@ class TrainingManager():
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
-            "x0_lambdas":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.65, 0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
-            "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "w_post":          {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "x0_lambda":       {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "bigram_lambda":   {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "resid_lambda":  {"optim": "adam",    "comms": "replicated",    "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
             "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
@@ -1690,11 +1750,9 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
-            "lm_head",
-            "bigram_embed",  # Medium
-            "value_embed",
-            "embed",   # lm_head must complete before embed sync (when tied)
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "w_post", "x0_lambda", "bigram_lambda", "resid_lambda",  # Small, fast
+            "value_embed", "bigram_embed",  # Medium
+            "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
         ]
 
