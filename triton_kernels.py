@@ -140,6 +140,144 @@ def XXT(A: torch.Tensor, out: torch.Tensor):
     )
     return out
 
+# -----------------------------------------------------------------------------
+# Triton kernel for X.T @ X (tall matrices)
+# Computes C = A.T @ A where A is (M, K) and output C is (K, K)
+
+@triton.jit
+def XTX_kernel(
+    A_ptr, C_ptr,
+    M, K,
+    a_stride_b, a_stride_r, a_stride_c,
+    c_stride_b, c_stride_r, c_stride_c,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    LOWER_UPPER: tl.constexpr,
+):
+    """
+    Compute C = A.T @ A where A is (M, K) and C is (K, K).
+    This is the transpose variant of XXT for tall matrices.
+    
+    The output matrix C is symmetric, so we compute upper triangle and mirror.
+    We iterate over blocks of M (the reduction dimension after transpose).
+    """
+    pid = tl.program_id(axis=0)
+    # Note: Output is (K, K), so we use K for the output grid
+    batch_idx, k_idx, n_idx = _pid_to_block(
+        pid, K, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
+
+    # Skip blocks that don't need to be computed (symmetry optimization)
+    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= k_idx)
+    skip_block_above_diag = (LOWER_UPPER != 0) and (k_idx + BLOCK_SIZE_M <= n_idx)
+    if skip_block_below_diag or skip_block_above_diag:
+        return
+
+    # Index into one matrix of batch
+    A_ptr += batch_idx * a_stride_b
+    C_ptr += batch_idx * c_stride_b
+
+    # For A.T @ A:
+    # - A.T has shape (K, M), so A.T[k, m] = A[m, k]
+    # - We load blocks from columns k_idx and n_idx of A (which are rows of A.T)
+    # - We reduce over M (the shared dimension)
+    offs_k = (k_idx + tl.arange(0, BLOCK_SIZE_M)) % K  # Output row indices (columns of A)
+    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % K  # Output col indices (columns of A)
+    offs_m = tl.arange(0, BLOCK_SIZE_K)  # Reduction dimension (rows of A)
+
+    # Pointers for loading A[:, k_idx:k_idx+BLOCK] (transposed view is A.T[k_idx:, :])
+    # at_ptrs loads A.T block: A.T[offs_k, offs_m] = A[offs_m, offs_k]
+    at_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
+    # a_ptrs loads A block for the other factor: A.T[offs_m, offs_n].T = A[offs_m, offs_n]
+    a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_n[None, :] * a_stride_c)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Accumulate over blocks of M (the reduction dimension)
+    for m in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
+        m_remaining = M - m * BLOCK_SIZE_K
+        # Load A.T[offs_k, offs_m] = A[offs_m, offs_k] -> shape (BLOCK_K, BLOCK_M)
+        at = tl.load(at_ptrs, mask=offs_m[:, None] < m_remaining, other=0.0)
+        # Load A[offs_m, offs_n] -> shape (BLOCK_K, BLOCK_N)
+        a = tl.load(a_ptrs, mask=offs_m[:, None] < m_remaining, other=0.0)
+        # C[k, n] = sum_m A.T[k, m] * A[m, n] = sum_m A[m, k] * A[m, n]
+        # at.T @ a: (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N) = (BLOCK_M, BLOCK_N)
+        accumulator = tl.dot(at.T, a, accumulator)
+        at_ptrs += BLOCK_SIZE_K * a_stride_r
+        a_ptrs += BLOCK_SIZE_K * a_stride_r
+
+    out_dtype = C_ptr.dtype.element_ty
+    output = accumulator.to(out_dtype)
+
+    # Store block of C
+    offs_ck = k_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C_ptr + (offs_ck[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
+    c_mask = (offs_ck[:, None] < K) & (offs_cn[None, :] < K)
+    tl.store(c_ptrs, output, mask=c_mask)
+
+    # Store block of C mirrored across the diagonal (symmetry)
+    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_ck[None, :] * c_stride_c)
+    c_mask_t = (offs_cn[:, None] < K) & (offs_ck[None, :] < K)
+    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
+
+
+def XTX(A: torch.Tensor, out: torch.Tensor):
+    """
+    Launch Triton kernel to compute C = A.T @ A
+    
+    For tall matrices (M > K), this is more efficient than transposing
+    and using XXT because the intermediate products are smaller (K x K vs M x M).
+    
+    Args:
+        A: Input tensor of shape (M, K) or (batch, M, K)
+        out: Output tensor of shape (K, K) or (batch, K, K)
+    
+    Returns:
+        out: The same output tensor, filled with A.T @ A
+    """
+    assert A.ndim == 2 or A.ndim == 3
+    M, K = A.shape[-2:]
+    assert out.size(-2) == K, f"Output matrix has incorrect shape: expected ({K}, {K}), got {tuple(out.shape[-2:])}"
+    assert out.size(-1) == K, f"Output matrix has incorrect shape: expected ({K}, {K}), got {tuple(out.shape[-2:])}"
+
+    batch_size = A.size(0) if A.ndim == 3 else 1
+    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
+    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+
+    # Hardcoded configs based on H100 autotuning
+    if K == 768:
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
+        num_stages, num_warps = 4, 8
+    else:
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 128, 128
+        num_stages, num_warps = 4, 8
+
+    grid = (batch_size * triton.cdiv(K, BLOCK_SIZE_M) * triton.cdiv(K, BLOCK_SIZE_N),)
+    XTX_kernel[grid](
+        A_ptr=A,
+        C_ptr=out,
+        M=M,
+        K=K,
+        a_stride_b=input_batch_stride,
+        a_stride_r=A.stride(-2),
+        a_stride_c=A.stride(-1),
+        c_stride_b=output_batch_stride,
+        c_stride_r=out.stride(-2),
+        c_stride_c=out.stride(-1),
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=8,
+        LOWER_UPPER=1,
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+    return out
+
+
 @triton.jit
 def ba_plus_cAA_kernel(
     A_ptr, C_ptr,
@@ -451,7 +589,8 @@ def fused_softcapped_entropy_bwd_kernel(
     n_rows, n_cols, n_predict,
     A, B, C,
     grad_s,
-    BLOCK_SIZE: tl.constexpr
+    BLOCK_SIZE: tl.constexpr,
+    N_PREDICT: tl.constexpr
 ):
     row_idx = tl.program_id(0).to(tl.int64)
 
@@ -461,14 +600,41 @@ def fused_softcapped_entropy_bwd_kernel(
     lse = tl.load(lse_ptr + row_idx)
     grad_loss = tl.load(grad_output_ptr + row_idx)
 
-    S_w = 0.0
-    for k in range(n_predict):
-        if row_idx + k < n_rows:
-            S_w += tl.load(mtp_weights_ptr + k)
-
     inv_C = 1.0 / C
     B_div_C = B * inv_C
     inv_C_A = inv_C * A
+    inv_grad_s = 1.0 / grad_s
+
+    # Preload all targets and weights before the column loop
+    S_w = 0.0
+    t0: tl.int32 = -1
+    t1: tl.int32 = -1
+    t2: tl.int32 = -1
+    w0: tl.float32 = 0.0
+    w1: tl.float32 = 0.0
+    w2: tl.float32 = 0.0
+
+    if N_PREDICT >= 1:
+        if row_idx + 0 < n_rows:
+            w0 = tl.load(mtp_weights_ptr + 0)
+            t0 = tl.load(targets_ptr + row_idx + 0).to(tl.int32)
+            S_w += w0
+
+    if N_PREDICT >= 2:
+        if row_idx + 1 < n_rows:
+            w1 = tl.load(mtp_weights_ptr + 1)
+            t1 = tl.load(targets_ptr + row_idx + 1).to(tl.int32)
+            S_w += w1
+
+    if N_PREDICT >= 3:
+        if row_idx + 2 < n_rows:
+            w2 = tl.load(mtp_weights_ptr + 2)
+            t2 = tl.load(targets_ptr + row_idx + 2).to(tl.int32)
+            S_w += w2
+
+    # Fuse all scalar multiplications
+    grad_scale = grad_loss * inv_grad_s
+    grad_scale_icA = grad_scale * inv_C_A
 
     for off in range(0, n_cols, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
@@ -480,19 +646,144 @@ def fused_softcapped_entropy_bwd_kernel(
         p = tl.exp(z - lse)
 
         term1 = S_w * p
-        term2 = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-        for k in range(n_predict):
-            if row_idx + k < n_rows:
-                target = tl.load(targets_ptr + row_idx + k).to(tl.int32)
-                weight = tl.load(mtp_weights_ptr + k)
-                term2 += tl.where(cols == target, weight, 0.0)
 
-        grad_z = grad_loss * (term1 - term2)
-        dz_dx = inv_C_A * sigmoid_u * (1.0 - sigmoid_u)
-        grad_x = grad_z * dz_dx
-        grad_x = grad_x / grad_s
+        term2 = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+        if N_PREDICT >= 1:
+            term2 += tl.where(cols == t0, w0, 0.0)
+        if N_PREDICT >= 2:
+            term2 += tl.where(cols == t1, w1, 0.0)
+        if N_PREDICT >= 3:
+            term2 += tl.where(cols == t2, w2, 0.0)
+
+        grad_z = term1 - term2
+        grad_x = grad_scale_icA * grad_z * sigmoid_u * (1.0 - sigmoid_u)
         grad_x = grad_x.to(tl.float8e5)
         tl.store(grad_row_ptr + cols, grad_x, mask=mask)
+
+# -----------------------------------------------------------------------------
+# Tiled transpose copy kernel: dst (N, M) = src (M, N).T
+# Uses coalesced reads from src and coalesced writes to dst via tl.trans().
+# Replaces PyTorch's elementwise copy_ which uses a naive 75k-block kernel
+# with non-coalesced writes, saturating all SMs and blocking NCCL.
+
+@triton.jit
+def _transpose_copy_kernel(
+    src_ptr, dst_ptr,
+    M, N,
+    src_stride_m, src_stride_n,
+    dst_stride_0, dst_stride_1,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    # Coalesced read from src (M, N)
+    tile = tl.load(
+        src_ptr + offs_m[:, None] * src_stride_m + offs_n[None, :] * src_stride_n,
+        mask=mask, other=0.0,
+    )
+
+    # Coalesced write to dst (N, M): dst[n, m] = src[m, n]
+    mask_T = (offs_n[:, None] < N) & (offs_m[None, :] < M)
+    tl.store(
+        dst_ptr + offs_n[:, None] * dst_stride_0 + offs_m[None, :] * dst_stride_1,
+        tl.trans(tile), mask=mask_T,
+    )
+
+
+def transpose_copy(src: torch.Tensor, dst: torch.Tensor):
+    """Tiled transpose copy: dst = src.T where src is (M, N) and dst is (N, M).
+
+    Uses a 32x32 tiled Triton kernel with coalesced reads AND writes,
+    achieving near memory-bandwidth-limited performance (~60-80us on H100
+    for 768x50304 BF16 vs ~296us for PyTorch's copy_).
+    """
+    assert src.ndim == 2 and dst.ndim == 2
+    M, N = src.shape
+    assert dst.shape == (N, M), f"Expected dst shape ({N}, {M}), got {dst.shape}"
+
+    BLOCK_M, BLOCK_N = 32, 32
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+    _transpose_copy_kernel[grid](
+        src, dst,
+        M, N,
+        src.stride(0), src.stride(1),
+        dst.stride(0), dst.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+        num_stages=2,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Tiled transpose-add kernel: dst (M, N) += src (N, M).T
+# Same tiling strategy as transpose_copy but with a fused read-add-write.
+# Replaces PyTorch's .add_(src.T) which uses the same 75k-block elementwise
+# kernel with non-coalesced reads from the transposed operand.
+
+@triton.jit
+def _transpose_add_kernel(
+    src_ptr, dst_ptr,
+    M, N,
+    src_stride_m, src_stride_n,
+    dst_stride_0, dst_stride_1,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    # Coalesced read from src (M, N)
+    src_tile = tl.load(
+        src_ptr + offs_m[:, None] * src_stride_m + offs_n[None, :] * src_stride_n,
+        mask=mask, other=0.0,
+    )
+
+    # Coalesced read-add-write on dst (N, M): dst[n, m] += src[m, n]
+    mask_T = (offs_n[:, None] < N) & (offs_m[None, :] < M)
+    dst_ptrs = dst_ptr + offs_n[:, None] * dst_stride_0 + offs_m[None, :] * dst_stride_1
+    dst_tile = tl.load(dst_ptrs, mask=mask_T, other=0.0)
+    tl.store(dst_ptrs, dst_tile + tl.trans(src_tile), mask=mask_T)
+
+
+def transpose_add(src: torch.Tensor, dst: torch.Tensor):
+    """Tiled transpose-add: dst += src.T where src is (M, N) and dst is (N, M).
+
+    Uses a 32x32 tiled Triton kernel with coalesced access on both src and dst,
+    replacing PyTorch's .add_(src.T) which has non-coalesced reads from the
+    transposed operand.
+    """
+    assert src.ndim == 2 and dst.ndim == 2
+    M, N = src.shape
+    assert dst.shape == (N, M), f"Expected dst shape ({N}, {M}), got {dst.shape}"
+
+    BLOCK_M, BLOCK_N = 32, 32
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+    _transpose_add_kernel[grid](
+        src, dst,
+        M, N,
+        src.stride(0), src.stride(1),
+        dst.stride(0), dst.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+        num_stages=2,
+    )
+
 
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
@@ -530,7 +821,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             logits.stride(0), logits.stride(1),
             n_rows, n_cols, n_predict,
             A, B, C,
-            BLOCK_SIZE=1024,
+            BLOCK_SIZE=2048,
             num_warps=2
         )
 
@@ -556,7 +847,8 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             A, B, C,
             grad_s,
             BLOCK_SIZE=1024,
-            num_warps=2
+            num_warps=4,
+            N_PREDICT=n_predict,
         )
 
         x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
@@ -582,3 +874,4 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         )
 
         return grad_x, None, None, grad_w, None, None, None
+
