@@ -179,14 +179,6 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
 
     momentum_t is a 0-D CPU tensor to avoid triggering graph recompilations when the value changes.
     """
-@torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
-def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, second_momentum_buffer: torch.Tensor,
-                  momentum_t: torch.Tensor, beta2_t: torch.Tensor, split_baddbmm: bool = False):
-    """
-    Fused AdaMuon + Polar Express Sign Method.
-    Adam steps are applied in FP32, then the result is cast to BF16 for polar express
-    orthogonalization.
-    """
     # AdaMuon Adam math (in FP32)
     beta1 = momentum_t.to(grad_chunk.dtype)
     beta2 = beta2_t.to(grad_chunk.dtype)
