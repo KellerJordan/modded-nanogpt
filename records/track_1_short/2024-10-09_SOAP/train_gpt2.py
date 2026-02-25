@@ -349,7 +349,7 @@ class SOAP(optim.Optimizer):
                 continue
             try:
                 _, Q = torch.linalg.eigh(m+1e-30*torch.eye(m.shape[0], device=m.device))
-            except:
+            except Exception:
                 _, Q = torch.linalg.eigh(m.to(torch.float64)+1e-30*torch.eye(m.shape[0], device=m.device))
                 Q = Q.to(m.dtype)
             Q = torch.flip(Q, [1])
