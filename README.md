@@ -5,8 +5,8 @@ This repository hosts the *NanoGPT speedrun*, in which we (collaboratively|compe
 The target (3.28 validation loss on FineWeb) follows Andrej Karpathy's [GPT-2 replication in llm.c, which attains that loss after running for 45 minutes](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 The speedrun code also descends from llm.c's [PyTorch trainer](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py), which itself descends from NanoGPT, hence the name of the repo.
 Thanks to the efforts of many contributors, this repo now contains a training algorithm which attains the target performance in:
-* Under 100 seconds on 8xH100 (the llm.c GPT-2 replication needed 45 minutes)
-* under 500M tokens (the llm.c GPT-2 replication needed 10B)
+* Under 90 seconds on 8xH100 (the llm.c GPT-2 replication needed 45 minutes)
+* under 400M tokens (the llm.c GPT-2 replication needed 10B)
 
 This improvement in training speed has been brought about by the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU²
@@ -26,12 +26,14 @@ This improvement in training speed has been brought about by the following techn
 * Cautious Weight Decay w/ schedule tied to LR
 * Exponential decay of residual stream
 * Batch size schedule
+* Max seq length schedule
 * Partial Key Offset
 * Multi token prediction
 * Untie embed and lm_head at 2/3 of training
 * Additional gating on value embeddings and skip connection
 * Paired head attention
 * Bigram hash embedding
+* Partitioned Hyperconnections
 
 As well as many systems optimizations.
 
@@ -47,8 +49,9 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@bernard24](https://github.com/bernard24)/https://www.hiverge.ai/, [@Gusarich](https://x.com/Gusarich), [@li_zichong](https://x.com/li_zichong),
 [@akash5474](https://github.com/akash5474), [@snimu](https://x.com/omouamoua), [@roeeshenberg](https://x.com/roeeshenberg),
 [@ChrisJMcCormick](https://x.com/ChrisJMcCormick), [@dominikkallusky](https://github.com/dominikkallusky), [@acutkosky](https://github.com/acutkosky), 
-[@manikbhandari](https://github.com/manikbhandari), [@andrewbriand](https://github.com/andrewbriand), [@jrauvola](https://github.com/jrauvola),
-[@soren_dunn_](https://x.com/soren_dunn_), [@photon_mz](https://x.com/photon_mz), [@srashedll](https://x.com/srashedll)
+[@manikbhandari](https://github.com/manikbhandari), [@andrewbriand](https://x.com/andrewbriand8), [@jrauvola](https://x.com/Joshrav21),
+[@soren_dunn_](https://x.com/soren_dunn_), [@photon_mz](https://x.com/photon_mz), [@srashedll](https://x.com/srashedll), [@dhrvji](https://x.com/dhrvji),
+[@EmmettBicker](https://github.com/EmmettBicker), [@dualverse-ai](https://github.com/dualverse-ai), [@sisovicm](https://x.com/sisovicm)
 
 
 ---
@@ -59,8 +62,8 @@ To run the current record, run the following commands.
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install uv
-uv pip install --system -r requirements.txt
-uv pip install --system torch==2.10.0.dev20251210+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126
+uv python install 3.12
+uv pip install --system --python 3.12 -r requirements.txt
 # downloads only the first 500M training tokens to save time
 python data/cached_fineweb10B.py 5
 ./run.sh
@@ -161,13 +164,22 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 56 | 1.894 minutes | [Optimize and compile Adam, increase Adam buffer precision, move gates from Muon to Adam parameter banks](https://x.com/classiclarryd/status/2007882371576873445) | 12/31/25 | [log](records/track_1_short/2025-12-31_GatesToCompiledAdam/12-31-gates-to-adam-20stps/219a5f2f-151e-4c56-ab91-3735ae4610b8.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/187) | @ChrisJMcCormick
 57 | 1.878 minutes | [Bfloat16 attn/mlp weights, mixed precision Muon, interweave Adam/Muon, finer-grain Adam beta](https://x.com/classiclarryd/status/2008261904566022590) | 01/04/26 | [log](records/track_1_short/2026-01-04_MixedPrecisionInterweavedOptimizer/41f606b6-1b9c-46a3-b46e-2beff1521d18.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/190) | @classiclarryd, feat. @YouJiacheng, @ChrisJMcCormick
 58 | 1.820 minutes | [Paired Head Attention](https://x.com/classiclarryd/status/2008963501688324228) | 01/07/26 | [log](records/track_1_short/2026-01-07_PairedHeadAttention/2a5d5cde-db5f-4aab-a4a8-cc8e183ea671.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/191) | @classiclarryd
-59 | 1.781 minutes | [Fused triton kernel for linear relu square MLP step](https://x.com/classiclarryd/status/2010545452832407943) | 01/10/26 | [log](records/track_1_short/2026-01-10_FusedLinearReLUSquare/3c47e63b-075e-4b5b-9c76-9dbe7bad9ad4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/197) | @andrewbriand, @jrauvola
+59 | 1.781 minutes | [Fused triton kernel for linear relu square MLP step](https://x.com/classiclarryd/status/2010545452832407943) | 01/10/26 | [log](records/track_1_short/2026-01-10_FusedLinearReLUSquare/3c47e63b-075e-4b5b-9c76-9dbe7bad9ad4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/197) | @andrewbriand8, @Joshrav21
 60 | 1.765 minutes | [Fused triton kernel for softcapped multi-token prediction cross entropy step](https://x.com/classiclarryd/status/2012927211448516796) | 01/16/26 | [log](records/track_1_short/2026-01-16_FusedSoftcappedEntropy/45beba56-93e2-4995-bc5b-caff3cb2c1b5.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/199) | @soren_dunn_ & AI System [Locus](https://www.intology.ai/blog/previewing-locus)
 61 | 1.748 minutes | [Unified Optimizers and Transposed LM Head](https://x.com/classiclarryd/status/2013399457841160702) | 01/18/26 | [log](records/track_1_short/2026-01-18_UnifiedOptimizers/unified-optimizer/2fc79469-a527-4bde-8540-8426ed3352d1.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/200) | @ChrisJMcCormick
 62 | 1.655 minutes | [Bigram Hash Embedding](https://x.com/classiclarryd/status/2013520088297558274) | 01/19/26 | [log](records/track_1_short/2026-01-19_BigramHashEmbedding/40ec7bb6-14b3-46f8-90b7-bb5ed188faba.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/201) | @classiclarryd
-63 | 1.650 minutes | [Untie Value Embeds](https://x.com/classiclarryd/status/2016968386476200301) | 01/26/26 | [log](records/track_1_short/2026-01-26-UntieValueEmbeddings/43955d93-6914-40cb-bdf8-786ace93784f.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/209) | @photo_mz
+63 | 1.650 minutes | [Untie Value Embeds](https://x.com/classiclarryd/status/2016968386476200301) | 01/26/26 | [log](records/track_1_short/2026-01-26-UntieValueEmbeddings/43955d93-6914-40cb-bdf8-786ace93784f.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/209) | @photon_mz
 64 | 1.630 minutes | [Tuned nonzero Attn V and O init](https://x.com/classiclarryd/status/2017735338601726357) | 01/30/26 | [log](records/track_1_short/2026-01-30_MimeticValueOutput/runs/0f262f64-20c4-4268-9ae7-d7440c810abd.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/214) | @srashedll
-65 | 1.613 minutes | Group Value Embeds into single parameter | 01/30/26 | [log](records/track_1_short/2026-01-30_VeFused/0ba09d92-4ef1-440f-85e3-9d2766294db4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/215) | @varunneal
+65 | 1.613 minutes | [Group Value Embeds into single parameter](https://x.com/classiclarryd/status/2018057653742920016) | 01/30/26 | [log](records/track_1_short/2026-01-30_VeFused/0ba09d92-4ef1-440f-85e3-9d2766294db4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/215) | @varunneal
+66 | 1.595 minutes | Torch 2.10 | 01/31/26 | - | -
+67 | 1.540 minutes | [Tune fused softcap kernels and fuse fp8 quantization in LM head](https://x.com/classiclarryd/status/2021015642472869978) | 01/31/26 | [log](records/track_1_short/2026-01-24_ImprovedLMHead/record/73a071ac-522d-4ce0-a4d6-cf3955a376e4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/207) | @andrewbriand8
+68 | 1.535 minutes | [Move bigram hash to GPU](https://x.com/classiclarryd/status/2021450730117460439) | 01/31/26 | [log](records/track_1_short/2026-01-31-BigramHashH2D/112c686e-b0d6-4dc8-814a-1ad1f5d5b274.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/216) | @dhrvji
+69 | 1.528 minutes | [Kernel Optimizations](https://x.com/classiclarryd/status/2023319358303510719) | 02/02/26 | [log](records/track_1_short/2026-02-02_KernelTuning/25afb73a-332f-4d69-b9ab-f6261497f2d8.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/217) | @EmmettBicker & AI System [Aster](https://www.asterlab.ai/)
+70 | 1.521 minutes | [Tune value embed layout and ve_gates](https://x.com/classiclarryd/status/2023319358303510719) | 02/03/26 | [log](records/track_1_short/2026-02-03_VeTuned/42cbebac-0599-4a89-a00e-26d1c4cad140.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/218) | @photon_mz
+71 | 1.516 minutes | [Sparse bigram gradient comms and optimized loading on CPU](https://x.com/classiclarryd/status/2023319358303510719) | 02/06/26 | [log](records/track_1_short/2026-02-06_SparseBigramGradient/02fee7bd-cd22-478b-9e8e-12e857ff3152.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/221) | @roeeshenberg
+72 | 1.496 minutes | [Increase minimum lr and add max_seq_len schedule](https://x.com/classiclarryd/status/2023319358303510719) | 02/10/26 | [log](records/track_1_short/2026-02-10_ShortWindow/Short-Window_1_1.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/224) | @dualverse-ai & AI System [Station](https://github.com/dualverse-ai/station)
+73 | 1.485 minutes | Partitioned Hyperconnections | 02/12/26 | [log](records/track_1_short/2026-02-12_ParallelResiduals/451050db-d471-49db-b19b-be824bb896d0.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/230) | @sisovicm
+74 | 1.468 minutes | Flattened GPT forward, removed post attention lambdas, added transpose kernels | 02/16/26 | [log](records/track_1_short/2026-02-16_FlattenForward/pr233/2026-02-16_21-30-05_time-362_secs_F-inject-post-attn_9f12a3.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/233) | @ChrisJMcCormick
 ## Rules
 
 New records must:
