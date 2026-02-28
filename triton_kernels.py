@@ -650,8 +650,8 @@ def _transpose_copy_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
 
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
 
@@ -672,15 +672,14 @@ def _transpose_copy_kernel(
 def transpose_copy(src: torch.Tensor, dst: torch.Tensor):
     """Tiled transpose copy: dst = src.T where src is (M, N) and dst is (N, M).
 
-    Uses a 32x32 tiled Triton kernel with coalesced reads AND writes,
-    achieving near memory-bandwidth-limited performance (~60-80us on H100
-    for 768x50304 BF16 vs ~296us for PyTorch's copy_).
+    Uses a 64x128 tiled Triton kernel with coalesced reads AND writes,
+    achieving near memory-bandwidth-limited performance.
     """
     assert src.ndim == 2 and dst.ndim == 2
     M, N = src.shape
     assert dst.shape == (N, M), f"Expected dst shape ({N}, {M}), got {dst.shape}"
 
-    BLOCK_M, BLOCK_N = 32, 32
+    BLOCK_M, BLOCK_N = 64, 128
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     _transpose_copy_kernel[grid](
@@ -690,7 +689,7 @@ def transpose_copy(src: torch.Tensor, dst: torch.Tensor):
         dst.stride(0), dst.stride(1),
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        num_warps=4,
+        num_warps=8,
         num_stages=2,
     )
 
@@ -835,9 +834,15 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             use_fast_accum=False,
         )
 
+        x_f8_T = torch.empty((x_f8.shape[1], x_f8.shape[0]), dtype=x_f8.dtype, device=x_f8.device)
+        transpose_copy(x_f8, x_f8_T)  # (768, n_rows) row-major
+
+        grad_input_T = torch.empty((n_cols, n_rows), dtype=grad_input.dtype, device=grad_input.device)
+        transpose_copy(grad_input, grad_input_T)  # (50304, n_rows) row-major
+
         grad_w = torch._scaled_mm(
-            x_f8.T.contiguous(),
-            grad_input.T.contiguous().T,
+            x_f8_T,            # (768, n_rows) row-major
+            grad_input_T.T,    # (n_rows, 50304) column-major view
             out_dtype=torch.float32,
             scale_a=x_scale,
             scale_b=grad_scale,
