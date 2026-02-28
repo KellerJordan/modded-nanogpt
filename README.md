@@ -61,9 +61,11 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 To run the current record, run the following commands.
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
-pip install -r requirements.txt
-# downloads only the first 900M training tokens to save time
-python data/cached_fineweb10B.py 9
+pip install uv
+uv python install 3.12
+uv pip install --system --python 3.12 -r requirements.txt
+# downloads only the first 500M training tokens to save time
+python data/cached_fineweb10B.py 5
 ./run.sh
 ```
 Add torchrun to path if ./run.sh gives error `torchrun: command not found`.
@@ -80,9 +82,9 @@ Note: an NVIDIA driver must already be installed on the system (useful if only t
 
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
-sudo docker build -t modded-nanogpt .
-sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt python data/cached_fineweb10B.py 8
-sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt sh run.sh
+docker build -t modded-nanogpt .
+docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt python data/cached_fineweb10B.py 5
+docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt sh run.sh
 ```
 
 To get an interactive docker, you can use
