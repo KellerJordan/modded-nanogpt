@@ -1889,13 +1889,14 @@ logfile = None
 if master_process:
     run_id = args.run_id
     os.makedirs("logs", exist_ok=True)
-    logfile = open(f"logs/{run_id}.txt", "a")
-    print(logfile.name)
+    logfile = f"logs/{run_id}.txt"
+    print(logfile)
 def print0(s, console=False):
     if master_process:
-        if console:
-            print(s)
-        print(s, file=logfile, flush=True)
+        with open(logfile, "a") as f:
+            if console:
+                print(s)
+            print(s, file=f)
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -2035,6 +2036,4 @@ for step in range(train_steps + 1):
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
-if logfile is not None:
-    logfile.close()
 dist.destroy_process_group()
