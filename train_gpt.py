@@ -1455,12 +1455,12 @@ class Shard:
                     raise StopIteration(f"Insufficient BOS ahead; hit tail of shard.")
                 cur = self.bos_idx[idx]
                 starts[r].append(cur)
-                end = min(self.bos_idx[idx + 1] if idx + 1 < n else self.size,
+                idx += 1
+                end = min(self.bos_idx[idx] if idx < n else self.size,
                           cur + max_seq_len,
                           cur + num_tokens_local - cur_len + 1)
                 ends[r].append(end)
                 cur_len += end - cur
-                idx += 1
 
             assert cur_len == num_tokens_local + 1
         self.i = idx
@@ -1945,7 +1945,7 @@ val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1,
 
 transition_steps = training_manager.get_transition_steps()
 # first and last pair of steps in each transition
-warmup_steps = sorted({0, 1 } | {s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 0})
+warmup_steps = sorted({0, 1} | {s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 2})
 print0(f"Sampling steps {warmup_steps} for warmup", console=True)
 for step in warmup_steps:
     training_manager.advance_schedule(step)
