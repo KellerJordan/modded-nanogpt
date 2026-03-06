@@ -401,13 +401,14 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
 
 @triton.jit
 def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
-                                 M, N, K,
+                                 M, N, K, w_scale,
                                  BLOCK_SIZE_M: tl.constexpr,
                                  BLOCK_SIZE_N: tl.constexpr,
                                  BLOCK_SIZE_K: tl.constexpr,
                                  GROUP_SIZE_M: tl.constexpr,
                                  NUM_SMS: tl.constexpr,
                                  FORWARD: tl.constexpr,
+                                 USE_FP8: tl.constexpr,
                                  ):
     dtype = tl.bfloat16
     start_pid = tl.program_id(axis=0)
@@ -431,6 +432,9 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
             a = a_desc.load([offs_am, offs_k])
             b = b_desc.load([offs_bn, offs_k])
             accumulator = tl.dot(a, b.T, accumulator)
+
+        if USE_FP8:
+            accumulator *= w_scale
 
         tile_id_c += NUM_SMS
         pid_m = tile_id // num_pid_n
@@ -467,10 +471,11 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
 
-def linear_relu_square(a, b, aux=None):
+def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0):
     M, K = a.shape
-    N, K = b.shape
-    dtype = a.dtype
+    N = b.shape[0] if b is not None else b_f8.shape[0]
+    dtype = torch.bfloat16
+    use_fp8 = b_f8 is not None
 
     c = torch.empty((M, N), device=a.device, dtype=dtype)
 
@@ -483,12 +488,14 @@ def linear_relu_square(a, b, aux=None):
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 256
-    BLOCK_SIZE_K = 64
+    BLOCK_SIZE_K = 128 if use_fp8 else 64
     num_stages = 4 if FORWARD else 3
     num_warps = 8
 
-    a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
-    b_desc = TensorDescriptor.from_tensor(b, [BLOCK_SIZE_N, BLOCK_SIZE_K])
+    a_actual = a_f8 if use_fp8 else a
+    a_desc = TensorDescriptor.from_tensor(a_actual, [BLOCK_SIZE_M, BLOCK_SIZE_K])
+    b_actual = b_f8 if use_fp8 else b
+    b_desc = TensorDescriptor.from_tensor(b_actual, [BLOCK_SIZE_N, BLOCK_SIZE_K])
     c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
     aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
 
@@ -500,13 +507,14 @@ def linear_relu_square(a, b, aux=None):
 
     linear_relu_square_kernel[grid](
         a_desc, b_desc, c_desc, aux_desc,
-        M, N, K,
+        M, N, K, w_scale,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         GROUP_SIZE_M=1,
         NUM_SMS=NUM_SMS,
         FORWARD=FORWARD,
+        USE_FP8=use_fp8,
         num_stages=num_stages,
         num_warps=num_warps
     )
@@ -516,10 +524,17 @@ def linear_relu_square(a, b, aux=None):
     else:
         return c
 
+_FP8_ACT_SCALE = 16.0 / torch.finfo(torch.float8_e4m3fn).max  # ~0.036, covers activations up to 16
+
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, W1, W2):
-        pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
+    def forward(ctx, x, W1, W2, W1_f8=None, W1_s=1.0):
+        x_flat = x.view((-1, x.shape[-1]))
+        if W1_f8 is not None:
+            x_f8 = (x_flat / _FP8_ACT_SCALE).to(torch.float8_e4m3fn)
+            pre, post = linear_relu_square(x_flat, W1, a_f8=x_f8, b_f8=W1_f8, w_scale=W1_s)
+        else:
+            pre, post = linear_relu_square(x_flat, W1)
         x3 = post @ W2
         ctx.save_for_backward(x, W1, W2, pre, post)
         return x3.view(x.shape)
@@ -528,10 +543,11 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         x, W1, W2, pre, post = ctx.saved_tensors
         dW2 = post.T @ grad_output
-        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
+        grad_flat = grad_output.view((-1, grad_output.shape[-1]))
+        dpre = linear_relu_square(grad_flat, W2, aux=pre)
         dW1 = dpre.T @ x
         dx = dpre @ W1
-        return dx.view(x.shape), dW1, dW2
+        return dx.view(x.shape), dW1, dW2, None, None
 
 
 # -----------------------------------------------------------------------------
