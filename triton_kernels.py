@@ -589,7 +589,8 @@ def fused_softcapped_entropy_bwd_kernel(
     n_rows, n_cols, n_predict,
     A, B, C,
     grad_s,
-    BLOCK_SIZE: tl.constexpr
+    BLOCK_SIZE: tl.constexpr,
+    N_PREDICT: tl.constexpr
 ):
     row_idx = tl.program_id(0).to(tl.int64)
 
@@ -599,14 +600,41 @@ def fused_softcapped_entropy_bwd_kernel(
     lse = tl.load(lse_ptr + row_idx)
     grad_loss = tl.load(grad_output_ptr + row_idx)
 
-    S_w = 0.0
-    for k in range(n_predict):
-        if row_idx + k < n_rows:
-            S_w += tl.load(mtp_weights_ptr + k)
-
     inv_C = 1.0 / C
     B_div_C = B * inv_C
     inv_C_A = inv_C * A
+    inv_grad_s = 1.0 / grad_s
+
+    # Preload all targets and weights before the column loop
+    S_w = 0.0
+    t0: tl.int32 = -1
+    t1: tl.int32 = -1
+    t2: tl.int32 = -1
+    w0: tl.float32 = 0.0
+    w1: tl.float32 = 0.0
+    w2: tl.float32 = 0.0
+
+    if N_PREDICT >= 1:
+        if row_idx + 0 < n_rows:
+            w0 = tl.load(mtp_weights_ptr + 0)
+            t0 = tl.load(targets_ptr + row_idx + 0).to(tl.int32)
+            S_w += w0
+
+    if N_PREDICT >= 2:
+        if row_idx + 1 < n_rows:
+            w1 = tl.load(mtp_weights_ptr + 1)
+            t1 = tl.load(targets_ptr + row_idx + 1).to(tl.int32)
+            S_w += w1
+
+    if N_PREDICT >= 3:
+        if row_idx + 2 < n_rows:
+            w2 = tl.load(mtp_weights_ptr + 2)
+            t2 = tl.load(targets_ptr + row_idx + 2).to(tl.int32)
+            S_w += w2
+
+    # Fuse all scalar multiplications
+    grad_scale = grad_loss * inv_grad_s
+    grad_scale_icA = grad_scale * inv_C_A
 
     for off in range(0, n_cols, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
@@ -618,17 +646,17 @@ def fused_softcapped_entropy_bwd_kernel(
         p = tl.exp(z - lse)
 
         term1 = S_w * p
-        term2 = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-        for k in range(n_predict):
-            if row_idx + k < n_rows:
-                target = tl.load(targets_ptr + row_idx + k).to(tl.int32)
-                weight = tl.load(mtp_weights_ptr + k)
-                term2 += tl.where(cols == target, weight, 0.0)
 
-        grad_z = grad_loss * (term1 - term2)
-        dz_dx = inv_C_A * sigmoid_u * (1.0 - sigmoid_u)
-        grad_x = grad_z * dz_dx
-        grad_x = grad_x / grad_s
+        term2 = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+        if N_PREDICT >= 1:
+            term2 += tl.where(cols == t0, w0, 0.0)
+        if N_PREDICT >= 2:
+            term2 += tl.where(cols == t1, w1, 0.0)
+        if N_PREDICT >= 3:
+            term2 += tl.where(cols == t2, w2, 0.0)
+
+        grad_z = term1 - term2
+        grad_x = grad_scale_icA * grad_z * sigmoid_u * (1.0 - sigmoid_u)
         grad_x = grad_x.to(tl.float8e5)
         tl.store(grad_row_ptr + cols, grad_x, mask=mask)
 
@@ -793,7 +821,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             logits.stride(0), logits.stride(1),
             n_rows, n_cols, n_predict,
             A, B, C,
-            BLOCK_SIZE=1024,
+            BLOCK_SIZE=2048,
             num_warps=2
         )
 
@@ -819,7 +847,8 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             A, B, C,
             grad_s,
             BLOCK_SIZE=1024,
-            num_warps=2
+            num_warps=4,
+            N_PREDICT=n_predict,
         )
 
         x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
