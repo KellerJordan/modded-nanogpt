@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
+from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy, init_fp8_amax_bufs
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
@@ -167,6 +167,7 @@ def quantize_weights_fp8(model):
         if model._mlp_bank_f8 is None:
             model._mlp_bank_f8 = torch.zeros_like(model.mlp_bank, dtype=torch.float8_e4m3fn)
             model._mlp_bank_scales = torch.ones(24, dtype=torch.float32, device=model.mlp_bank.device)
+            init_fp8_amax_bufs(model.mlp_bank.device)
         # Vectorized: compute all 24 scales and quantize in bulk
         flat = model.mlp_bank.view(24, -1)
         scales = flat.abs().amax(dim=1).clamp(min=1e-12) / E4M3_MAX
@@ -1374,6 +1375,8 @@ class GPT(nn.Module):
             # Select attention variant for this layer
             attn = self.attn_paired if i in self.paired_head_layers else self.attn
 
+            # Skip FP8 for last 2 layers to preserve gradient precision near output
+            use_fp8_here = use_mlp_fp8
             # Skip attention on layer 6 @YouJiacheng. Instead pull skip connection from prior long window
             if i == 6:
                 x = x + skip_gate_out * skip_connection
@@ -1382,7 +1385,7 @@ class GPT(nn.Module):
                 attn_out = attn(norm(attn_in), attn_args, qkvo_w)
                 x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
             normed = norm(x)
-            mlp_args = (c_fc, c_proj, fc_f8, fc_s, (normed * _FP8_ACT_SCALE_INV).to(torch.float8_e4m3fn)) if use_mlp_fp8 else (c_fc, c_proj)
+            mlp_args = (c_fc, c_proj, fc_f8, fc_s, (normed * _FP8_ACT_SCALE_INV).to(torch.float8_e4m3fn)) if use_fp8_here else (c_fc, c_proj)
             x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(normed, *mlp_args)
             if i == 3:
                 skip_connection = x

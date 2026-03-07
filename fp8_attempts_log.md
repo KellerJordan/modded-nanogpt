@@ -227,10 +227,101 @@ Baseline consistently hits 3.277-3.280. FP8 consistently hits 3.282-3.283. Gap o
 
 **Why 5 extra steps didn't help:** Added to `num_scheduled_iterations` (1450→1455), but those 5 steps are deep in the 60% cooldown phase where LR is near minimum. They contribute almost nothing. The gap is a precision floor, not slower convergence.
 
+---
+
+## Attempt 4: Delayed dynamic per-tensor scaling (zero-overhead amax)
+
+### Key Insight
+Standard FP8 training (NVIDIA TransformerEngine) uses **per-tensor dynamic scaling** — computing amax of each activation tensor and setting `scale = amax / E4M3_MAX`. Our fixed scale=16 wastes FP8 range (actual RMSNorm amax is ~5-6). Per-tensor scaling better utilizes the available precision.
+
+The overhead concern (amax reduction = 32μs/call = 3.1ms/step) is solved by **delayed scaling**: compute amax as a free side-effect of the matmul kernel (data is already in registers), use it for the *next* call. Zero extra kernels, zero extra memory traffic.
+
+References:
+- [Per-Tensor and Per-Block Scaling Strategies](https://developer.nvidia.com/blog/per-tensor-and-per-block-scaling-strategies-for-effective-fp8-training/)
+- [TransformerEngine FP8 Primer](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html)
+
+### Kernel infrastructure added
+Added `TRACK_AMAX` and `USE_SCALE_PTR` constexpr flags to `linear_relu_square_kernel`:
+- `TRACK_AMAX`: computes `max(abs(a))` as a free side-effect of the matmul (data already in registers), writes via `tl.atomic_max` to an output buffer
+- `USE_SCALE_PTR`: reads `w_scale` from a GPU tensor pointer instead of a kernel arg (enables dynamic scale without `.item()`)
+- Both default to `False`, so existing code path is unchanged
+- Dummy float32 pointers passed when unused (Triton requires valid pointers for all positional args)
+
+### Attempt 4a: Delayed scaling inside compiled graph
+- Computed `act_scale_inv = 448 / amax_buf.clamp(min=1e-12)` using tensor ops inside autograd function
+- Global `_fp8_amax_bufs` tensor stores per-layer amax, kernel writes to it, function reads from it
+- All `.item()` calls removed — scale computation uses GPU tensor ops only
+- `combined_scale` passed to kernel via `w_scale_ptr` (GPU pointer)
+- **Result: val_loss=3.4410, 482.09ms/step — CONVERGENCE FAILURE**
+- **Root cause:** `torch.compile(fullgraph=True)` captures `_fp8_amax_bufs` as a constant during tracing. The kernel's `tl.atomic_max` writes and `amax_buf.mul_()` mutations are invisible to the compiled graph. The amax stays frozen at the initial value (6.0) and never updates, breaking the delayed scaling feedback loop.
+- **Lesson:** Global mutable state inside `torch.compile(fullgraph=True)` does NOT work for feedback loops. TransformerEngine solves this with their own `autocast` context that manages scale state outside compilation.
+
+### Attempt 4b: Tighter fixed scale (range -8 to 8)
+- Changed `_FP8_ACT_SCALE_INV` from 28.0 (covers ±16) to 56.0 (covers ±8)
+- Hypothesis: RMSNorm outputs have amax ~5-6, so ±8 would give ~2× better precision
+- **Result: val_loss=3.8640, 479.00ms/step — CATASTROPHIC FAILURE**
+- Despite "0% clipping" at scale=16, values DO exceed 8 enough to destroy training
+- Confirms the ±16 range is necessary for outlier coverage
+
+### Attempt 4c: Selective FP8 — BF16 for last 2 layers
+- FP8 for layers 0-9, BF16 for layers 10-11
+- Rationale: NVIDIA TransformerEngine docs recommend "running final network layers in higher precision" for sensitive operations. The last layers have most impact on convergence since they directly affect the loss gradient.
+- **Result: val_loss=3.2813, 477.65ms/step — BEST CONVERGENCE YET**
+- Gap vs baseline: only 0.002 (down from 0.004 with all-FP8)
+- Speedup preserved: 4.44ms/step faster than baseline (482.09ms)
+- 10/12 layers use FP8, so ~83% of FP8 compute benefit retained
+
+### Results comparison table
+
+| Run | Steps | ms/step | val_loss | Notes |
+|-----|-------|---------|----------|-------|
+| **Baseline (master)** | 1490 | 482.09 | 3.2794 | BF16 everywhere |
+| **FP8 3f (all layers)** | 1490 | 476.77 | 3.2832 | All 12 MLP layers FP8 |
+| **FP8 4a (delayed scaling)** | 1490 | 482.09 | 3.4410 | BROKEN — torch.compile freezes amax |
+| **FP8 4b (tight scale ±8)** | 1490 | 479.00 | 3.8640 | BROKEN — too much clipping |
+| **FP8 4c (skip last 2)** | 1490 | 477.65 | 3.2813 | gap=0.002, speedup=4.4ms |
+| **FP8 4d (skip last 1)** | 1490 | 476.27 | 3.2834 | Skipping 1 layer barely helps convergence |
+| **FP8 4e (skip last 3)** | 1490 | 478.68 | 3.2799 | Just barely under 3.28, only 3.4ms speedup |
+
+### Why Attempt 4a (delayed scaling inside compile) failed
+
+The approach was correct in principle but broken by `torch.compile(fullgraph=True)`:
+
+1. `_fp8_amax_bufs` is a **global tensor** (not a module parameter/buffer)
+2. Inside the compiled autograd function, we did:
+   ```python
+   amax_buf = _fp8_amax_bufs[layer_idx:layer_idx+1]  # read from global
+   act_scale_inv = 448 / amax_buf.clamp(min=1e-12)    # compute scale
+   ```
+3. `torch.compile` **captures the global tensor as a constant** during tracing — it snapshots the value at compile time (6.0) and never re-reads it
+4. The kernel's `tl.atomic_max` writes to the CUDA pointer succeed at the hardware level, but the compiled graph ignores the updated values on subsequent calls
+5. Similarly, `amax_buf.mul_(act_scale)` mutations are traced but don't persist across compiled calls
+
+**The fix:** Store scales as **model attributes** (not globals). Dynamo re-reads `self.some_attr` on every call (verified experimentally). Compute updated scales **between steps** in `quantize_weights_fp8()` (outside compile), store as `model._fp8_act_scale_inv` (Python float). The kernel tracks amax as a free side-effect, and the training loop converts the raw amax to a scale for the next step.
+
+### Attempt 4f (next): Proper delayed scaling via model attributes
+
+Plan:
+- Kernel writes `max(abs(x_f8))` to `_fp8_amax_bufs` (CUDA side-effect, works even inside compile)
+- Between steps: `quantize_weights_fp8()` reads amaxes, computes `act_scale_inv = 448 / amax`, stores as `model._fp8_act_scale_inv` (Python float)
+- Forward: `(normed * self._fp8_act_scale_inv).to(fp8)` — dynamo sees a concrete float from module attribute
+- Pre-multiplied combined scale: `model._mlp_bank_scales[i] = w_scale * act_scale` (concrete float via `.item()`)
+
+### Selective FP8 analysis
+- Each of the last 3 layers (9, 10, 11) contributes ~0.001 val_loss gap
+- First 9 layers contribute negligible gap
+- The last layers are closest to the loss, so FP8 noise in their gradient masks has outsized impact
+- This matches NVIDIA TransformerEngine guidance: "For sensitive operations, consider running final network layers in higher precision"
+
 ### Estimated 8×H100 impact
-- On 8×H100, baseline step time is ~40ms/step (vs ~482ms on 1×H100)
-- FP8 compute savings scale with matmul FLOPS which are constant per-GPU
-- Per-step saving scales roughly as: 4.88ms × (40/482) ≈ **0.40ms/step**
-- Over 1495 steps: 0.40 × 1495 ≈ **0.6 seconds saved**
-- The 5 extra steps cost: 5 × 40ms = 0.2s
-- **Net 8×H100 estimate: ~0.4 seconds faster** (marginal but free)
+
+| Variant | 1×H100 speedup | 8×H100 est. speedup/step | 8×H100 est. total savings |
+|---------|----------------|--------------------------|---------------------------|
+| All FP8 (3f) | 5.3ms (1.1%) | 0.44ms | 0.66s |
+| Skip last 2 (4c) | 4.4ms (0.9%) | 0.37ms | 0.55s |
+| Skip last 1 (4d) | 5.8ms (1.2%) | 0.48ms | 0.72s |
+| Skip last 3 (4e) | 3.4ms (0.7%) | 0.28ms | 0.42s |
+
+*8×H100 estimates use scaling factor 40/482 (baseline step time ratio)*
+*Best convergence-safe option: 4c (skip last 2) — 0.55s faster, val_loss gap 0.002*
+*Best speed option: 4d (skip last 1) — 0.72s faster, but val_loss gap 0.004 risks exceeding 3.28*

@@ -401,7 +401,8 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
 
 @triton.jit
 def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
-                                 M, N, K, w_scale,
+                                 M, N, K, w_scale, w_scale_ptr,
+                                 amax_ptr,
                                  BLOCK_SIZE_M: tl.constexpr,
                                  BLOCK_SIZE_N: tl.constexpr,
                                  BLOCK_SIZE_K: tl.constexpr,
@@ -409,6 +410,8 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                                  NUM_SMS: tl.constexpr,
                                  FORWARD: tl.constexpr,
                                  USE_FP8: tl.constexpr,
+                                 TRACK_AMAX: tl.constexpr,
+                                 USE_SCALE_PTR: tl.constexpr,
                                  ):
     dtype = tl.bfloat16
     start_pid = tl.program_id(axis=0)
@@ -420,6 +423,9 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
     tile_id_c = start_pid - NUM_SMS
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
+    if USE_SCALE_PTR:
+        w_scale = tl.load(w_scale_ptr)
+
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
         pid_m = tile_id // num_pid_n
         pid_n = tile_id % num_pid_n
@@ -427,11 +433,18 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
         offs_bn = pid_n * BLOCK_SIZE_N
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        local_amax = 0.0
         for ki in range(k_tiles):
             offs_k = ki * BLOCK_SIZE_K
             a = a_desc.load([offs_am, offs_k])
             b = b_desc.load([offs_bn, offs_k])
+            if TRACK_AMAX:
+                tile_max = tl.max(tl.abs(a.to(tl.float32)))
+                local_amax = tl.maximum(local_amax, tile_max)
             accumulator = tl.dot(a, b.T, accumulator)
+
+        if TRACK_AMAX:
+            tl.atomic_max(amax_ptr, local_amax)
 
         if USE_FP8:
             accumulator *= w_scale
@@ -471,11 +484,21 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
 
-def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0):
+_dummy_f32 = None  # lazily initialized 1-element tensor for unused pointer args
+
+def _get_dummy_f32(device):
+    global _dummy_f32
+    if _dummy_f32 is None or _dummy_f32.device != device:
+        _dummy_f32 = torch.zeros(1, dtype=torch.float32, device=device)
+    return _dummy_f32
+
+def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0, w_scale_ptr=None, amax_out=None):
     M, K = a.shape
     N = b.shape[0] if b is not None else b_f8.shape[0]
     dtype = torch.bfloat16
     use_fp8 = b_f8 is not None
+    use_scale_ptr = w_scale_ptr is not None
+    track_amax = amax_out is not None
 
     c = torch.empty((M, N), device=a.device, dtype=dtype)
 
@@ -483,6 +506,16 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0):
     if aux is None:
         FORWARD = True
         aux = torch.empty((M, N), device=a.device, dtype=dtype)
+
+    if track_amax:
+        amax_out.zero_()
+
+    # Triton needs valid pointers even for unused args
+    dummy = _get_dummy_f32(a.device)
+    if w_scale_ptr is None:
+        w_scale_ptr = dummy
+    if amax_out is None:
+        amax_out = dummy
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
@@ -507,7 +540,8 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0):
 
     linear_relu_square_kernel[grid](
         a_desc, b_desc, c_desc, aux_desc,
-        M, N, K, w_scale,
+        M, N, K, w_scale, w_scale_ptr,
+        amax_out,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
@@ -515,6 +549,8 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0):
         NUM_SMS=NUM_SMS,
         FORWARD=FORWARD,
         USE_FP8=use_fp8,
+        TRACK_AMAX=track_amax,
+        USE_SCALE_PTR=use_scale_ptr,
         num_stages=num_stages,
         num_warps=num_warps
     )
@@ -544,6 +580,16 @@ def scale_cast_fp8(x: torch.Tensor) -> torch.Tensor:
     grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
     _scale_cast_fp8_kernel[grid](x, out, _FP8_ACT_SCALE_INV, n, BLOCK_SIZE=BLOCK_SIZE)
     return out
+
+_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+# Global amax storage — invisible to torch.compile, updated by autograd function
+_fp8_amax_bufs = None  # set by init_fp8_amax_bufs()
+_fp8_amax_default = 6.0  # typical RMSNorm output amax
+
+def init_fp8_amax_bufs(device, n_layers=12):
+    global _fp8_amax_bufs
+    _fp8_amax_bufs = torch.full((n_layers,), _fp8_amax_default, dtype=torch.float32, device=device)
 
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
