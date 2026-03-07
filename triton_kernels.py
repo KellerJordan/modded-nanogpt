@@ -593,14 +593,17 @@ def init_fp8_amax_bufs(device, n_layers=12):
 
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, W1, W2, W1_f8=None, W1_s=1.0, x_f8=None):
+    def forward(ctx, x, W1, W2, W1_f8=None, W1_s=None, x_f8=None):
         x_flat = x.view((-1, x.shape[-1]))
         if W1_f8 is not None:
             if x_f8 is None:
                 x_f8 = scale_cast_fp8(x_flat)
             else:
                 x_f8 = x_f8.view((-1, x_f8.shape[-1]))
-            pre, post = linear_relu_square(x_flat, W1, a_f8=x_f8, b_f8=W1_f8, w_scale=W1_s)
+            if isinstance(W1_s, torch.Tensor):
+                pre, post = linear_relu_square(x_flat, W1, a_f8=x_f8, b_f8=W1_f8, w_scale_ptr=W1_s)
+            else:
+                pre, post = linear_relu_square(x_flat, W1, a_f8=x_f8, b_f8=W1_f8, w_scale=W1_s if W1_s is not None else 1.0)
         else:
             pre, post = linear_relu_square(x_flat, W1)
         x3 = post @ W2

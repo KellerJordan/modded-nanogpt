@@ -282,6 +282,9 @@ Added `TRACK_AMAX` and `USE_SCALE_PTR` constexpr flags to `linear_relu_square_ke
 | **FP8 4c (skip last 2)** | 1490 | 477.65 | 3.2813 | gap=0.002, speedup=4.4ms |
 | **FP8 4d (skip last 1)** | 1490 | 476.27 | 3.2834 | Skipping 1 layer barely helps convergence |
 | **FP8 4e (skip last 3)** | 1490 | 478.68 | 3.2799 | Just barely under 3.28, only 3.4ms speedup |
+| **FP8 4f (current scaling)** | 1490 | 476.63 | 3.2810 | Best convergence, but phase-degraded speed |
+| **FP8 4g (current + skip 1)** | 1490 | 475.99 | 3.2781 | **BEST — beats baseline val_loss, 6.1ms faster** |
+| **FP8 4h (current + skip 2)** | 1490 | 475.65 | 3.2799 | 0.4ms faster than 4g, but above 3.279 target |
 
 ### Why Attempt 4a (delayed scaling inside compile) failed
 
@@ -299,13 +302,32 @@ The approach was correct in principle but broken by `torch.compile(fullgraph=Tru
 
 **The fix:** Store scales as **model attributes** (not globals). Dynamo re-reads `self.some_attr` on every call (verified experimentally). Compute updated scales **between steps** in `quantize_weights_fp8()` (outside compile), store as `model._fp8_act_scale_inv` (Python float). The kernel tracks amax as a free side-effect, and the training loop converts the raw amax to a scale for the next step.
 
-### Attempt 4f (next): Proper delayed scaling via model attributes
+### Attempt 4f: Current scaling (just-in-time amax)
 
-Plan:
-- Kernel writes `max(abs(x_f8))` to `_fp8_amax_bufs` (CUDA side-effect, works even inside compile)
-- Between steps: `quantize_weights_fp8()` reads amaxes, computes `act_scale_inv = 448 / amax`, stores as `model._fp8_act_scale_inv` (Python float)
-- Forward: `(normed * self._fp8_act_scale_inv).to(fp8)` — dynamo sees a concrete float from module attribute
-- Pre-multiplied combined scale: `model._mlp_bank_scales[i] = w_scale * act_scale` (concrete float via `.item()`)
+**Approach:** Compute `amax = normed.abs().max()` and quantize right before each FP8 matmul. Weight scale passed as tensor via `w_scale_ptr`. Eliminates stale-scale issue of delayed scaling.
+
+**Sub-attempts:**
+- **4f-v1**: amax computation + quantization outside autograd Function, `normed.detach()` to avoid backward-through-graph error. Pre-allocated scale buffer not used.
+  - Initial error: `RuntimeError: Trying to backward through the graph a second time` — fixed by `.detach()` on `normed` for amax/x_f8 computation
+  - **Result: val_loss=3.2810, step_avg=476.63ms** — convergence good!
+  - **Problem:** Step time degrades across torch.compile recompilation phases:
+    - Steps 0-483: ~353ms/step
+    - Steps 484-967: ~430ms/step (after 1st recompilation)
+    - Steps 968-1490: ~630ms/step (after 2nd recompilation)
+  - This is NOT a memory leak — individual step times are stable within each phase. The phases correspond to different compiled graphs for different training configurations (batch size, LR schedule, etc.)
+
+- **4f-v2**: Moved amax computation + quantization inside autograd Function's forward (autograd disabled there). Same phase degradation.
+
+- **4f-v3**: Tried `.item()` on amax/combined_scale to convert to Python float. **Failed:** `PendingUnbackedSymbolNotFound` — `.item()` on dynamically computed tensors creates unbacked symbols that `torch.compile(fullgraph=True)` can't handle.
+
+- **4f-v4**: Pre-allocated `_fp8_scale_buf` module attribute with in-place ops (`copy_`, `mul_`, `div_`). Same phase degradation — confirms the issue is NOT from tensor allocation but from how torch.compile handles the FP8 tensor-scale path across recompilations.
+
+**Analysis of phase degradation:**
+The step_avg "climbs" because early steps (~353ms) are fast and later steps (~430ms, then ~630ms) are slow due to different compiled kernels. The **total training time** averages to ~476ms/step, essentially identical to attempt 3f (476.77ms). The phase differences come from how torch.compile specializes different graph configurations — the FP8 tensor ops (amax reduction, tensor scale multiplication) interact differently with each specialization.
+
+**Key finding:** Attempt 3f avoids this by using `.item()` on module attribute weight scales (always the same tensor, dynamo knows its value at trace time) and a fixed global activation scale (Python float constant). The current scaling approach creates dynamic tensor operations that torch.compile can't optimize consistently across phases.
+
+**Convergence result:** val_loss=3.2810 is the BEST FP8 result yet — slightly better than 3f (3.2832) and only +0.002 above baseline (3.2794). Current scaling with all 12 layers converges nearly as well as baseline.
 
 ### Selective FP8 analysis
 - Each of the last 3 layers (9, 10, 11) contributes ~0.001 val_loss gap
@@ -324,4 +346,47 @@ Plan:
 
 *8×H100 estimates use scaling factor 40/482 (baseline step time ratio)*
 *Best convergence-safe option: 4c (skip last 2) — 0.55s faster, val_loss gap 0.002*
+| Current scaling (4f) | 5.5ms (1.1%) | 0.45ms | 0.68s |
+| Current + skip 1 (4g) | 6.1ms (1.3%) | 0.51ms | 0.76s |
+| Current + skip 2 (4h) | 6.4ms (1.3%) | 0.53ms | 0.80s |
+
+*8×H100 estimates use scaling factor 40/482 (baseline step time ratio)*
+*Best convergence-safe option: 4c (skip last 2) — 0.55s faster, val_loss gap 0.002*
 *Best speed option: 4d (skip last 1) — 0.72s faster, but val_loss gap 0.004 risks exceeding 3.28*
+*Current scaling (4f) has best convergence (gap 0.002) but same speed as 3f due to phase degradation*
+
+### Attempt 4g: Current scaling + skip last 1
+
+**Approach:** Current scaling (just-in-time amax per activation tensor) with last 1 layer kept in BF16 (`FP8_SKIP_LAST=1`). Combines the precision benefits of current scaling with selective FP8 for the most sensitive final layer.
+
+- **Result: val_loss=3.2781, step_avg=475.99ms**
+- Gap vs baseline: -0.001 (actually BETTER than baseline 3.2794!)
+- Speedup: 6.1ms/step faster than baseline (1.3%)
+- **Under 3.279 target with margin — BEST RESULT**
+
+### Attempt 4h: Current scaling + skip last 2
+
+**Approach:** Same as 4g but skipping last 2 layers (`FP8_SKIP_LAST=2`).
+
+- **Result: val_loss=3.2799, step_avg=475.65ms**
+- Gap vs baseline: +0.001
+- Speedup: 6.4ms/step faster than baseline (1.3%)
+- Just barely above 3.279 target — does NOT meet user target of ≤3.279
+
+### 4g vs 4h comparison
+
+| Run | Steps | ms/step | val_loss | Meets ≤3.279? |
+|-----|-------|---------|----------|---------------|
+| **Baseline** | 1490 | 482.09 | 3.2794 | Yes |
+| **4g (current, skip 1)** | 1490 | 475.99 | 3.2781 | **Yes** |
+| **4h (current, skip 2)** | 1490 | 475.65 | 3.2799 | No (3.2799) |
+
+**Winner: 4g** — best val_loss (3.2781, actually beats baseline), 6.1ms/step faster. Skipping 2 layers (4h) is marginally faster but doesn't reliably meet the 3.279 target.
+
+### How to run the winning config (4g)
+
+```bash
+FP8_SKIP_LAST=1 bash run.sh
+```
+
+The `FP8_SKIP_LAST` env var controls how many of the last 12 MLP layers stay in BF16 (default=0, meaning all layers use FP8). Without it, the code runs attempt 4f (all layers FP8, current scaling).
