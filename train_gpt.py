@@ -158,6 +158,7 @@ mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 # FP8 pre-quantized MLP weights for Triton kernel
 
 _FP8_ACT_SCALE = 16.0 / torch.finfo(torch.float8_e4m3fn).max  # ~0.036
+_FP8_ACT_SCALE_INV = 1.0 / _FP8_ACT_SCALE  # ~28.0
 
 def quantize_weights_fp8(model):
     """Pre-quantize MLP weight bank to FP8 for use in linear_relu_square Triton kernel."""
@@ -1373,7 +1374,6 @@ class GPT(nn.Module):
             # Select attention variant for this layer
             attn = self.attn_paired if i in self.paired_head_layers else self.attn
 
-            mlp_args = (c_fc, c_proj, fc_f8, fc_s) if use_mlp_fp8 else (c_fc, c_proj)
             # Skip attention on layer 6 @YouJiacheng. Instead pull skip connection from prior long window
             if i == 6:
                 x = x + skip_gate_out * skip_connection
@@ -1381,7 +1381,9 @@ class GPT(nn.Module):
                 attn_in = x_backout if x_backout is not None else x
                 attn_out = attn(norm(attn_in), attn_args, qkvo_w)
                 x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
-            x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), *mlp_args)
+            normed = norm(x)
+            mlp_args = (c_fc, c_proj, fc_f8, fc_s, (normed * _FP8_ACT_SCALE_INV).to(torch.float8_e4m3fn)) if use_mlp_fp8 else (c_fc, c_proj)
+            x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(normed, *mlp_args)
             if i == 3:
                 skip_connection = x
             if i == 7:

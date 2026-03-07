@@ -525,13 +525,35 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, w_scale=1.0):
         return c
 
 _FP8_ACT_SCALE = 16.0 / torch.finfo(torch.float8_e4m3fn).max  # ~0.036, covers activations up to 16
+_FP8_ACT_SCALE_INV = 1.0 / _FP8_ACT_SCALE  # ~28.0, multiply is faster than divide
+
+@triton.jit
+def _scale_cast_fp8_kernel(x_ptr, out_ptr, scale_inv, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    x = (x * scale_inv).to(tl.float8e4nv)
+    tl.store(out_ptr + offsets, x, mask=mask)
+
+def scale_cast_fp8(x: torch.Tensor) -> torch.Tensor:
+    """Fused multiply-by-inv-scale + cast to FP8 in a single Triton kernel."""
+    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    n = x.numel()
+    BLOCK_SIZE = 1024
+    grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+    _scale_cast_fp8_kernel[grid](x, out, _FP8_ACT_SCALE_INV, n, BLOCK_SIZE=BLOCK_SIZE)
+    return out
 
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, W1, W2, W1_f8=None, W1_s=1.0):
+    def forward(ctx, x, W1, W2, W1_f8=None, W1_s=1.0, x_f8=None):
         x_flat = x.view((-1, x.shape[-1]))
         if W1_f8 is not None:
-            x_f8 = (x_flat / _FP8_ACT_SCALE).to(torch.float8_e4m3fn)
+            if x_f8 is None:
+                x_f8 = scale_cast_fp8(x_flat)
+            else:
+                x_f8 = x_f8.view((-1, x_f8.shape[-1]))
             pre, post = linear_relu_square(x_flat, W1, a_f8=x_f8, b_f8=W1_f8, w_scale=W1_s)
         else:
             pre, post = linear_relu_square(x_flat, W1)
@@ -547,7 +569,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         dpre = linear_relu_square(grad_flat, W2, aux=pre)
         dW1 = dpre.T @ x
         dx = dpre @ W1
-        return dx.view(x.shape), dW1, dW2, None, None
+        return dx.view(x.shape), dW1, dW2, None, None, None
 
 
 # -----------------------------------------------------------------------------
