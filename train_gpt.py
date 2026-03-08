@@ -1221,14 +1221,7 @@ class GPT(nn.Module):
         self.bigram_embed = nn.Embedding(args.bigram_vocab_size, model_dim)
         nn.init.zeros_(self.bigram_embed.weight)
 
-        # Parallel-connections: 2-lane residual stream (attn reads lane0, MLP reads lane1)
-        self.parallel_start = 7 # Layers 7-10 are 2-lane
-
-        # Post-write scaling: [num_layers, 2, 2] = [layer, attn/mlp, lane0/lane1]
-        post_lambdas_init = torch.ones(num_layers, 2, 2)
-        for layer in range(self.parallel_start, num_layers):
-            post_lambdas_init[layer, 0, 1] = 1.5  # attn -> lane1 amplified for parallel layers
-        self.post_lambdas = nn.Parameter(post_lambdas_init)
+        self.post_lambdas = nn.Parameter(torch.ones(num_layers, 2))
 
         # Per-layer injection coefficients for x0 and bigram
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
@@ -1260,11 +1253,7 @@ class GPT(nn.Module):
         # ---- Schedule and layer topology ----
         mtp_weights, train_max_seq_len = schedule_cfg.mtp_weights, schedule_cfg.train_max_seq_len
         ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
-        skip_connections = []
-        skip_in = [3] # long attention window on layer 3
-        skip_out = [6] # no attn op on layer 6
-        x_backout = None
-        backout_layer = 7
+
         # set block masks and key shift
         bm_sizes = [ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, None, ws_short, ws_short, ws_short, ws_long]
         assert len(bm_sizes) == self.num_layers
@@ -1277,10 +1266,8 @@ class GPT(nn.Module):
         skip_lambda = self.scalars[2 * self.num_layers + 2]
         resid_lambdas_attn = self.resid_lambdas[:, 0].bfloat16().unbind(0)
         resid_lambdas_mlp  = self.resid_lambdas[:, 1].bfloat16().unbind(0)
-        post_lambdas_attn_ln0 = self.post_lambdas[:, 0, 0].bfloat16().unbind(0)
-        post_lambdas_attn_ln1 = self.post_lambdas[:, 0, 1].bfloat16().unbind(0)
-        post_lambdas_mlp_ln0  = self.post_lambdas[:, 1, 0].bfloat16().unbind(0)
-        post_lambdas_mlp_ln1  = self.post_lambdas[:, 1, 1].bfloat16().unbind(0)
+        post_lambdas_attn = self.post_lambdas[:, 0].bfloat16().unbind(0)
+        post_lambdas_mlp  = self.post_lambdas[:, 1].bfloat16().unbind(0)
         x0_lambdas = self.x0_lambdas.bfloat16().unbind(0)
         bigram_lambdas = self.bigram_lambdas.bfloat16().unbind(0)
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
@@ -1311,15 +1298,16 @@ class GPT(nn.Module):
         x = x0 = norm(x[None])
 
         # Initialize residual stream with pre-layer-0 bigram injection
-        # lane1 introduced at parallel_start (single-stream before that)
-        lane0 = x0 + x0_bigram * bigram_lambdas[0]
-        lane1 = None
+        x = x + x0_bigram * bigram_lambdas[0]
 
         # Precompute x0/bigram injection (added to attention output each layer)
         # Layer 0: bigram already injected above, so only x0 component
         x0_inject = (x0 * x0_lambdas[0],) + tuple(x0 * x0_lambdas[i] + x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
-
+        skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
+        
         # ---- Transformer layers ----
+        x_backout = None
+        skip_connection = None
         for i in range(self.num_layers):
             yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
             attn_args = AttnArgs(
@@ -1338,53 +1326,23 @@ class GPT(nn.Module):
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
 
-            # Introduce lane1 at parallel_start by copying lane0
-            if i == self.parallel_start:
-                lane1 = lane0
-
-            # Skip connection injection
-            if i in skip_out:
-                skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
-                skip_val = skip_connections.pop()
-                lane0 = lane0 + skip_gate_out * skip_val
-                if lane1 is not None:
-                    lane1 = lane1 + skip_gate_out * skip_val
-
             # Select attention variant for this layer
             attn = self.attn_paired if i in self.paired_head_layers else self.attn
 
-            # Dispatch based on layer type
-            post_attn = None
+            # Skip attention on layer 6 @YouJiacheng. Instead pull skip connection from prior long window
             if i == 6:
-                # MLP-only layer (no attention) @YouJiacheng
-                post_attn = lane0
-                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
-            elif i < self.parallel_start:
-                # Single-stream: attn and mlp both read/write lane0
-                attn_out = attn(norm(lane0), attn_args, qkvo_w)
-                lane0 = resid_lambdas_attn[i] * lane0 + attn_out + x0_inject[i]
-                post_attn = lane0
-                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
+                x = x + skip_gate_out * skip_connection
             else:
-                # Parallel: attn reads lane0, mlp reads lane1, both write to both lanes
-                attn_out = attn(norm(lane0), attn_args, qkvo_w)
-                lane0 = resid_lambdas_attn[i] * lane0 + post_lambdas_attn_ln0[i] * attn_out + x0_inject[i]
-                lane1 = resid_lambdas_attn[i] * lane1 + post_lambdas_attn_ln1[i] * attn_out
-                post_attn = lane0
-                mlp_out = ReLUSqrdMLP(norm(lane1), c_fc, c_proj)
-                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * mlp_out
-                lane1 = resid_lambdas_mlp[i] * lane1 + post_lambdas_mlp_ln1[i] * mlp_out
+                attn_in = x_backout if x_backout is not None else x
+                attn_out = attn(norm(attn_in), attn_args, qkvo_w)
+                x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
+            x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+            if i == 3:
+                skip_connection = x
+            if i == 7:
+                x_backout = x
 
-            # Skip connection and backout bookkeeping
-            if i in skip_in:
-                skip_connections.append(post_attn)
-            if i == backout_layer:
-                x_backout = lane0
-
-        # ---- Output and loss ----
-        x = (lane0 + lane1) * 0.5
-
-        # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
+        # back out contributions from first 7 layers
         x -= backout_lambda * x_backout
         x = norm(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
