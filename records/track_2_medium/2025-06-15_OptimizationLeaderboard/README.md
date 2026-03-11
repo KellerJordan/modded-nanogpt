@@ -6,8 +6,7 @@ The goal of this leaderboard is to collaboratively/competitively find good optim
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install -r requirements.txt
-# downloads 55B training tokens
-python data/cached_fineweb10B.py 55
+python data/cached_fineweb10B.py 55  # downloads 55B training tokens
 torchrun --standalone --nproc_per_node=8 records/track_2_medium/OptimizationLeaderboard/train_gpt_medium.py
 ```
 
