@@ -245,7 +245,7 @@ class Muon(torch.optim.Optimizer):
 
 
 ########################################
-#     Initialization and Optimizer     #
+#            Initialization            #
 ########################################
 
 model = GPT(vocab_size=50257, num_layers=12, model_dim=768).cuda()
