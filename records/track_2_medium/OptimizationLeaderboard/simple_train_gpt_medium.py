@@ -108,7 +108,7 @@ class GPT(nn.Module):
         x = norm(x)
         logits = self.proj(x).float()
         logits = 15 * logits * torch.rsqrt(logits.square() + 225)
-        return F.cross_entropy(logits, targets, reduction="sum")
+        return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
 
 
 ########################################
