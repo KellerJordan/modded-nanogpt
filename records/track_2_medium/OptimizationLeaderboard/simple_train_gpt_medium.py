@@ -298,10 +298,10 @@ dist.barrier()
 t0 = time.perf_counter()
 # begin training
 for step in range(train_steps + 1):
-    last_step = (step == train_steps)
+    is_last_step = (step == train_steps)
 
     # --------------- VALIDATION SECTION -----------------
-    if last_step or step % 125 == 0:
+    if is_last_step or step % 125 == 0:
         # stop the clock
         dist.barrier()
         training_time_ms += 1000 * (time.perf_counter() - t0)
@@ -321,7 +321,7 @@ for step in range(train_steps + 1):
         dist.barrier()
         t0 = time.perf_counter()
 
-    if last_step:
+    if is_last_step:
         # the last step only has the validation loop, so break to avoid training
         break
 
