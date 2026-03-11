@@ -45,7 +45,9 @@ A natural response is that this claim currently lacks evidence. For example, Muo
 
 So before taking this critique too seriously, we should ask for evidence. A critic should be able to point to an architectural change in the baseline that substantially alters the relative efficiency of two optimizers. Without that, the objection remains speculative.
 
-That said, even if such evidence were produced, it still would not really change the practical situation. The community would still need open-source leaderboards in order to get useful signal; the alternative is to rely blindly on claims made in papers, and that has never worked especially well. At most, it would imply that we need more than one leaderboard, so that different architectural regimes are represented.
+That said, even if such evidence could be produced, the practical need for leaderboards would still remain.
+For the public community, the only alternative to open-source leaderboards is to place naive trust in the claims made by papers, which has never worked out particularly well.
+Therefore, at most such evidence would only imply that we need more than one leaderboard, so that multiple architectural regimes can be represented.
 
 
 ## Notes
