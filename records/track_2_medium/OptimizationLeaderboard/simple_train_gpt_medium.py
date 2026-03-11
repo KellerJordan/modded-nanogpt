@@ -319,7 +319,7 @@ def get_lr(step: int):
 ########################################
 
 torch.cuda.reset_peak_memory_stats()
-train_loader = distributed_data_generator(args.train_files, world_size * args.batch_size)
+train_loader = distributed_data_generator(args.train_files, args.batch_size)
 training_time_ms = 0
 # start the clock
 dist.barrier()
@@ -335,10 +335,9 @@ for step in range(train_steps + 1):
         dist.barrier()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        val_batch_size = world_size * args.batch_size
-        assert args.val_tokens % val_batch_size == 0
-        val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size)
+        assert args.val_tokens % args.batch_size == 0
+        val_steps = args.val_tokens // args.batch_size
+        val_loader = distributed_data_generator(args.val_files, args.batch_size)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
