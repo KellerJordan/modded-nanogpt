@@ -277,6 +277,7 @@ for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
+val_tokens = 10485760
 batch_size = 8*64*1024
 train_steps = 6125
 cooldown_frac = 0.7
@@ -305,7 +306,6 @@ for step in range(train_steps + 1):
 
     # --------------- VALIDATION SECTION -----------------
     if last_step or step % 125 == 0:
-        val_tokens = 10485760
         # stop the clock
         dist.barrier()
         training_time_ms += 1000 * (time.perf_counter() - t0)
@@ -317,7 +317,6 @@ for step in range(train_steps + 1):
             for _ in range(val_tokens // batch_size):
                 inputs, targets = next(val_loader)
                 val_loss += model(inputs, targets)
-        del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
         val_loss /= val_tokens
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.6f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
