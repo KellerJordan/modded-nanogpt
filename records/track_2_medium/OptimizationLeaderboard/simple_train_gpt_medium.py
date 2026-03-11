@@ -22,15 +22,9 @@ import torch.distributed as dist
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
-def init_linear(w: Tensor):
-    std = 0.5 * (w.size(-1) ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
-    bound = (3 ** 0.5) * std
-    return w.uniform_(-bound, bound)
-
 class Linear(nn.Linear):
     def __init__(self, in_features, out_features):
         super().__init__(in_features, out_features, bias=False)
-        init_linear(self.weight.data)
     
     def forward(self, x):
         return F.linear(x, self.weight.bfloat16())
@@ -265,9 +259,21 @@ print0("="*100)
 ########################################
 
 model: nn.Module = GPT(vocab_size=50257, num_layers=12, model_dim=768).cuda()
+model.compile(dynamic=False)
+
+# initialize parameters
+for name, param in model.named_parameters():
+    w = param.data
+    if name.endswith("weight"):
+        if "proj" in name:
+            w.zero_()
+        else:
+            std = 0.5 * (w.size(-1) ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
+            bound = (3 ** 0.5) * std
+            w.uniform_(-bound, bound)
+
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
-model.compile(dynamic=False)
 
 # collect the parameters to optimize
 hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
