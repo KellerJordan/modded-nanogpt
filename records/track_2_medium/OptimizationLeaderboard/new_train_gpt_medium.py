@@ -469,26 +469,6 @@ def get_window_size_blocks(step: int):
 model: nn.Module = torch.compile(model, dynamic=False)
 
 ########################################
-#            Warmup kernels            #
-########################################
-
-# Warmup the training kernels, then re-initialize the state so we aren't cheating
-warmup_steps = 10
-initial_state = copy.deepcopy(dict(model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers]))
-for _ in range(warmup_steps):
-    inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
-    model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
-    for param in model.parameters():
-        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-    for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
-model.load_state_dict(initial_state["model"])
-for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
-    opt.load_state_dict(opt_state)
-del initial_state
-
-########################################
 #        Training and validation       #
 ########################################
 
