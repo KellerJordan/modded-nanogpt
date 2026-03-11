@@ -117,8 +117,7 @@ class GPT(nn.Module):
         x = norm(x)
         logits = self.proj(x).float()
         logits = 15 * logits * torch.rsqrt(logits.square() + 225)
-        loss = F.cross_entropy(logits, target_seq)
-        return loss
+        return F.cross_entropy(logits, target_seq, reduction="sum")
 
 
 ########################################
@@ -325,16 +324,15 @@ for step in range(train_steps + 1):
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
         assert args.val_tokens % args.batch_size == 0
-        val_steps = args.val_tokens // args.batch_size
         val_loader = distributed_data_generator(args.val_files, args.batch_size)
         val_loss = 0
         with torch.no_grad():
-            for _ in range(val_steps):
+            for _ in range(args.val_tokens // args.batch_size):
                 inputs, targets = next(val_loader)
                 val_loss += model(inputs, targets)
-        val_loss /= val_steps
         del val_loader
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+        val_loss /= args.val_tokens
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.6f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
