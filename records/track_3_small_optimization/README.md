@@ -48,8 +48,8 @@ in order to become informed of what works and doesn't work.
 Such researchers therefore typically have a good picture of what really works and doesn't work.
 * Academic researchers in prestigious labs are typically well-connected to sources of information, both in terms of learning from other academics, and sometimes
 secretly learning what's going on inside the ostensibly-closed corporate labs. They therefore have a pretty good idea of what really works and doesn't work.
-* Academics at non-prestigous labs and independent researchers are left out to dry by this arrangement. Currently, their best source of information
-is in the open-source research published by the Chinese industrial labs.
+* Independent researchers and academics at non-prestigous labs are left out to dry.
+Currently, their best source of information is the open-source research published by the Chinese industrial labs.
 
 
 ### Response to a potential critique
