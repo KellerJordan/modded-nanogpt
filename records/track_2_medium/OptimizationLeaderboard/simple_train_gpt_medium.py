@@ -212,15 +212,13 @@ class Muon(torch.optim.Optimizer):
 @dataclass
 class Hyperparameters:
     # data
-    train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
-    val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
-    val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens = 10485760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     batch_size = 8*64*1024
     # optimization
-    train_steps = 6125 # number of iterations to run
-    cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
+    train_steps = 6125  # number of iterations to run
+    cooldown_frac = 0.7  # fraction of training spent cooling down the learning rate
     # evaluation and logging
-    val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every = 125  # every how many steps to evaluate val loss? 0 for only at the end
 args = Hyperparameters()
 
 # torchrun sets these env variables
@@ -229,7 +227,7 @@ device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
-assert dist.get_world_size() == 8 # this code is designed for 8xH100
+assert 8 % dist.get_world_size() == 0  # no weird world sizes
 
 # begin logging
 if dist.get_rank() == 0:
@@ -303,7 +301,7 @@ def get_lr(step: int):
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(args.train_files, args.batch_size)
+train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", args.batch_size)
 training_time_ms = 0
 # start the clock
 dist.barrier()
@@ -319,7 +317,7 @@ for step in range(args.train_steps + 1):
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
         assert args.val_tokens % args.batch_size == 0
-        val_loader = distributed_data_generator(args.val_files, args.batch_size)
+        val_loader = distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", args.batch_size)
         val_loss = 0
         with torch.no_grad():
             for _ in range(args.val_tokens // args.batch_size):
