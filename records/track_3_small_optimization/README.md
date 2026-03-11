@@ -26,7 +26,7 @@ torchrun --standalone --nproc_per_node=$(nvidia-smi -L | wc -l) records/track_3_
 
 ## Rules
 
-To be considered a valid attempt at a new optimization record, an attempt must:
+To be considered a valid, a new record attempt must:
 1. Not change the dataset, batch size, or architecture.
 2. Attain 3.28 val loss.
 
