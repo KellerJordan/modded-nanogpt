@@ -165,7 +165,7 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int):
         super().__init__()
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len)
         self.mlp = MLP(dim)
@@ -185,7 +185,7 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = Linear(model_dim, next_multiple_of_n(vocab_size, n=128), init_zero=True)
