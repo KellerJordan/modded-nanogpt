@@ -282,7 +282,6 @@ for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
-val_tokens = 10485760
 batch_size = 8*64*1024
 train_steps = 3800
 cooldown_frac = 0.7
@@ -315,6 +314,7 @@ for step in range(train_steps + 1):
         dist.barrier()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
+        val_tokens = 10485760
         assert val_tokens % batch_size == 0
         val_loader = distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", batch_size)
         val_loss = 0
