@@ -38,7 +38,7 @@ class Linear(nn.Linear):
 class Rotary(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
+        # half-truncate RoPE (w/ base freq tuning)
         angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
         self.angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
 
@@ -131,9 +131,9 @@ def _load_data_shard(file: Path):
     assert header[1] == 1, "unsupported version"
     num_tokens = int(header[2]) # number of tokens (claimed)
     with file.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
         f.seek(256 * 4)
-        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
@@ -287,8 +287,6 @@ assert len(optimized_parameters_set) == sum(len(lst) for lst in params_collectio
 
 # init the optimizer(s)
 adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_params, lr=0.3), dict(params=scalar_params, lr=0.015)]
-# small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
-# discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
 optimizer2 = Muon(hidden_matrix_params, lr=0.025, weight_decay=0.01)
 optimizers = [optimizer1, optimizer2]
