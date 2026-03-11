@@ -12,6 +12,13 @@ python data/cached_fineweb10B.py 55  # downloads 55B training tokens
 torchrun --standalone --nproc_per_node=8 records/track_3_small_optimization/train_gpt_simple.py
 ```
 
+## Record history
+
+| # | Steps to 3.28 | Description | Date | Log | Contributors |
+| - | - | - | - | - | - |
+| 1 | 3800 | Muon baseline; lr=.02 wd=.01 | 2026/03/10 | [log](58ec69a8-ebfa-447c-94b6-88855e0139d1.txt) | @kellerjordan0 |
+
+
 ## Rules
 
 To be considered a valid attempt at a new optimization record, an attempt must:
@@ -20,12 +27,6 @@ To be considered a valid attempt at a new optimization record, an attempt must:
 
 To reduce the number of steps, record attempts are free to change the optimizer (algorithm or hyperparameters) as well as model initialization.
 
-
-## Record history
-
-| # | Steps to 3.28 | Description | Date | Log | Contributors |
-| - | - | - | - | - | - |
-| 1 | 3800 | Muon baseline; lr=.02 wd=.01 | 2026/03/10 | [log](58ec69a8-ebfa-447c-94b6-88855e0139d1.txt) | @kellerjordan0 |
 
 ## Discussion
 
