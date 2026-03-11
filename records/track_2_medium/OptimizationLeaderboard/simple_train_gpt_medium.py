@@ -243,7 +243,6 @@ model.compile(dynamic=False)
 #     Initialization and optimizer     #
 ########################################
 
-# initialize parameters
 for name, param in model.named_parameters():
     w = param.data
     if name.endswith("weight"):
@@ -253,8 +252,6 @@ for name, param in model.named_parameters():
             std = 0.5 * (w.size(-1) ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
             bound = (3 ** 0.5) * std
             w.uniform_(-bound, bound)
-
-for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
 # collect the parameters to optimize
