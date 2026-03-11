@@ -63,9 +63,6 @@ class CausalSelfAttention(nn.Module):
         self.v = Linear(dim, hdim)
         self.proj = Linear(hdim, dim, init_zero=True) # out zero init suggested by @Grad62304977
         self.rotary = Rotary(head_dim)
-        # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
-        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-        self.attn_scale = 0.12
 
     def forward(self, x: Tensor):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -74,7 +71,7 @@ class CausalSelfAttention(nn.Module):
         v = self.v(x).view(B, T, self.num_heads, self.head_dim)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), scale=self.attn_scale).transpose(1, 2)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), scale=0.12).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.proj(y)
         return y
