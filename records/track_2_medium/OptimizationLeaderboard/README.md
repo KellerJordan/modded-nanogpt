@@ -15,7 +15,7 @@ torchrun --standalone --nproc_per_node=8 records/track_2_medium/OptimizationLead
 ## Rules
 
 - Each optimizer will have its own history of records. We are interested in finding the best setting for each optimizer, in order to help the community make a fair comparisons and find good new optimizers.
-- The foundation of all runs in this leaderboard will be the NanoGPT-medium record from 04/22/25 which is held by @jadenj3o. New runs must not modify the main speedrun's architecture or data pipeline; in particular the batch size should stay the same.
+- The foundation of all runs in this leaderboard will be the NanoGPT-medium record of 04/22/25. New runs must not modify the main speedrun's architecture or data pipeline; in particular the batch size should stay the same.
 - New runs can use any optimizer. They will be considered a new record for their respective optimizer if they attain a faster steps-to-target than the previous record.
 
 ## Overall optimizer leaderboard
