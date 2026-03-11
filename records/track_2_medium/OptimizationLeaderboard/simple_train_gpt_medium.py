@@ -217,8 +217,6 @@ class Hyperparameters:
     # optimization
     train_steps = 6125  # number of iterations to run
     cooldown_frac = 0.7  # fraction of training spent cooling down the learning rate
-    # evaluation and logging
-    val_loss_every = 125  # every how many steps to evaluate val loss? 0 for only at the end
 args = Hyperparameters()
 
 # torchrun sets these env variables
@@ -312,7 +310,7 @@ for step in range(args.train_steps + 1):
     last_step = (step == args.train_steps)
 
     # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+    if last_step or step % 125 == 0:
         # stop the clock
         dist.barrier()
         training_time_ms += 1000 * (time.perf_counter() - t0)
