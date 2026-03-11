@@ -22,9 +22,9 @@ torchrun --standalone --nproc_per_node=8 records/track_3_small_optimization/trai
 
 | Optimizer | Steps to 3.28 | Hparam summary | Log | Contributors |
 | - | - | - | - | - |
-| [Muon](https://kellerjordan.github.io/posts/muon/) | ? | lr=.025, wd=.01, double wd for MLP | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @kellerjordan0 |
-| [AdamW](https://arxiv.org/abs/1711.05101) | ? | lr=.0015, wd=.125, warmup_steps=250 | ? | @kellerjordan0 |
-| [PSGD Kron](https://github.com/evanatyourservice/kron_torch) | ? | lr=.0005, wd=.625 | ? | @kellerjordan0 |
+| [Muon](https://kellerjordan.github.io/posts/muon/) | ? | lr=.025, wd=.01 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @kellerjordan0 |
+| [AdamW](https://arxiv.org/abs/1711.05101) | ? | lr=.0015, wd=.125, warmup_steps=250 | ? | ? |
+| [PSGD Kron](https://github.com/evanatyourservice/kron_torch) | ? | lr=.0005, wd=.625 | ? | ? |
 | [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo) | ? | ? | ? | ? | ? |
 | Sophia | ? | ? | ? | ? |
 | Lion | ? | ? | ? | ? |
@@ -39,21 +39,12 @@ torchrun --standalone --nproc_per_node=8 records/track_3_small_optimization/trai
 | - | - | - | - | - | - |
 | 1 | 5960 | lr=0.025, wd=0.01, double wd for MLP | 04/22/25 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj3o |
 
-Comments:
-* This is just the NanoGPT-medium speedrun record as of 06/15/25.
-* If we drop the custom weight decay settings (2x wd for MLP weights), then we lose ~165 steps.
-
 ### [AdamW](https://arxiv.org/abs/1711.05101)
 
 | # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
 | - | - | - | - | - | - |
 | 1 | 10500 | lr=0.0015, wd=0.125, warmup_steps=500, bf16 weights | 06/15/25 | ? | @kellerjordan0 |
 | 2 | 9500 | lr=0.0015, wd=0.125, warmup_steps=500 | 06/19/25 | ? | @kellerjordan0 |
-
-Precise steps to reproduce:
-* #1: In the main `train_gpt_medium.py`, replace `optimizer2` with `AdamW(hidden_matrix_params, lr=0.0015, weight_decay=0.125, betas=(0.9, 0.95), eps=1e-10)`
-and add a warmup using `if step < 500: return step / 500` in `get_lr()`.
-* #2: In the `train_gpt_medium.py` contained in this folder, which enables fp32 weights for any optimizer, do the same thing as above.
 
 ### [PSGD Kron](https://github.com/evanatyourservice/kron_torch)
 
