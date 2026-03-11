@@ -61,18 +61,18 @@ class CausalSelfAttention(nn.Module):
         self.q = Linear(dim, hdim)
         self.k = Linear(dim, hdim)
         self.v = Linear(dim, hdim)
-        self.proj = Linear(hdim, dim) # out zero init suggested by @Grad62304977
+        self.proj = Linear(hdim, dim)
         self.rotary = Rotary(head_dim)
 
     def forward(self, x: Tensor):
-        B, T = x.size(0), x.size(1) # batch size, sequence length
+        B, T = x.size(0), x.size(1)
         q = self.q(x).view(B, T, self.num_heads, self.head_dim)
         k = self.k(x).view(B, T, self.num_heads, self.head_dim)
         v = self.v(x).view(B, T, self.num_heads, self.head_dim)
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = norm(q), norm(k)
         q, k = self.rotary(q), self.rotary(k)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), scale=0.12).transpose(1, 2)
-        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
         y = self.proj(y)
         return y
 
@@ -85,7 +85,7 @@ class MLP(nn.Module):
 
     def forward(self, x: Tensor):
         x = self.fc(x)
-        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = F.relu(x).square()
         x = self.proj(x)
         return x
 
@@ -111,7 +111,7 @@ class GPT(nn.Module):
 
     def forward(self, input_seq: Tensor, target_seq: Tensor):
         assert input_seq.ndim == 1
-        x = norm(self.embed(input_seq)) # use of norm here by @Grad62304977
+        x = norm(self.embed(input_seq))
         x = x.view(len(x), -1, self.seq_len)
         for block in self.blocks:
             x = block(x)
@@ -126,7 +126,7 @@ class GPT(nn.Module):
 
 @torch.compile
 def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
-    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+    assert G.ndim >= 2
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
         X = X.mT
@@ -142,7 +142,7 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
         (2.8366, -3.0525, 1.2012),
     ]:
         A = X @ X.mT
-        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        B = b * A + c * A @ A
         X = a * X + B @ X
 
     if G.size(-2) > G.size(-1):
