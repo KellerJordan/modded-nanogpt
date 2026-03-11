@@ -61,7 +61,7 @@ class CausalSelfAttention(nn.Module):
         self.q = Linear(dim, hdim)
         self.k = Linear(dim, hdim)
         self.v = Linear(dim, hdim)
-        self.proj = Linear(hdim, dim, init_zero=True) # out zero init suggested by @Grad62304977
+        self.proj = Linear(hdim, dim) # out zero init suggested by @Grad62304977
         self.rotary = Rotary(head_dim)
 
     def forward(self, x: Tensor):
@@ -81,7 +81,7 @@ class MLP(nn.Module):
         super().__init__()
         hdim = 4 * dim
         self.fc = Linear(dim, hdim)
-        self.proj = Linear(hdim, dim, init_zero=True)
+        self.proj = Linear(hdim, dim)
 
     def forward(self, x: Tensor):
         x = self.fc(x)
@@ -90,9 +90,9 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int):
+    def __init__(self, dim: int, num_heads: int):
         super().__init__()
-        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len)
+        self.attn = CausalSelfAttention(dim, num_heads)
         self.mlp = MLP(dim)
 
     def forward(self, x: Tensor):
@@ -104,11 +104,9 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, seq_len: int):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len) for i in range(num_layers)])
-        # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
-        # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads) for _ in range(num_layers)])
         padded_vocab_size = 128 * (1 + (vocab_size - 1) // 128)
-        self.logits_proj = Linear(model_dim, padded_vocab_size)
+        self.proj = Linear(model_dim, padded_vocab_size)
         self.seq_len = seq_len
 
     def forward(self, input_seq: Tensor, target_seq: Tensor):
@@ -120,7 +118,7 @@ class GPT(nn.Module):
             x = block(x)
         x = norm(x)
 
-        logits = self.logits_proj(x).float()
+        logits = self.proj(x).float()
         logits = 15 * logits * torch.rsqrt(logits.square() + 225)
         loss = F.cross_entropy(logits, target_seq)
         return loss
