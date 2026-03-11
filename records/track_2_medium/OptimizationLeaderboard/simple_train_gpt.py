@@ -131,14 +131,14 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1
     files = sorted(Path.cwd().glob(filename_pattern))
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
-    file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
+    file_iter = iter(files)
     tokens, pos = _load_data_shard(next(file_iter)), 0
     while True:
         if pos + batch_size + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
         buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
         pos += batch_size
         yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
 
@@ -214,7 +214,7 @@ device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
-# This code is designed for world_size == 8. Running on fewer GPUs should be equivalent, but you might hit an OOM.
+# this code is designed for world_size == 8. running on fewer GPUs should be equivalent, but you might hit an OOM.
 assert 8 % dist.get_world_size() == 0
 
 # logging
