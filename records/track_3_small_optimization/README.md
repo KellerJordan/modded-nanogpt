@@ -14,7 +14,7 @@ You can run the current record via the following command.
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install -r requirements.txt
 python data/cached_fineweb10B.py 55  # downloads 55B training tokens
-torchrun --standalone --nproc_per_node=8 records/track_3_small_optimization/train_gpt_simple.py
+torchrun --standalone --nproc_per_node=$(nvidia-smi -L | wc -l) records/track_3_small_optimization/train_gpt_simple.py
 ```
 
 ## Record history
