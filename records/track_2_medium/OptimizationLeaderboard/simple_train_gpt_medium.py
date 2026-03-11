@@ -209,15 +209,6 @@ class Muon(torch.optim.Optimizer):
 # -----------------------------------------------------------------------------
 # int main
 
-@dataclass
-class Hyperparameters:
-    # data
-    batch_size = 8*64*1024
-    # optimization
-    train_steps = 6125  # number of iterations to run
-    cooldown_frac = 0.7  # fraction of training spent cooling down the learning rate
-args = Hyperparameters()
-
 # torchrun sets these env variables
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
@@ -286,27 +277,31 @@ for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
+batch_size = 8*64*1024
+train_steps = 6125
+cooldown_frac = 0.7
+
 # learning rate schedule: stable then decay
 def get_lr(step: int):
-    x = step / args.train_steps # progress in training
+    x = step / train_steps # progress in training
     assert 0 <= x < 1
-    if x < 1 - args.cooldown_frac:
+    if x < 1 - cooldown_frac:
         return 1.0
     else:
-        return (1 - x) / args.cooldown_frac
+        return (1 - x) / cooldown_frac
 
 ########################################
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", args.batch_size)
+train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
 training_time_ms = 0
 # start the clock
 dist.barrier()
 t0 = time.perf_counter()
 # begin training
-for step in range(args.train_steps + 1):
-    last_step = (step == args.train_steps)
+for step in range(train_steps + 1):
+    last_step = (step == train_steps)
 
     # --------------- VALIDATION SECTION -----------------
     if last_step or step % 125 == 0:
@@ -315,17 +310,17 @@ for step in range(args.train_steps + 1):
         dist.barrier()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        assert val_tokens % args.batch_size == 0
-        val_loader = distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", args.batch_size)
+        assert val_tokens % batch_size == 0
+        val_loader = distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", batch_size)
         val_loss = 0
         with torch.no_grad():
-            for _ in range(val_tokens // args.batch_size):
+            for _ in range(val_tokens // batch_size):
                 inputs, targets = next(val_loader)
                 val_loss += model(inputs, targets)
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
         val_loss /= val_tokens
-        print0(f"step:{step}/{args.train_steps} val_loss:{val_loss:.6f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.6f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
         dist.barrier()
@@ -350,6 +345,6 @@ for step in range(args.train_steps + 1):
     model.zero_grad(set_to_none=True)
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{args.train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 dist.destroy_process_group()
