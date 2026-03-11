@@ -14,46 +14,14 @@ torchrun --standalone --nproc_per_node=8 records/track_3_small_optimization/trai
 
 ## Rules
 
-- Changing the dataset, batch size, or architecture is disallowed. We are only interested in improving the optimizer.
-- Each optimizer will have its own history of records. We are interested in finding the best setting for each optimizer, in order to help the community make a fair comparisons and find good new optimizers.
-- New runs can use any optimizer. They will be considered a new record for their respective optimizer if they attain a faster steps-to-target than the previous record.
-
-## Overall optimizer leaderboard
-
-| Optimizer | Steps to 3.28 | Hparam summary | Log | Contributors |
-| - | - | - | - | - |
-| [Muon](https://kellerjordan.github.io/posts/muon/) | 3800 | lr=.02, wd=.01 | [log](58ec69a8-ebfa-447c-94b6-88855e0139d1.txt) | @kellerjordan0 |
-| [AdamW](https://arxiv.org/abs/1711.05101) | ? | ? | ? | ? |
-| [PSGD Kron](https://github.com/evanatyourservice/kron_torch) | ? | ? | ? | ? |
-| [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo) | ? | ? | ? | ? | ? |
-| Sophia | ? | ? | ? | ? |
-| Lion | ? | ? | ? | ? |
-| ? | ? | ? | ? | ? |
+- Record attempts are not allowed to change the dataset, batch size, or architecture.
+- Attempts are free to change the optimizer (algorithm and hyperparameters) as well as model initialization.
 
 
-## Per-optimizer record histories
+## Record history
 
-### [Muon](https://kellerjordan.github.io/posts/muon/)
-
-| # | Steps to 3.28 | Hparam summary | Date | Log | Contributors |
-| - | - | - | - | - | - |
-| 1 | 3800 | lr=0.02, wd=0.01 | 2026/03/10 | [log](58ec69a8-ebfa-447c-94b6-88855e0139d1.txt) | @kellerjordan0 |
-
-### [AdamW](https://arxiv.org/abs/1711.05101)
-
-| # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
-| - | - | - | - | - | - |
-| 1 | ? | ? | ? | ? | ? |
-
-Note: The last time I tried `AdamW` in a similar setting, it was optimal to use `lr=.0015, wd=.125, warmup_tokens=250`.
-
-### [PSGD Kron](https://github.com/evanatyourservice/kron_torch)
-
-| # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
-| - | - | - | - | - | - |
-| 1 | ? | ? | ? | ? | ? |
-
-Note: The last time I tried `Kron` in a similar setting, it was optimal to use `lr=.0005, weight_decay=.625`.
+| # | Steps to 3.28 | Description | Date | Log | Contributors |
+| 1 | 3800 | Muon baseline; lr=.02 wd=.01 | 2026/03/10 | [log](58ec69a8-ebfa-447c-94b6-88855e0139d1.txt) | @kellerjordan0 |
 
 ## Discussion
 
@@ -66,3 +34,10 @@ And here's a reply:
 First, it's simply not clear whether this is true. Muon was originally empirically determined for the CIFAR-10 speedrun, where it lowered the record from 3.09 to 2.59 seconds, and then it was transferred to NanoGPT, where it was found to "generalize." The fact that these two settings are about as different as you can get in deep learning research indicates that the process of searching for good optimizers doesn't actually tend to produce results that are "overfit" to the choice of architecture. Therefore, before taking this critique seriously, we should ask for evidence: The critic should describe an archiectural modification to the speedrun which causes the relative strength of a pair of optimizers to significantly change.
 
 That being said, even if such evidence could be procured, there would still not really be anything we can do about it. In particular, the community would still need open-source leaderboards to get signal (the alternative would be blindly trusting the claims made by papers, which has never worked very well). It would just need more than one of them in order to cover a variety of architectural cases.
+
+
+## Notes
+
+For future attempts:
+* The last time I tried [AdamW](https://arxiv.org/abs/1711.05101) in a similar setting, it was optimal to use `lr=.0015, wd=.125, warmup_tokens=250`.
+* The last time I tried [PSGD Kron](https://github.com/evanatyourservice/kron_torch) in a similar setting, it was optimal to use `lr=.0005, weight_decay=.625`.
