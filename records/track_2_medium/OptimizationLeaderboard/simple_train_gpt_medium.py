@@ -205,8 +205,9 @@ class Muon(torch.optim.Optimizer):
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
 
-# -----------------------------------------------------------------------------
-# int main
+########################################
+#                Setup                 #
+########################################
 
 # torchrun sets these env variables
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
@@ -234,12 +235,13 @@ print0("="*100)
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0("="*100)
 
-########################################
-#    Construct model and optimizer     #
-########################################
-
 model = GPT(vocab_size=50257, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
+
+
+########################################
+#     Initialization and optimizer     #
+########################################
 
 # initialize parameters
 for name, param in model.named_parameters():
