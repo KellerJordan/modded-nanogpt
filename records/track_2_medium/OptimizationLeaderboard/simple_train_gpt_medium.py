@@ -14,7 +14,6 @@ torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.nn.attention.flex_attention import BlockMask
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -47,8 +46,6 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
 def muon_update(grad, momentum, beta=0.95, nesterov=True):
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
-    if update.ndim == 4: # for the case of conv filters
-        update = update.view(len(update), -1)
     update = zeropower_via_newtonschulz5(update)
     update *= max(1, grad.size(-2) / grad.size(-1))**0.5
     return update
