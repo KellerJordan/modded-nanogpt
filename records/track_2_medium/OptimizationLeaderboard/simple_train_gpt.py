@@ -284,7 +284,7 @@ for opt in optimizers:
 
 val_tokens = 10485760
 batch_size = 8*64*1024
-train_steps = 4500
+train_steps = 4000
 cooldown_frac = 0.7
 
 # learning rate schedule: stable then decay
