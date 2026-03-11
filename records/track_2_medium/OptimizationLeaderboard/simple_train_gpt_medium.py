@@ -226,6 +226,7 @@ class Hyperparameters:
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     batch_size = 8*64*1024
+    seq_len = 1024
     # optimization
     num_iterations = 6125 # number of iterations to run
     cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
