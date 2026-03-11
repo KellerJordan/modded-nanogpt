@@ -22,6 +22,37 @@ import torch.distributed as dist
 
 
 ########################################
+#                Setup                 #
+########################################
+
+# torchrun sets these env variables
+device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+torch.cuda.set_device(device)
+dist.init_process_group(backend="nccl", device_id=device)
+dist.barrier()
+# this code is designed for world_size == 8. running on fewer GPUs should be equivalent, but you might hit an OOM.
+assert 8 % dist.get_world_size() == 0
+
+# logging
+if dist.get_rank() == 0:
+    os.makedirs("logs", exist_ok=True)
+    logfile = f"logs/{uuid.uuid4()}.txt"
+    print(logfile)
+def print0(s, console=False):
+    if dist.get_rank() == 0:
+        with open(logfile, "a") as f:
+            if console:
+                print(s)
+            print(s, file=f)
+
+# begin by printing this file (the Python code)
+print0(code)
+print0("="*100)
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
+print0("="*100)
+
+
+########################################
 #             Architecture             #
 ########################################
 
@@ -213,42 +244,11 @@ class Muon(torch.optim.Optimizer):
 
 
 ########################################
-#                Setup                 #
+#     Initialization and Optimizer     #
 ########################################
-
-# torchrun sets these env variables
-device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
-dist.barrier()
-# this code is designed for world_size == 8. running on fewer GPUs should be equivalent, but you might hit an OOM.
-assert 8 % dist.get_world_size() == 0
-
-# logging
-if dist.get_rank() == 0:
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{uuid.uuid4()}.txt"
-    print(logfile)
-def print0(s, console=False):
-    if dist.get_rank() == 0:
-        with open(logfile, "a") as f:
-            if console:
-                print(s)
-            print(s, file=f)
-
-# begin by printing this file (the Python code)
-print0(code)
-print0("="*100)
-print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
-print0("="*100)
 
 model = GPT(vocab_size=50257, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
-
-
-########################################
-#     Initialization and Optimizer     #
-########################################
 
 for name, param in model.named_parameters():
     w = param.data
@@ -310,7 +310,7 @@ for step in range(train_steps + 1):
     if is_last_step or step % 125 == 0:
         # stop the clock
         dist.barrier()
-        training_time_ms += time.perf_counter() - t0
+        training_time += time.perf_counter() - t0
         model.eval()
         val_tokens = 10485760
         assert val_tokens % batch_size == 0
