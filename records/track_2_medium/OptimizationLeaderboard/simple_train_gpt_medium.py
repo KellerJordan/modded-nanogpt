@@ -124,10 +124,10 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         hdim = num_heads * head_dim
-        self.c_q = Linear(dim, hdim)
-        self.c_k = Linear(dim, hdim)
-        self.c_v = Linear(dim, hdim)
-        self.c_proj = Linear(hdim, dim, init_zero=True) # out zero init suggested by @Grad62304977
+        self.q = Linear(dim, hdim)
+        self.k = Linear(dim, hdim)
+        self.v = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim, init_zero=True) # out zero init suggested by @Grad62304977
         self.rotary = Rotary(head_dim, max_seq_len)
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
@@ -136,28 +136,28 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q = self.c_q(x).view(B, T, self.num_heads, self.head_dim)
-        k = self.c_k(x).view(B, T, self.num_heads, self.head_dim)
-        v = self.c_v(x).view(B, T, self.num_heads, self.head_dim)
+        q = self.q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.v(x).view(B, T, self.num_heads, self.head_dim)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         v = norm(v)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), scale=self.attn_scale).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = self.c_proj(y)
+        y = self.proj(y)
         return y
 
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         hdim = 4 * dim
-        self.c_fc = Linear(dim, hdim)
-        self.c_proj = Linear(hdim, dim, init_zero=True)
+        self.fc = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim, init_zero=True)
 
     def forward(self, x: Tensor):
-        x = self.c_fc(x)
+        x = self.fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
+        x = self.proj(x)
         return x
 
 class Block(nn.Module):
