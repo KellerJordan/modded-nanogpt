@@ -9,7 +9,7 @@ pip install -r requirements.txt
 # downloads 55B training tokens
 python data/cached_fineweb10B.py 55
 cd track_2_medium/OptimizationLeaderboard
-./run.sh
+torchrun --standalone --nproc_per_node=8 records/track_2_medium/OptimizationLeaderboard/train_gpt_medium.py
 ```
 
 ## Rules
