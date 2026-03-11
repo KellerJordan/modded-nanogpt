@@ -240,12 +240,12 @@ class Hyperparameters:
 args = Hyperparameters()
 
 # torchrun sets these env variables
-assert dist.get_world_size() == 8 # this code is designed for 8xH100
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
+assert dist.get_world_size() == 8 # this code is designed for 8xH100
 
 # begin logging
 if dist.get_rank() == 0:
