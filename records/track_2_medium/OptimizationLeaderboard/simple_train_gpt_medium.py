@@ -53,11 +53,11 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, head_dim=128):
+    def __init__(self, dim: int, head_dim=128):
         super().__init__()
-        self.num_heads = num_heads
+        self.num_heads = dim // head_dim
         self.head_dim = head_dim
-        hdim = num_heads * head_dim
+        hdim = self.num_heads * self.head_dim
         self.q = Linear(dim, hdim)
         self.k = Linear(dim, hdim)
         self.v = Linear(dim, hdim)
@@ -90,9 +90,9 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int):
         super().__init__()
-        self.attn = CausalSelfAttention(dim, num_heads)
+        self.attn = CausalSelfAttention(dim)
         self.mlp = MLP(dim)
 
     def forward(self, x: Tensor):
@@ -101,10 +101,10 @@ class Block(nn.Module):
         return x
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int, seq_len: int):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads) for _ in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
         padded_vocab_size = 128 * (1 + (vocab_size - 1) // 128)
         self.proj = Linear(model_dim, padded_vocab_size)
         self.seq_len = seq_len
