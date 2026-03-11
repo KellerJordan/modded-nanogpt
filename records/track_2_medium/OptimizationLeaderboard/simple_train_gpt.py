@@ -320,10 +320,8 @@ for step in range(train_steps + 1):
         # start the clock again
         dist.barrier()
         t0 = time.perf_counter()
-
-    if is_last_step:
-        # the last step only has the validation loop, so break to avoid training
-        break
+        if is_last_step:
+            break
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
