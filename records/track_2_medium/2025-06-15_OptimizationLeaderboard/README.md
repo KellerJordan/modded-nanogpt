@@ -8,12 +8,11 @@ The goal of this leaderboard is to collaboratively/competitively find good optim
 - The foundation of all runs in this leaderboard will be the NanoGPT-medium record from 04/22/25 which is held by @jadenj3o. New runs must not modify the main speedrun's architecture or data pipeline; in particular the batch size should stay the same.
 - New runs can use any optimizer. They will be considered a new record for their respective optimizer if they attain a faster steps-to-target than the previous record.
 
-## Best currently known hyperparameters for each optimizer
+## Overall optimizer leaderboard
 
 | Optimizer | Steps to 2.92 | Hparam summary | Log | Contributors |
 | - | - | - | - | - |
-| Muon w/ 2x MLP wd | 5960 | lr=.025, wd=.01, double wd for MLP | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj30 et al. |
-| [Muon](https://kellerjordan.github.io/posts/muon/) | 6125 | lr=.025, wd=.01 | ? | @kellerjordan0 |
+| [Muon](https://kellerjordan.github.io/posts/muon/) | 5960 | lr=.025, wd=.01, double wd for MLP | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj30 et al. |
 | [AdamW](https://arxiv.org/abs/1711.05101) | 9500 | lr=.0015, wd=.125, warmup_steps=500 | ? | @kellerjordan0 |
 | [PSGD Kron](https://github.com/evanatyourservice/kron_torch) | 7875 | lr=.0005, wd=.625 | ? | @kellerjordan0 |
 | [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo) | ? | ? | ? | ? | ? |
@@ -22,23 +21,17 @@ The goal of this leaderboard is to collaboratively/competitively find good optim
 | ? | ? | ? | ? | ? |
 
 
-## Record histories for each optimizer
-
-### Muon w/ 2x MLP wd
-
-| # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
-| - | - | - | - | - | - |
-| 1 | 5960 | lr=0.025, wd=0.01, double wd for MLP | 04/22/25 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj3o |
-
-Comment: This is just the NanoGPT-medium speedrun record as of 06/15/25.
+## Per-optimizer record histories
 
 ### [Muon](https://kellerjordan.github.io/posts/muon/)
 
 | # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
 | - | - | - | - | - | - |
-| 1 | 6125 | lr=0.025, wd=0.01 | 06/19/25 | ? | @kellerjordan0 |
+| 1 | 5960 | lr=0.025, wd=0.01, double wd for MLP | 04/22/25 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj3o |
 
-Comment: We lose a ~165 steps by removing the custom weight decay settings from the speedrun.
+Comments:
+* This is just the NanoGPT-medium speedrun record as of 06/15/25.
+* If we drop the custom weight decay settings (2x wd for MLP weights), then we lose ~165 steps.
 
 ### [AdamW](https://arxiv.org/abs/1711.05101)
 
