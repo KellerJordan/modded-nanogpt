@@ -58,10 +58,10 @@ research. Fortunately, there is a relatively easy solution: The field can be reo
 If each new optimizer paper compares against a single leaderboard, rather than the current situation where each new paper
 makes up its own unique baseline, then effective new methods will become readily identified by anyone.
 
-The reasons this hasn't happened already are that (a) there is little incentive for anyone to enact this reorganization
-because the reorganization itself requires a relatively high level of clout to successfully kick off without generating much more of it, and (b) it is actually in the interest of the median paper
-*author* (not viewer/reader) to not use such a leaderboard, because the median paper involves overclaiming or fake results, which become
-impossible in the presence of a competitive leaderboard.
+The reasons this hasn't happened already are that (a) such a reorganization requires a relatively high level of academic clout to pull off, but
+(b) does not generate much more clout (whereas clouty individuals are typically looking for ways to get a bunch more), and separately (c)
+faces significant friction in adoption because authors are incentivized to use their own ad-hoc unique baselines,
+in order to enable (intentional or unintentional) manipulation/exaggeration of results.
 
 
 
