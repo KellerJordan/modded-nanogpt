@@ -124,8 +124,6 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         hdim = num_heads * head_dim
-        # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
-        # https://x.com/hi_tysam/status/1879699187107033311
         self.c_q = Linear(dim, hdim)
         self.c_k = Linear(dim, hdim)
         self.c_v = Linear(dim, hdim)
