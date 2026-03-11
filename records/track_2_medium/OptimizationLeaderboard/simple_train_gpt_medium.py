@@ -266,9 +266,9 @@ class GPT(nn.Module):
                        short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
         assert len(block_masks) == len(self.blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
         for i, block in enumerate(self.blocks):
-            x = block(x, x0, block_masks[i])
+            x = block(x, block_masks[i])
         x = norm(x)
         x = x.flatten(end_dim=1)
 
