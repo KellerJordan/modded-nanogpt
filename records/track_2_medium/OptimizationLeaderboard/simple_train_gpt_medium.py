@@ -4,7 +4,6 @@ with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
 import time
-import copy
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -15,23 +14,13 @@ torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
-# use of FlexAttention contributed by @KoszarskyB
-from torch.nn.attention.flex_attention import BlockMask, flex_attention
+from torch.nn.attention.flex_attention import BlockMask
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
 @torch.compile
 def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' ∈ [1 - l, 1 + r], which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
     assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
