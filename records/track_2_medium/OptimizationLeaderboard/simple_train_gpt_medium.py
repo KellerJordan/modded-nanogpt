@@ -304,7 +304,6 @@ def get_lr(step: int):
 #        Training and validation       #
 ########################################
 
-torch.cuda.reset_peak_memory_stats()
 train_loader = distributed_data_generator(args.train_files, args.batch_size)
 training_time_ms = 0
 # start the clock
