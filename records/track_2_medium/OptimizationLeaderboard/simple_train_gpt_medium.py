@@ -100,18 +100,15 @@ class Block(nn.Module):
         return x
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, model_dim: int, seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
         self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
         padded_vocab_size = 128 * (1 + (vocab_size - 1) // 128)
         self.proj = Linear(model_dim, padded_vocab_size)
-        self.seq_len = seq_len
 
     def forward(self, input_seq: Tensor, target_seq: Tensor):
-        assert input_seq.ndim == 1
         x = norm(self.embed(input_seq))
-        x = x.view(-1, self.seq_len, x.size(-1))
         for block in self.blocks:
             x = block(x)
         x = norm(x)
@@ -136,7 +133,7 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-def distributed_data_generator(filename_pattern: str, batch_size: int):
+def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len: int):
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     files = sorted(Path.cwd().glob(filename_pattern))
@@ -151,7 +148,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int):
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
         pos += batch_size
-        yield inputs, targets
+        yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
 
 
 ########################################
@@ -232,8 +229,6 @@ class Hyperparameters:
     # optimization
     num_iterations = 6125 # number of iterations to run
     cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
-    # architecture
-    vocab_size = 50257
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
 args = Hyperparameters()
@@ -268,7 +263,7 @@ print0("="*100)
 #    Construct model and optimizer     #
 ########################################
 
-model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=12, model_dim=768, seq_len=1024).cuda()
+model: nn.Module = GPT(vocab_size=50257, num_layers=12, model_dim=768, seq_len=1024).cuda()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 model.compile(dynamic=False)
@@ -307,7 +302,7 @@ def get_lr(step: int):
 ########################################
 
 torch.cuda.reset_peak_memory_stats()
-train_loader = distributed_data_generator(args.train_files, args.batch_size)
+train_loader = distributed_data_generator(args.train_files, args.batch_size, args.seq_len)
 training_time_ms = 0
 # start the clock
 dist.barrier()
@@ -324,7 +319,7 @@ for step in range(train_steps + 1):
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
         assert args.val_tokens % args.batch_size == 0
-        val_loader = distributed_data_generator(args.val_files, args.batch_size)
+        val_loader = distributed_data_generator(args.val_files, args.batch_size, args.seq_len)
         val_loss = 0
         with torch.no_grad():
             for _ in range(args.val_tokens // args.batch_size):
