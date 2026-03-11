@@ -52,6 +52,7 @@ even finding out through their connections about what's going on inside the oste
 Currently, their best source of information is the open-source research published by the Chinese industry.
 
 My understanding is that the majority of all humans who are working on AI research fall into this last category.
+Certainly, the majority of efforts to develop new optimizers are conducted by non-elite non-corporate academics.
 It is therefore quite unfortunate that they are not being well-served - to use left terminology - by the current structure of
 research. Fortunately, there is a relatively easy solution: The field can be reorganized around competitive leaderboards.
 If each new optimizer paper compares against a single leaderboard, rather than the current situation where each new paper
