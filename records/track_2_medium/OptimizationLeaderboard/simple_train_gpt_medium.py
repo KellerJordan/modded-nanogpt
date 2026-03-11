@@ -40,7 +40,7 @@ class Rotary(nn.Module):
         super().__init__()
         # half-truncate RoPE (w/ base freq tuning)
         angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
-        self.angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
+        self.angular_freq = nn.Buffer(torch.cat([angular_freq, angular_freq.new_zeros(dim//4)]))
 
     def forward(self, x_BTHD: Tensor):
         pos = torch.arange(x_BTHD.size(1), dtype=torch.float, device=x_BTHD.device)
