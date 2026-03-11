@@ -1,4 +1,4 @@
-# NanoGPT-Medium Optimizer Leaderboard
+# NanoGPT-Small Optimizer Leaderboard
 
 The goal of this leaderboard is to collaboratively|competitively find the optimizer for training to the NanoGPT-medium benchmark perplexity. Unlike the main speedrun which seeks to minimize wallclock, here we will only care about minimizing step count by improving the optimizer.
 
@@ -9,7 +9,7 @@ You can run the current record via the following command.
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install -r requirements.txt
 python data/cached_fineweb10B.py 55  # downloads 55B training tokens
-torchrun --standalone --nproc_per_node=8 records/track_2_medium/OptimizationLeaderboard/simple_train_gpt.py
+torchrun --standalone --nproc_per_node=8 records/track_3_small_optimization/train_gpt_simple.py
 ```
 
 ## Rules
