@@ -212,7 +212,6 @@ class Muon(torch.optim.Optimizer):
 @dataclass
 class Hyperparameters:
     # data
-    val_tokens = 10485760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     batch_size = 8*64*1024
     # optimization
     train_steps = 6125  # number of iterations to run
@@ -311,20 +310,21 @@ for step in range(args.train_steps + 1):
 
     # --------------- VALIDATION SECTION -----------------
     if last_step or step % 125 == 0:
+        val_tokens = 10485760
         # stop the clock
         dist.barrier()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        assert args.val_tokens % args.batch_size == 0
+        assert val_tokens % args.batch_size == 0
         val_loader = distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", args.batch_size)
         val_loss = 0
         with torch.no_grad():
-            for _ in range(args.val_tokens // args.batch_size):
+            for _ in range(val_tokens // args.batch_size):
                 inputs, targets = next(val_loader)
                 val_loss += model(inputs, targets)
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
-        val_loss /= args.val_tokens
+        val_loss /= val_tokens
         print0(f"step:{step}/{args.train_steps} val_loss:{val_loss:.6f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
