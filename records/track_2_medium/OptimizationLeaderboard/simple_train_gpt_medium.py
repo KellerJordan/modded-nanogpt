@@ -137,7 +137,9 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, rank : int, world_size : int):
+def distributed_data_generator(filename_pattern: str, batch_size: int):
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
     files = sorted(Path.cwd().glob(filename_pattern))
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
@@ -318,7 +320,7 @@ def get_lr(step: int):
 ########################################
 
 torch.cuda.reset_peak_memory_stats()
-train_loader = distributed_data_generator(args.train_files, world_size * args.batch_size, rank, world_size)
+train_loader = distributed_data_generator(args.train_files, world_size * args.batch_size)
 training_time_ms = 0
 # start the clock
 dist.barrier()
@@ -337,7 +339,7 @@ for step in range(train_steps + 1):
         val_batch_size = world_size * args.batch_size
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
+        val_loader = distributed_data_generator(args.val_files, val_batch_size)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
