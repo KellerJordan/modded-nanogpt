@@ -35,9 +35,22 @@ To reduce the number of steps needed to reach 3.28, record attempts are free to 
 
 ## Discussion
 
-### The need for some sieve that can filter signal from noise
+### There is a need for some sieve that can filter signal from noise
 
-There are [hundreds](https://chatgpt.com/c/69b10bd7-f92c-8325-b516-d999b5b2b409) to [thousands](https://claude.ai/share/fb9590de-c4b7-44f8-bfbb-7f80af30d3f9) of neural network optimizer papers.
+There are [hundreds](https://chatgpt.com/c/69b10bd7-f92c-8325-b516-d999b5b2b409) to [thousands](https://claude.ai/share/fb9590de-c4b7-44f8-bfbb-7f80af30d3f9) of neural network optimizer papers floating around.
+The typical such paper claims to improve upon standard practice by a wide margin, e.g., the [Sophia](https://arxiv.org/abs/2305.14342) claims to attain
+a 2x speedup over Adam.
+With few compelling meta-analyses out there, anyone interested in conducting neural network optimization research must technically
+go through and replicate every such paper before being able to claim to be caught up with the literature.
+Of course, this is impossible. So the practical alternative is that each researcher relies on their (human) network
+in order to become informed of what works and doesn't work.
+* Industry reserachers inside of the large industry labs benefit from gigantic human networks, who are mostly not incentivized to fake results.
+Such researchers therefore typically have a good picture of what really works and doesn't work.
+* Academic researchers in prestigious labs are typically well-connected to sources of information, both in terms of learning from other academics, and sometimes
+secretly learning from the nominally closed industry labs. They therefore have a pretty good idea of what really works and doesn't work.
+* Academics at non-prestigous labs and independent researchers are left out to dry by this arrangement. Currently, their best source of information
+is in the open-source research published by the Chinese industrial labs.
+
 
 ### Response to a potential critique
 
@@ -45,7 +58,7 @@ One possible critique of a leaderboard like this is the following, quoted from a
 
 > The idea of SOTA in “optimization” is b.s. When the architecture changes we may get need different optimization algorithms.
 
-And here's a reply:
+Here's a reply:
 
 A natural response is that this claim simply lacks evidence. For example, Muon was originally found empirically in the CIFAR-10 speedrun setting, where it lowered the record from 3.09 to 2.59 seconds.
 It was then transferred to NanoGPT, where it also worked well. These two settings are about as different as one can reasonably find within deep learning research, which suggests that the process of searching for good optimizers does not, in practice, usually produce results that are merely overfit to a particular architecture.
