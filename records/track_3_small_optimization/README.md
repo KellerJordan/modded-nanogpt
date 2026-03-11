@@ -61,7 +61,7 @@ then effective new methods will become readily identifiable.
 The reasons this hasn't happened already are that (a) creating a benchmark with enough momentum to have a chance at being adopted requires a relatively high level of preexisting clout to pull off, but
 (b) generates zero money and not much more clout if successful (whereas clouty individuals are typically looking for ways to get more), and also separately (c)
 faces significant friction, because authors are of course incentivized to keep using their own ad-hoc unique baselines,
-in order to enable continued (intentional or unintentional) manipulation/exaggeration of results.
+in order to enable continued manipulation/exaggeration of results (intentional or unintentional).
 
 
 
