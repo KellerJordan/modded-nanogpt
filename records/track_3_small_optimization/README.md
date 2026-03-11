@@ -18,7 +18,7 @@ To be considered a valid attempt at a new optimization record, an attempt must:
 1. Not change the dataset, batch size, or architecture.
 2. Attain 3.28 val loss.
 
-To reduce the number of steps, record attempts are free to change the optimizer (algorithm and hyperparameters) as well as model initialization.
+To reduce the number of steps, record attempts are free to change the optimizer (algorithm or hyperparameters) as well as model initialization.
 
 
 ## Record history
