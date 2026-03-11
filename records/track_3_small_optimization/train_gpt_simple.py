@@ -249,7 +249,7 @@ model.compile(dynamic=False)
 
 
 ########################################
-#     Initialization and optimizer     #
+#     Initialization and Optimizer     #
 ########################################
 
 for name, param in model.named_parameters():
@@ -296,8 +296,9 @@ def get_lr(step: int):
     else:
         return (1 - x) / cooldown_frac
 
+
 ########################################
-#        Training and validation       #
+#        Training and Validation       #
 ########################################
 
 train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
