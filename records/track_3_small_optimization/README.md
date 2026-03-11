@@ -24,6 +24,7 @@ To reduce the number of steps, record attempts are free to change the optimizer 
 ## Record history
 
 | # | Steps to 3.28 | Description | Date | Log | Contributors |
+| - | - | - | - | - | - |
 | 1 | 3800 | Muon baseline; lr=.02 wd=.01 | 2026/03/10 | [log](58ec69a8-ebfa-447c-94b6-88855e0139d1.txt) | @kellerjordan0 |
 
 ## Discussion
