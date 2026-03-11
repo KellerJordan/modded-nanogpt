@@ -56,7 +56,7 @@ Certainly, the majority of efforts to develop new optimizers are conducted by no
 It is therefore quite unfortunate that they are not being well-served - to use left terminology - by the current structure of
 research. Fortunately, there is a relatively easy solution: The field can be reorganized around competitive leaderboards/benchmarks.
 If each new optimizer paper compares against a single leaderboard, rather than the current situation where each new paper
-makes up its own unique baseline, then the most effective methods can be readily identified by anyone.
+makes up its own unique baseline, then effective new methods will become readily identified by anyone.
 
 The reason this hasn't already happened are that (a) there is little incentive for anyone to enact this reorganization
 because it the reorganization itself generates little academic clout, and (b) it is actually in the interest of the median paper
