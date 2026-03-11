@@ -1,3 +1,10 @@
+"""
+simple_train_gpt.py
+
+This code descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
+See the repo for a full list of contributors.
+"""
+
 import os
 import sys
 with open(sys.argv[0]) as f:
