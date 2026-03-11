@@ -322,7 +322,7 @@ for step in range(train_steps + 1):
                 val_loss += model(inputs, targets)
         dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
         val_loss /= val_tokens
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.6f} train_time:{training_time:.3f}s"
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
                + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
