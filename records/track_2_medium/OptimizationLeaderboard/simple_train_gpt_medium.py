@@ -174,9 +174,6 @@ class Block(nn.Module):
 # -----------------------------------------------------------------------------
 # The main model
 
-def next_multiple_of_n(v: float | int, *, n: int):
-    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
-
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
         super().__init__()
@@ -184,7 +181,8 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = Linear(model_dim, next_multiple_of_n(vocab_size, n=128), init_zero=True)
+        padded_vocab_size = 128 * (1 + (vocab_size - 1) // 128)
+        self.logits_proj = Linear(model_dim, padded_vocab_size)
 
     def forward(self, input_seq: Tensor, target_seq: Tensor):
         assert input_seq.ndim == 1
@@ -195,7 +193,7 @@ class GPT(nn.Module):
         x = norm(x)
         x = x.flatten(end_dim=1)
 
-        logits = self.lm_head(x).float()
+        logits = self.logits_proj(x).float()
         logits = 15 * logits * torch.rsqrt(logits.square() + 225)
         loss = F.cross_entropy(logits, target_seq)
         return loss
