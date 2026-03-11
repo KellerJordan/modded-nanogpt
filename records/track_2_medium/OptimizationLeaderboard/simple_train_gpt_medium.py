@@ -127,7 +127,7 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len: int):
+def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     files = sorted(Path.cwd().glob(filename_pattern))
@@ -217,7 +217,6 @@ class Hyperparameters:
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     batch_size = 8*64*1024
-    seq_len = 1024
     # optimization
     num_iterations = 6125 # number of iterations to run
     cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
@@ -306,7 +305,7 @@ def get_lr(step: int):
 ########################################
 
 torch.cuda.reset_peak_memory_stats()
-train_loader = distributed_data_generator(args.train_files, args.batch_size, args.seq_len)
+train_loader = distributed_data_generator(args.train_files, args.batch_size)
 training_time_ms = 0
 # start the clock
 dist.barrier()
@@ -323,7 +322,7 @@ for step in range(train_steps + 1):
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
         assert args.val_tokens % args.batch_size == 0
-        val_loader = distributed_data_generator(args.val_files, args.batch_size, args.seq_len)
+        val_loader = distributed_data_generator(args.val_files, args.batch_size)
         val_loss = 0
         with torch.no_grad():
             for _ in range(args.val_tokens // args.batch_size):
