@@ -328,7 +328,7 @@ for step in range(train_steps + 1):
     model(inputs, targets).backward()
     for name, param in model.named_parameters():
         assert param.grad is not None, name
-        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
     # set optimization hyperparameters and take step
     for opt in optimizers:
         for group in opt.param_groups:
