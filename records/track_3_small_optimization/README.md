@@ -61,7 +61,7 @@ makes up its own unique baseline, then effective new methods will become readily
 The reason this hasn't already happened are that (a) there is little incentive for anyone to enact this reorganization
 because it the reorganization itself generates little academic clout, and (b) it is actually in the interest of the median paper
 *author* (not viewer/reader) to not use such a leaderboard, because the median paper involves overclaiming or fake reuslts, which become
-impossible in the presence of a competitive leaderboard. But, as the Muon author, maybe I am clouty enough to make a change.
+impossible in the presence of a competitive leaderboard. But, as the Muon firstauthor, maybe I am clouty enough to make a change.
 
 
 
