@@ -278,7 +278,7 @@ model.compile(dynamic=False)
 hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
 embed_params = [*model.embed.parameters()]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
-head_params: list[nn.Parameter] = [model.lm_head.weight]
+head_params: list[nn.Parameter] = [model.proj.weight]
 # sanity check
 params_collections = [hidden_matrix_params, embed_params, scalar_params, head_params]
 optimized_parameters_set = {p for params in params_collections for p in params}
