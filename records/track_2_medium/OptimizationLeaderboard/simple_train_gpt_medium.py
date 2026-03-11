@@ -4,7 +4,6 @@ with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -278,7 +277,7 @@ for opt in optimizers:
 
 val_tokens = 10485760
 batch_size = 8*64*1024
-train_steps = 6125
+train_steps = 4500
 cooldown_frac = 0.7
 
 # learning rate schedule: stable then decay
