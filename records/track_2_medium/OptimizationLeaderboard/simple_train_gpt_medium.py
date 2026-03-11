@@ -26,12 +26,9 @@ def init_linear(w: Tensor):
     return w.uniform_(-bound, bound)
 
 class Linear(nn.Linear):
-    def __init__(self, in_features, out_features, init_zero=False):
+    def __init__(self, in_features, out_features):
         super().__init__(in_features, out_features, bias=False)
-        if init_zero:
-            self.weight.data.zero_()
-        else:
-            init_linear(self.weight.data)
+        init_linear(self.weight.data)
     
     def forward(self, x):
         return F.linear(x, self.weight.bfloat16())
