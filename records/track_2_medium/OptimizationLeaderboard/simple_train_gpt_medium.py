@@ -152,8 +152,10 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
         pos += batch_size
         yield inputs, targets
 
-# -----------------------------------------------------------------------------
-# Optimizer
+
+########################################
+#              Optimizer               #
+########################################
 
 @torch.compile
 def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
@@ -214,6 +216,7 @@ class Muon(torch.optim.Optimizer):
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
 
 # -----------------------------------------------------------------------------
 # int main
