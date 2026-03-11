@@ -276,7 +276,7 @@ assert len(optimized_parameters_set) == sum(len(lst) for lst in params_collectio
 # init the optimizer(s)
 adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_params, lr=0.3)]
 optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.025, weight_decay=0.01)
+optimizer2 = Muon(hidden_matrix_params, lr=0.02, weight_decay=0.01)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
@@ -284,7 +284,7 @@ for opt in optimizers:
 
 val_tokens = 10485760
 batch_size = 8*64*1024
-train_steps = 4000
+train_steps = 3800
 cooldown_frac = 0.7
 
 # learning rate schedule: stable then decay
