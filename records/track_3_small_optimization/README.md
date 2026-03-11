@@ -54,9 +54,9 @@ Currently, their best source of information is the open-source research publishe
 My understanding is that the majority of all humans who are working on AI research fall into this last category.
 Certainly, the majority of efforts to develop new optimizers are conducted by non-elite non-corporate academics.
 It is therefore unfortunate that they are not being well-served - to use left terminology - by the current structure of
-research. Fortunately, there is a relatively easy solution: The field can be reorganized around competitive leaderboards/benchmarks.
-If each new optimizer paper compares against a single leaderboard, rather than the current situation where each new paper
-makes up its own unique baseline, then effective new methods will become readily identified by anyone.
+research. Fortunately, there is a relatively easy solution:
+If new optimizer papers line themselves up on a competitive leaderboard/benchmark,
+then effective new methods will become readily identifiable.
 
 The reasons this hasn't happened already are that (a) such a reorganization requires a relatively high level of preexisting clout to pull off, but
 (b) generates zero money and not much more clout if successful (whereas clouty individuals are typically looking for ways to get more), and separately (c)
