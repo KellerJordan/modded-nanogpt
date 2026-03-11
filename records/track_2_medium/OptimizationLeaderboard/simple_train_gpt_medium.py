@@ -15,70 +15,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 # -----------------------------------------------------------------------------
-# Muon optimizer
-
-@torch.compile
-def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
-    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
-    X = G.bfloat16()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations
-    for a, b, c in [
-        (4.0848, -6.8946, 2.9270),
-        (3.9505, -6.3029, 2.6377),
-        (3.7418, -5.5913, 2.3037),
-        (2.8769, -3.1427, 1.2046),
-        (2.8366, -3.0525, 1.2012),
-    ]:
-        A = X @ X.mT
-        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
-
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-    return X
-
-def muon_update(grad, momentum, beta=0.95, nesterov=True):
-    momentum.lerp_(grad, 1 - beta)
-    update = grad.lerp_(momentum, beta) if nesterov else momentum
-    update = zeropower_via_newtonschulz5(update)
-    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
-    return update
-
-class Muon(torch.optim.Optimizer):
-    """
-    https://kellerjordan.github.io/posts/muon/
-    """
-    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
-        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
-        params = sorted(params, key=lambda x: x.size(), reverse=True)
-        super().__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self):
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
-        for group in self.param_groups:
-            params = group["params"]
-            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
-            for base_i in range(len(params))[::world_size]:
-                if base_i + rank < len(params):
-                    p = params[base_i + rank]
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state["momentum_buffer"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
-                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
-
-# -----------------------------------------------------------------------------
-# PyTorch nn.Module definitions for the model
+# Architecture
 
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
@@ -171,9 +108,6 @@ class Block(nn.Module):
         x = x + self.mlp(norm(x))
         return x
 
-# -----------------------------------------------------------------------------
-# The main model
-
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
         super().__init__()
@@ -197,6 +131,69 @@ class GPT(nn.Module):
         logits = 15 * logits * torch.rsqrt(logits.square() + 225)
         loss = F.cross_entropy(logits, target_seq)
         return loss
+
+# -----------------------------------------------------------------------------
+# Optimizer
+
+@torch.compile
+def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
+    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Perform the NS iterations
+    for a, b, c in [
+        (4.0848, -6.8946, 2.9270),
+        (3.9505, -6.3029, 2.6377),
+        (3.7418, -5.5913, 2.3037),
+        (2.8769, -3.1427, 1.2046),
+        (2.8366, -3.0525, 1.2012),
+    ]:
+        A = X @ X.mT
+        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+def muon_update(grad, momentum, beta=0.95, nesterov=True):
+    momentum.lerp_(grad, 1 - beta)
+    update = grad.lerp_(momentum, beta) if nesterov else momentum
+    update = zeropower_via_newtonschulz5(update)
+    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    return update
+
+class Muon(torch.optim.Optimizer):
+    """
+    https://kellerjordan.github.io/posts/muon/
+    """
+    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95):
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
+        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        for group in self.param_groups:
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            for base_i in range(len(params))[::world_size]:
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum_buffer"] = torch.zeros_like(p)
+                    update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
