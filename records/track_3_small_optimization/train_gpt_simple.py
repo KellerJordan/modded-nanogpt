@@ -156,7 +156,6 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1
 #              Optimizer               #
 ########################################
 
-@torch.compile
 def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     assert G.ndim >= 2
     X = G.bfloat16()
@@ -181,6 +180,7 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
         X = X.mT
     return X
 
+@torch.compile
 def muon_update(grad, momentum, beta=0.95, nesterov=True):
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
