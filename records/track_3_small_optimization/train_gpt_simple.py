@@ -322,7 +322,8 @@ for step in range(train_steps + 1):
                 val_loss += model(inputs, targets)
         dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
         val_loss /= val_tokens
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.6f} train_time:{training_time:.3f}s step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.6f} train_time:{training_time:.3f}s"
+               + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
         dist.barrier()
@@ -343,6 +344,7 @@ for step in range(train_steps + 1):
         opt.step()
     model.zero_grad(set_to_none=True)
     approx_training_time = training_time + (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
+           + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True)
 
 dist.destroy_process_group()
