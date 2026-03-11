@@ -482,12 +482,10 @@ for step in range(train_steps + 1):
     for name, param in model.named_parameters():
         assert param.grad is not None, name
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-    # set optimization hyperparameters
+    # set optimization hyperparameters and take step
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * get_lr(step)
-    # step the optimizers
-    for opt in optimizers:
         opt.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
