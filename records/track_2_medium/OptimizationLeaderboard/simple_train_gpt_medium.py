@@ -109,7 +109,7 @@ class Block(nn.Module):
         return x
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, seq_len: int):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len) for i in range(num_layers)])
@@ -117,15 +117,16 @@ class GPT(nn.Module):
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         padded_vocab_size = 128 * (1 + (vocab_size - 1) // 128)
         self.logits_proj = Linear(model_dim, padded_vocab_size)
+        self.seq_len = seq_len
 
     def forward(self, input_seq: Tensor, target_seq: Tensor):
         assert input_seq.ndim == 1
 
-        x = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x = norm(self.embed(input_seq)) # use of norm here by @Grad62304977
+        x = x.view(len(x), -1, self.seq_len)
         for block in self.blocks:
             x = block(x)
         x = norm(x)
-        x = x.flatten(end_dim=1)
 
         logits = self.logits_proj(x).float()
         logits = 15 * logits * torch.rsqrt(logits.square() + 225)
