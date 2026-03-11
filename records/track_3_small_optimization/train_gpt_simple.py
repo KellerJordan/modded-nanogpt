@@ -33,7 +33,7 @@ dist.barrier()
 # this code is designed for world_size == 8. running on fewer GPUs should be equivalent, but you might hit an OOM.
 assert 8 % dist.get_world_size() == 0
 
-# logging
+# logging setup
 if dist.get_rank() == 0:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{uuid.uuid4()}.txt"
@@ -45,7 +45,7 @@ def print0(s, console=False):
                 print(s)
             print(s, file=f)
 
-# begin by printing this file (the Python code)
+# we begin by logging this file itself
 print0(code)
 print0("="*100)
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
