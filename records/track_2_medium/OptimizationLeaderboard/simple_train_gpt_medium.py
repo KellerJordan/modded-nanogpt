@@ -5,7 +5,6 @@ with open(sys.argv[0]) as f:
 import uuid
 import time
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
