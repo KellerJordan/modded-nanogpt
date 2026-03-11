@@ -3,6 +3,8 @@
 The goal of this leaderboard is to collaboratively|competitively find the optimizer for training to the NanoGPT-medium benchmark perplexity. Unlike the main speedrun which seeks to minimize wallclock, here we will only care about minimizing step count by improving the optimizer.
 
 ## Quickstart
+
+You can run the current record via the following command.
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install -r requirements.txt
