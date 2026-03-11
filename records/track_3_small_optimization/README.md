@@ -22,7 +22,7 @@ torchrun --standalone --nproc_per_node=8 records/track_3_small_optimization/trai
 
 | Optimizer | Steps to 3.28 | Hparam summary | Log | Contributors |
 | - | - | - | - | - |
-| [Muon](https://kellerjordan.github.io/posts/muon/) | 3800 | lr=.02, wd=.01 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @kellerjordan0 |
+| [Muon](https://kellerjordan.github.io/posts/muon/) | 3800 | lr=.02, wd=.01 | [log](58ec69a8-ebfa-447c-94b6-88855e0139d1.txt) | @kellerjordan0 |
 | [AdamW](https://arxiv.org/abs/1711.05101) | ? | ? | ? | ? |
 | [PSGD Kron](https://github.com/evanatyourservice/kron_torch) | ? | ? | ? | ? |
 | [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo) | ? | ? | ? | ? | ? |
@@ -37,7 +37,7 @@ torchrun --standalone --nproc_per_node=8 records/track_3_small_optimization/trai
 
 | # | Steps to 3.28 | Hparam summary | Date | Log | Contributors |
 | - | - | - | - | - | - |
-| 1 | 3800 | lr=0.02, wd=0.01 | 2026/03/10 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @kellerjordan0 |
+| 1 | 3800 | lr=0.02, wd=0.01 | 2026/03/10 | [log](58ec69a8-ebfa-447c-94b6-88855e0139d1.txt) | @kellerjordan0 |
 
 ### [AdamW](https://arxiv.org/abs/1711.05101)
 
