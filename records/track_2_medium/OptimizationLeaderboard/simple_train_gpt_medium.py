@@ -224,10 +224,10 @@ class Muon(torch.optim.Optimizer):
 @dataclass
 class Hyperparameters:
     # data
-    train_files = "../../data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
-    val_files = "../../data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
+    train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
+    val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    seq_len = 64*1024
+    batch_size = 64*1024
     # optimization
     num_iterations = 6125 # number of iterations to run
     cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
@@ -319,7 +319,7 @@ model: nn.Module = torch.compile(model, dynamic=False)
 ########################################
 
 torch.cuda.reset_peak_memory_stats()
-train_loader = distributed_data_generator(args.train_files, world_size * args.seq_len, rank, world_size)
+train_loader = distributed_data_generator(args.train_files, world_size * args.batch_size, rank, world_size)
 training_time_ms = 0
 # start the clock
 dist.barrier()
@@ -335,7 +335,7 @@ for step in range(train_steps + 1):
         dist.barrier()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        val_batch_size = world_size * args.seq_len
+        val_batch_size = world_size * args.batch_size
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
         val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
