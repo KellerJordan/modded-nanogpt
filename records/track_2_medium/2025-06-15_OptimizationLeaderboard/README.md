@@ -58,7 +58,7 @@ Precise steps to reproduce:
 
 ## Discussion
 
-One possible critique is the following (quoted from a researcher on Twitter):
+One possible critique of a leaderboard like this is the following (quoted from a researcher on Twitter):
 
 > The idea of SOTA in “optimization” is b.s. When the architecture changes we may get need different optimization algorithms.
 
