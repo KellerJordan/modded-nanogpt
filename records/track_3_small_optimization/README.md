@@ -21,7 +21,7 @@ torchrun --standalone --nproc_per_node=$(nvidia-smi -L | wc -l) records/track_3_
 
 | # | Steps to 3.28 | Description | Date | Log | Contributors |
 | - | - | - | - | - | - |
-| 1 | 3800 | Muon baseline, lr=.02 wd=.01 | 2026/03/10 | [log](58ec69a8-ebfa-447c-94b6-88855e0139d1.txt) | @kellerjordan0 |
+| 1 | 3800 | Muon baseline, lr=.02 wd=.01 | 2026/03/10 | [log](a34ecb11-38b1-463d-8dc1-c692e4dd233d.txt) | @kellerjordan0 |
 
 
 ## Rules
@@ -34,6 +34,12 @@ To reduce the number of steps needed to reach 3.28, record attempts are free to 
 
 
 ## Discussion
+
+### The need for some sieve that can filter signal from noise
+
+There are likely in excess of 1,000 papers on arXiv which propose a new neural network optimizer (GPT Gemini [Claude](https://claude.ai/share/fb9590de-c4b7-44f8-bfbb-7f80af30d3f9)).
+
+### Response to a potential critique
 
 One possible critique of a leaderboard like this is the following, quoted from a post on X:
 
