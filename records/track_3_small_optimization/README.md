@@ -54,5 +54,5 @@ Therefore, at most such evidence would only imply that we need more than one lea
 ## Notes
 
 For future attempts:
-* The last time I tried [AdamW](https://arxiv.org/abs/1711.05101) in a similar setting, it was optimal to use `lr=.0015, wd=.125, warmup_tokens=250`.
-* The last time I tried [PSGD Kron](https://github.com/evanatyourservice/kron_torch) in a similar setting, it was optimal to use `lr=.0005, weight_decay=.625`.
+* For [AdamW](https://arxiv.org/abs/1711.05101), it seems that reasonable starting hparams are `lr=.0015, wd=.125, warmup_tokens=250`.
+* For [PSGD Kron](https://github.com/evanatyourservice/kron_torch), it seems that reasonable starting hparams are `lr=.0005, weight_decay=.625`.
