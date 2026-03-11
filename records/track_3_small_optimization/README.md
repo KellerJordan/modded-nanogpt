@@ -39,7 +39,7 @@ To reduce the number of steps needed to reach 3.28, record attempts are free to 
 
 There are between [hundreds](https://chatgpt.com/c/69b10bd7-f92c-8325-b516-d999b5b2b409) and [thousands](https://claude.ai/share/fb9590de-c4b7-44f8-bfbb-7f80af30d3f9) of neural network optimizer papers floating around the internet.
 The typical such paper claims to improve upon standard practice by a wide margin:
-Prototypically, the [Sophia](https://arxiv.org/abs/2305.14342) optimizer is claimed to attain a 2x speedup over Adam.
+Prototypically, the [Sophia](https://arxiv.org/abs/2305.14342) paper claimed to attain a 2x speedup over Adam.
 With few compelling meta-analyses out there, anyone interested in conducting neural network optimization research must technically
 go through and replicate every such paper before being able to claim to be caught up with the literature.
 Of course, this is impossible. So the practical alternative is that each researcher relies on their (human) network
