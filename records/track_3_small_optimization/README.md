@@ -45,7 +45,7 @@ go through and replicate every one of these papers before being able to claim to
 Of course, in practice this is impossible. So instead, the de facto arrangement is that each researcher relies on their own (human) network
 in order to become informed of what works and doesn't work.
 * Industry reserachers in the big corporate labs benefit from being part of a gigantic pool of other human industry researchers, who are mostly not incentivized to fake results (because if a fake result messes up the bigrun, that's not good).
-Such researchers therefore typically have a good picture of what really works and doesn't work.
+Such researchers therefore typically have a good picture of what really works and what doesn't.
 * Academic researchers in prestigious labs are typically well-connected to sources of information, both in terms of learning from other academics, and sometimes
 secretly learning what's going on inside the ostensibly-closed corporate labs. They therefore have a pretty good idea of what really works and doesn't work.
 * Independent researchers and academics at non-prestigous labs are left out to dry.
