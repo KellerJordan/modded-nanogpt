@@ -60,6 +60,6 @@ Precise steps to reproduce:
 
 One possible critique is the following (quoted from a researcher on Twitter):
 
-> "The idea of SOTA in “optimization” is b.s. When the architecture changes we may get need different optimization algorithms."
+> The idea of SOTA in “optimization” is b.s. When the architecture changes we may get need different optimization algorithms.
 
 Response: Firstly, I'm simply skeptical about whether this is true. Muon was originally empirically determined for the CIFAR-10 speedrun, where it lowered the record from 3.09 to 2.59 seconds, and then it was transferred to NanoGPT. These two settings are about as different as you can get in deep learning research, which indicates that optimizers can't actually be dramatically "overfit" to architectures. Secondly, if this critique is true, then it should be possible to procure evidence proving it. The critic could describe an archiectural modification to the speedrun which causes the relative strength of a pair of optimizers to significantly change. I would like to see this evidence before taking the critique too seriously. Thirdly, even if this critique is true and that evidence can indeed be procured, then there's still not really anything we can do about it: The community would still need open-source leaderboards; it would just need more of them in order to cover additional architecture cases. So overall, I don't believe this critique significantly detracts from the value of a leaderboard like this.
