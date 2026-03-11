@@ -1,5 +1,5 @@
 """
-simple_train_gpt.py
+train_gpt_simple.py
 
 This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
 It was prepared as a simplified version of the speedrun for use in neural net optimization research.
