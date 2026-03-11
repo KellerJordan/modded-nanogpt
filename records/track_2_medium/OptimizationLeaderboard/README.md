@@ -1,6 +1,6 @@
 # NanoGPT-Medium Optimizer Leaderboard
 
-The goal of this leaderboard is to collaboratively|competitively find good optimizers for use with the NanoGPT-medium speedrun record. Unlike the main speedrun which seeks to minimize wallclock, here we will only care about minimizing step count by modifying only the optimizer.
+The goal of this leaderboard is to collaboratively|competitively find the optimizer for training to the NanoGPT-medium benchmark perplexity. Unlike the main speedrun which seeks to minimize wallclock, here we will only care about minimizing step count by improving the optimizer.
 
 ## Quickstart
 ```bash
