@@ -70,7 +70,7 @@ class CausalSelfAttention(nn.Module):
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = 0.12
 
-    def forward(self, x: Tensor, block_mask: BlockMask):
+    def forward(self, x: Tensor):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         q = self.q(x).view(B, T, self.num_heads, self.head_dim)
