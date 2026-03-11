@@ -37,7 +37,7 @@ To reduce the number of steps needed to reach 3.28, record attempts are free to 
 
 ### The need for some sieve that can filter signal from noise
 
-There are likely in excess of 1,000 papers on arXiv which propose a new neural network optimizer (GPT Gemini [Claude](https://claude.ai/share/fb9590de-c4b7-44f8-bfbb-7f80af30d3f9)).
+There are [hundreds](https://chatgpt.com/c/69b10bd7-f92c-8325-b516-d999b5b2b409) to [thousands](https://claude.ai/share/fb9590de-c4b7-44f8-bfbb-7f80af30d3f9) of neural network optimizer papers.
 
 ### Response to a potential critique
 
