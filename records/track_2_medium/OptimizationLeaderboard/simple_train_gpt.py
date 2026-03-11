@@ -296,7 +296,6 @@ training_time_ms = 0
 # start the clock
 dist.barrier()
 t0 = time.perf_counter()
-# begin training
 for step in range(train_steps + 1):
     is_last_step = (step == train_steps)
 
@@ -329,14 +328,12 @@ for step in range(train_steps + 1):
     for name, param in model.named_parameters():
         assert param.grad is not None, name
         dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-    # set optimization hyperparameters and take step
+    # set optimization hyperparameters and take a step
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * get_lr(step)
         opt.step()
-    # null the gradients
     model.zero_grad(set_to_none=True)
-    # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
