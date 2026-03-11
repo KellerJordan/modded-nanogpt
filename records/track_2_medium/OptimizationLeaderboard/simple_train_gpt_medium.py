@@ -101,14 +101,14 @@ class GPT(nn.Module):
         padded_vocab_size = 128 * (1 + (vocab_size - 1) // 128)
         self.proj = Linear(model_dim, padded_vocab_size)
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor):
-        x = norm(self.embed(input_seq))
+    def forward(self, inputs: Tensor, targets: Tensor):
+        x = norm(self.embed(inputs))
         for block in self.blocks:
             x = block(x)
         x = norm(x)
         logits = self.proj(x).float()
         logits = 15 * logits * torch.rsqrt(logits.square() + 225)
-        return F.cross_entropy(logits, target_seq, reduction="sum")
+        return F.cross_entropy(logits, targets, reduction="sum")
 
 
 ########################################
