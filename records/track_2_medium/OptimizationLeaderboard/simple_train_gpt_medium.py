@@ -66,24 +66,7 @@ def muon_update(grad, momentum, beta=0.95, nesterov=True):
 
 class Muon(torch.optim.Optimizer):
     """
-    Muon - MomentUm Orthogonalized by Newton-schulz
-
     https://kellerjordan.github.io/posts/muon/
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. For efficient orthogonalization we use a Newton-Schulz iteration, which has the
-    advantage that it can be stably run in bfloat16 on the GPU.
-
-    Muon should only be used for hidden weight layers. The input embedding, final output layer,
-    and any internal gains or biases should be optimized using a standard method such as AdamW.
-    Hidden convolutional weights can be trained using Muon by viewing them as 2D and then
-    collapsing their last 3 dimensions.
-
-    Arguments:
-        lr: The learning rate, in units of spectral norm per update.
-        weight_decay: The AdamW-style weight decay.
-        momentum: The momentum. A value of 0.95 here is usually fine.
     """
     def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
