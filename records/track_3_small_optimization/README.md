@@ -34,15 +34,17 @@ To reduce the number of steps, record attempts are free to change the optimizer 
 
 ## Discussion
 
-One possible critique of a leaderboard like this is the following (quoted from a post on X):
+One possible critique of a leaderboard like this is the following, quoted from a post on X:
 
 > The idea of SOTA in “optimization” is b.s. When the architecture changes we may get need different optimization algorithms.
 
-And here's a reply:
+And here's a reply (edited by GPT-5.4):
 
-Firstly, there is a lack of evidence that this is true. Muon was originally empirically determined for the CIFAR-10 speedrun, where it lowered the record from 3.09 to 2.59 seconds, and then it was transferred to NanoGPT, where it was found to "generalize." The fact that these two settings are about as different as you can get in deep learning research indicates that the process of searching for good optimizers doesn't actually tend to produce results that are "overfit" to the choice of architecture. Therefore, before taking this critique seriously, we should ask for evidence: The critic should describe an architectural modification to the baseline which causes the relative efficiency of a pair of optimizers to significantly change.
+A natural response is that there is currently little evidence for this claim. Muon was originally found empirically in the CIFAR-10 speedrun setting, where it lowered the record from 3.09 to 2.59 seconds. It was then transferred to NanoGPT, where it also appeared to generalize well. These two settings are about as different as one could reasonably find within deep learning research, which suggests that the process of searching for good optimizers does not, in practice, usually produce results that are merely overfit to a particular architecture.
 
-That being said, even if such evidence could be procured, there would still not really be anything we can do about it. In particular, the community would still need open-source leaderboards to get signal (the alternative would be blindly trusting the claims made by papers, which has never worked very well). It would just need more than one of them in order to cover a variety of architectural cases.
+So before taking this critique too seriously, we should ask for evidence. A critic should be able to point to an architectural change in the baseline that substantially alters the relative efficiency of two optimizers. Without that, the objection remains speculative.
+
+That said, even if such evidence were produced, it still would not really change the practical situation. The community would still need open-source leaderboards in order to get useful signal; the alternative is to rely blindly on claims made in papers, and that has never worked especially well. At most, it would imply that we need more than one leaderboard, so that different architectural regimes are represented.
 
 
 ## Notes
