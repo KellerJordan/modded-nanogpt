@@ -127,7 +127,7 @@ class CausalSelfAttention(nn.Module):
         self.c_q = Linear(dim, hdim)
         self.c_k = Linear(dim, hdim)
         self.c_v = Linear(dim, hdim)
-        self.c_o = Linear(hdim, dim, init_zero=True) # out zero init suggested by @Grad62304977
+        self.c_proj = Linear(hdim, dim, init_zero=True) # out zero init suggested by @Grad62304977
         self.rotary = Rotary(head_dim, max_seq_len)
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
@@ -144,7 +144,7 @@ class CausalSelfAttention(nn.Module):
         v = norm(v)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), scale=self.attn_scale).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = self.c_o(y)
+        y = self.c_proj(y)
         return y
 
 class MLP(nn.Module):
