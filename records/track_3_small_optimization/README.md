@@ -41,7 +41,7 @@ One possible critique of a leaderboard like this is the following, quoted from a
 
 And here's a reply (reading flow improved by GPT-5.4):
 
-A natural response is that this claim currently lacks evidence. For example, Muon was originally found empirically in the CIFAR-10 speedrun setting, where it lowered the record from 3.09 to 2.59 seconds. It was then transferred to NanoGPT, where it also appeared to generalize well. These two settings are about as different as one could reasonably find within deep learning research, which suggests that the process of searching for good optimizers does not, in practice, usually produce results that are merely overfit to a particular architecture.
+A natural response is that this claim currently lacks evidence. For example, Muon was originally found empirically in the CIFAR-10 speedrun setting, where it lowered the record from 3.09 to 2.59 seconds. It was then transferred to NanoGPT, where it also worked well. These two settings are about as different as one could reasonably find within deep learning research, which suggests that the process of searching for good optimizers does not, in practice, usually produce results that are merely overfit to a particular architecture.
 
 So before taking this critique too seriously, we should ask for evidence. A critic should be able to point to an architectural change in the baseline that substantially alters the relative efficiency of two optimizers. Without that, the objection remains speculative.
 
