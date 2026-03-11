@@ -30,7 +30,7 @@ To be considered a valid, a new record attempt must:
 1. Not change the dataset, batch size, or architecture.
 2. Attain 3.28 val loss.
 
-To reduce the number of steps needed to reach 3.28, record attempts are free to change the optimizer (algorithm or hyperparameters) as well as model initialization.
+To reduce the number of steps needed to reach 3.28, record attempts are free to change the optimizer (algorithm or hyperparameters) as well as the model initialization.
 
 
 ## Discussion
