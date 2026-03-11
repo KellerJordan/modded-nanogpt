@@ -210,7 +210,6 @@ class Muon(torch.optim.Optimizer):
 # int main
 
 # torchrun sets these env variables
-assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
@@ -218,7 +217,7 @@ dist.barrier()
 # This code is designed for world_size == 8. Running on fewer GPUs should be equivalent, but you might hit an OOM.
 assert 8 % dist.get_world_size() == 0
 
-# begin logging
+# logging
 if dist.get_rank() == 0:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{uuid.uuid4()}.txt"
