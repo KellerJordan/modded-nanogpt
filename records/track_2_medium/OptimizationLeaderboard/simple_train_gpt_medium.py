@@ -269,7 +269,7 @@ print0("="*100)
 #    Construct model and optimizer     #
 ########################################
 
-model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, model_dim=1024, seq_len=1024).cuda()
+model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=12, model_dim=768, seq_len=1024).cuda()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 model.compile(dynamic=False)
