@@ -60,7 +60,7 @@ then effective new methods will become readily identifiable.
 
 The reasons this hasn't happened already are that (a) creating a benchmark with enough momentum to have a chance at being adopted requires a relatively high level of preexisting clout to pull off, but
 (b) generates little excess clout even if successful (which is a problem because clouty individuals are typically looking for ways to get more), and also separately (c)
-faces significant friction, because authors are of course incentivized to keep using their own ad-hoc unique baselines,
+faces significant friction, because most authors are of course incentivized to avoid such a leaderboard in favor of keeping their own ad-hoc idiosyncratic baselines,
 in order to enable continued manipulation/exaggeration of results (intentional or unintentional).
 
 
