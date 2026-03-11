@@ -164,9 +164,8 @@ class CausalSelfAttention(nn.Module):
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = 0.12
-        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
 
-    def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
+    def forward(self, x: Tensor, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         q = self.c_q(x).view(B, T, self.num_heads, self.head_dim)
@@ -175,10 +174,6 @@ class CausalSelfAttention(nn.Module):
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         v = norm(v)
-        if ve is not None:
-            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
-        else: # skip mid-layers token value embeddings by @YouJiacheng
-            v = self.lambdas[0] * v
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.c_o(y)
@@ -202,11 +197,9 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len)
         self.mlp = MLP(dim)
-        self.lambdas = nn.Parameter(torch.tensor([1.0, 0.0]))
 
-    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
-        x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x = x + self.attn(x, ve, block_mask)
+    def forward(self, x: Tensor, block_mask: BlockMask):
+        x = x + self.attn(x, block_mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -220,9 +213,6 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
-        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
-        # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
-        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
@@ -271,11 +261,6 @@ class GPT(nn.Module):
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
 
-        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
-        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
-        assert len(ve) == len(self.blocks)
-
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, 
                        short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
@@ -283,7 +268,7 @@ class GPT(nn.Module):
 
         x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
         for i, block in enumerate(self.blocks):
-            x = block(x, ve[i], x0, block_masks[i])
+            x = block(x, x0, block_masks[i])
         x = norm(x)
         x = x.flatten(end_dim=1)
 
@@ -400,7 +385,7 @@ for param in model.parameters():
 
 # collect the parameters to optimize
 hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
-embed_params = [*model.embed.parameters(), *model.value_embeds.parameters()]
+embed_params = [*model.embed.parameters()]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params: list[nn.Parameter] = [model.lm_head.weight]
 # sanity check
