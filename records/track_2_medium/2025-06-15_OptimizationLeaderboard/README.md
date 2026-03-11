@@ -2,6 +2,16 @@
 
 The goal of this leaderboard is to collaboratively/competitively find good optimizers for use with the NanoGPT-medium speedrun record. Unlike the main speedrun which seeks to minimize wallclock, here we will only care about minimizing step count by modifying only the optimizer.
 
+## Quickstart
+```
+git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
+pip install -r requirements.txt
+# downloads 55B training tokens
+python data/cached_fineweb10B.py 55
+cd track_2_medium/OptimizationLeaderboard
+./run.sh
+```
+
 ## Rules
 
 - Each optimizer will have its own history of records. We are interested in finding the best setting for each optimizer, in order to help the community make a fair comparisons and find good new optimizers.
