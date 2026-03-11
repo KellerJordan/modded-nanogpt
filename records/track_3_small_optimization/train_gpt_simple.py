@@ -319,7 +319,8 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_tokens // batch_size):
                 inputs, targets = next(val_loader)
-                val_loss += model(inputs, targets)
+                for i in range(len(inputs) // 64):
+                    val_loss += model(inputs[64*i:64*i+64], targets[64*i:64*i+64]).backward()
         dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
         val_loss /= val_tokens
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
@@ -333,7 +334,9 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    model(inputs, targets).backward()
+    # accumulate across microbatches in case we are running with fewer than 8 gpus
+    for i in range(len(inputs) // 64):
+        model(inputs[64*i:64*i+64], targets[64*i:64*i+64]).backward()
     for name, param in model.named_parameters():
         assert param.grad is not None, name
         dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
