@@ -35,7 +35,7 @@ To reduce the number of steps needed to reach 3.28, record attempts are free to 
 
 ## Discussion
 
-### There is a need for some sieve that can filter signal from noise
+### There is a need for some way to filter signal from noise
 
 There are between [hundreds](https://chatgpt.com/c/69b10bd7-f92c-8325-b516-d999b5b2b409) and [thousands](https://claude.ai/share/fb9590de-c4b7-44f8-bfbb-7f80af30d3f9) of neural network optimizer papers floating around the internet.
 The typical such paper claims to improve upon standard practice by a wide margin:
@@ -46,10 +46,13 @@ Of course, in practice this is impossible. So instead, the de facto arrangement 
 in order to become informed of what works and doesn't work.
 * Industry reserachers in the big corporate labs benefit from being part of a gigantic pool of other human industry researchers, who are mostly not incentivized to fake results (because if a fake result messes up the bigrun, that's not good).
 Such researchers therefore typically have a good picture of what really works and what doesn't.
-* Academic researchers in prestigious labs are typically well-connected to sources of information, both in terms of learning from other academics, and sometimes
-even learning through their connections about what's going on inside the ostensibly-closed corporate labs. These academics therefore have a decent idea of what really works.
+* Academic researchers in prestigious labs are typically well-connected to sources of information, both in terms of learning from other well-connected academics, and sometimes
+even finding out through their connections about what's going on inside the ostensibly-closed corporate labs. These elite academics therefore have a decent idea of what really works.
 * Independent researchers and academics at non-prestigous labs are left out to dry.
 Currently, their best source of information is the open-source research published by the Chinese industry.
+
+My understanding is that the majority of all humans who are working on AI research fall into this last category.
+
 
 
 ### Response to a potential critique
