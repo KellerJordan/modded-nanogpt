@@ -111,13 +111,11 @@ class GPT(nn.Module):
 
     def forward(self, input_seq: Tensor, target_seq: Tensor):
         assert input_seq.ndim == 1
-
         x = norm(self.embed(input_seq)) # use of norm here by @Grad62304977
         x = x.view(len(x), -1, self.seq_len)
         for block in self.blocks:
             x = block(x)
         x = norm(x)
-
         logits = self.proj(x).float()
         logits = 15 * logits * torch.rsqrt(logits.square() + 225)
         loss = F.cross_entropy(logits, target_seq)
