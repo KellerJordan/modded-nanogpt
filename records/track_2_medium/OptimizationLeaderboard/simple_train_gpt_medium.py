@@ -240,23 +240,20 @@ class Hyperparameters:
 args = Hyperparameters()
 
 # torchrun sets these env variables
-rank = int(os.environ["RANK"])
-world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == 8 # this code is designed for 8xH100
+assert dist.get_world_size() == 8 # this code is designed for 8xH100
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
-master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 # begin logging
-if master_process:
+if dist.get_rank() == 0:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{uuid.uuid4()}.txt"
     print(logfile)
 def print0(s, console=False):
-    if master_process:
+    if dist.get_rank() == 0:
         with open(logfile, "a") as f:
             if console:
                 print(s)
