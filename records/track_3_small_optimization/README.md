@@ -14,8 +14,11 @@ torchrun --standalone --nproc_per_node=8 records/track_3_small_optimization/trai
 
 ## Rules
 
-- Record attempts are not allowed to change the dataset, batch size, or architecture.
-- Attempts are free to change the optimizer (algorithm and hyperparameters) as well as model initialization.
+To be considered a valid attempt at a new optimization record, an attempt must:
+- Not change the dataset, batch size, or architecture.
+- Attain 3.28 val loss.
+
+To reduce the number of steps, record attempts are free to change the optimizer (algorithm and hyperparameters) as well as model initialization.
 
 
 ## Record history
