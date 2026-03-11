@@ -102,7 +102,7 @@ class Block(nn.Module):
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, model_dim: int, seq_len: int):
         super().__init__()
-        self.embed = nn.Embedding(vocab_size, model_dim)
+        self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
         self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
         padded_vocab_size = 128 * (1 + (vocab_size - 1) // 128)
         self.proj = Linear(model_dim, padded_vocab_size)
@@ -229,7 +229,7 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    batch_size = 64*1024
+    batch_size = 8*64*1024
     # optimization
     num_iterations = 6125 # number of iterations to run
     cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
@@ -279,7 +279,6 @@ print0("="*100)
 ########################################
 
 model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, model_dim=1024, seq_len=1024).cuda()
-model.embed.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 model.compile(dynamic=False)
