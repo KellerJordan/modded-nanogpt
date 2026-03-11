@@ -197,18 +197,10 @@ class GPT(nn.Module):
         x = norm(x)
         x = x.flatten(end_dim=1)
 
-        if self.training:
-            logits = self.lm_head(x).float()
-            logits = 15 * logits * torch.rsqrt(logits.square() + 225)
-            loss = F.cross_entropy(logits, target_seq)
-            return loss
-        else:
-            loss = 0
-            for i in range(4):
-                logits = self.lm_head(x.chunk(4)[i]).float()
-                logits = 15 * logits * torch.rsqrt(logits.square() + 225)
-                loss += F.cross_entropy(logits, target_seq.chunk(4)[i]) / 4
-            return loss
+        logits = self.lm_head(x).float()
+        logits = 15 * logits * torch.rsqrt(logits.square() + 225)
+        loss = F.cross_entropy(logits, target_seq)
+        return loss
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -249,8 +241,7 @@ class Hyperparameters:
     train_files = "../../data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "../../data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 64*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
+    seq_len = 64*1024
     # optimization
     num_iterations = 6125 # number of iterations to run
     cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
@@ -300,7 +291,7 @@ print0("="*100)
 ########################################
 
 model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, num_heads=8, model_dim=1024,
-                       max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+                       max_seq_len=max(args.seq_len, args.seq_len)).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -345,7 +336,7 @@ model: nn.Module = torch.compile(model, dynamic=False)
 ########################################
 
 torch.cuda.reset_peak_memory_stats()
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
+train_loader = distributed_data_generator(args.train_files, world_size * args.seq_len, rank, world_size)
 training_time_ms = 0
 # start the clock
 dist.barrier()
@@ -361,7 +352,7 @@ for step in range(train_steps + 1):
         dist.barrier()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        val_batch_size = world_size * args.val_seq_len
+        val_batch_size = world_size * args.seq_len
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
         val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
