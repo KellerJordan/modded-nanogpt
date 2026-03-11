@@ -301,7 +301,7 @@ def get_lr(step: int):
 ########################################
 
 train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
-training_time_ms = 0
+training_time = 0
 # start the clock
 dist.barrier()
 t0 = time.perf_counter()
@@ -312,7 +312,7 @@ for step in range(train_steps + 1):
     if is_last_step or step % 125 == 0:
         # stop the clock
         dist.barrier()
-        training_time_ms += 1000 * (time.perf_counter() - t0)
+        training_time_ms += time.perf_counter() - t0
         model.eval()
         val_tokens = 10485760
         assert val_tokens % batch_size == 0
@@ -324,7 +324,7 @@ for step in range(train_steps + 1):
                 val_loss += model(inputs, targets)
         dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
         val_loss /= val_tokens
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.6f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.6f} train_time:{training_time:.3f}s step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
         dist.barrier()
@@ -344,7 +344,7 @@ for step in range(train_steps + 1):
             group["lr"] = group["initial_lr"] * get_lr(step)
         opt.step()
     model.zero_grad(set_to_none=True)
-    approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    approx_training_time = training_time + (time.perf_counter() - t0)
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True)
 
 dist.destroy_process_group()
