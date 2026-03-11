@@ -22,9 +22,9 @@ torchrun --standalone --nproc_per_node=8 records/track_3_small_optimization/trai
 
 | Optimizer | Steps to 3.28 | Hparam summary | Log | Contributors |
 | - | - | - | - | - |
-| [Muon](https://kellerjordan.github.io/posts/muon/) | ? | lr=.025, wd=.01 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @kellerjordan0 |
-| [AdamW](https://arxiv.org/abs/1711.05101) | ? | lr=.0015, wd=.125, warmup_steps=250 | ? | ? |
-| [PSGD Kron](https://github.com/evanatyourservice/kron_torch) | ? | lr=.0005, wd=.625 | ? | ? |
+| [Muon](https://kellerjordan.github.io/posts/muon/) | ? | lr=.02, wd=.01 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @kellerjordan0 |
+| [AdamW](https://arxiv.org/abs/1711.05101) | ? | ? | ? | ? |
+| [PSGD Kron](https://github.com/evanatyourservice/kron_torch) | ? | ? | ? | ? |
 | [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo) | ? | ? | ? | ? | ? |
 | Sophia | ? | ? | ? | ? |
 | Lion | ? | ? | ? | ? |
@@ -37,25 +37,23 @@ torchrun --standalone --nproc_per_node=8 records/track_3_small_optimization/trai
 
 | # | Steps to 3.28 | Hparam summary | Date | Log | Contributors |
 | - | - | - | - | - | - |
-| 1 | 5960 | lr=0.025, wd=0.01, double wd for MLP | 04/22/25 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj3o |
+| 1 | 3800 | lr=0.02, wd=0.01 | 2026/03/10 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @kellerjordan0 |
 
 ### [AdamW](https://arxiv.org/abs/1711.05101)
 
 | # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
 | - | - | - | - | - | - |
-| 1 | 10500 | lr=0.0015, wd=0.125, warmup_steps=500, bf16 weights | 06/15/25 | ? | @kellerjordan0 |
-| 2 | 9500 | lr=0.0015, wd=0.125, warmup_steps=500 | 06/19/25 | ? | @kellerjordan0 |
+| 1 | ? | ? | ? | ? | ? |
+
+Note: The last time I tried `AdamW` in a similar setting, it was optimal to use `lr=.0015, wd=.125, warmup_tokens=250`.
 
 ### [PSGD Kron](https://github.com/evanatyourservice/kron_torch)
 
 | # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
 | - | - | - | - | - | - |
-| 1 | 9000 | lr=.0005, wd=.625, bf16 weights | 06/19/25 | ? | @kellerjordan0 |
-| 2 | 9000 | lr=.0005, wd=.625 | 06/19/25 | ? | @kellerjordan0 |
+| 1 | ? | ? | ? | ? | ? |
 
-Precise steps to reproduce:
-* #1: Install and import `Kron`, then replace `optimizer2` with `Kron(hidden_matrix_params, lr=.0005, weight_decay=.625)` in the `train_gpt_medium.py` of the main folder. Note: Adding lr warmup does not seem to be needed.
-* #2: Same thing, but instead on top of the `train_gpt_medium.py` that's contained in this folder instead of the main folder. That way we get fp32 weights.
+Note: The last time I tried `Kron` in a similar setting, it was optimal to use `lr=.0005, weight_decay=.625`.
 
 ## Discussion
 
