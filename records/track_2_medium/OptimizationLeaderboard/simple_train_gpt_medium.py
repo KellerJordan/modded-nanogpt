@@ -341,19 +341,6 @@ def get_lr(step: int):
     else:
         return (1 - x) / args.cooldown_frac
 
-# attention window size schedule: linearly increase
-@lru_cache(1)
-def get_window_size_blocks_helper(window_size: int):
-    return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-def get_window_size_blocks(step: int):
-    x = step / args.num_iterations # progress in training
-    assert 0 <= x <= 1
-    # Linearly increase the block-wise sliding window size over training 128 -> 1792
-    # increase by @fernbear.bsky.social; block-wise by @YouJiacheng
-    factor = 4 * x ** 3 - 6 * x ** 2 + 3 * x # cubic schedule by @jadenj3o
-    window_size = next_multiple_of_n(3456 * factor, n=128)
-    return get_window_size_blocks_helper(window_size)
-
 model: nn.Module = torch.compile(model, dynamic=False)
 
 ########################################
@@ -385,7 +372,7 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets = next(val_loader)
-                val_loss += model(inputs, targets, get_window_size_blocks(step))
+                val_loss += model(inputs, targets)
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -405,7 +392,7 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    model(inputs, targets).backward()
     for name, param in model.named_parameters():
         assert param.grad is not None, name
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
