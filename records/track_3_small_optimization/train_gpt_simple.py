@@ -283,10 +283,9 @@ for opt in optimizers:
 
 batch_size = 8*64*1024
 train_steps = 3800
-cooldown_frac = 0.7
 
 # learning rate schedule: stable then decay
-def get_lr(step: int):
+def get_lr(step: int, cooldown_frac=0.7):
     x = step / train_steps # progress in training
     assert 0 <= x < 1
     if x < 1 - cooldown_frac:
