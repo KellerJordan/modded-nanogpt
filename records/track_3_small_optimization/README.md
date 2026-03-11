@@ -44,7 +44,7 @@ With few compelling meta-analyses out there, anyone interested in conducting neu
 go through and replicate every one of these papers before being able to claim to be truly caught up with the state of the art.
 Of course, in practice this is impossible. So instead, the de facto arrangement is that each researcher relies on their own (human) network
 in order to become informed of what works and doesn't work.
-* Industry reserachers in the big corporate labs benefit from gigantic networks of other human industry researchers, who are mostly not incentivized to fake results.
+* Industry reserachers in the big corporate labs benefit from being part of a gigantic pool of other human industry researchers, who are mostly not incentivized to fake results (because if a fake result messes up the bigrun, that's not good).
 Such researchers therefore typically have a good picture of what really works and doesn't work.
 * Academic researchers in prestigious labs are typically well-connected to sources of information, both in terms of learning from other academics, and sometimes
 secretly learning what's going on inside the ostensibly-closed corporate labs. They therefore have a pretty good idea of what really works and doesn't work.
