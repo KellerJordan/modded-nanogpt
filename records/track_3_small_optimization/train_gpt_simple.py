@@ -30,7 +30,7 @@ device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
-# this code is designed for world_size == 8. running on fewer GPUs should be equivalent, but you might hit an OOM.
+# this code can be run equivalently with 1, 2, 4, or 8 gpus.
 assert 8 % dist.get_world_size() == 0
 
 # logging setup
