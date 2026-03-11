@@ -48,10 +48,14 @@ in order to become informed of what works and doesn't work.
 Such researchers therefore typically have a good picture of what really works and what doesn't.
 * Academic researchers in prestigious labs are typically well-connected to sources of information, both in terms of learning from other well-connected academics, and sometimes
 even finding out through their connections about what's going on inside the ostensibly-closed corporate labs. These elite academics therefore have a decent idea of what really works.
-* Independent researchers and academics at non-prestigous labs are left out to dry.
+* All the remaining independent researchers and academics at non-prestigous labs are left out to dry.
 Currently, their best source of information is the open-source research published by the Chinese industry.
 
 My understanding is that the majority of all humans who are working on AI research fall into this last category.
+It is therefore quite unfortunate that they are not being well-served - to use left terminology - by the current structure of
+research. Fortunately, there is a relatively easy solution: The field can be reorganized around competitive leaderboards.
+If each new optimizer paper compares against a single leaderboard, rather than the current situation where each new paper
+makes up its own unique baseline, then the most effective methods can be readily identified by anyone.
 
 
 
