@@ -265,13 +265,7 @@ def print0(s, console=False):
 # begin by printing this file (the Python code)
 print0(code)
 print0("="*100)
-# log information about the hardware/software environment this is running on
-print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
-def nvidia_smi():
-    import subprocess  # avoid top level import
-    return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
-print0(nvidia_smi())
 print0("="*100)
 
 ########################################
