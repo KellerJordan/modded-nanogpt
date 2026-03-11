@@ -1,6 +1,10 @@
 # NanoGPT-Small Optimizer Leaderboard
 
-The goal of this leaderboard is to collaboratively|competitively find the optimizer for training to the NanoGPT-medium benchmark perplexity. Unlike the main speedrun which seeks to minimize wallclock, here we will only care about minimizing step count by improving the optimizer.
+The goal of this leaderboard is to collaboratively|competitively find the best optimizer for training NanoGPT to 3.28 val loss.
+Unlike the main speedrun which seeks to minimize wallclock time, here we will only care about minimizing step count by improving the optimizer.
+
+We have initialized this leaderboard with a simplified variant of the speedrun (350 lines of code).
+Compared to the main speedrun, this variant removes non-standard parameters (value embeddings, skip connection lambdas) and all triton kernels.
 
 ## Quickstart
 
