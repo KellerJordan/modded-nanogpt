@@ -238,7 +238,7 @@ print0("="*100)
 #    Construct model and optimizer     #
 ########################################
 
-model: nn.Module = GPT(vocab_size=50257, num_layers=12, model_dim=768).cuda()
+model = GPT(vocab_size=50257, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
 
 # initialize parameters
@@ -259,7 +259,7 @@ for param in model.parameters():
 hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
 embed_params = [*model.embed.parameters()]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
-head_params: list[nn.Parameter] = [model.proj.weight]
+head_params = [model.proj.weight]
 # sanity check
 params_collections = [hidden_matrix_params, embed_params, scalar_params, head_params]
 optimized_parameters_set = {p for params in params_collections for p in params}
