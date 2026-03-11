@@ -20,11 +20,11 @@ torchrun --standalone --nproc_per_node=8 records/track_3_small_optimization/trai
 
 ## Overall optimizer leaderboard
 
-| Optimizer | Steps to 2.92 | Hparam summary | Log | Contributors |
+| Optimizer | Steps to 3.28 | Hparam summary | Log | Contributors |
 | - | - | - | - | - |
-| [Muon](https://kellerjordan.github.io/posts/muon/) | 5960 | lr=.025, wd=.01, double wd for MLP | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj30 et al. |
-| [AdamW](https://arxiv.org/abs/1711.05101) | 9500 | lr=.0015, wd=.125, warmup_steps=500 | ? | @kellerjordan0 |
-| [PSGD Kron](https://github.com/evanatyourservice/kron_torch) | 7875 | lr=.0005, wd=.625 | ? | @kellerjordan0 |
+| [Muon](https://kellerjordan.github.io/posts/muon/) | ? | lr=.025, wd=.01, double wd for MLP | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @kellerjordan0 |
+| [AdamW](https://arxiv.org/abs/1711.05101) | ? | lr=.0015, wd=.125, warmup_steps=250 | ? | @kellerjordan0 |
+| [PSGD Kron](https://github.com/evanatyourservice/kron_torch) | ? | lr=.0005, wd=.625 | ? | @kellerjordan0 |
 | [DistributedShampoo](https://github.com/facebookresearch/optimizers/tree/main/distributed_shampoo) | ? | ? | ? | ? | ? |
 | Sophia | ? | ? | ? | ? |
 | Lion | ? | ? | ? | ? |
@@ -35,7 +35,7 @@ torchrun --standalone --nproc_per_node=8 records/track_3_small_optimization/trai
 
 ### [Muon](https://kellerjordan.github.io/posts/muon/)
 
-| # | Steps to 2.92 | Hparam summary | Date | Log | Contributors |
+| # | Steps to 3.28 | Hparam summary | Date | Log | Contributors |
 | - | - | - | - | - | - |
 | 1 | 5960 | lr=0.025, wd=0.01, double wd for MLP | 04/22/25 | [log](075_640429f2-e726-4e83-aa27-684626239ffc.txt) | @jadenj3o |
 
@@ -68,7 +68,7 @@ Precise steps to reproduce:
 
 ## Discussion
 
-One possible critique of a leaderboard like this is the following (quoted from a researcher on Twitter):
+One possible critique of a leaderboard like this is the following (quoted from a post on X):
 
 > The idea of SOTA in “optimization” is b.s. When the architecture changes we may get need different optimization algorithms.
 
