@@ -56,8 +56,10 @@ Precise steps to reproduce:
 * #1: Install and import `Kron`, then replace `optimizer2` with `Kron(hidden_matrix_params, lr=.0005, weight_decay=.625)` in the `train_gpt_medium.py` of the main folder. Note: Adding lr warmup does not seem to be needed.
 * #2: Same thing, but instead on top of the `train_gpt_medium.py` that's contained in this folder instead of the main folder. That way we get fp32 weights.
 
-## Response to a possible critique
+## Discussion
 
-Critique: "The idea of SOTA in “optimization” is b.s. When the architecture changes we may get need different optimization algorithms." (this is quoted from a researcher on Twitter)
+One possible critique is the following:
+
+| "The idea of SOTA in “optimization” is b.s. When the architecture changes we may get need different optimization algorithms." (this is quoted from a researcher on Twitter)
 
 Response: Firstly, I'm simply skeptical about whether this is true. Muon was originally empirically determined for the CIFAR-10 speedrun, where it lowered the record from 3.09 to 2.59 seconds, and then it was transferred to NanoGPT. These two settings are about as different as you can get in deep learning research, which indicates that optimizers can't actually be dramatically "overfit" to architectures. Secondly, if this critique is true, then it should be possible to procure evidence proving it. The critic could describe an archiectural modification to the speedrun which causes the relative strength of a pair of optimizers to significantly change. I would like to see this evidence before taking the critique too seriously. Thirdly, even if this critique is true and that evidence can indeed be procured, then there's still not really anything we can do about it: The community would still need open-source leaderboards; it would just need more of them in order to cover additional architecture cases. So overall, I don't believe this critique significantly detracts from the value of a leaderboard like this.
