@@ -182,9 +182,6 @@ def muon_update(grad, momentum, beta=0.95, nesterov=True):
     return update
 
 class Muon(torch.optim.Optimizer):
-    """
-    https://kellerjordan.github.io/posts/muon/
-    """
     def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
