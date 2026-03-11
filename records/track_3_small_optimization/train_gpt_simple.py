@@ -135,7 +135,8 @@ class CausalSelfAttention(nn.Module):
         v = self.v(x).view(B, T, self.num_heads, self.head_dim)
         q, k = norm(q), norm(k)
         q, k = self.rotary(q), self.rotary(k)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
+                                           v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
         y = self.proj(y)
         return y
