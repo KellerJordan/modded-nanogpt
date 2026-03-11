@@ -56,6 +56,10 @@ It is therefore quite unfortunate that they are not being well-served - to use l
 research. Fortunately, there is a relatively easy solution: The field can be reorganized around competitive leaderboards.
 If each new optimizer paper compares against a single leaderboard, rather than the current situation where each new paper
 makes up its own unique baseline, then the most effective methods can be readily identified by anyone.
+The reason this hasn't already happened are that (a) there is little incentive for anyone to enact this reorganization
+because it the reorganization itself generates little academic clout, and (b) it is actually in the interest of the median paper
+*author* (not viewer/reader) to not use such a leaderboard, because the median paper involves overclaiming or fake reuslts, which become
+impossible in the presence of a competitive leaderboard.
 
 
 
