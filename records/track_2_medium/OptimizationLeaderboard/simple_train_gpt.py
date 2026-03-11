@@ -2,8 +2,7 @@
 simple_train_gpt.py
 
 This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
-It was prepared as a simplified version of the speedrun which removes non-standard parameters
-(hence we remove value embeddings and skip connections, and keep ReLU^2 and softcap).
+It was prepared as a simplified version of the speedrun which removes non-standard parameters.
 
 See the speedrun repo for a full list of contributors.
 """
