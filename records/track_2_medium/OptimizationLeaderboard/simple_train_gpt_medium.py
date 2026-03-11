@@ -280,6 +280,7 @@ model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, model_dim=1024
 model.embed.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
+model.compile(dynamic=False)
 
 # collect the parameters to optimize
 hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
@@ -311,8 +312,6 @@ def get_lr(step: int):
         return 1.0
     else:
         return (1 - x) / args.cooldown_frac
-
-model: nn.Module = torch.compile(model, dynamic=False)
 
 ########################################
 #        Training and validation       #
