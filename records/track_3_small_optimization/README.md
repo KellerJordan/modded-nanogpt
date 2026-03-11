@@ -41,8 +41,8 @@ There are between [hundreds](https://chatgpt.com/c/69b10bd7-f92c-8325-b516-d999b
 The typical such paper claims to improve upon standard practice by a wide margin:
 Prototypically, the [Sophia](https://arxiv.org/abs/2305.14342) paper claimed to attain a 2x speedup over Adam.
 With few compelling meta-analyses out there, anyone interested in conducting neural network optimization research must technically
-go through and replicate every such paper before being able to claim to be caught up with the literature.
-Of course, this is impossible. So the practical alternative is that each researcher relies on their (human) network
+go through and replicate every one of these papers before being able to claim to be truly caught up with the state of the art.
+Of course, in practice this is impossible. So instead, the de facto arrangement is that each researcher relies on their own (human) network
 in order to become informed of what works and doesn't work.
 * Industry reserachers in the big corporate labs benefit from gigantic networks of other human industry researchers, who are mostly not incentivized to fake results.
 Such researchers therefore typically have a good picture of what really works and doesn't work.
