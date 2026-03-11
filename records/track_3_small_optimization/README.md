@@ -58,7 +58,7 @@ research. Fortunately, there is a relatively easy solution:
 If new optimizer papers line themselves up on a competitive leaderboard/benchmark,
 then effective new methods will become readily identifiable.
 
-The reasons this hasn't happened already are that (a) such a reorganization requires a relatively high level of preexisting clout to pull off, but
+The reasons this hasn't happened already are that (a) creating a benchmark with momentum behind it requires a relatively high level of preexisting clout to pull off, but
 (b) generates zero money and not much more clout if successful (whereas clouty individuals are typically looking for ways to get more), and separately (c)
 faces significant friction in adoption because authors are incentivized to use their own ad-hoc unique baselines,
 in order to enable (intentional or unintentional) manipulation/exaggeration of results, which would become impossible when using a competitive benchmark.
