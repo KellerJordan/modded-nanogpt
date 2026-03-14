@@ -362,6 +362,8 @@ class ParamConfig:
     momentum: float | None = None
     beta2: float | None = None
     per_matrix_lr_mul: list[float] | None = None
+    # Magma: block-level temporal regularization (per Magma paper, applied to attn/mlp blocks)
+    use_magma: bool = False
 
 
 class NorMuonAndAdam:
@@ -529,6 +531,7 @@ class NorMuonAndAdam:
                 momentum=self.normuon_defaults["momentum"],
                 beta2=self.normuon_defaults["beta2"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
+                use_magma=table_entry.get("use_magma", self.normuon_defaults.get("use_magma", False)),
             )
         else:
             raise ValueError(f"Unknown optim type: {optim}")
@@ -573,6 +576,7 @@ class NorMuonAndAdam:
                     momentum_buffer=momentum_buffer,
                     second_momentum_buffer=second_momentum_buffer,
                     mantissa=mantissa,
+                    magma_s=1.0,  # Magma EMA alignment score (scalar, not a tensor)
                 )
 
     # -----------------------------------
@@ -646,6 +650,7 @@ class NorMuonAndAdam:
                 p_state["momentum_buffer"].zero_()
                 p_state["mantissa"].zero_()
                 p_state["second_momentum_buffer"].zero_()
+                p_state["magma_s"] = 1.0
 
     def copy_lm_state_to_embed(self):
         """
@@ -866,22 +871,50 @@ class NorMuonAndAdam:
         p_state = self.param_states[param]
         grad_chunk = grad_chunk.float()  # FP32 for momentum
 
+        # Magma: compute gradient-momentum alignment BEFORE polar_express modifies buffers.
+        # Cosine similarity between raw gradient and current momentum estimates temporal noise.
+        # The EMA score (magma_s) and a 50/50 Bernoulli coin flip together produce magma_scale:
+        #   magma_scale = s_t * m_t   where s_t ∈ (0,1) is alignment, m_t ∈ {0,1} is the coin.
+        # When m_t = 0: skip parameter update + CWD entirely (momentum still updates via polar_express).
+        # When m_t = 1: scale the gradient step by s_t (CWD applied normally, unscaled).
+        magma_scale = 1.0
+        if p_cfg.use_magma:
+            mu = p_state["momentum_buffer"]
+            cos_sim = F.cosine_similarity(grad_chunk.flatten(), mu.flatten(), dim=0)
+            s_tilde = torch.sigmoid(cos_sim / 2.0)  # tau = 2.0 per Magma paper
+            p_state["magma_s"] = 0.9 * p_state["magma_s"] + 0.1 * s_tilde.item()
+            m_t = 1.0 if torch.rand(1).item() >= 0.5 else 0.0
+            magma_scale = p_state["magma_s"] * m_t
+
         self._momentum_t.fill_(p_cfg.momentum)
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
         # Fused Nesterov momentum + Polar Express orthogonalization
+        # Always runs — Magma requires an uninterrupted momentum stream even on dropped steps.
         is_large_matrix = chunk_shape[-2] > 1024
         v_chunk = polar_express(
             grad_chunk, p_state["momentum_buffer"], self._momentum_t,
             split_baddbmm=is_large_matrix,
         )
 
+        # Magma dropped this block: momentum updated above, but skip parameter + CWD update.
+        # Without this guard, CWD would apply full weight decay to a zero-update step
+        # because (0 * weight) >= 0 evaluates True for all elements.
+        if magma_scale == 0.0:
+            param_view = param.data.view(p_cfg.reshape)
+            return param_view[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size]
+
         # Variance reduction
         red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
         v_chunk = NorMuonAndAdam._apply_normuon_variance_reduction(
             v_chunk, p_state["second_momentum_buffer"], p_cfg.beta2, red_dim
         )
+
+        # Magma: scale the orthogonalized update by alignment score.
+        # Sign is preserved so CWD mask (grad * p >= 0) is unaffected.
+        if magma_scale != 1.0:
+            v_chunk = v_chunk * magma_scale
 
         # Update parameter, in place, with cautious weight decay
         param_view = param.data.view(p_cfg.reshape)
@@ -1676,8 +1709,8 @@ class TrainingManager():
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
         self.param_table = {
-            "attn_bank":      {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
-            "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "attn_bank":      {"optim": "normuon", "comms": "sharded",    "adam_betas": None, "use_magma": True},
+            "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None, "use_magma": True},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
