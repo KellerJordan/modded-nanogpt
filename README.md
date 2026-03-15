@@ -51,7 +51,8 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@ChrisJMcCormick](https://x.com/ChrisJMcCormick), [@dominikkallusky](https://github.com/dominikkallusky), [@acutkosky](https://github.com/acutkosky), 
 [@manikbhandari](https://github.com/manikbhandari), [@andrewbriand](https://x.com/andrewbriand8), [@jrauvola](https://x.com/Joshrav21),
 [@soren_dunn_](https://x.com/soren_dunn_), [@photon_mz](https://x.com/photon_mz), [@srashedll](https://x.com/srashedll), [@dhrvji](https://x.com/dhrvji),
-[@EmmettBicker](https://github.com/EmmettBicker), [@dualverse-ai](https://github.com/dualverse-ai), [@sisovicm](https://x.com/sisovicm)
+[@EmmettBicker](https://github.com/EmmettBicker), [@dualverse-ai](https://github.com/dualverse-ai), [@sisovicm](https://x.com/sisovicm),
+[@moof2x](https://github.com/moof2x), [@samacqua](https://github.com/samacqua)
 
 
 ---
@@ -178,8 +179,11 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 70 | 1.521 minutes | [Tune value embed layout and ve_gates](https://x.com/classiclarryd/status/2023319358303510719) | 02/03/26 | [log](records/track_1_short/2026-02-03_VeTuned/42cbebac-0599-4a89-a00e-26d1c4cad140.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/218) | @photon_mz
 71 | 1.516 minutes | [Sparse bigram gradient comms and optimized loading on CPU](https://x.com/classiclarryd/status/2023319358303510719) | 02/06/26 | [log](records/track_1_short/2026-02-06_SparseBigramGradient/02fee7bd-cd22-478b-9e8e-12e857ff3152.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/221) | @roeeshenberg
 72 | 1.496 minutes | [Increase minimum lr and add max_seq_len schedule](https://x.com/classiclarryd/status/2023319358303510719) | 02/10/26 | [log](records/track_1_short/2026-02-10_ShortWindow/Short-Window_1_1.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/224) | @dualverse-ai & AI System [Station](https://github.com/dualverse-ai/station)
-73 | 1.485 minutes | Partitioned Hyperconnections | 02/12/26 | [log](records/track_1_short/2026-02-12_ParallelResiduals/451050db-d471-49db-b19b-be824bb896d0.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/230) | @sisovicm
-74 | 1.468 minutes | Flattened GPT forward, removed post attention lambdas, added transpose kernels | 02/16/26 | [log](records/track_1_short/2026-02-16_FlattenForward/pr233/2026-02-16_21-30-05_time-362_secs_F-inject-post-attn_9f12a3.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/233) | @ChrisJMcCormick
+73 | 1.485 minutes | [Partitioned Hyperconnections](https://x.com/classiclarryd/status/2026131531207761924) | 02/12/26 | [log](records/track_1_short/2026-02-12_ParallelResiduals/451050db-d471-49db-b19b-be824bb896d0.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/230) | @sisovicm
+74 | 1.468 minutes | [Flattened GPT forward, removed post attention lambdas, added transpose kernels](https://x.com/classiclarryd/status/2027228782483182059) | 02/16/26 | [log](records/track_1_short/2026-02-16_FlattenForward/pr233/2026-02-16_21-30-05_time-362_secs_F-inject-post-attn_9f12a3.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/233) | @ChrisJMcCormick
+75 | 1.453 minutes | [Cross Entropy Kernel Optimizations](https://x.com/classiclarryd/status/2030087884854939947) | 02/23/26 | [log](records/track_1_short/2026-02-23_CrossEntropyKernel/1e51be6b-7dd4-41ab-b95d-e57da5814776.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/235) | @moof2x
+76 | 1.446 minutes | Reuse and tune backward transpose kernel | 02/28/26 | [log](records/track_1_short/2026-02-28_TransposeCopyBackward/this_pr/14c9cefc-c840-493f-870e-61bb1d2b1d97.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/240) | @samacqua
+77 | 1.435 minutes | Replace partitioned hyperconnections with single saved activation | 03/06/26 | [log](records/track_1_short/2026-03-06_SimplifyHC/0ab4a843-8c3a-4fb4-9fff-8e1d39852646.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/241) | @classiclarryd
 ## Rules
 
 New records must:
