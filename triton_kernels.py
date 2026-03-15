@@ -589,7 +589,8 @@ def fused_softcapped_entropy_bwd_kernel(
     n_rows, n_cols, n_predict,
     A, B, C,
     grad_s,
-    BLOCK_SIZE: tl.constexpr
+    BLOCK_SIZE: tl.constexpr,
+    N_PREDICT: tl.constexpr
 ):
     row_idx = tl.program_id(0).to(tl.int64)
 
@@ -599,14 +600,41 @@ def fused_softcapped_entropy_bwd_kernel(
     lse = tl.load(lse_ptr + row_idx)
     grad_loss = tl.load(grad_output_ptr + row_idx)
 
-    S_w = 0.0
-    for k in range(n_predict):
-        if row_idx + k < n_rows:
-            S_w += tl.load(mtp_weights_ptr + k)
-
     inv_C = 1.0 / C
     B_div_C = B * inv_C
     inv_C_A = inv_C * A
+    inv_grad_s = 1.0 / grad_s
+
+    # Preload all targets and weights before the column loop
+    S_w = 0.0
+    t0: tl.int32 = -1
+    t1: tl.int32 = -1
+    t2: tl.int32 = -1
+    w0: tl.float32 = 0.0
+    w1: tl.float32 = 0.0
+    w2: tl.float32 = 0.0
+
+    if N_PREDICT >= 1:
+        if row_idx + 0 < n_rows:
+            w0 = tl.load(mtp_weights_ptr + 0)
+            t0 = tl.load(targets_ptr + row_idx + 0).to(tl.int32)
+            S_w += w0
+
+    if N_PREDICT >= 2:
+        if row_idx + 1 < n_rows:
+            w1 = tl.load(mtp_weights_ptr + 1)
+            t1 = tl.load(targets_ptr + row_idx + 1).to(tl.int32)
+            S_w += w1
+
+    if N_PREDICT >= 3:
+        if row_idx + 2 < n_rows:
+            w2 = tl.load(mtp_weights_ptr + 2)
+            t2 = tl.load(targets_ptr + row_idx + 2).to(tl.int32)
+            S_w += w2
+
+    # Fuse all scalar multiplications
+    grad_scale = grad_loss * inv_grad_s
+    grad_scale_icA = grad_scale * inv_C_A
 
     for off in range(0, n_cols, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
@@ -618,17 +646,17 @@ def fused_softcapped_entropy_bwd_kernel(
         p = tl.exp(z - lse)
 
         term1 = S_w * p
-        term2 = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-        for k in range(n_predict):
-            if row_idx + k < n_rows:
-                target = tl.load(targets_ptr + row_idx + k).to(tl.int32)
-                weight = tl.load(mtp_weights_ptr + k)
-                term2 += tl.where(cols == target, weight, 0.0)
 
-        grad_z = grad_loss * (term1 - term2)
-        dz_dx = inv_C_A * sigmoid_u * (1.0 - sigmoid_u)
-        grad_x = grad_z * dz_dx
-        grad_x = grad_x / grad_s
+        term2 = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+        if N_PREDICT >= 1:
+            term2 += tl.where(cols == t0, w0, 0.0)
+        if N_PREDICT >= 2:
+            term2 += tl.where(cols == t1, w1, 0.0)
+        if N_PREDICT >= 3:
+            term2 += tl.where(cols == t2, w2, 0.0)
+
+        grad_z = term1 - term2
+        grad_x = grad_scale_icA * grad_z * sigmoid_u * (1.0 - sigmoid_u)
         grad_x = grad_x.to(tl.float8e5)
         tl.store(grad_row_ptr + cols, grad_x, mask=mask)
 
@@ -650,8 +678,8 @@ def _transpose_copy_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
 
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
 
@@ -672,15 +700,14 @@ def _transpose_copy_kernel(
 def transpose_copy(src: torch.Tensor, dst: torch.Tensor):
     """Tiled transpose copy: dst = src.T where src is (M, N) and dst is (N, M).
 
-    Uses a 32x32 tiled Triton kernel with coalesced reads AND writes,
-    achieving near memory-bandwidth-limited performance (~60-80us on H100
-    for 768x50304 BF16 vs ~296us for PyTorch's copy_).
+    Uses a 64x128 tiled Triton kernel with coalesced reads AND writes,
+    achieving near memory-bandwidth-limited performance.
     """
     assert src.ndim == 2 and dst.ndim == 2
     M, N = src.shape
     assert dst.shape == (N, M), f"Expected dst shape ({N}, {M}), got {dst.shape}"
 
-    BLOCK_M, BLOCK_N = 32, 32
+    BLOCK_M, BLOCK_N = 64, 128
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     _transpose_copy_kernel[grid](
@@ -690,7 +717,7 @@ def transpose_copy(src: torch.Tensor, dst: torch.Tensor):
         dst.stride(0), dst.stride(1),
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        num_warps=4,
+        num_warps=8,
         num_stages=2,
     )
 
@@ -793,7 +820,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             logits.stride(0), logits.stride(1),
             n_rows, n_cols, n_predict,
             A, B, C,
-            BLOCK_SIZE=1024,
+            BLOCK_SIZE=2048,
             num_warps=2
         )
 
@@ -819,7 +846,8 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             A, B, C,
             grad_s,
             BLOCK_SIZE=1024,
-            num_warps=2
+            num_warps=4,
+            N_PREDICT=n_predict,
         )
 
         x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
@@ -835,9 +863,15 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             use_fast_accum=False,
         )
 
+        x_f8_T = torch.empty((x_f8.shape[1], x_f8.shape[0]), dtype=x_f8.dtype, device=x_f8.device)
+        transpose_copy(x_f8, x_f8_T)  # (768, n_rows) row-major
+
+        grad_input_T = torch.empty((n_cols, n_rows), dtype=grad_input.dtype, device=grad_input.device)
+        transpose_copy(grad_input, grad_input_T)  # (50304, n_rows) row-major
+
         grad_w = torch._scaled_mm(
-            x_f8.T.contiguous(),
-            grad_input.T.contiguous().T,
+            x_f8_T,            # (768, n_rows) row-major
+            grad_input_T.T,    # (n_rows, 50304) column-major view
             out_dtype=torch.float32,
             scale_a=x_scale,
             scale_b=grad_scale,
