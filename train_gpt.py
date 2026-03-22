@@ -1371,6 +1371,7 @@ def _load_data_shard(file: Path):
     return tokens
 
 BOS_ID = 50256
+TRAIN_MAX_NUM_DOCS = {16384: 64, 32768: 96, 49152: 128}
 
 class Shard:
     def __init__(self, tokens: Tensor, world_size: int = 1):
@@ -1477,7 +1478,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 
     while True:
         num_tokens_local = num_tokens // world_size
-        max_num_docs = next_multiple_of_n(num_tokens_local // 300, n=128)  # median doc length is ~400
+        max_num_docs = TRAIN_MAX_NUM_DOCS.get(num_tokens_local, next_multiple_of_n(num_tokens_local // 300, n=128))
 
         if align_to_bos:
             try:
@@ -1711,7 +1712,7 @@ class TrainingManager():
         normuon_defaults = dict(
             lr=0.023,
             momentum=0.95,
-            beta2=0.95,
+            beta2=0.9,
             weight_decay=1.2,
         )
 
