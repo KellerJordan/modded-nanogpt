@@ -1370,7 +1370,7 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-BOS_ID = 50256
+BOS_ID = int(os.environ.get("BOS_ID", 50256))
 
 class Shard:
     def __init__(self, tokens: Tensor, world_size: int = 1):
@@ -1544,8 +1544,8 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 class Hyperparameters:
     # data
     data_path = os.environ.get("DATA_PATH", ".")
-    train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin") # input .bin to train on
-    val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin") # input .bin to eval validation loss on
+    train_files: str = os.environ.get("TRAIN_FILES", os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin")) # input .bin to train on
+    val_files: str = os.environ.get("VAL_FILES", os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin")) # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
@@ -1558,7 +1558,7 @@ class Hyperparameters:
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
-    bigram_vocab_size: int = 50304 * 5
+    bigram_vocab_size: int = next_multiple_of_n(int(os.environ.get("VOCAB_SIZE", 50257)), n=128) * 5
 
 args = Hyperparameters()
 
@@ -1870,7 +1870,7 @@ print0(nvidia_smi())
 print0("="*100)
 
 model: nn.Module = GPT(
-    vocab_size=50257,
+    vocab_size=int(os.environ.get("VOCAB_SIZE", 50257)),
     num_layers=11,
     num_heads=6,
     head_dim=128,
