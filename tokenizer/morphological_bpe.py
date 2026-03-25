@@ -86,8 +86,7 @@ class MorphologicalBPETrainer:
                     # Assign next available ID
                     merged_id = 256 + len(self.merges)
                     self.merges[pair] = merged_id
-                    self.vocab[merged_id] = self.vocab.get(pair[0], bytes([pair[0]])) + \
-                                            self.vocab.get(pair[1], bytes([pair[1]]))
+                    self.vocab[merged_id] = self.vocab[pair[0]] + self.vocab[pair[1]]
                     merges_created += 1
 
                     # Apply this merge to all words
@@ -157,8 +156,7 @@ class MorphologicalBPETrainer:
             # Assign next available ID
             new_id = 256 + merges_done
             self.merges[pair] = new_id
-            self.vocab[new_id] = self.vocab.get(pair[0], bytes([pair[0]])) + \
-                                 self.vocab.get(pair[1], bytes([pair[1]]))
+            self.vocab[new_id] = self.vocab[pair[0]] + self.vocab[pair[1]]
 
             if verbose and (merges_done % 100 == 0 or merges_done < 10):
                 print(f"merge {merges_done}/{num_merges}: {pair} -> {new_id} "
@@ -278,8 +276,7 @@ class MorphologicalBPETrainer:
 
             new_id = 256 + merges_done
             self.merges[pair] = new_id
-            self.vocab[new_id] = self.vocab.get(pair[0], bytes([pair[0]])) + \
-                                 self.vocab.get(pair[1], bytes([pair[1]]))
+            self.vocab[new_id] = self.vocab[pair[0]] + self.vocab[pair[1]]
 
             if verbose and (merges_done % 500 == 0):
                 print(f"merge {merges_done}/{num_merges}: {pair} -> {new_id} freq={stats[pair]}")
@@ -386,8 +383,8 @@ class MorphologicalBPETrainer:
         # Merged tokens: sorted by merge order (token ID)
         sorted_merges = sorted(self.merges.items(), key=lambda x: x[1])
         for (left, right), merged_id in sorted_merges:
-            left_bytes = self.vocab.get(left, bytes([left]))
-            right_bytes = self.vocab.get(right, bytes([right]))
+            left_bytes = self.vocab[left]
+            right_bytes = self.vocab[right]
             merged_bytes = left_bytes + right_bytes
             mergeable_ranks[merged_bytes] = merged_id
 
