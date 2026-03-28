@@ -1,24 +1,27 @@
 ## New Record: FP8 lm_head, YaRN fix, LR tuning (-30s)
 
-Three changes from the prior record (#18):
+The main change I made is re-introducing the FP8 kernel for the `lm_head`, using the following scaling factors: 
 
-**1. Enable FP8 on lm_head**
+`x_s=32/448`, `w_s=2.25/448`, `grad_s=1.5/448`. 
 
-The prior PR dropped FP8 on `lm_head` due to the effort required to tune the scaling coefficients.
-We calibrated the coefficients for the medium track (`x_s=32/448`, `w_s=2.25/448`, `grad_s=1.5/448`)
-and switched `CastedLinear` → `CastedLinearT` (transposed weight storage) to match the short track.
-This saves ~4% per step by running the largest matmul in the model in FP8.
+Basically, I ran a few profiling runs, and found that 
+x_max = 31.375, w_max = 2.0000, and grad_max = 1.3438, so I added a bit of leeway and divided by 448 since x and w will be be cast to `float8_e4m3fn` (and 448 is the maximum finite value in e4m3fn). 
 
-**2. Fix YaRN cap**
+Technically, I noticed that grad is cast to `float8_e5m2` which has a wider dynamic range, but the short track currently still computes grad_s by dividing by 448. That means we're not using the entire dynamic range available to us, but it probably doesn't matter, so I kept the /448 factor from the short track. 
 
-The prior PR stopped applying YaRN once the long attention window exceeded 13 blocks, citing uncertainty
-about its behaviour at larger windows. Removing this cap and applying YaRN at every window-size transition
-improves validation loss by ~0.001.
+Implementing fp8 matmuls for `lm_head` is by far the majority of the speed up, but I tuned the learning rate for muon and adam as well (which accounts for about 2s worth of speedup). I was also able to verify that using YaRN works fine for the larger attention windows, and adding it back provides a small improvement to the validation loss. 
 
-**3. Tune learning rate**
+I also tuned the learning rate for Muon and Adam to: (`muon_lr`: 0.015 -> 0.012, and `adam_lr`: 0.008 -> 0.004). 
 
-Reduced `muon_lr` from 0.015 → 0.012. The prior LR was selected conservatively while chasing an
-attention bug; the lower value gives a small but consistent improvement.
+Interestingly, smaller learning rates perform substantially better at first (up to about INSERT VALUE HERE), but then at around step 3000 onwards, they lose most of their advantage. They are way ahead at step 3000 though, so I imagine that by tuning the LR warmup schedule a bit, we could preserve that advantage and maybe get around another minute worth of speedup just from that. I tried for a little bit, but didn't manage to make much progress there. 
+
+INSERT GRAPH OF SWEEPS HERE
+
+I also switched `CastedLinear` → `CastedLinearT` (transposed weight storage) to match the short track. This saves us some transpositions in backprop, and delivers about a 1 second speedup as opposed compared to our original implementation. 
+
+In summary, I think that tuning the learning rate schedule could substantially improve this run, in addition to implementing the remaining short track features that haven't yet made it to the medium track. 
+
+I think spending some effort to properly tune the LR for this run could be really valuable to provide scaling intuition for hyperparameters with Muon. The difficulty is that tuning the learning rate at least requires running the entire run (since mid-run data can be quite deceiving) and that takes quite a bit. 
 
 ## Timing and Validation
 
