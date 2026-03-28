@@ -4,18 +4,27 @@ The main change I made is re-introducing the FP8 kernel for the `lm_head`, using
 
 `x_s=32/448`, `w_s=2.25/448`, `grad_s=1.5/448`. 
 
-Basically, I ran a few profiling runs, and found that 
-x_max = 31.375, w_max = 2.0000, and grad_max = 1.3438, so I added a bit of leeway and divided by 448 since x and w will be be cast to `float8_e4m3fn` (and 448 is the maximum finite value in e4m3fn). 
+Basically, I ran a few profiling runs, and found that x_max = 31.375, w_max = 2.0000, and grad_max = 1.3438, so I added a bit of leeway and divided by 448 since x and w will be be cast to `float8_e4m3fn` (and 448 is the maximum finite value in e4m3fn). 
 
-Technically, I noticed that grad is cast to `float8_e5m2` which has a wider dynamic range, but the short track currently still computes grad_s by dividing by 448. That means we're not using the entire dynamic range available to us, but it probably doesn't matter, so I kept the /448 factor from the short track. 
+Technically, I noticed that grad is cast to `float8_e5m2` which has a wider dynamic range, but the short track currently still computes grad_s by dividing by 448. That means we're not using the entire dynamic range available to us, but it probably doesn't matter, so I kept the 448 factor from the short track. 
 
 Implementing fp8 matmuls for `lm_head` is by far the majority of the speed up, but I tuned the learning rate for muon and adam as well (which accounts for about 2s worth of speedup). I was also able to verify that using YaRN works fine for the larger attention windows, and adding it back provides a small improvement to the validation loss. 
 
 I also tuned the learning rate for Muon and Adam to: (`muon_lr`: 0.015 -> 0.012, and `adam_lr`: 0.008 -> 0.004). 
 
-Interestingly, smaller learning rates perform substantially better at first (up to about INSERT VALUE HERE), but then at around step 3000 onwards, they lose most of their advantage. They are way ahead at step 3000 though, so I imagine that by tuning the LR warmup schedule a bit, we could preserve that advantage and maybe get around another minute worth of speedup just from that. I tried for a little bit, but didn't manage to make much progress there. 
+Interestingly, smaller learning rates perform substantially better at first (up to about 0.008 for Muon), but then at around step 3000 onwards, they lose most of their advantage. They are way ahead at step 3000 though, so I imagine that by tuning the LR warmup schedule a bit, we could preserve that advantage and maybe get around another minute worth of speedup just from that. I tried for a little bit, but didn't manage to make much progress there. 
 
-INSERT GRAPH OF SWEEPS HERE
+![Sweep Results: Lower learning rates jump ahead early, but lose their lead](./lr_sweep.png)
+
+*Caption: Results of learning rate sweeps for Muon and Adam optimizers with learning rates <0.015. Lower learning rates show much faster progress and are well ahead around step 2000, but after about step 3000 they quickly lose their advantage as higher learning rates catch up and surpass them by the end of training. Note: I stopped the 0.014 learning rate run early, which is why the graph doesn't complete.*
+
+![Sweep Results: Higher learning rates stagnate and never reach competitive loss](./lr_high_sweep.png)
+
+*Caption: Results of learning rate sweeps for Muon and Adam optimizers with learning rates >0.015. Increasing the learning rate beyond 0.015 is totally hopeless*
+
+![Low LR and Cooldown Schedules: Ultra-low learning rate (0.008) excels early, but loses its lead as training continues](./low_lr_x_cooldown.png)
+
+*Caption: Experimenting with an even lower Muon learning rate of 0.008, I found it performed best mid-run—well ahead of all other rates. However, by the end, it lost its advantage and was surpassed. I also tested various cooldown schedules to see if a more aggressive or tailored decay could help the 0.008 LR run preserve its early progress. Despite these adjustments, the low LR curve still faded by the end. This suggests that tuning the cooldown/warmup schedule in tandem with these very low LRs may be necessary to lock in the early gains, and could be an avenue for further speed or loss improvements. Note: Lowering the LR to less than 0.008 no longer improves the performance at step 3000, which is why this graph doesn't test learning rates lower.*
 
 I also switched `CastedLinear` → `CastedLinearT` (transposed weight storage) to match the short track. This saves us some transpositions in backprop, and delivers about a 1 second speedup as opposed compared to our original implementation. 
 
