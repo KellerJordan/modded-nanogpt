@@ -18,7 +18,7 @@ This improvement in training speed has been brought about by the following techn
 * Flash Attention 3 with long-short sliding window attention pattern (inspired by Gemma 2) and window size warmup with YaRN
 * Align training batch starts with EoS and set a max document length
 * Accumulate gradients for 2 steps for embedding and lm_head before updating parameters
-* Enable model to back out contributions from first 2/3 layers before prediction
+* Backout, with single activation input for last 3 attention layers
 * Polar Express implementation in Muon
 * Smear module to enable 1 token look back
 * Sparse attention gate
@@ -33,7 +33,6 @@ This improvement in training speed has been brought about by the following techn
 * Additional gating on value embeddings and skip connection
 * Paired head attention
 * Bigram hash embedding
-* Partitioned Hyperconnections
 
 As well as many systems optimizations.
 
@@ -182,6 +181,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 75 | 1.453 minutes | [Cross Entropy Kernel Optimizations](https://x.com/classiclarryd/status/2030087884854939947) | 02/23/26 | [log](records/track_1_short/2026-02-23_CrossEntropyKernel/1e51be6b-7dd4-41ab-b95d-e57da5814776.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/235) | @moof2x
 76 | 1.446 minutes | Reuse and tune backward transpose kernel | 02/28/26 | [log](records/track_1_short/2026-02-28_TransposeCopyBackward/this_pr/14c9cefc-c840-493f-870e-61bb1d2b1d97.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/240) | @samacqua
 77 | 1.435 minutes | Replace partitioned hyperconnections with single saved activation | 03/06/26 | [log](records/track_1_short/2026-03-06_SimplifyHC/0ab4a843-8c3a-4fb4-9fff-8e1d39852646.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/241) | @classiclarryd
+78 | 1.426 minutes | Tighten bounds on fa3 max_num_docs to match fineweb distribution | 03/22/26 | [log](records/track_1_short/2026-03-22_VarlenMaxDocs/combined/2026-03-22_20-07-32_time-186_secs_06-mbeta2-max-docs_227ce8.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/246) | @ChrisJMcCormick
 ## Rules
 
 New records must:
