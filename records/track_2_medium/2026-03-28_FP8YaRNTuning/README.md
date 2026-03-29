@@ -14,17 +14,17 @@ I also tuned the learning rate for Muon and Adam to: (`muon_lr`: 0.015 -> 0.012,
 
 Interestingly, smaller learning rates perform substantially better at first (up to about 0.008 for Muon), but then at around step 3000 onwards, they lose most of their advantage. They are way ahead at step 3000 though, so I imagine that by tuning the LR warmup schedule a bit, we could preserve that advantage and maybe get around another minute worth of speedup just from that. I tried for a little bit, but didn't manage to make much progress there. 
 
-![Sweep Results: Lower learning rates jump ahead early, but lose their lead](./lr_sweep.png)
+![Sweep Results: Lower learning rates jump ahead early, but lose their lead](./low_lr_sweep.png)
 
 *Caption: Results of learning rate sweeps for Muon and Adam optimizers with learning rates <0.015. Lower learning rates show much faster progress and are well ahead around step 2000, but after about step 3000 they quickly lose their advantage as higher learning rates catch up and surpass them by the end of training. Note: I stopped the 0.014 learning rate run early, which is why the graph doesn't complete.*
 
-![Sweep Results: Higher learning rates stagnate and never reach competitive loss](./lr_high_sweep.png)
+![Sweep Results: Higher learning rates stagnate and never reach competitive loss](./high_lr_sweep.png)
 
 *Caption: Results of learning rate sweeps for Muon and Adam optimizers with learning rates >0.015. Increasing the learning rate beyond 0.015 is totally hopeless*
 
 ![Low LR and Cooldown Schedules: Ultra-low learning rate (0.008) excels early, but loses its lead as training continues](./low_lr_x_cooldown.png)
 
-*Caption: Experimenting with an even lower Muon learning rate of 0.008, I found it performed best mid-run—well ahead of all other rates. However, by the end, it lost its advantage and was surpassed. I also tested various cooldown schedules to see if a more aggressive or tailored decay could help the 0.008 LR run preserve its early progress. Despite these adjustments, the low LR curve still faded by the end. This suggests that tuning the cooldown/warmup schedule in tandem with these very low LRs may be necessary to lock in the early gains, and could be an avenue for further speed or loss improvements. Note: Lowering the LR to less than 0.008 no longer improves the performance at step 3000, which is why this graph doesn't test learning rates lower.*
+*Caption: Experimenting with an even lower Muon learning rate of 0.008, I found it performed best mid-run—well ahead of all other rates. However, by the end, it lost its advantage and was surpassed. I also tested various cooldown schedules to see if a less/more aggressive decay could help the 0.008 LR run preserve its early progress. I wasn't able to make this work. Note: Lowering the LR to less than 0.008 no longer improves the performance at step 3000, which is why this graph doesn't test learning rates lower.*
 
 I also switched `CastedLinear` → `CastedLinearT` (transposed weight storage) to match the short track. This saves us some transpositions in backprop, and delivers about a 1 second speedup as opposed compared to our original implementation. 
 
