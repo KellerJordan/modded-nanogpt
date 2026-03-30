@@ -1254,15 +1254,6 @@ class GPT(nn.Module):
         # ---- Schedule and layer topology ----
         mtp_weights, train_max_seq_len = schedule_cfg.mtp_weights, schedule_cfg.train_max_seq_len
         ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
-<<<<<<< HEAD
-        skip_connections = []
-        skip_in = 3 # long attention window on layer 3
-        skip_out = 6 # no attn op on layer 6
-        x_backout = None
-        backout_layer = 7
-=======
-
->>>>>>> master
         # set block masks and key shift
         bm_sizes = [ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, None, ws_short, ws_short, ws_short, ws_long]
         assert len(bm_sizes) == self.num_layers
@@ -1335,21 +1326,6 @@ class GPT(nn.Module):
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
 
-<<<<<<< HEAD
-            # Introduce lane1 at parallel_start by copying lane0
-            if i == self.parallel_start:
-                lane1 = lane0
-
-            # Skip connection injection
-            if i == skip_out:
-                skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
-                skip_val = skip_connections.pop()
-                lane0 = lane0 + skip_gate_out * skip_val
-                if lane1 is not None:
-                    lane1 = lane1 + skip_gate_out * skip_val
-
-=======
->>>>>>> master
             # Select attention variant for this layer
             attn = self.attn_paired if i in self.paired_head_layers else self.attn
 
@@ -1366,20 +1342,7 @@ class GPT(nn.Module):
             if i == 7:
                 x_backout = x
 
-<<<<<<< HEAD
-            # Skip connection and backout bookkeeping
-            if i == skip_in:
-                skip_connections.append(post_attn)
-            if i == backout_layer:
-                x_backout = lane0
-
-        # ---- Output and loss ----
-        x = (lane0 + lane1) * 0.5
-
-        # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
-=======
         # back out contributions from first 7 layers
->>>>>>> master
         x -= backout_lambda * x_backout
         x = norm(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
