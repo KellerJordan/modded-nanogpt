@@ -445,24 +445,26 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
         c0 = acc0.to(dtype)
         if not FORWARD:
             c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
-            c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
+            # LeakyReLU(0.5)² backward: d/dx = 2x if x>0, 2*0.25*x if x<0
+            c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0.25 * c0_pre)
 
         c_desc.store([offs_am_c, offs_bn_c], c0)
 
         if FORWARD:
-            c0_post = tl.maximum(c0, 0)
+            # LeakyReLU(0.5)² forward: f(x) = x² if x>0, 0.25x² if x<0
+            c0_post = tl.where(c0 > 0, c0, c0 * 0.5)
             c0_post = c0_post * c0_post
             aux_desc.store([offs_am_c, offs_bn_c], c0_post)
 
         c1 = acc1.to(dtype)
         if not FORWARD:
             c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
-            c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
+            c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0.25 * c1_pre)
 
         c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
 
         if FORWARD:
-            c1_post = tl.maximum(c1, 0)
+            c1_post = tl.where(c1 > 0, c1, c1 * 0.5)
             c1_post = c1_post * c1_post
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 

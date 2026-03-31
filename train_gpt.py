@@ -36,8 +36,8 @@ from kernels import get_kernel
 from torch import Tensor, nn
 
 from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
-# Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
-# https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+# Fused triton kernel: leaky_relu(x @ W1.T, 0.5)^2 @ W2.T
+# LeakyReLU(0.5)² preserves negative gradient flow; ReLU² orig by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
 
 dynamo.config.recompile_limit = 64
