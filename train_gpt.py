@@ -342,7 +342,7 @@ def sparse_comms_merge_gradients(grad, recv_idx, recv_vals, rank, world):
 # -----------------------------------------------------------------------------
 # Combined NorMuon + Adam Optimizer
 
-@dataclass
+@dataclass(slots=True)
 class ParamConfig:
     """Per-parameter configuration for NorMuonAndAdam optimizer."""
     label: str
@@ -438,7 +438,7 @@ class NorMuonAndAdam:
             self._build_param_cfg(param, label)
 
         # Assert scatter_order and work_order match present labels exactly
-        present = set(self._param_by_label.keys())
+        present = self._param_by_label.keys()
         assert set(scatter_order) == present and set(work_order) == present
 
         # Handle world_size=1: overwrite comms to "none"
@@ -696,7 +696,7 @@ class NorMuonAndAdam:
     def load_state_dict(self, state_dict):
         """Load optimizer state from a dict."""
         # Build id->param mapping
-        id_to_param = {id(p): p for p in self.param_cfgs.keys()}
+        id_to_param = {id(p): p for p in self.param_cfgs}
 
         # Load state, preserving dtypes
         for param_id, saved_p_state in state_dict["param_states"].items():
@@ -889,9 +889,9 @@ class NorMuonAndAdam:
 
         # MLP has per-matrix LR multipliers (c_proj gets 2x LR)
         if p_cfg.per_matrix_lr_mul is not None:
+            self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
             for mat_idx in range(p_cfg.chunk_size):
                 self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.per_matrix_lr_mul[mat_idx] * p_cfg.lr)
-                self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
                 NorMuonAndAdam._cautious_wd_and_update_inplace(
                     p_slice[mat_idx].view(torch.uint16), p_state["mantissa"][mat_idx], v_chunk[mat_idx],
                     self._eff_wd_t, self._eff_lr_t
@@ -1011,7 +1011,7 @@ class Yarn(nn.Module):
             )
         else:
             t_even = 2 * t
-            t_odd = 2 * t + 1
+            t_odd = t_even + 1
             theta1 = torch.outer(t_even, angular_freq)
             theta2 = torch.outer(t_odd, angular_freq)
             self.factor1 = nn.Buffer(
@@ -1039,7 +1039,7 @@ class Yarn(nn.Module):
             self.factor2.copy_(theta.sin())
         else:
             t_even = 2 * t
-            t_odd = 2 * t + 1
+            t_odd = t_even + 1
             theta1 = torch.outer(t_even, self.angular_freq)
             theta2 = torch.outer(t_odd, self.angular_freq)
             self.factor1.copy_(torch.cat((theta1.cos(), theta2.cos()), dim=-1))
@@ -1047,7 +1047,7 @@ class Yarn(nn.Module):
         self.factor2[..., 1::2] *= -1
         self.attn_scale *= 0.2 * math.log(new_window / old_window) + 1
 
-@dataclass
+@dataclass(slots=True)
 class AttnArgs:
     ve: torch.Tensor
     sa_lambdas: torch.Tensor
@@ -1138,9 +1138,9 @@ class CausalSelfAttention(nn.Module):
 # The main model
 
 def next_multiple_of_n(v: float | int, *, n: int):
-    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+    return math.ceil(v / n) * n
 
-@dataclass
+@dataclass(slots=True)
 class ForwardScheduleConfig:
     mtp_weights: torch.Tensor
     ws_short: int
@@ -1167,6 +1167,7 @@ class GPT(nn.Module):
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
         self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 unique gates
+        self.gate_filler_nones = [None] * (num_layers - 6)
 
         # -----------------------------------
         # Parameter banks for sharded optimization, by @chrisjmccormick
@@ -1253,7 +1254,6 @@ class GPT(nn.Module):
         # ---- Schedule and layer topology ----
         mtp_weights, train_max_seq_len = schedule_cfg.mtp_weights, schedule_cfg.train_max_seq_len
         ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
-
         # set block masks and key shift
         bm_sizes = [ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, None, ws_short, ws_short, ws_short, ws_long]
         assert len(bm_sizes) == self.num_layers
@@ -1270,10 +1270,10 @@ class GPT(nn.Module):
         post_lambdas_mlp  = self.post_lambdas[:, 1].bfloat16().unbind(0)
         x0_lambdas = self.x0_lambdas.bfloat16().unbind(0)
         bigram_lambdas = self.bigram_lambdas.bfloat16().unbind(0)
-        ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
-        veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
-        attn_gates = ag[:6] + [None] + ag[6:]
-        ve_gates = [None] + [veg[0], veg[1]] + [None] * (self.num_layers - 6) + [veg[2], veg[3], veg[4]]
+        ag = self.attn_gate_bank.unbind(0)
+        veg = self.ve_gate_bank.unbind(0)
+        attn_gates = [*ag[:6], None, *ag[6:]]
+        ve_gates = [None, veg[0], veg[1], *self.gate_filler_nones, veg[2], veg[3], veg[4]]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
         attn_weights = self.attn_bank.unbind(0)  # tuple of [4*dim, hdim] tensors
@@ -1289,7 +1289,7 @@ class GPT(nn.Module):
         # Value embeddings - always computed (not precomputed)
         ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
         # Shifted .01 ... 234 structure on token value embeddings by @photomz
-        ve = [None, ve[0], ve[1]] + [None] * (self.num_layers - 6) + [ve[2], ve[3], ve[4]]
+        ve = [None, ve[0], ve[1], *self.gate_filler_nones, ve[2], ve[3], ve[4]]
         assert len(ve) == self.num_layers
 
         # smear token embed forward 1 position @classiclarryd
@@ -1412,12 +1412,12 @@ class Shard:
                     raise StopIteration(f"Insufficient BOS ahead; hit tail of shard.")
                 cur = self.bos_idx[idx]
                 starts[r].append(cur)
-                end = min(self.bos_idx[idx + 1] if idx + 1 < n else self.size,
+                idx += 1
+                end = min(self.bos_idx[idx] if idx < n else self.size,
                           cur + max_seq_len,
                           cur + num_tokens_local - cur_len + 1)
                 ends[r].append(end)
                 cur_len += end - cur
-                idx += 1
 
             assert cur_len == num_tokens_local + 1
         self.i = idx
@@ -1541,7 +1541,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 # -----------------------------------------------------------------------------
 # Training Management
 
-@dataclass
+@dataclass(slots=True)
 class Hyperparameters:
     # data
     data_path = os.environ.get("DATA_PATH", ".")
@@ -1563,7 +1563,7 @@ class Hyperparameters:
 
 args = Hyperparameters()
 
-@dataclass
+@dataclass(slots=True)
 class TrainingStage:
     lr_mul: float
     batch_size: int
@@ -1596,7 +1596,7 @@ class TrainingSchedule:
         self.total_steps = self.scheduled_iterations + extension_iterations
 
         # Build stage boundaries (last is extension stage)
-        ends = [0] + [round(c * scheduled_iterations) for c in accumulate(s.duration for s in stages[:-1])] + [self.total_steps]
+        ends = [0, *[round(c * scheduled_iterations) for c in accumulate(s.duration for s in stages[:-1])], self.total_steps]
         assert self.scheduled_iterations == ends[-2]
         self.boundaries = list(pairwise(ends))
 
@@ -1719,7 +1719,7 @@ class TrainingManager():
         self.optimizer = NorMuonAndAdam(
             model.named_parameters(),
             param_table=self.param_table,
-            scatter_order=list(self.param_table.keys()),  # Dict order defines scatter priority
+            scatter_order=list(self.param_table),  # Dict order defines scatter priority
             work_order=self.work_order,
             adam_defaults=adam_defaults,
             normuon_defaults=normuon_defaults,
@@ -1904,7 +1904,7 @@ val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1,
 
 transition_steps = training_manager.get_transition_steps()
 # first and last pair of steps in each transition
-warmup_steps = sorted({0, 1 } | set(s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 0))
+warmup_steps = sorted({0, 1} | {s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 2})
 print0(f"Sampling steps {warmup_steps} for warmup", console=True)
 for step in warmup_steps:
     training_manager.advance_schedule(step)
