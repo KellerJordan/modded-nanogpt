@@ -533,132 +533,6 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         dx = dpre @ W1
         return dx.view(x.shape), dW1, dW2
 
-# -----------------------------------------------------------------------------
-# Fused Softcapped Cross Entropy
-
-
-@triton.jit
-def fused_softcapped_entropy_fwd_kernel(
-    logits_ptr, losses_ptr, lse_ptr, targets_ptr, mtp_weights_ptr,
-    stride_logits_n, stride_logits_v,
-    n_rows, n_cols, n_predict,
-    A, B, C,
-    BLOCK_SIZE: tl.constexpr
-):
-    row_idx = tl.program_id(0).to(tl.int64)
-    logits_row_ptr = logits_ptr + row_idx * stride_logits_n
-
-    max_val = -float('inf')
-    sum_exp = 0.0
-
-    inv_C = 1.0 / C
-    B_div_C = B * inv_C
-
-    for off in range(0, n_cols, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < n_cols
-        val = tl.load(logits_row_ptr + cols, mask=mask, other=-float('inf')).to(tl.float32)
-        z = A * tl.sigmoid(val * inv_C + B_div_C)
-        z = tl.where(mask, z, -float('inf'))
-        curr_max = tl.max(z, axis=0)
-        new_max = tl.maximum(max_val, curr_max)
-        sum_exp = sum_exp * tl.exp(max_val - new_max) + tl.sum(tl.exp(z - new_max), axis=0)
-        max_val = new_max
-
-    lse = max_val + tl.log(sum_exp)
-    tl.store(lse_ptr + row_idx, lse)
-
-    total_loss = 0.0
-    for k in range(n_predict):
-        target_idx = row_idx + k
-        if target_idx < n_rows:
-            weight = tl.load(mtp_weights_ptr + k)
-            if weight > 0:
-                target = tl.load(targets_ptr + target_idx).to(tl.int32)
-                if target >= 0 and target < n_cols:
-                    val_target = tl.load(logits_row_ptr + target).to(tl.float32)
-                    z_target = A * tl.sigmoid(val_target * inv_C + B_div_C)
-                    total_loss += weight * (lse - z_target)
-
-    tl.store(losses_ptr + row_idx, total_loss)
-
-@triton.jit
-def fused_softcapped_entropy_bwd_kernel(
-    grad_input_ptr, grad_output_ptr, lse_ptr, logits_ptr, targets_ptr, mtp_weights_ptr,
-    stride_logits_n, stride_logits_v, stride_grad_n, stride_grad_v,
-    n_rows, n_cols, n_predict,
-    A, B, C,
-    grad_s,
-    BLOCK_SIZE: tl.constexpr,
-    N_PREDICT: tl.constexpr
-):
-    row_idx = tl.program_id(0).to(tl.int64)
-
-    logits_row_ptr = logits_ptr + row_idx * stride_logits_n
-    grad_row_ptr = grad_input_ptr + row_idx * stride_grad_n
-
-    lse = tl.load(lse_ptr + row_idx)
-    grad_loss = tl.load(grad_output_ptr + row_idx)
-
-    inv_C = 1.0 / C
-    B_div_C = B * inv_C
-    inv_C_A = inv_C * A
-    inv_grad_s = 1.0 / grad_s
-
-    # Preload all targets and weights before the column loop
-    S_w = 0.0
-    t0: tl.int32 = -1
-    t1: tl.int32 = -1
-    t2: tl.int32 = -1
-    w0: tl.float32 = 0.0
-    w1: tl.float32 = 0.0
-    w2: tl.float32 = 0.0
-
-    if N_PREDICT >= 1:
-        if row_idx + 0 < n_rows:
-            w0 = tl.load(mtp_weights_ptr + 0)
-            t0 = tl.load(targets_ptr + row_idx + 0).to(tl.int32)
-            S_w += w0
-
-    if N_PREDICT >= 2:
-        if row_idx + 1 < n_rows:
-            w1 = tl.load(mtp_weights_ptr + 1)
-            t1 = tl.load(targets_ptr + row_idx + 1).to(tl.int32)
-            S_w += w1
-
-    if N_PREDICT >= 3:
-        if row_idx + 2 < n_rows:
-            w2 = tl.load(mtp_weights_ptr + 2)
-            t2 = tl.load(targets_ptr + row_idx + 2).to(tl.int32)
-            S_w += w2
-
-    # Fuse all scalar multiplications
-    grad_scale = grad_loss * inv_grad_s
-    grad_scale_icA = grad_scale * inv_C_A
-
-    for off in range(0, n_cols, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < n_cols
-        val = tl.load(logits_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        u = val * inv_C + B_div_C
-        sigmoid_u = tl.sigmoid(u)
-        z = A * sigmoid_u
-        p = tl.exp(z - lse)
-
-        term1 = S_w * p
-
-        term2 = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-        if N_PREDICT >= 1:
-            term2 += tl.where(cols == t0, w0, 0.0)
-        if N_PREDICT >= 2:
-            term2 += tl.where(cols == t1, w1, 0.0)
-        if N_PREDICT >= 3:
-            term2 += tl.where(cols == t2, w2, 0.0)
-
-        grad_z = term1 - term2
-        grad_x = grad_scale_icA * grad_z * sigmoid_u * (1.0 - sigmoid_u)
-        grad_x = grad_x.to(tl.float8e5)
-        tl.store(grad_row_ptr + cols, grad_x, mask=mask)
 
 # -----------------------------------------------------------------------------
 # Tiled transpose copy kernel: dst (N, M) = src (M, N).T
@@ -784,9 +658,278 @@ def transpose_add(src: torch.Tensor, dst: torch.Tensor):
     )
 
 
+CE_KERNEL_BLOCK_SIZE = 256
+CE_KERNEL_VOCAB_SIZE = 50304
+
+CE_KERNEL_DECLS = f"""
+constexpr int VOCAB_SIZE = {CE_KERNEL_VOCAB_SIZE};
+constexpr int BLOCK_SIZE = {CE_KERNEL_BLOCK_SIZE};
+"""
+
+CE_KERNEL_SOURCE = """
+#include <cuda_bf16.h>
+#include <math_constants.h>
+
+#define __nv_fp8_e5m2 char
+#define uint16_t unsigned short
+#define uint8_t unsigned char
+#define int64_t long long
+
+__device__ __forceinline__ __nv_fp8_e5m2 f32_to_fp8_e5m2(float x) {
+    uint16_t packed;
+    asm volatile(
+        "cvt.rn.satfinite.e5m2x2.f32 %0, %1, %2;"
+        : "=h"(packed)
+        : "f"(x), "f"(0.0f)
+    );
+    __nv_fp8_e5m2 result;
+    *reinterpret_cast<uint8_t*>(&result) = (packed & (0xFF << 8)) >> 8;
+    return result;
+}
+
+struct __align__(16) __nv_bfloat168 {
+    __nv_bfloat16 data[8];
+    __device__ __nv_bfloat16& operator[](int i) { return data[i]; }
+    __device__ const __nv_bfloat16& operator[](int i) const { return data[i]; }
+};
+
+struct __align__(8) __nv_fp8_e5m28 {
+    __nv_fp8_e5m2 data[8];
+    __device__ __nv_fp8_e5m2& operator[](int i) { return data[i]; }
+    __device__ const __nv_fp8_e5m2& operator[](int i) const { return data[i]; }
+};
+
+template<typename T> __device__ constexpr T CEIL_DIV(T a, T b) { return (a + b - 1) / b; }
+
+//__device__ float sigmoid(float x) {
+//  return 1.0f / (1.0f + __expf(-x));
+//}
+__device__ float sigmoid(float x) {
+  return 0.5f + __tanhf(x * 0.5f) * 0.5f;
+}
+
+extern "C"
+__launch_bounds__(BLOCK_SIZE, 2)
+__global__ void ce_fwd_bwd_kernel(
+    const __nv_bfloat16* __restrict__ logits,
+    const int64_t* __restrict__ targets,
+    const float* __restrict__ mtp_weights,
+    float* __restrict__ losses,
+    __nv_fp8_e5m2* grad_input,
+    int batch_size,
+    int n_predict,
+    double A_param,
+    double B_param,
+    double C_param,
+    double grad_s_param,
+    double grad_scale_param)
+{
+  constexpr int VEC_WIDTH = 8;
+  constexpr int NUM_FULL_LOADS = VOCAB_SIZE / (BLOCK_SIZE * VEC_WIDTH);
+  constexpr int NUM_LOADS = CEIL_DIV(VOCAB_SIZE, BLOCK_SIZE * VEC_WIDTH);
+
+  float A = (float)A_param;
+  float B = (float)B_param;
+  float C = (float)C_param;
+  float grad_s = (float)grad_s_param;
+  float grad_scale = (float)grad_scale_param;
+
+  extern __shared__ __nv_bfloat16 smem[];
+
+  static_assert(VEC_WIDTH == 8);
+
+  const __nv_bfloat16 *block_logit_ptr = logits + VOCAB_SIZE * blockIdx.x;
+
+  float inv_C = 1 / C;
+  float B_div_C = B * inv_C;
+  float thread_max = -CUDART_INF_F;
+
+  #pragma unroll 25
+  for (int i = 0; i < NUM_LOADS; i++) {
+    int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
+    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+      __nv_bfloat168 result = *(__nv_bfloat168*)(&block_logit_ptr[idx]);
+      __nv_bfloat168 result_sigmoid;
+      #pragma unroll
+      for (int k = 0; k < VEC_WIDTH; k++) {
+        float tmp = __bfloat162float(result[k]);
+        tmp = sigmoid(tmp * inv_C + B_div_C);
+        result_sigmoid[k] = __float2bfloat16(tmp);
+        tmp = A * tmp;
+        thread_max = max(tmp, thread_max);
+      }
+      *(__nv_bfloat168*)(&smem[idx]) = result_sigmoid;
+    }
+  }
+
+  constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+  int warp_id = threadIdx.x / 32;
+  __shared__ float block_maxs[NUM_WARPS];
+  __shared__ float block_sums[NUM_WARPS];
+
+  for (int offset = 16; offset > 0; offset >>= 1)
+    thread_max = fmaxf(thread_max, __shfl_down_sync(0xFFFFFFFF, thread_max, offset));
+
+  if (threadIdx.x % 32 == 0) {
+    block_maxs[warp_id] = thread_max;
+  }
+
+  __syncthreads();
+
+  float block_max = -CUDART_INF_F;
+  for (int i = 0; i < NUM_WARPS; i++) {
+    block_max = fmaxf(block_max, block_maxs[i]);
+  }
+
+  float thread_sum = 0.0f;
+  #pragma unroll 2
+  for (int i = 0; i < NUM_LOADS; i++) {
+    int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
+    __nv_bfloat168 l;
+    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+      l = *(__nv_bfloat168*)(&smem[idx]);
+    }
+    #pragma unroll
+    for (int k = 0; k < VEC_WIDTH; k++) {
+      float tmp = A * __bfloat162float(l[k]);
+      tmp = __expf(tmp - block_max);
+      if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+        thread_sum += tmp;
+      }
+    }
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1)
+    thread_sum += __shfl_down_sync(0xFFFFFFFF, thread_sum, offset);
+
+  if (threadIdx.x % 32 == 0) {
+    block_sums[warp_id] = thread_sum;
+  }
+
+  __syncthreads();
+
+  float block_sum = 0.0f;
+  for (int i = 0; i < NUM_WARPS; i++) {
+    block_sum += block_sums[i];
+  }
+
+  float lse = block_max + __logf(block_sum);
+
+  if (threadIdx.x == 0) {
+    float total_loss = 0.0f;
+    for (int k = 0; k < n_predict; k++) {
+      int64_t target_idx = blockIdx.x + k;
+      if (target_idx < batch_size) {
+        float weight = mtp_weights[k];
+        int64_t target = targets[target_idx];
+        if (target >= 0 && target < VOCAB_SIZE) {
+          float z_target = A * __bfloat162float(smem[target]);
+          total_loss += weight * (lse - z_target);
+        }
+      }
+    }
+    losses[blockIdx.x] = total_loss;
+  }
+
+  float S_w = 0.0f;
+
+  for (int i = 0; i < n_predict; i++) {
+    S_w += mtp_weights[i];
+  }
+
+  #pragma unroll 4
+  for (int i = 0; i < NUM_LOADS; i++) {
+    int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
+    __nv_fp8_e5m28 result;
+
+    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+      __nv_bfloat168 sigmoid_us = *(__nv_bfloat168*)(&smem[idx]);
+      #pragma unroll
+      for (int j = 0; j < VEC_WIDTH; j++) {
+        float sigmoid_u = __bfloat162float(sigmoid_us[j]);
+        float z = A * sigmoid_u;
+        float p = __expf(z - lse);
+
+        float term1 = S_w * p;
+        float term2 = 0.0f;
+
+        float grad_z = term1 - term2;
+        float grad_x = grad_scale * (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
+        auto result_tmp = f32_to_fp8_e5m2(grad_x);
+        result[j] = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
+      }
+      *(__nv_fp8_e5m28*)(&grad_input[blockIdx.x * VOCAB_SIZE + idx]) = result;
+    }
+  }
+
+  __syncthreads();
+
+  if (threadIdx.x < n_predict && blockIdx.x + threadIdx.x < batch_size) {
+    int i = threadIdx.x;
+    int64_t target = targets[blockIdx.x + i];
+
+    float sigmoid_u = __bfloat162float(smem[target]);
+    float z = A * sigmoid_u;
+    float p = __expf(z - lse);
+
+    float term1 = S_w * p;
+    float term2 = 0.0f;
+
+    #pragma unroll
+    for (int k = 0; k < 3; k++) {
+      int64_t target_idx = blockIdx.x + k;
+      if (target_idx < batch_size && k < n_predict) {
+        if (targets[target_idx] == target) {
+          term2 += mtp_weights[k];
+        }
+      }
+    }
+
+    float grad_z = term1 - term2;
+    float grad_x = grad_scale * (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
+    auto result_tmp = f32_to_fp8_e5m2(grad_x);
+    auto result = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
+    grad_input[blockIdx.x * VOCAB_SIZE + target] = result;
+  }
+}
+"""
+
+ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
+    CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
+    "ce_fwd_bwd_kernel",
+    compute_capability="90",
+    cuda_include_dirs=["/usr/local/cuda/include/"],
+    nvcc_options=["-lineinfo", "--use_fast_math"],
+)
+ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
+
+@torch.library.custom_op("nanogpt::ce_fwd_bwd", mutates_args={"losses", "grad_input"})
+def ce_fwd_bwd(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mtp_weights: torch.Tensor,
+    losses: torch.Tensor,
+    grad_input: torch.Tensor,
+    n_rows: int,
+    n_predict: int,
+    A: float,
+    B: float,
+    C: float,
+    grad_s: float,
+    grad_scale: float,
+) -> None:
+    grid = (n_rows, 1, 1)
+    ce_fwd_bwd_kernel(
+        grid,
+        (CE_KERNEL_BLOCK_SIZE, 1, 1),
+        (logits, targets, mtp_weights, losses, grad_input,
+         n_rows, n_predict, A, B, C, grad_s, grad_scale),
+        shared_mem=CE_KERNEL_VOCAB_SIZE * 2,
+    )
+
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, A=23.0, B=5.0, C=7.5):
+    def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, grad_scale, A=23.0, B=5.0, C=7.5):
 
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
         w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
@@ -814,41 +957,23 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         targets = targets.contiguous()
         mtp_weights = mtp_weights.contiguous()
 
-        grid = (n_rows,)
-        fused_softcapped_entropy_fwd_kernel[grid](
-            logits, losses, lse, targets, mtp_weights,
-            logits.stride(0), logits.stride(1),
-            n_rows, n_cols, n_predict,
-            A, B, C,
-            BLOCK_SIZE=2048,
-            num_warps=2
-        )
+        grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
 
-        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8)
+        ce_fwd_bwd(logits, targets, mtp_weights, losses, grad_input,
+             n_rows, n_predict, A, B, C, grad_s, grad_scale)
+
+        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, grad_input)
         ctx.params = (A, B, C, x_s, w_s, grad_s)
         return losses
 
     @staticmethod
     def backward(ctx, grad_output):
-        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8 = ctx.saved_tensors
+        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, grad_input = ctx.saved_tensors
         A, B, C, x_s, w_s, grad_s = ctx.params
         n_rows, n_cols = logits.shape
         n_predict = mtp_weights.shape[0]
 
-        grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
         grad_output = grad_output.contiguous()
-
-        grid = (n_rows,)
-        fused_softcapped_entropy_bwd_kernel[grid](
-            grad_input, grad_output, lse, logits, targets, mtp_weights,
-            logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
-            n_rows, n_cols, n_predict,
-            A, B, C,
-            grad_s,
-            BLOCK_SIZE=1024,
-            num_warps=4,
-            N_PREDICT=n_predict,
-        )
 
         x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
         w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)
