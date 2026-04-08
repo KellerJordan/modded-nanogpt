@@ -1180,12 +1180,20 @@ class GPT(nn.Module):
         hdim = num_heads * head_dim
         mlp_hdim = 4 * model_dim
 
-        # Attention bank: stores QKVO weights for all attention layers
-        # merged QKVO weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
-        # https://x.com/hi_tysam/status/1879699187107033311
-        # Simplified layout by @chrisjmccormick
-        self.attn_bank = nn.Parameter(torch.empty(num_attn_layers, 4 * model_dim, hdim)) # (10, 3072, 768)
-        self.attn_bank.reshape = (num_attn_layers * 4, hdim, hdim)   # Shape for sharding: (40, 768, 768)
+        # QK bank: per-head-pair Muon groups for Q, K weights
+        # Each pair of adjacent heads gets its own independent polar express orthogonalization
+        self._num_attn_layers = num_attn_layers
+        num_qk_groups = num_attn_layers * 2 * (num_heads // 2)  # 10 * 2 * 3 = 60
+        self._num_qk_groups = num_qk_groups
+        num_qk_padded = next_multiple_of_n(num_qk_groups, n=world_size)  # 64
+        self.qk_bank = nn.Parameter(torch.empty(num_qk_padded, head_dim * 2, model_dim))
+        self.qk_bank.reshape = (num_qk_padded, head_dim * 2, model_dim)
+
+        # VO bank: per-layer Muon groups for V and O weights
+        num_vo_real = num_attn_layers * 2  # 20
+        num_vo_padded = next_multiple_of_n(num_vo_real, n=world_size)  # 24
+        self.vo_bank = nn.Parameter(torch.empty(num_vo_padded, hdim, hdim))
+        self.vo_bank.reshape = (num_vo_padded, hdim, hdim)
 
         # MLP bank: stores c_fc and c_proj for all MLP layers
         # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
@@ -1196,11 +1204,14 @@ class GPT(nn.Module):
         std = 0.5 * model_dim ** -0.5
         bound = (3 ** 0.5) * std
         with torch.no_grad():
-            self.attn_bank.uniform_(-bound, bound)
+            self.qk_bank[:num_qk_groups].uniform_(-bound, bound)
+            self.qk_bank[num_qk_groups:].zero_()
+            self.vo_bank[:num_vo_real].uniform_(-bound, bound)
+            self.vo_bank[num_vo_real:].zero_()
             self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
 
-        # Attention modules (no learned params -- weights come from attn_bank)
+        # Attention modules (no learned params -- weights come from qk_bank/vo_bank)
         self.paired_head_layers = [0, 2, 5, 9]
         self.attn = CausalSelfAttention(model_dim, head_dim, num_heads, paired=False)
         self.attn_paired = CausalSelfAttention(model_dim, head_dim, num_heads, paired=True)
@@ -1276,7 +1287,9 @@ class GPT(nn.Module):
         ve_gates = [None] + [veg[0], veg[1]] + [None] * (self.num_layers - 6) + [veg[2], veg[3], veg[4]]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
-        attn_weights = self.attn_bank.unbind(0)  # tuple of [4*dim, hdim] tensors
+        qk_all = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])
+        vo_flat = self.vo_bank[:self._num_attn_layers * 2].view(self._num_attn_layers, 2, *self.vo_bank.shape[1:]).flatten(1, 2)
+        attn_weights = torch.cat([qk_all, vo_flat], dim=1).unbind(0)
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
@@ -1322,7 +1335,8 @@ class GPT(nn.Module):
                 train_max_seq_len=train_max_seq_len
             )
             # Select weights from banks
-            qkvo_w = attn_weights[i - (i > 6)] if i != 6 else None
+            attn_idx = i - (i > 6) if i != 6 else None
+            qkvo_w = attn_weights[attn_idx] if attn_idx is not None else None
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
 
@@ -1551,7 +1565,7 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1450  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1440  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1677,7 +1691,8 @@ class TrainingManager():
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
         self.param_table = {
-            "attn_bank":      {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "qk_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "vo_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
@@ -1700,7 +1715,7 @@ class TrainingManager():
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
             "value_embeds", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
-            "attn_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
+            "qk_bank", "vo_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
         ]
 
         adam_defaults = dict(
@@ -1883,7 +1898,8 @@ for m in model.modules():
         m.weight.data = m.weight.data.bfloat16()
 model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
-model.attn_bank.data = model.attn_bank.data.bfloat16()
+model.qk_bank.data = model.qk_bank.data.bfloat16()
+model.vo_bank.data = model.vo_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
