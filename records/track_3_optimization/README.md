@@ -1,6 +1,6 @@
-# NanoGPT-Small Optimizer Leaderboard
+# NanoGPT-Small Optimization Leaderboard
 
-The goal of this leaderboard is to collaboratively|competitively find the best optimizer for training NanoGPT-small models to 3.28 val loss.
+The goal of this leaderboard/benchmark is to collaboratively|competitively find the best optimizer for training NanoGPT-small models to 3.28 val loss.
 Unlike the main speedrun which seeks to minimize wallclock time, here we will only care about minimizing step count by improving the optimizer.
 
 We have initialized this leaderboard with a highly simplified variant of the speedrun, which should make experimentation convenient.
@@ -37,14 +37,13 @@ To reduce the number of steps needed to reach 3.28, record attempts are free to 
 
 ### There is a need for some way to filter signal from noise
 
-There are between [hundreds](https://chatgpt.com/c/69b10bd7-f92c-8325-b516-d999b5b2b409) and [thousands](https://claude.ai/share/fb9590de-c4b7-44f8-bfbb-7f80af30d3f9) of neural network optimizer papers floating around the internet.
-The typical such paper claims to improve upon standard practice by a wide margin:
-Prototypically, the [Sophia](https://arxiv.org/abs/2305.14342) paper claims a 2x speedup over Adam.
-With few compelling meta-analyses out there, anyone interested in conducting neural network optimization research must technically
+Somewhere between [hundreds](https://chatgpt.com/c/69b10bd7-f92c-8325-b516-d999b5b2b409) and [thousands](https://claude.ai/share/fb9590de-c4b7-44f8-bfbb-7f80af30d3f9) of papers on neural network optimization exist on the internet.
+Many of these papers claim to improve upon standard practice by a wide margin, e.g., the *[Sophia: A Scalable Stochastic Second-order Optimizer for Language Model Pre-training](https://arxiv.org/abs/2305.14342)* paper claims a 2x speedup over Adam.
+With few compelling meta-analyses out there, anyone interested in conducting neural network optimization research must 
 go through and replicate every one of these papers before being able to claim to be truly caught up with the state of the art.
 Of course, in practice this is impossible. So instead, the de facto arrangement is that each researcher relies on their network of (human) connections
 in order to become informed of what works and doesn't work.
-* Industry reserachers in the big corporate labs benefit from being part of a gigantic pool of other human industry researchers, who are mostly not incentivized to fake results (because if a fake result messes up the bigrun, that's not good).
+* Industry researchers in the big corporate labs benefit from being part of a gigantic pool of other human industry researchers, who are mostly not incentivized to fake results (because if a fake result messes up the bigrun, that's not good).
 Such researchers therefore typically have a good picture of what really works and what doesn't.
 * Academic researchers in prestigious labs are typically well-connected to sources of information, both in terms of learning from other well-connected academics, and sometimes
 even finding out through their connections about what's going on inside the ostensibly-closed corporate labs. These elite academics therefore have a decent idea of what really works.
