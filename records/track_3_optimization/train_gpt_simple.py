@@ -170,8 +170,7 @@ class GPT(nn.Module):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
         self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
-        padded_vocab_size = 128 * (1 + (vocab_size - 1) // 128)
-        self.proj = Linear(model_dim, padded_vocab_size)
+        self.proj = Linear(model_dim, vocab_size)
 
     def forward(self, inputs: Tensor, targets: Tensor):
         x = norm(self.embed(inputs))
@@ -248,7 +247,7 @@ class Muon(torch.optim.Optimizer):
 #            Initialization            #
 ########################################
 
-model = GPT(vocab_size=50257, num_layers=12, model_dim=768).cuda()
+model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
 
 for name, param in model.named_parameters():
