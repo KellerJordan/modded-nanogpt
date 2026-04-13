@@ -251,14 +251,8 @@ model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
 
 for name, param in model.named_parameters():
-    w = param.data
-    if name.endswith("weight"):
-        if "proj" in name:
-            w.zero_()
-        else:
-            std = 0.5 * (w.size(-1) ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
-            bound = (3 ** 0.5) * std
-            w.uniform_(-bound, bound)
+    if name.endswith("weight") and "proj" in name:
+        param.data.zero_()
     dist.broadcast(param.detach(), 0)
 
 # collect the parameters to optimize
