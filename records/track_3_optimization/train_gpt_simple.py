@@ -281,7 +281,6 @@ for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
-batch_size = 8*64*1024
 train_steps = 3800
 
 # learning rate schedule: stable then decay
@@ -298,7 +297,7 @@ def get_lr(step: int, cooldown_frac=0.7):
 #        Training and Validation       #
 ########################################
 
-train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size=8*64*1024)
 training_time = 0
 # start the clock
 dist.barrier()
