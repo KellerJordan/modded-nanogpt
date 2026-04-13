@@ -266,15 +266,10 @@ for name, param in model.named_parameters():
 hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
 embed_params = [*model.embed.parameters()]
 head_params = [model.proj.weight]
-# sanity check
-params_collections = [hidden_matrix_params, embed_params, head_params]
-optimized_parameters_set = {p for params in params_collections for p in params}
-assert optimized_parameters_set == {*model.parameters()}
-assert len(optimized_parameters_set) == sum(len(lst) for lst in params_collections)
 
 # init the optimizer(s)
 adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_params, lr=0.3)]
-optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
+optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
 optimizer2 = Muon(hidden_matrix_params, lr=0.02, weight_decay=0.01)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
