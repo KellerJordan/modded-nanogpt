@@ -1072,7 +1072,12 @@ class CausalSelfAttention(nn.Module):
         assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
         # Weights are stored in parameter banks and passed via forward()
 
-    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor):
+    def forward(self, x: Tensor|tuple[Tensor, Tensor], attn_args: AttnArgs, qkvo_w: Tensor):
+        # MUDD v-only add mode: x is a tuple (x_residual, v_mudd) where v_mudd (B, T, H, D_head)
+        # is added to the baseline V derived from x_residual (saves a per-channel matmul).
+        is_mudd = isinstance(x, tuple)
+        if is_mudd:
+            x, v_mudd = x
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
@@ -1086,6 +1091,8 @@ class CausalSelfAttention(nn.Module):
         train_max_seq_len = attn_args.train_max_seq_len
 
         q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        if is_mudd:
+            v = v + v_mudd
         max_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         q, k = norm(q), norm(k) # QK norm @Grad62304977
@@ -1255,9 +1262,42 @@ class GPT(nn.Module):
                 ]
             )
         )
+        self._init_mudd(num_layers, model_dim)
+
         # Auto-label parameters
         for name, param in self.named_parameters():
             param.label = name.replace('.weight', '')
+
+    def _init_mudd(self, num_layers: int, model_dim: int):
+        # MUDD on last 2 layers {9, 10}, both wsumming over best subset {-1, 3, 5, 7, 9}.
+        self.mudd_layer_set = {num_layers - 2, num_layers - 1}  # {9, 10}
+        self.last_mudd_layer = num_layers - 1                    # 10 (qkv outputs unused)
+        # max_C trimmed from 4 to 2: only v_mudd (C=0) and residual (C=1) channels are used.
+        # (Q/K add channels were dropped by vonly mode; they were wasted compute.)
+        self.max_C = 2
+        self.mudd_hidden_indices = {
+            num_layers - 2: (-1, 7, 9),
+            num_layers - 1: (-1, 9, ),
+        }
+        # Union of all needed layer indices (we cache each at most once per fwd)
+        self.hidden_append_set = set().union(*[set(v) for v in self.mudd_hidden_indices.values()])
+        max_L = max(len(v) for v in self.mudd_hidden_indices.values())  # 5
+        # Only allocate MUDD params for the layers that actually use them.
+        # Map transformer-layer index -> local MUDD param index (e.g. {9: 0, 10: 1}).
+        mudd_layers_sorted = sorted(self.mudd_layer_set)
+        self.mudd_layer_idx = {layer_i: j for j, layer_i in enumerate(mudd_layers_sorted)}
+        num_mudd_layers = len(mudd_layers_sorted)
+        # MUDD initer block
+        _initer_block = 64
+        dw_shape = (self.max_C, max_L)
+        initer_dim = (int(np.prod(dw_shape)) // _initer_block + 1) * _initer_block
+        self.dense_w1 = nn.Parameter(torch.empty(num_mudd_layers, initer_dim, model_dim))
+        self.dense_w1.reshape = (num_mudd_layers * (initer_dim // 8), 8, model_dim)
+        for j in range(num_mudd_layers):
+            nn.init.kaiming_uniform_(self.dense_w1.data[j], a=math.sqrt(5))
+        self.dense_w2 = nn.Parameter(torch.zeros(num_mudd_layers, initer_dim, *dw_shape))
+        self.dense_w2.reshape = (num_mudd_layers * initer_dim, *dw_shape)
+        self.dense_bs = nn.Parameter(torch.zeros(num_mudd_layers, self.max_C, max_L))
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
@@ -1317,7 +1357,13 @@ class GPT(nn.Module):
         # Layer 0: bigram already injected above, so only x0 component
         x0_inject = (x0 * x0_lambdas[0],) + tuple(x0 * x0_lambdas[i] + x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
         skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
-        
+
+        # ---- MUDD state ----
+        # Dict keyed by source layer index. -1 sentinel = pre-layer-0 hidden.
+        # Each MUDD layer pulls its own subset (see self.mudd_hidden_indices).
+        hiddens = {-1: x}
+        v_mudd = None  # (B, T, H, D_head) v-only additive correction from previous MUDD layer
+
         # ---- Transformer layers ----
         x_backout = None
         skip_connection = None
@@ -1348,9 +1394,48 @@ class GPT(nn.Module):
                 x = x + skip_gate_out * skip_connection
             else:
                 attn_in = x_backout if x_backout is not None else x
-                attn_out = attn(norm(attn_in), attn_args, qkvo_w)
+                if v_mudd is not None:
+                    attn_out = attn((norm(attn_in), v_mudd), attn_args, qkvo_w)
+                    v_mudd = None
+                else:
+                    attn_out = attn(norm(attn_in), attn_args, qkvo_w)
                 x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
             x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+
+            # ---- MUDD: append hidden / produce v for next attn ----
+            if i in self.hidden_append_set:
+                hiddens[i] = x
+            if i in self.mudd_layer_set:
+                # Per-layer subset: each MUDD layer pulls its own diverse hiddens
+                hs = [hiddens[idx] for idx in self.mudd_hidden_indices[i]]
+                L = len(hs)
+                scale_factor = 0.2 / math.sqrt(L)
+                # MUDD weight: GELU(x @ W1) -> einsum to (B,T,C,L) -> bias -> scale
+                mj = self.mudd_layer_idx[i]
+                dense_w1_out = F.gelu(F.linear(x, self.dense_w1[mj]))
+                dw = torch.einsum('BTd, dCL -> BTCL', dense_w1_out, self.dense_w2[mj, :, :self.max_C, :L])
+                dw = (dw + self.dense_bs[mj, :self.max_C, :L]) * scale_factor
+                is_last = (i == self.last_mudd_layer)
+                # Channel layout (max_C=2): C=0 -> v_mudd, C=1 -> residual (o3)
+                if is_last:
+                    # Last MUDD layer: only need residual contribution
+                    o3 = hs[0] * dw[:, :, 1:2, 0]
+                    for kk in range(1, L):
+                        o3 = o3 + hs[kk] * dw[:, :, 1:2, kk]
+                else:
+                    # v-way mode: compute o2 (V mudd) and o3 (residual mudd)
+                    h0 = hs[0]
+                    o2 = h0 * dw[:, :, 0:1, 0]
+                    o3 = h0 * dw[:, :, 1:2, 0]
+                    for kk in range(1, L):
+                        hk = hs[kk]
+                        o2 = o2 + hk * dw[:, :, 0:1, kk]
+                        o3 = o3 + hk * dw[:, :, 1:2, kk]
+                    o2 = 1.15 * o2
+                    B_, T_ = o2.size(0), o2.size(1)
+                    v_mudd = o2.squeeze(2).view(B_, T_, self.attn.num_heads, self.attn.head_dim)
+                x = x + o3
+
             if i == 3:
                 skip_connection = x
             if i == 7:
@@ -1565,8 +1650,8 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1440  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 1400  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 30  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
@@ -1709,11 +1794,22 @@ class TrainingManager():
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
 
+        # ---- MUDD parameter overrides ----
+        self.param_table.update({
+            "dense_w1":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25},
+            "dense_w2":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25},
+            "dense_bs":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25, "wd_mul": 0.0},
+        })
+
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "dense_bs", 
+            "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+        ] + [
+            "dense_w2",
             "value_embeds", "bigram_embed",  # Medium
+            "dense_w1",
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "qk_bank", "vo_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
         ]
@@ -1861,8 +1957,8 @@ class TrainingManager():
 logfile = None
 if master_process:
     run_id = args.run_id
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{run_id}.txt"
+    os.makedirs("logs_mudd5", exist_ok=True)
+    logfile = f"logs_mudd5/{run_id}.txt"
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -1901,6 +1997,9 @@ model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.qk_bank.data = model.qk_bank.data.bfloat16()
 model.vo_bank.data = model.vo_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
+model.dense_w1.data = model.dense_w1.data.bfloat16()
+model.dense_w2.data = model.dense_w2.data.bfloat16()
+model.dense_bs.data = model.dense_bs.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
