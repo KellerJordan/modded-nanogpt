@@ -1058,6 +1058,7 @@ class AttnArgs:
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
     train_max_seq_len: torch.Tensor
+    xsa: bool  # apply Exclusive Self Attention (non-paired layers only)
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
@@ -1128,6 +1129,12 @@ class CausalSelfAttention(nn.Module):
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
+        # Exclusive Self Attention (arXiv:2603.09078): remove the component of the attention
+        # output that lies along the current token's value vector. Targets self-attention bias in
+        # deep layers. Only applied on non-paired layers where v has the same (B,T,H,D) shape as y.
+        if attn_args.xsa and not self.paired:
+            vn = F.normalize(v.view(B, T, self.num_heads, self.head_dim), dim=-1, eps=1e-4)
+            y = y - (y * vn).sum(-1, keepdim=True) * vn
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
@@ -1269,6 +1276,9 @@ class GPT(nn.Module):
         bm_sizes = [ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, None, ws_short, ws_short, ws_short, ws_long]
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==ws_long for b in bm_sizes] # apply partial key offset to long windows
+        # XSA on the last 3 non-paired attention layers {7, 8, 10}. Paired layers {0,2,5,9} and
+        # the MLP-only layer 6 are skipped; self-attention bias is strongest in deep layers.
+        xsa_layers = [i in (7, 8, 10) for i in range(self.num_layers)]
 
         # ---- Unbind parameters (avoid select_backward kernels) ----
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
@@ -1332,7 +1342,8 @@ class GPT(nn.Module):
                 key_offset=key_offset[i],
                 attn_gate_w=attn_gates[i],
                 ve_gate_w=ve_gates[i],
-                train_max_seq_len=train_max_seq_len
+                train_max_seq_len=train_max_seq_len,
+                xsa=xsa_layers[i],
             )
             # Select weights from banks
             attn_idx = i - (i > 6) if i != 6 else None
