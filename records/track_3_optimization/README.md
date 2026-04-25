@@ -37,8 +37,8 @@ To be considered valid, new results must:
 
 New results have the freedom to modify:
 1. The optimization algorithm, even to something slow in terms of wallclock speed.
-2. The optimizer hyperparameters, including schedules
-3. The model initialization
+2. The optimizer hyperparameters, including schedules.
+3. The model initialization.
 
 
 ## Motivation
