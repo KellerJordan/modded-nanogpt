@@ -4,7 +4,7 @@ The goal of this benchmark is to collaboratively|competitively find strong optim
 Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any means, here we will restrict our aim to minimizing *step count* by improving the optimization algorithm.
 
 Most neural network optimizer research occurs in the public research community, not in the frontier labs.
-This benchmark aims to provide a method for the community to filter signal from noise, thereby reducing the burden on individual researchers to test everything themselves
+This benchmark aims to provide a way for the community to filter signal from noise, thereby reducing the burden on individual researchers to test everything themselves
 before being caught up to the SOTA.
 
 The architecture for this benchmark is fixed to a simplified variant of the speedrun, which should make experimentation accessible and convenient.
