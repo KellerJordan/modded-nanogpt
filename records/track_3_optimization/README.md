@@ -51,7 +51,7 @@ For researchers interested in neural network optimization, this is daunting -- a
 This benchmark aims to provide a simple, easily-accessible way communally shared way to filter signal from noise, thereby surfacing ignored papers and reducing the number of experiments that each researcher must do in order to get an accurate picture of the SOTA.
 Prior optimization benchmarks already exist, but often suffer from high barriers to entry due to strenuous requirements or high complexity.
 This benchmark aims for maximum convenience in order to make submission of new results as convenient/accessible as possible:
-The baseline code should be comprehensible with minimal effort, and new results should not take more than 10 minutes to run or cost more than $5.
+The baseline code should be comprehensible with minimal effort, and experiments should not take more than 10 minutes or cost more than $5.
 
 
 ## Addressing a potential critique
