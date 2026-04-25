@@ -46,42 +46,20 @@ So, the remaining space of competitive freedom is as follows:
 > [benchmark competitions are the prime mover of AI progress](https://www.argmin.net/p/too-much-information#:~:text=benchmark%20competitions%20are%20the%20prime%20mover%20of%20AI%20progress.)
 > -- Prof. Ben Recht
 
-Since the publication of [Muon](https://kellerjordan.github.io/posts/muon/), there have been [40+ citing papers published that propose a new optimizer](
-https://chatgpt.com/share/69ed22e3-0870-83ea-a449-b4ce97d764f3).
-Are any of these new optimizers better? I believe it would be uncontroversial to say that the community simply does not know.
+Since the release of [Muon](https://kellerjordan.github.io/posts/muon/), there have been [40+ citing papers published that propose a new optimizer of their own](
+https://chatgpt.com/share/69ed22e3-0870-83ea-a449-b4ce97d764f3). More broadly, there exist somewhere between [hundreds](https://chatgpt.com/c/69b10bd7-f92c-8325-b516-d999b5b2b409) and [thousands](https://claude.ai/share/fb9590de-c4b7-44f8-bfbb-7f80af30d3f9) of papers on neural network optimization across the internet.
 
-### There is a need for some way to filter signal from noise
+How do these hundreds of optimizers compare -- which ones are able to optimize neural networks in the fewest steps?
+The reality is that as a community, we simply don't know. Why not?
+Because typically, each of these papers uses its own unique experimental setup, making it difficult to verify whether their baseline is well-tuned, and impossible to compare between papers.
 
-Somewhere between [hundreds](https://chatgpt.com/c/69b10bd7-f92c-8325-b516-d999b5b2b409) and [thousands](https://claude.ai/share/fb9590de-c4b7-44f8-bfbb-7f80af30d3f9) of papers on neural network optimization exist on the internet.
-Many of these papers claim to improve upon standard practice by a wide margin, e.g., *Sophia: A Scalable Stochastic Second-order Optimizer for Language Model Pre-training* [[arxiv](https://arxiv.org/abs/2305.14342)] claims a 2x speedup over Adam.
-
-The current status quo is that there are almost as many benchmarks as there are papers. Each paper uses a different benchmark
+For researchers interested in neural network optimization, this is daunting -- a sea of methods, many of them claiming to be SOTA, and no shared infrastructure to sort signal from noise.
 
 
+How do the hundreds of optimizers which have been proposed compare -- which ones optimize can neural networks in the fewest steps?
+The reality is that as a community, we simply don't know, even at small scale where such knowledge is in theory cheaply accessible.
 
 
-With few compelling meta-analyses out there, anyone interested in conducting neural network optimization research must 
-go through and replicate every one of these papers before being able to claim to be truly caught up with the state of the art.
-Of course, in practice this is impossible. So instead, the de facto arrangement is that each researcher relies on their network of (human) connections
-in order to become informed of what works and doesn't work.
-* Industry researchers in the big corporate labs benefit from being part of a gigantic pool of other human industry researchers, who are mostly not incentivized to fake results (because if a fake result messes up the bigrun, it).
-Such researchers therefore typically have a good picture of what really works and what doesn't.
-* Academic researchers in prestigious labs are typically well-connected to sources of information, both in terms of learning from other well-connected academics, and sometimes
-even finding out through their connections about what's going on inside the ostensibly-closed corporate labs. These elite academics therefore have a decent idea of what really works.
-* All the remaining independent researchers and academics at non-prestigous labs are left out to dry.
-Currently, their best source of information is the open-source research published by the Chinese industry.
-
-My understanding is that the majority of all humans who are working on AI research fall into this last category.
-Certainly, the majority of efforts to develop new optimizers are conducted by non-elite non-corporate academics.
-It is therefore unfortunate that they are not being well-served - to use left terminology - by the current structure of
-research. Fortunately, there is a relatively easy solution:
-If new optimizer papers line themselves up on a competitive leaderboard/benchmark,
-then effective new methods will become readily identifiable.
-
-The reasons this hasn't happened already are that (a) creating a benchmark with enough momentum to have a chance at being adopted requires a relatively high level of preexisting clout to pull off, but
-(b) generates little excess clout even if successful (which is a problem because clouty individuals are typically looking for ways to get more), and also separately (c)
-faces significant friction, because most authors are of course incentivized to avoid such a leaderboard in favor of keeping their own ad-hoc idiosyncratic baselines,
-in order to enable continued manipulation/exaggeration of results (intentional or unintentional).
 
 
 
@@ -91,16 +69,13 @@ One possible critique of a leaderboard like this is the following, quoted from a
 
 > The idea of SOTA in “optimization” is b.s. When the architecture changes we may get need different optimization algorithms.
 
-Here's a reply:
+Two replies:
 
-A natural response is that this claim simply lacks evidence. For example, Muon was originally found empirically in the CIFAR-10 speedrun setting, where it lowered the record from 3.09 to 2.59 seconds.
-It was then transferred to NanoGPT, where it also worked well. These two settings are about as different as one can reasonably find within deep learning research, which suggests that the process of searching for good optimizers does not, in practice, usually produce results that are merely overfit to a particular architecture.
+1) This claim lacks evidence. For example, Muon was originally found empirically in the CIFAR-10 speedrun setting, where it lowered the record from 3.09 to 2.59 seconds.
+It was then transferred to NanoGPT, where it also worked well. These two settings are about as different as one can reasonably find within deep learning research, which suggests that when a properly-tuned baseline is used, the process of searching for good optimizers does not actually tend to produce results that are overfit to any particular experimental setup.
 
-So before taking this critique too seriously, we should ask for evidence. A critic should be able to point to an architectural change in the baseline that substantially alters the relative efficiency of two optimizers. Without that, the objection remains speculative.
-
-That said, even if such evidence could be produced, the practical need for leaderboards would still remain.
-For the public community, the only alternative to open-source leaderboards is to place naive trust in the claims made by papers, which has never worked out particularly well.
-Therefore, at most such evidence would only imply that we need more than one leaderboard, so that multiple architectural regimes can be represented.
+2) Even in the world where the best optimizer does depend heavily on the choice of experimental setup, the practical need for leaderboards to filter signal from noise would still remain.
+What would be different is just that we would need more than one leaderboard, in order to cover the space of experimental setups.
 
 
 ## Notes
