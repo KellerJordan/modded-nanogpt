@@ -36,6 +36,9 @@ We welcome not only new results which advance the global SOTA, but even just res
 e.g., better hyperparameters for AdamW (even if it still isn't beating Muon).
 
 
+------
+------
+
 ## Motivation
 
 > [benchmark competitions are the prime mover of AI progress.](https://www.argmin.net/p/too-much-information#:~:text=benchmark%20competitions%20are%20the%20prime%20mover%20of%20AI%20progress.)
