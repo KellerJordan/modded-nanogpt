@@ -3,13 +3,17 @@
 The goal of this leaderboard/benchmark is to collaboratively|competitively find the best optimizer for training NanoGPT-small models to 3.28 val loss.
 Unlike the main speedrun which seeks to minimize wallclock time, here we will only care about minimizing step count by improving the optimizer.
 
+Most optimizer research occurs in academia and open-source, not in the frontier labs.
+This leaderboard aims to help filter signal from noise, reducing the burden on academic labs and independent researchers to test everything themselves
+before being caught up to the SOTA.
+
 The architecture for this leaderboard is fixed to a simplified variant of the speedrun, which should make experimentation accessible and convenient.
 Compared to the main speedrun, the setup used here removes non-standard parameters (value embeddings, skip connection lambdas) and all triton kernels.
 We have also switched from the sophisticated local-global pattern of attention used in the speedrun to simple causal attention across contexts of 1024 tokens.
 
 ## Quickstart
 
-You can run the current record via the following command.
+The current record can be run using the following command:
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install -r requirements.txt
@@ -26,11 +30,15 @@ torchrun --standalone --nproc_per_node=$(nvidia-smi -L | wc -l) records/track_3_
 
 ## Rules
 
-To be considered a valid, a new record attempt must:
-1. Not change the dataset, batch size, or architecture.
-2. Attain 3.28 val loss.
+To be considered valid, new record attempts must:
+1. Keep the same dataset, batch size, and architecture as the baseline.
+2. Not perform multiple forward-backward passes per step. Each step must correspond to a single forward-backward.
+3. Attain 3.28 val loss, thereby matching the performance of [Andrej Karpathy's GPT-2 replication](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
-To reduce the number of steps needed to reach 3.28, record attempts are free to change the optimizer (algorithm or hyperparameters) as well as the model initialization.
+So, the remaining space of competitive freedom is as follows:
+* The optimization algorithm can be modified arbitrarily, even to something that is slow in terms of wallclock speed.
+* Optimizer hyperparameters can be tuned
+* The model initialization can be changed
 
 
 ## Discussion
