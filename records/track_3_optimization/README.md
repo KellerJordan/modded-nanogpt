@@ -30,12 +30,12 @@ torchrun --standalone --nproc_per_node=$(nvidia-smi -L | wc -l) records/track_3_
 
 ## Rules
 
-To be considered valid, new entries must:
+To be considered valid, new results must:
 1. Keep the same dataset, batch size, and architecture as the baseline.
 2. Not perform multiple forward-backward passes per step. Each step must correspond to a single forward-backward.
-3. Attain 3.28 val loss, thereby matching the performance of [Andrej Karpathy's GPT-2 replication](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
+3. Attain 3.28 val loss, thereby matching [Andrej Karpathy's GPT-2 replication](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
-What remains is that entries have the freedom to modify:
+New results have the freedom to modify:
 1. The optimization algorithm, even to something slow in terms of wallclock speed.
 2. The optimizer hyperparameters, including schedules
 3. The model initialization
