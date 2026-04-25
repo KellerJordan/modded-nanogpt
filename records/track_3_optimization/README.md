@@ -33,7 +33,7 @@ New results have the freedom to modify:
 3. The model initialization.
 
 We welcome not only new results which advance the global SOTA, but even just results which advance the per-optimizer SOTA,
-e.g., better hyperparameters for AdamW (even if it still isn't beating Muon).
+e.g., better hyperparameters for AdamW (even if it still isn't beating the baseline).
 
 
 ------
