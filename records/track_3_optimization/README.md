@@ -3,10 +3,6 @@
 The goal of this benchmark is to collaboratively|competitively find strong optimizers for training small transformers.
 Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any means, here we will restrict our aim to minimizing *step count* by improving the optimization algorithm.
 
-Most neural network optimizer research occurs in the public research community, not in the frontier labs.
-This benchmark aims to provide a way for the community to filter signal from noise, thereby reducing the burden on individual researchers to test everything themselves
-before being caught up to the SOTA.
-
 The architecture for this benchmark is fixed to a simplified variant of the speedrun, which should make experimentation accessible and convenient.
 Compared to the main speedrun, the setup used here removes non-standard parameters (value embeddings, skip connection lambdas) and all triton kernels.
 We have also switched from the sophisticated local-global pattern of attention used in the speedrun to simple causal attention across contexts of 1024 tokens.
@@ -46,6 +42,7 @@ New results have the freedom to modify:
 > [benchmark competitions are the prime mover of AI progress.](https://www.argmin.net/p/too-much-information#:~:text=benchmark%20competitions%20are%20the%20prime%20mover%20of%20AI%20progress.)
 > -- Prof. Ben Recht
 
+Most neural network optimizer research occurs in the public research community, not in the frontier labs.
 Since the release of [Muon](https://kellerjordan.github.io/posts/muon/), there have been [40+ papers published citing it that propose a new optimizer of their own](
 https://chatgpt.com/share/69ed22e3-0870-83ea-a449-b4ce97d764f3). More broadly, there exist somewhere between [hundreds](https://chatgpt.com/c/69b10bd7-f92c-8325-b516-d999b5b2b409) and [thousands](https://claude.ai/share/fb9590de-c4b7-44f8-bfbb-7f80af30d3f9) of papers on neural network optimization across the internet.
 
@@ -53,7 +50,9 @@ How do these hundreds of optimizers compare -- which ones are able to optimize n
 The reality is that as a community, we simply don't know. Why not?
 Because typically, these papers all use their own unique experimental setups, making it challenging to verify whether their baselines are well-tuned or to make comparisons between papers.
 
-For researchers interested in neural network optimization, this is daunting -- a sea of methods, many of them claiming to be SOTA, and no shared infrastructure to sort signal from noise.
+For researchers interested in neural network optimization, this is daunting -- a sea of methods, many of them claiming to be SOTA, and no shared infrastructure to sort signal from noise. As it stands, the burden is on the individual researcher to make sense of this madness. Calculating the outcome -- If N different researchers publish N optimizer papers claiming SOTA, all of them unverifiable and mutually incomparable, then there are only two possibilities: Either (a) research grinds to a halt due to the Θ(N) growth in experiments that each researcher needs to conduct to get a private sense of the real SOTA, or (b) researchers start simply ignoring each other's papers.
+
+This benchmark aims to provide a communally shared way to filter signal from noise, thereby reducing the amount of fieldwide work to Θ(N).
 
 
 ## Addressing a potential critique
