@@ -42,7 +42,7 @@ e.g., better hyperparameters for AdamW (even if it still isn't beating Muon).
 > -- Prof. Ben Recht
 
 Most research into novel neural network optimizers occurs in the public research community, not in the frontier labs.
-Since the release of [Muon](https://kellerjordan.github.io/posts/muon/), there have been [40+ papers published citing it that propose a new optimizer of their own](
+For example, since the release of Muon, there have been [40+ papers published citing it that propose a new optimizer of their own](
 https://chatgpt.com/share/69ed22e3-0870-83ea-a449-b4ce97d764f3). And more broadly, there exist somewhere between [hundreds](https://chatgpt.com/c/69b10bd7-f92c-8325-b516-d999b5b2b409) and [thousands](https://claude.ai/share/fb9590de-c4b7-44f8-bfbb-7f80af30d3f9) of papers on neural network optimization across the internet.
 
 How do these hundreds of optimizers compare -- which ones are able to optimize neural networks in the fewest steps?
