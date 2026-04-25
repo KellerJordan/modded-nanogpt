@@ -1,7 +1,7 @@
 # NanoGPT Optimization Benchmark
 
 The goal of this benchmark is to collaboratively|competitively find efficient optimizers for training small transformers.
-Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any means, here we aim to minimize *step count* by improving the optimization algorithm.
+Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any means, here we aim to minimize *step count* by improving the optimization algorithm (allowing slow methods in terms of wallclock).
 
 ## Quickstart
 
