@@ -1,13 +1,13 @@
 # NanoGPT-Small Optimization Benchmark
 
-The goal of this benchmark is to collaboratively|competitively find the strongest optimizer for training small transformers.
-Unlike the main speedrun which seeks to minimize wallclock time by any means, here we will only care about minimizing step count, and we will refrain from modifying the transformer architecture.
+The goal of this benchmark is to collaboratively|competitively find strong optimizers for training small transformers.
+Unlike the main NanoGPT speedrun which seeks to minimize wallclock time by any means, here we will only care about minimizing step count by means of modifications to the optimization algorithm.
 
-Most optimizer research occurs in academia and open-source, not in the frontier labs.
-This leaderboard aims to help filter signal from noise, reducing the burden on academic labs and independent researchers to test everything themselves
+Most neural network optimizer research occurs in the public research community, not in the frontier labs.
+This benchmark aims to provide the means for the community to filter signal from noise, thereby reducing the burden on individual researchers to test everything themselves
 before being caught up to the SOTA.
 
-The architecture for this leaderboard is fixed to a simplified variant of the speedrun, which should make experimentation accessible and convenient.
+The architecture for this benchmark is fixed to a simplified variant of the speedrun, which should make experimentation accessible and convenient.
 Compared to the main speedrun, the setup used here removes non-standard parameters (value embeddings, skip connection lambdas) and all triton kernels.
 We have also switched from the sophisticated local-global pattern of attention used in the speedrun to simple causal attention across contexts of 1024 tokens.
 
@@ -59,7 +59,7 @@ How do the hundreds of optimizers which have been proposed compare -- which ones
 The reality is that as a community, we simply don't know, even at small scale where such knowledge is in theory cheaply accessible.
 
 
-### Response to a potential critique
+## Addressing a potential critique
 
 Quoted from a post on X:
 
