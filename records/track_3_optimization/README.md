@@ -1,11 +1,7 @@
 # NanoGPT Optimization Benchmark
 
-The goal of this benchmark is to collaboratively|competitively find strong optimizers for training small transformers.
-Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any means, here we will restrict our aim to minimizing *step count* by improving the optimization algorithm.
-
-The architecture for this benchmark is fixed to a simplified variant of the speedrun, which should make experimentation accessible and convenient.
-Compared to the main speedrun, the setup used here removes non-standard parameters (value embeddings, skip connection lambdas) and all triton kernels.
-We have also switched from the sophisticated local-global pattern of attention used in the speedrun to simple causal attention across contexts of 1024 tokens.
+The goal of this benchmark is to collaboratively|competitively find efficient optimizers for training small transformers.
+Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any means, here our goal is to minimize *step count* by improving the optimization algorithm.
 
 ## Quickstart
 
@@ -66,6 +62,13 @@ Two replies:
 1. This claim lacks evidence. For example, Muon was originally determined empirically for the CIFAR-10 speedrun setting, where it lowered the record from 3.09 to 2.59 seconds.
 It was then transferred to NanoGPT, where it continued to work well. These two settings are about as different as one can reasonably find within deep learning research. This suggests that when a properly-tuned baseline is used, the process of searching for good optimizers does not tend to produce methods that are overfit to any particular experimental setup.
 2. That being said, even in the world where the best optimizer *does* depend heavily on the choice of experimental setup, the practical need for leaderboards to filter signal from noise would still remain. We would just need to set up more than one leaderboard, in order to effectively cover the space of experimental setups.
+
+
+## Details on relation to the main speedrun
+
+Aiming towards simplicity, for this benchmark we have removed the non-standard neural network parameters (value embeddings, skip connection lambdas) and triton kernels that are used in the main speedrun.
+We have also replaced the sophisticated local-global pattern of attention by simple causal attention across contexts of 1024 tokens.
+The result is a concise plain-PyTorch training script measuring 338 lines of code.
 
 
 ## Notes
