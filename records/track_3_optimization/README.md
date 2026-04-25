@@ -1,6 +1,6 @@
-# NanoGPT-Small Optimization Leaderboard
+# NanoGPT-Small Optimization Benchmark
 
-The goal of this leaderboard/benchmark is to collaboratively|competitively find the strongest optimizer for training small transformers.
+The goal of this benchmark is to collaboratively|competitively find the strongest optimizer for training small transformers.
 Unlike the main speedrun which seeks to minimize wallclock time by any means, here we will only care about minimizing step count, and we will refrain from modifying the transformer architecture.
 
 Most optimizer research occurs in academia and open-source, not in the frontier labs.
@@ -21,7 +21,7 @@ python data/cached_fineweb10B.py 40  # downloads 4B training tokens
 torchrun --standalone --nproc_per_node=$(nvidia-smi -L | wc -l) records/track_3_small_optimization/train_gpt_simple.py
 ```
 
-## Record history
+## Results history
 
 | # | Steps to 3.28 | Description | Date | Log | Contributors |
 | - | - | - | - | - | - |
@@ -30,15 +30,15 @@ torchrun --standalone --nproc_per_node=$(nvidia-smi -L | wc -l) records/track_3_
 
 ## Rules
 
-To be considered valid, new record attempts must:
+To be considered valid, new entries must:
 1. Keep the same dataset, batch size, and architecture as the baseline.
 2. Not perform multiple forward-backward passes per step. Each step must correspond to a single forward-backward.
 3. Attain 3.28 val loss, thereby matching the performance of [Andrej Karpathy's GPT-2 replication](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
-So, the remaining space of competitive freedom is as follows:
-* The optimization algorithm can be modified arbitrarily, even to something that is slow in terms of wallclock speed.
-* Optimizer hyperparameters can be tuned
-* The model initialization can be changed
+What remains is that entries have the freedom to modify:
+1. The optimization algorithm, even to something slow in terms of wallclock speed.
+2. The optimizer hyperparameters, including schedules
+3. The model initialization
 
 
 ## Motivation
