@@ -1,7 +1,7 @@
 # NanoGPT-Small Optimization Leaderboard
 
-The goal of this leaderboard/benchmark is to collaboratively|competitively find the best optimizer for training NanoGPT-small models to 3.28 val loss.
-Unlike the main speedrun which seeks to minimize wallclock time, here we will only care about minimizing step count by improving the optimizer.
+The goal of this leaderboard/benchmark is to collaboratively|competitively find the strongest optimizer for training small transformers.
+Unlike the main speedrun which seeks to minimize wallclock time by any means, here we will only care about minimizing step count, and we will refrain from modifying the transformer architecture.
 
 Most optimizer research occurs in academia and open-source, not in the frontier labs.
 This leaderboard aims to help filter signal from noise, reducing the burden on academic labs and independent researchers to test everything themselves
