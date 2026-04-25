@@ -13,7 +13,7 @@ We have also switched from the sophisticated local-global pattern of attention u
 
 ## Quickstart
 
-The current record can be run using the following command:
+On any {1,2,4,8}x-{A,H}100 machine, the baseline can be run using the following command:
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install -r requirements.txt
