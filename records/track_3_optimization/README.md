@@ -55,26 +55,22 @@ Because typically, each of these papers uses its own unique experimental setup, 
 
 For researchers interested in neural network optimization, this is daunting -- a sea of methods, many of them claiming to be SOTA, and no shared infrastructure to sort signal from noise.
 
-
 How do the hundreds of optimizers which have been proposed compare -- which ones optimize can neural networks in the fewest steps?
 The reality is that as a community, we simply don't know, even at small scale where such knowledge is in theory cheaply accessible.
 
 
-
-
-
 ### Response to a potential critique
 
-One possible critique of a leaderboard like this is the following, quoted from a post on X:
+One possible critique of a leaderboard like this is the following, quoted from a post seen on X:
 
 > The idea of SOTA in “optimization” is b.s. When the architecture changes we may get need different optimization algorithms.
 
 Two replies:
 
 1. This claim lacks evidence. For example, Muon was originally determined empirically for the CIFAR-10 speedrun setting, where it lowered the record from 3.09 to 2.59 seconds.
-It was then transferred to NanoGPT, where it also worked well. These two settings are about as different as one can reasonably find within deep learning research. This suggests that when a properly-tuned baseline is used, the process of searching for good optimizers does not tend to produce results that are overfit to any particular experimental setup.
+It was then transferred to NanoGPT, where it continued to work well. These two settings are about as different as one can reasonably find within deep learning research. This suggests that when a properly-tuned baseline is used, the process of searching for good optimizers does not tend to produce results that are overfit to any particular experimental setup.
 2. Even in the world where the best optimizer does depend heavily on the choice of experimental setup, the practical need for leaderboards to filter signal from noise would still remain.
-What would be different in this world is just that we would need more than one leaderboard to effectively cover the space of experimental setups.
+What would be different in this world is only that we would need to set up more than one leaderboard, in order to effectively cover the space of experimental setups.
 
 
 ## Notes
