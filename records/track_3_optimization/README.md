@@ -41,7 +41,14 @@ So, the remaining space of competitive freedom is as follows:
 * The model initialization can be changed
 
 
-## Discussion
+## Motivation
+
+> [benchmark competitions are the prime mover of AI progress](https://www.argmin.net/p/too-much-information)
+> Prof. Ben Recht
+
+Since the publication of [Muon](https://kellerjordan.github.io/posts/muon/), there have been [40+ citing papers published that propose a new optimizer](
+https://chatgpt.com/share/69ed22e3-0870-83ea-a449-b4ce97d764f3).
+Are any of these new optimizers better? I believe it would be uncontroversial to say that the community simply does not know.
 
 ### There is a need for some way to filter signal from noise
 
