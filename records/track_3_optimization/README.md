@@ -43,8 +43,8 @@ So, the remaining space of competitive freedom is as follows:
 
 ## Motivation
 
-> [benchmark competitions are the prime mover of AI progress](https://www.argmin.net/p/too-much-information)
-> Prof. Ben Recht
+> [benchmark competitions are the prime mover of AI progress](https://www.argmin.net/p/too-much-information#:~:text=benchmark%20competitions%20are%20the%20prime%20mover%20of%20AI%20progress)
+> -- Prof. Ben Recht
 
 Since the publication of [Muon](https://kellerjordan.github.io/posts/muon/), there have been [40+ citing papers published that propose a new optimizer](
 https://chatgpt.com/share/69ed22e3-0870-83ea-a449-b4ce97d764f3).
