@@ -48,7 +48,7 @@ Because typically, these papers all use their own unique experimental setups, ma
 
 For researchers interested in neural network optimization, this is daunting -- a sea of methods, many of them claiming to be SOTA, and no shared infrastructure to sort signal from noise. As it stands, the burden is on the individual researcher to make sense of this madness. Calculating the outcome: If N different researchers publish N optimizer papers claiming SOTA, all of them unverifiable and mutually incomparable, then there are only two possibilities: Either (a) research grinds to a halt due to the Θ(N) growth in experiments that each researcher needs to conduct to get a private sense of the real SOTA, or (b) researchers start simply ignoring each other's papers.
 
-This benchmark aims to provide a simple, easily-accessible way communally shared way to filter signal from noise, thereby surfacing ignored papers and reducing the number of experiments that each researcher must do to to get an accurate picture of the SOTA.
+This benchmark aims to provide a simple, easily-accessible way communally shared way to filter signal from noise, thereby surfacing ignored papers and reducing the number of experiments that each researcher must do in order to get an accurate picture of the SOTA.
 Prior optimization benchmarks already exist, but often suffer from high barriers to entry due to strenuous requirements or high complexity.
 This benchmark aims for maximum convenience in order to make submission of new results as easy as possible:
 The baseline code should be as easy to understand as possible, and new results should not take more than 10 minutes to run or cost more than $5.
