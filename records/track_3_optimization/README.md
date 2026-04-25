@@ -46,7 +46,7 @@ New results have the freedom to modify:
 > [benchmark competitions are the prime mover of AI progress.](https://www.argmin.net/p/too-much-information#:~:text=benchmark%20competitions%20are%20the%20prime%20mover%20of%20AI%20progress.)
 > -- Prof. Ben Recht
 
-Since the release of [Muon](https://kellerjordan.github.io/posts/muon/), there have been [40+ citing papers published that propose a new optimizer of their own](
+Since the release of [Muon](https://kellerjordan.github.io/posts/muon/), there have been [40+ papers published citing it that propose a new optimizer of their own](
 https://chatgpt.com/share/69ed22e3-0870-83ea-a449-b4ce97d764f3). More broadly, there exist somewhere between [hundreds](https://chatgpt.com/c/69b10bd7-f92c-8325-b516-d999b5b2b409) and [thousands](https://claude.ai/share/fb9590de-c4b7-44f8-bfbb-7f80af30d3f9) of papers on neural network optimization across the internet.
 
 How do these hundreds of optimizers compare -- which ones are able to optimize neural networks in the fewest steps?
