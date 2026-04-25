@@ -61,7 +61,7 @@ The reality is that as a community, we simply don't know, even at small scale wh
 
 ### Response to a potential critique
 
-Here's one possible critique, quoted from a post on X:
+Quoted from a post on X:
 
 > The idea of SOTA in “optimization” is b.s. When the architecture changes we may get need different optimization algorithms.
 
