@@ -71,11 +71,10 @@ One possible critique of a leaderboard like this is the following, quoted from a
 
 Two replies:
 
-1) This claim lacks evidence. For example, Muon was originally found empirically in the CIFAR-10 speedrun setting, where it lowered the record from 3.09 to 2.59 seconds.
-It was then transferred to NanoGPT, where it also worked well. These two settings are about as different as one can reasonably find within deep learning research, which suggests that when a properly-tuned baseline is used, the process of searching for good optimizers does not actually tend to produce results that are overfit to any particular experimental setup.
-
-2) Even in the world where the best optimizer does depend heavily on the choice of experimental setup, the practical need for leaderboards to filter signal from noise would still remain.
-What would be different is just that we would need more than one leaderboard, in order to cover the space of experimental setups.
+1. This claim lacks evidence. For example, Muon was originally determined empirically for the CIFAR-10 speedrun setting, where it lowered the record from 3.09 to 2.59 seconds.
+It was then transferred to NanoGPT, where it also worked well. These two settings are about as different as one can reasonably find within deep learning research. This suggests that when a properly-tuned baseline is used, the process of searching for good optimizers does not tend to produce results that are overfit to any particular experimental setup.
+2. Even in the world where the best optimizer does depend heavily on the choice of experimental setup, the practical need for leaderboards to filter signal from noise would still remain.
+What would be different in this world is just that we would need more than one leaderboard to effectively cover the space of experimental setups.
 
 
 ## Notes
