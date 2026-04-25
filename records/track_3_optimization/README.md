@@ -51,12 +51,9 @@ https://chatgpt.com/share/69ed22e3-0870-83ea-a449-b4ce97d764f3). More broadly, t
 
 How do these hundreds of optimizers compare -- which ones are able to optimize neural networks in the fewest steps?
 The reality is that as a community, we simply don't know. Why not?
-Because typically, each of these papers uses its own unique experimental setup, making it difficult to verify whether their baseline is well-tuned, and impossible to compare between papers.
+Because typically, each of these papers uses its own unique experimental setup, making it challenging to verify whether their baselines are well-tuned or to make comparisons between papers.
 
 For researchers interested in neural network optimization, this is daunting -- a sea of methods, many of them claiming to be SOTA, and no shared infrastructure to sort signal from noise.
-
-How do the hundreds of optimizers which have been proposed compare -- which ones optimize can neural networks in the fewest steps?
-The reality is that as a community, we simply don't know, even at small scale where such knowledge is in theory cheaply accessible.
 
 
 ## Addressing a potential critique
