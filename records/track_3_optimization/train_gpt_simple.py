@@ -320,8 +320,10 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
     # accumulate across microbatches in case we are running with fewer than 8 gpus
-    for i in range(len(inputs) // 64):
-        model(inputs[64*i:64*i+64], targets[64*i:64*i+64]).backward()
+    mbs = 64
+    assert len(inputs) % mbs == 0
+    for i in range(len(inputs) // mbs):
+        model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
     for name, param in model.named_parameters():
         assert param.grad is not None, name
         dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
