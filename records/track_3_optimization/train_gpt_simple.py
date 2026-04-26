@@ -95,10 +95,18 @@ def norm(x: Tensor):
 
 class Linear(nn.Linear):
     def __init__(self, in_features, out_features):
-        super().__init__(in_features, out_features, bias=False)
+        super().__init__(in_features, out_features, bias=True)
     
     def forward(self, x):
-        return F.linear(x, self.weight.type_as(x))
+        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gains = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return (norm(x.float()) * self.gains).type_as(x)
 
 class Rotary(nn.Module):
     def __init__(self, dim: int):
@@ -159,10 +167,12 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(dim)
         self.mlp = MLP(dim)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
 
     def forward(self, x: Tensor):
-        x = x + self.attn(norm(x))
-        x = x + self.mlp(norm(x))
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
 class GPT(nn.Module):
@@ -171,12 +181,14 @@ class GPT(nn.Module):
         self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
         self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
         self.proj = Linear(model_dim, vocab_size)
+        self.norm1 = RMSNorm(model_dim)
+        self.norm2 = RMSNorm(model_dim)
 
     def forward(self, inputs: Tensor, targets: Tensor):
-        x = norm(self.embed(inputs))
+        x = self.norm1(self.embed(inputs))
         for block in self.blocks:
             x = block(x)
-        logits = self.proj(norm(x)).float()
+        logits = self.proj(self.norm2(x)).float()
         logits = 15 * logits * (logits.square() + 15**2).rsqrt()
         return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
 
@@ -252,7 +264,8 @@ for name, p in model.named_parameters():
 
 # init the optimizer(s)
 optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
-                    dict(params=[model.proj.weight], lr=1/320)],
+                    dict(params=[model.proj.weight], lr=1/320),
+                    dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
                    betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
 optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
                   lr=0.02, weight_decay=0.01)
