@@ -37,7 +37,7 @@ if dist.get_rank() == 0:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{uuid.uuid4()}.txt"
     print(logfile)
-def print0(s, console=False, logfile=True):
+def print0(s, console=False, log=True):
     if dist.get_rank() == 0:
         with open(logfile, "a") as f:
             if console:
@@ -263,8 +263,8 @@ for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
+# modify this in order to reach 3.28
 train_steps = 3800
-mbs = 64
 
 # learning rate schedule: stable then decay
 def get_lr(step: int, cooldown_frac=0.7):
@@ -280,7 +280,9 @@ def get_lr(step: int, cooldown_frac=0.7):
 #        Training and Validation       #
 ########################################
 
-train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size=8*64*1024)
+batch_size = 8 * 64 * 1024
+mbs = 64
+train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
 training_time = 0
 # start the clock
 dist.barrier()
@@ -293,7 +295,7 @@ for step in range(train_steps + 1):
         dist.barrier()
         training_time += time.perf_counter() - t0
         model.eval()
-        val_tokens = 10485760
+        val_tokens = 20 * 524288
         val_loader = distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens)
         val_loss = 0
         with torch.no_grad():
@@ -330,6 +332,6 @@ for step in range(train_steps + 1):
     model.zero_grad(set_to_none=True)
     approx_training_time = training_time + (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
-           + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, logfile=False)
+           + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
 
 dist.destroy_process_group()
