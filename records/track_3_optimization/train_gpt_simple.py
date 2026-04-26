@@ -97,7 +97,7 @@ class Linear(nn.Linear):
         super().__init__(in_features, out_features, bias=False)
     
     def forward(self, x):
-        return F.linear(x, self.weight.bfloat16())
+        return F.linear(x, self.weight.type_as(x))
 
 class Rotary(nn.Module):
     def __init__(self, dim: int):
