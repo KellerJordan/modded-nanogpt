@@ -81,7 +81,12 @@ Finally, we have replaced the sophisticated local-global pattern of attention by
 ## Technical notes and tips
 
 For future attempts:
-* For [AdamW](https://arxiv.org/abs/1711.05101), it seems that reasonable starting hparams are `lr=.0015, wd=.125, warmup_tokens=250`.
+* For [AdamW](https://arxiv.org/abs/1711.05101), it seems that reasonable starting hparams are `lr=.0015, wd=.125, warmup_steps=250`.
 * For [PSGD Kron](https://github.com/evanatyourservice/kron_torch), it seems that reasonable starting hparams are `lr=.0005, weight_decay=.625`.
 
-On data: The baseline trains for 3800 * 524288 = 2B tokens. The quickstart script downloads 4B tokens of FineWeb, allowing training up to 7600 steps of training. If you'd like to train for even more steps than that, you must get more tokens via something like `python data/cached_fineweb10B.py 100`, which will download the maximum 10B tokens.
+On data: The baseline trains for 3550 * 524288 = ~2B tokens. The quickstart script downloads 4B tokens of FineWeb, allowing trainings up to 7600 steps. If you'd like to train for more steps than that, then you must get more tokens via something like `python data/cached_fineweb10B.py 100`, which will download the maximum 10B tokens.
+
+
+## Logfile guidelines
+
+Results should be submitted in the form of logfiles, like the ones linked in the [results history](#results-history) section above. Logfiles must include the full code used by the run, such that if we replace `train_gpt_simple.py` by the code, then running the quickstart will reproduce the run (up to random seed variance). In particular, hardcoded hyperparameters are to be preferred as compared to command line arguments.
