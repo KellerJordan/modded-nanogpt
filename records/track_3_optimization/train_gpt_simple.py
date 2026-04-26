@@ -15,6 +15,7 @@ from pathlib import Path
 
 import torch
 from torch import Tensor, nn
+from torch.optim import AdamW
 import torch.nn.functional as F
 import torch.distributed as dist
 
@@ -248,16 +249,15 @@ for name, param in model.named_parameters():
         param.data.zero_()
     dist.broadcast(param.detach(), 0)
 
-# collect the parameters to optimize
-hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
-embed_params = [*model.embed.parameters()]
-head_params = [model.proj.weight]
-
 # init the optimizer(s)
-adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_params, lr=0.3)]
-optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.02, weight_decay=0.01)
+optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
+                    dict(params=[model.proj.weight], lr=1/320)],
+                   betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
+optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
+                  lr=0.02, weight_decay=0.01)
 optimizers = [optimizer1, optimizer2]
+assert set(p for opt in optimizers for pg in opt.param_groups
+           for p in pg["params"]) == set(model.parameters())
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
