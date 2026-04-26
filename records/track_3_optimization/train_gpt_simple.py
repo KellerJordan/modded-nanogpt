@@ -176,7 +176,7 @@ class GPT(nn.Module):
         for block in self.blocks:
             x = block(x)
         logits = self.proj(norm(x)).float()
-        logits = 15 * logits * torch.rsqrt(logits.square() + 225)
+        logits = 15 * logits * (logits.square() + 15**2).rsqrt()
         return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
 
 
