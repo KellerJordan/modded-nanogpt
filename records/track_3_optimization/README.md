@@ -8,7 +8,7 @@ Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any
 The baseline can be run using the following command on any {1,2,4,8}x-{A,H}100 machine:
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
-pip install -r requirements.txt
+pip install torch==2.10 huggingface_hub
 python data/cached_fineweb10B.py 40  # downloads 4B training tokens
 torchrun --standalone --nproc_per_node=$(nvidia-smi -L | wc -l) records/track_3_optimization/train_gpt_simple.py
 ```
