@@ -191,7 +191,7 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
 
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations, not optimizing for speed
+    # Perform the NS iterations, not optimizing for wallclock speed
     a, b, c = 2, -1.5, 0.5
     for _ in range(12):
         A = X @ X.mT
