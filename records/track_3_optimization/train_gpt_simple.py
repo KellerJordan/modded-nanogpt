@@ -107,7 +107,7 @@ class Rotary(nn.Module):
         self.angular_freq = nn.Buffer(torch.cat([angular_freq, angular_freq.new_zeros(dim//4)]))
 
     def forward(self, x_BTHD: Tensor):
-        pos = torch.arange(x_BTHD.size(1), dtype=torch.float, device=x_BTHD.device)
+        pos = torch.arange(x_BTHD.size(1), dtype=torch.float32, device=x_BTHD.device)
         theta = torch.outer(pos, self.angular_freq)[None, :, None, :]
         cos, sin = theta.cos(), theta.sin()
         x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
