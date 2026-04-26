@@ -287,13 +287,16 @@ for opt in optimizers:
         group["initial_lr"] = group["lr"]
 
 # learning rate schedule: stable then decay
-def get_lr(step: int, cooldown_frac=0.7):
+def set_hparams(step, cooldown_frac=0.7):
     progress = step / train_steps
     assert 0 <= progress < 1
     if progress < 1 - cooldown_frac:
-        return 1.0
+        eta = 1.0
     else:
-        return (1 - progress) / cooldown_frac
+        eta = (1 - progress) / cooldown_frac
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * eta
 
 
 ########################################
@@ -339,9 +342,8 @@ for step in range(train_steps + 1):
         assert p.grad is not None, name
         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
     # set optimization hyperparameters and take a step
+    set_hparams(step)
     for opt in optimizers:
-        for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
         opt.step()
     model.zero_grad(set_to_none=True)
     approx_training_time = training_time + (time.perf_counter() - t0)
