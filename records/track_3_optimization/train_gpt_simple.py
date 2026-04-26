@@ -264,6 +264,7 @@ for opt in optimizers:
         group["initial_lr"] = group["lr"]
 
 train_steps = 3800
+mbs = 64
 
 # learning rate schedule: stable then decay
 def get_lr(step: int, cooldown_frac=0.7):
@@ -297,8 +298,9 @@ for step in range(train_steps + 1):
         val_loss = 0
         with torch.no_grad():
             inputs, targets = next(val_loader)
-            for i in range(len(inputs) // 64):
-                val_loss += model(inputs[64*i:64*i+64], targets[64*i:64*i+64])
+            assert len(inputs) % mbs == 0
+            for i in range(len(inputs) // mbs):
+                val_loss += model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
         dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
         val_loss /= val_tokens
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
@@ -314,7 +316,6 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
     # accumulate across microbatches in case we are running with fewer than 8 gpus
-    mbs = 64
     assert len(inputs) % mbs == 0
     for i in range(len(inputs) // mbs):
         model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
