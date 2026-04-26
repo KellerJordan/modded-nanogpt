@@ -37,7 +37,6 @@ e.g., better hyperparameters for AdamW (even if it still isn't beating the basel
 
 
 ------
-------
 
 ## Motivation
 
