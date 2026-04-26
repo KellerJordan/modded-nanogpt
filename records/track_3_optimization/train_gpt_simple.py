@@ -245,10 +245,10 @@ class Muon(torch.optim.Optimizer):
 model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
 
-for name, param in model.named_parameters():
-    if name.endswith("weight") and "proj" in name:
-        param.data.zero_()
-    dist.broadcast(param.detach(), 0)
+for name, p in model.named_parameters():
+    if "proj" in name:
+        p.data.zero_()
+    dist.broadcast(p.detach(), 0)
 
 # init the optimizer(s)
 optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
@@ -321,9 +321,9 @@ for step in range(train_steps + 1):
     assert len(inputs) % mbs == 0
     for i in range(len(inputs) // mbs):
         model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
-    for name, param in model.named_parameters():
-        assert param.grad is not None, name
-        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+    for name, p in model.named_parameters():
+        assert p.grad is not None, name
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
     # set optimization hyperparameters and take a step
     for opt in optimizers:
         for group in opt.param_groups:
