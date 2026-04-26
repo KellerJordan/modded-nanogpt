@@ -37,12 +37,13 @@ if dist.get_rank() == 0:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{uuid.uuid4()}.txt"
     print(logfile)
-def print0(s, console=False):
+def print0(s, console=False, logfile=True):
     if dist.get_rank() == 0:
         with open(logfile, "a") as f:
             if console:
                 print(s)
-            print(s, file=f)
+            if logfile:
+                print(s, file=f)
 
 # we begin by logging this file itself
 print0(code)
@@ -284,10 +285,9 @@ training_time = 0
 dist.barrier()
 t0 = time.perf_counter()
 for step in range(train_steps + 1):
-    is_last_step = (step == train_steps)
-
+    
     # --------------- VALIDATION SECTION -----------------
-    if is_last_step or step % 125 == 0:
+    if step == train_steps or step % 125 == 0:
         # stop the clock
         dist.barrier()
         training_time += time.perf_counter() - t0
@@ -307,8 +307,9 @@ for step in range(train_steps + 1):
         # start the clock again
         dist.barrier()
         t0 = time.perf_counter()
-        if is_last_step:
-            break
+    
+    if step == train_steps:
+        break
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
@@ -328,6 +329,6 @@ for step in range(train_steps + 1):
     model.zero_grad(set_to_none=True)
     approx_training_time = training_time + (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
-           + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True)
+           + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, logfile=False)
 
 dist.destroy_process_group()
