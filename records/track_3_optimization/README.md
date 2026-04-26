@@ -78,8 +78,10 @@ Aiming towards simplicity, for this benchmark we have removed the non-standard n
 We have also replaced the sophisticated local-global pattern of attention by simple causal attention across contexts of 1024 tokens.
 
 
-## Notes
+## Technical notes and tips
 
 For future attempts:
 * For [AdamW](https://arxiv.org/abs/1711.05101), it seems that reasonable starting hparams are `lr=.0015, wd=.125, warmup_tokens=250`.
 * For [PSGD Kron](https://github.com/evanatyourservice/kron_torch), it seems that reasonable starting hparams are `lr=.0005, weight_decay=.625`.
+
+On data: The baseline trains for 3800 * 524288 = 2B tokens. The quickstart script downloads 4B tokens of FineWeb, allowing training up to 7600 steps of training. If you'd like to train for even more steps than that, you must get more tokens via something like `python data/cached_fineweb10B.py 100`, which will download the maximum 10B tokens.
