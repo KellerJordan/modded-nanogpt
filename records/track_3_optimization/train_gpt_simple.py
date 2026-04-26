@@ -42,7 +42,7 @@ def print0(s, console=False, log=True):
         with open(logfile, "a") as f:
             if console:
                 print(s)
-            if logfile:
+            if log:
                 print(s, file=f)
 
 # we begin by logging this file itself
