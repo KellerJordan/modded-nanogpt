@@ -256,8 +256,8 @@ optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
 optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
                   lr=0.02, weight_decay=0.01)
 optimizers = [optimizer1, optimizer2]
-assert set(p for opt in optimizers for pg in opt.param_groups
-           for p in pg["params"]) == set(model.parameters())
+assert set(p for opt in optimizers for group in opt.param_groups
+           for p in group["params"]) == set(model.parameters())
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
