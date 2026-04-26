@@ -21,38 +21,6 @@ import torch.distributed as dist
 
 
 ########################################
-#                Setup                 #
-########################################
-
-# torchrun sets these env variables
-device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
-dist.barrier()
-# this code can be run equivalently with 1, 2, 4, or 8 gpus.
-assert 8 % dist.get_world_size() == 0
-
-# logging setup
-if dist.get_rank() == 0:
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{uuid.uuid4()}.txt"
-    print(logfile)
-def print0(s, console=False, log=True):
-    if dist.get_rank() == 0:
-        with open(logfile, "a") as f:
-            if console:
-                print(s)
-            if log:
-                print(s, file=f)
-
-# we begin by logging this file itself
-print0(code)
-print0("="*100)
-print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
-print0("="*100)
-
-
-########################################
 #              Dataloader              #
 ########################################
 
@@ -251,18 +219,60 @@ class Muon(torch.optim.Optimizer):
 
 
 ########################################
-#            Initialization            #
+#                Setup                 #
 ########################################
+
+# torchrun sets these env variables
+device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+torch.cuda.set_device(device)
+dist.init_process_group(backend="nccl", device_id=device)
+dist.barrier()
+# this code can be run equivalently with 1, 2, 4, or 8 gpus.
+assert 8 % dist.get_world_size() == 0
+
+# logging setup
+if dist.get_rank() == 0:
+    os.makedirs("logs", exist_ok=True)
+    logfile = f"logs/{uuid.uuid4()}.txt"
+    print(logfile)
+def print0(s, console=False, log=True):
+    if dist.get_rank() == 0:
+        with open(logfile, "a") as f:
+            if console:
+                print(s)
+            if log:
+                print(s, file=f)
+
+# we begin by logging this file itself
+print0(code)
+print0("="*100)
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
+print0("="*100)
+
+val_tokens = 20 * 524288
+batch_size = 8 * 64 * 1024
+mbs = 64
+train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
 
 model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
 
+
+########################################
+#       Init & Optim Hyperparams       #
+########################################
+
+# we want to minimize this while still reaching 3.28 val loss
+train_steps = 3500
+
+# initialize model parameters
 for name, p in model.named_parameters():
     if "proj" in name:
         p.data.zero_()
     dist.broadcast(p.detach(), 0)
 
-# init the optimizer(s)
+# create the optimizer(s)
 optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
                     dict(params=[model.proj.weight], lr=1/320),
                     dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
@@ -276,26 +286,20 @@ for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
-# modify this in order to reach 3.28
-train_steps = 3800
-
 # learning rate schedule: stable then decay
 def get_lr(step: int, cooldown_frac=0.7):
-    x = step / train_steps # progress in training
-    assert 0 <= x < 1
-    if x < 1 - cooldown_frac:
+    progress = step / train_steps
+    assert 0 <= progress < 1
+    if progress < 1 - cooldown_frac:
         return 1.0
     else:
-        return (1 - x) / cooldown_frac
+        return (1 - progress) / cooldown_frac
 
 
 ########################################
 #        Training and Validation       #
 ########################################
 
-batch_size = 8 * 64 * 1024
-mbs = 64
-train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
 training_time = 0
 # start the clock
 dist.barrier()
@@ -308,14 +312,11 @@ for step in range(train_steps + 1):
         dist.barrier()
         training_time += time.perf_counter() - t0
         model.eval()
-        val_tokens = 20 * 524288
-        val_loader = distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens)
         val_loss = 0
         with torch.no_grad():
-            inputs, targets = next(val_loader)
-            assert len(inputs) % mbs == 0
-            for i in range(len(inputs) // mbs):
-                val_loss += model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+            assert len(val_inputs) % mbs == 0
+            for i in range(len(val_inputs) // mbs):
+                val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
         dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
         val_loss /= val_tokens
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
