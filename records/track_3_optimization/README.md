@@ -74,8 +74,8 @@ It was then transferred to NanoGPT, where it continued to work well. These two s
 
 ## Details on relation to the main speedrun
 
-Aiming towards simplicity, for this benchmark we have removed the non-standard neural network parameters (value embeddings, skip connection lambdas) and triton kernels that are used in the main speedrun.
-We have also replaced the sophisticated local-global pattern of attention by simple causal attention across contexts of 1024 tokens.
+Aiming towards simplicity, for this benchmark we have removed the non-standard neural network parameters (value embeddings, skip connection lambdas) and triton kernels that are used in the main speedrun. We have also added back standard parameters which are wallclock-inefficient at small scale, namely the RMSNorm gains and Linear layer biases.
+Finally, we have replaced the sophisticated local-global pattern of attention by simple causal attention across contexts of 1024 tokens.
 
 
 ## Technical notes and tips
