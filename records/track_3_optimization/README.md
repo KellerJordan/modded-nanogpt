@@ -13,13 +13,15 @@ python data/cached_fineweb10B.py 40  # downloads 4B training tokens
 torchrun --standalone --nproc_per_node=$(nvidia-smi -L | wc -l) records/track_3_optimization/train_gpt_simple.py
 ```
 
-## Results history
+## Notable results history
+
+The following is a history of notable results, in particular, improvements to the best known hyperparameters for each optimizer.
 
 | # | Steps to 3.28 | Description | Date | Log | Contributors |
 | - | - | - | - | - | - |
-| 1 | 3550 | [Muon](https://kellerjordan.github.io/posts/muon/) baseline, lr=.02 wd=.01 | 2026/04/26 | [log](results/c0ca36ae-1684-4362-aefb-c7654cf970ba.txt) | @kellerjordan0 |
+| 1 | 3550 | [Muon](https://kellerjordan.github.io/posts/muon/) lr=.02 wd=.01 | 2026/04/26 | [log](results/c0ca36ae-1684-4362-aefb-c7654cf970ba.txt) | @kellerjordan0 |
 
-Many more non-SOTA results (e.g., hyperparameter sweeps) can be found in `results/`.
+Many more non-SOTA results (e.g., from hyperparameter sweeps) can be found in `results/`.
 
 ## Rules
 
