@@ -35,7 +35,7 @@ To be considered valid, new results must:
 
 New results have the freedom to modify:
 1. The optimization algorithm, even to something slow in terms of wallclock speed.
-2. The optimizer hyperparameters, including schedules.
+2. The optimization hyperparameters, including schedules thereof.
 3. The model initialization.
 
 We welcome not only new results which advance the global SOTA, but even just results which advance the per-optimizer SOTA,
