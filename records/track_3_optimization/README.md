@@ -24,6 +24,8 @@ Many more non-SOTA results (e.g., from hyperparameter sweeps) can be found in `r
 | 2 | 5625 | AdamW lr=0.0015 wd=0.1 betas=(0.9, 0.95) warmup_steps=250 | 2026/04/26 | [log](results/a63a68d1-24aa-4a22-af9a-224e43209ea4.txt) | @kellerjordan0 |
 | 3 | 3500 | [Muon](https://kellerjordan.github.io/posts/muon/) lr=.025 wd=.0125 | 2026/04/26 | [log](results/311d7833-8dfc-43ea-a55c-fd313a11c4a8.txt) | @kellerjordan0 |
 
+![](figure.png)
+
 ## Rules
 
 To be considered valid, new results must:
