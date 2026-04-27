@@ -61,8 +61,8 @@ For researchers interested in neural network optimization, this is daunting - a 
 Neither of these are desireable outcomes, and today we are in some mix of the two.
 
 This benchmark aims to provide a simple, easily-accessible communally-shared way to filter signal from noise, aiming to surface ignored papers/ideas and reduce the number of experiments that each researcher must do in order to get an accurate picture of the SOTA.
-It is a collaborative|competitive benchmark, meaning that e.g., if anyone can find hyperparameters enabling AdamW
-to reach below 3.28 in fewer steps than Muon, then we the benchmark authors will be keen to include this result and promite it on social media
+It is a collaborative|competitive benchmark, meaning that, for example, if anyone can find hyperparameters that enable AdamW
+to reach the target loss in fewer steps than Muon, then we the benchmark authors will be keen to include this result and promote it on social media
 within a short period of time, even though there is a conflict of interest since we are also Muon authors.
 In contrast, in historical cases where a paper proposing a new SOTA-claiming optimizer has later turned out to have been confounded by an undertuned baseline,
 it has often been difficult such information to propagate through the community, due to the fact that negative results are typically not paper-worthy on their own,
