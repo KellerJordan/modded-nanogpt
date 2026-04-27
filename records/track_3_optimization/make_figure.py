@@ -47,7 +47,7 @@ ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/04/26', pad=12, f
 ax.set_xlabel('Training step', fontsize=11)
 ax.set_ylabel('Validation loss', fontsize=11)
 ax.legend(frameon=True)
-ax.set_xlim(left=0, right=6000)
+ax.set_xlim(0, 6000)
 ax.set_ylim(3.15, 4.0)
 ax.tick_params(axis='both', which='major', labelsize=10)
 
