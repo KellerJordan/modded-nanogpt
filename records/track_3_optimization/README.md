@@ -66,7 +66,7 @@ to reach the target loss in fewer steps than Muon, then we the benchmark authors
 within a short period of time, even though there is a conflict of interest since we are also Muon authors.
 In contrast, in historical cases where a paper proposing a new SOTA-claiming optimizer has later turned out to have been confounded by an undertuned baseline,
 it has often been difficult for such information to propagate through the community, due to the fact that negative results are typically not paper-worthy on their own,
-even if they disprove another paper with hundreds of citations.
+even if they disprove another paper which has hundreds of citations.
 
 Prior competitive optimization benchmarks already exist, but often suffer from high barriers to entry due to strenuous requirements or high complexity.
 This benchmark aims for maximum convenience in order to make new results as convenient/accessible as possible:
