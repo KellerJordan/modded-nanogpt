@@ -1282,30 +1282,34 @@ class GPT(nn.Module):
         MUDD trimmed for speedrun: only layers {N-2, N-1} consume MUDD signals.
         Connectivity is fixed (no longer driven by a generic per-layer source dict):
 
-          - layer N-2 (=9):  produces both v_mudd (added into layer-10 attention V)
-                             and a residual delta. Sources: {x0, h7, current x}.
+          - layer N-2 (=9):  produces v_mudd (-> layer-10 V), residual delta, ve_gate
+                             (-> layer-10 attn), and 6 layer-10 scalar gates:
+                             resid_attn, post_attn, resid_mlp, post_mlp, x0_lambda,
+                             bigram_lambda. Sources: {x0, h7, current x}.
                              "current x" is a self-reference and is fused as (1+m_r9)*x.
-          - layer N-1 (=10): produces residual delta only. Sources: {x0, h7, h9, ve_bank0}.
-                             dense_bs[1, 1, 1] = -0.5 absorbs the legacy backout
-                             `x -= backout_lambda * x_7` into MUDD initialization.
-                             ve_bank0 is the first value-embed slice (same tensor as layer-1 attn ve).
+          - layer N-1 (=10): produces residual delta only.
+                             Sources: {x0, h7, h9, ve_bank0, skip_connection}.
+                             dense_bs[1, 1, 1] = -0.5 absorbs the legacy backout.
+                             ve_bank0 is the first value-embed slice (layer-1 attn ve).
+                             skip_connection is the layer-3 output (long-window snapshot).
 
-        The MUDD weight is GELU(x @ W1) -> einsum to (B,T,C,L) -> + bias -> * scale,
-        where C=2 (V-mudd, residual-mudd) and L=3 source hiddens on layer N-2; layer N-1
-        residual uses L+1=4 coefficients (fourth column shares the last dim with layer-9's
-        ve_gate column in dense_w2[0] only — dense_w2[1]'s fourth column is the ve_bank0 mix).
-        Layer 10's V-channel slot in dense_w2 is unused (kept zero by zero-init); we
-        keep the param shape uniform to avoid changing the optimizer table.
+        dense_w2[0] layout (C=2, L_with_gate=8):
+          cols 0..2 (L=3): source coefficients for v_mudd (C=0) and residual (C=1).
+          col 3 (_mudd_L): ve_gate for layer 10's attention (both C channels → num_heads).
+          cols 4..5 (_mudd_L+1, +2): resid/post lambda gates.
+              C=0 → resid_attn[10], post_attn[10]; C=1 → resid_mlp[10], post_mlp[10].
+          cols 6..7 (_mudd_L+3, +4): x0/bigram injection gates (C=0 only).
+              C=0 → x0_lambda[10], bigram_lambda[10]; C=1 unused (zero).
+        dense_w2[1] only uses cols 0..4 (C=1 channel, 5 sources); extra cols stay zero.
         """
         num_mudd_layers = 2  # layers N-2 and N-1
         self._mudd_C = 2     # 0 = v_mudd, 1 = residual delta
         self._mudd_L = 3     # 3 sources on layer N-2 (x0, h7, x_self); gate at index _mudd_L
-        self._mudd_L10 = 4   # layer N-1 residual: x0, h7, h9, plus first VE bank
-        # Extend L by 1: the extra (L+1)-th column is *not* part of the per-layer
-        # source combination; instead it produces an additional (B, T, C, 1) gate
-        # per token that the *next* layer's attention consumes as its ve_gate
-        # (replacing the per-layer x+ve sigmoid gate). Used for layer 9 -> layer 10.
-        self._mudd_L_with_gate = self._mudd_L + 1
+        self._mudd_L10 = 5   # layer N-1 residual: x0, h7, h9, ve_bank0, skip_connection
+        # Extend L by 5: column _mudd_L (=3) is the ve_gate for layer 10's attention;
+        # columns _mudd_L+1, +2 produce layer-10 resid/post gates for attn (C=0) and
+        # mlp (C=1); columns _mudd_L+3, +4 in C=0 produce layer-10 x0/bigram lambdas.
+        self._mudd_L_with_gate = self._mudd_L + 5  # 3 + 5 = 8
         self._mudd_scale = 0.2 / math.sqrt(self._mudd_L)
         # inter_dim is the shared MLP-hidden width used by both MUDD layers.
         # Rounded up to the nearest multiple of 64 (matching the original heuristic
@@ -1321,13 +1325,21 @@ class GPT(nn.Module):
             num_mudd_layers, inter_dim, self._mudd_C, self._mudd_L_with_gate
         ))
         self.dense_w2.reshape = (num_mudd_layers * inter_dim, self._mudd_C, self._mudd_L_with_gate)
-        # Bias init: only layer-10 / residual-channel / h7-source is non-zero.
-        # This puts the legacy backout (`-0.5 * h_7` before lm_head) inside MUDD as
-        # a learnable starting point. Effective initial coef is -0.5 * scale ≈ -0.058,
-        # so the model warms up with a weak backout and learns the rest.
-        # The extra gate column (index self._mudd_L) stays at zero -> initial ve_gate = 0.
+        # Bias init: most entries zero.  All gate biases are in pre-scaled domain
+        # (effective init = bias * scale).
+        # - [1, 1, 1] = -4.34: legacy backout absorbed into MUDD (layer 10, residual, h7).
+        # - [0, :, _mudd_L] = 0: ve_gate for layer 10 starts at 0.
+        # - [0, 0, _mudd_L+1/+2]: layer-10 resid_attn / post_attn gates
+        # - [0, 1, _mudd_L+1/+2]: layer-10 resid_mlp  / post_mlp  gates
+        # - [0, 0, _mudd_L+3/+4]: layer-10 x0_lambda  / bigram_lambda gates
         bs_init = torch.zeros(num_mudd_layers, self._mudd_C, self._mudd_L_with_gate)
         bs_init[1, 1, 1] = -4.34  # [layer 10, residual, source h7]
+        bs_init[0, 0, self._mudd_L + 1] = 1.1**0.5 / self._mudd_scale  # resid_attn[10]
+        bs_init[0, 0, self._mudd_L + 2] = 1.0 / self._mudd_scale       # post_attn[10]
+        bs_init[0, 1, self._mudd_L + 1] = 1.1**0.5 / self._mudd_scale  # resid_mlp[10]
+        bs_init[0, 1, self._mudd_L + 2] = 1.0 / self._mudd_scale       # post_mlp[10]
+        bs_init[0, 0, self._mudd_L + 3] = 0.0                          # x0_lambda[10] (init 0)
+        bs_init[0, 0, self._mudd_L + 4] = 0.05 / self._mudd_scale      # bigram_lambda[10]
         self.dense_bs = nn.Parameter(bs_init)
         # The (B, T, C) extra-column gate is broadcast to (B, T, num_heads, 1) by
         # repeat_interleave so each C channel covers num_heads // C heads.
@@ -1407,6 +1419,13 @@ class GPT(nn.Module):
         # ve_gate produced by the previous MUDD layer's extra L+1 column,
         # consumed by the *next* layer's attention (e.g. layer 9 -> layer 10).
         next_ve_gate = None
+        # Layer-10 gates, produced by layer-9 MUDD and consumed at layer 10.
+        next_resid_attn_gate = None
+        next_post_attn_gate = None
+        next_resid_mlp_gate = None
+        next_post_mlp_gate = None
+        next_x0_lambda_gate = None
+        next_bigram_lambda_gate = None
 
         # ---- Transformer layers ----
         # x_backout: snapshot of the residual at end of layer 7. Used as the *attention
@@ -1448,8 +1467,21 @@ class GPT(nn.Module):
                     v_mudd = None
                 else:
                     attn_out = attn(norm(attn_in), attn_args, qkvo_w)
-                x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
-            x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+                if next_resid_attn_gate is not None:
+                    x0_inj = next_x0_lambda_gate * x0 + next_bigram_lambda_gate * x0_bigram
+                    x = next_resid_attn_gate * x + next_post_attn_gate * attn_out + x0_inj
+                    next_resid_attn_gate = None
+                    next_post_attn_gate = None
+                    next_x0_lambda_gate = None
+                    next_bigram_lambda_gate = None
+                else:
+                    x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
+            if next_resid_mlp_gate is not None:
+                x = next_resid_mlp_gate * x + next_post_mlp_gate * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+                next_resid_mlp_gate = None
+                next_post_mlp_gate = None
+            else:
+                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
 
             # ---- MUDD: layer 9 (N-2) ----
             # Sources (L=3): x0, h7, current x (self-reference for residual channel).
@@ -1459,11 +1491,11 @@ class GPT(nn.Module):
             # which matches the reviewer's `(1 + m9) * x` suggestion exactly.
             if i == self.num_layers - 2:
                 dw1 = F.gelu(F.linear(x, self.dense_w1[0]))
-                # dense_w2[0] has shape (inter_dim, C=2, L+1=4): first L cols feed the
-                # source combination; the extra L-th col is the per-head ve_gate for
-                # the next layer's attention.
+                # dense_w2[0] shape: (inter_dim, C=2, L+5=8). First L(=3) cols are
+                # source coefficients; col L is ve_gate; cols L+1..L+4 are layer-10
+                # gates (attn/mlp lambdas and x0/bigram injection).
                 dw = torch.einsum('BTd, dCL -> BTCL', dw1, self.dense_w2[0])
-                dw = (dw + self.dense_bs[0]) * self._mudd_scale  # (B, T, 2, L+1)
+                dw = (dw + self.dense_bs[0]) * self._mudd_scale  # (B, T, 2, 8)
                 # V-mudd channel (C=0), first L source columns
                 m_v0, m_v7, m_v9 = dw[..., 0, :self._mudd_L].split(1, dim=-1)
                 v_mudd_raw = 1.15 * (m_v0 * x0 + m_v7 * h7_snap + m_v9 * x)
@@ -1477,26 +1509,21 @@ class GPT(nn.Module):
                 # layer 10 sees the same h9 the original generic-loop version saw.
                 h9_snap = x
                 x = (1 + m_r9) * x + m_r0 * x0 + m_r7 * h7_snap
-                # Extra L-th column (gate column): (B, T, C=2) per token. Tile across
-                # heads via repeat_interleave so each C channel covers num_heads // C
-                # heads; used as the next layer's ve_gate, multiplied directly with ve
-                # (no sigmoid) per @lishengping.
+                # Extra columns from the MUDD gate output:
+                # Column _mudd_L (=3): ve_gate for layer 10's attention (B, T, C=2),
+                #   tiled to (B, T, num_heads, 1).
                 ve_gate_extra = dw[..., self._mudd_L]  # (B, T, C)
                 next_ve_gate = ve_gate_extra.repeat_interleave(
                     self._mudd_gate_repeat, dim=-1
                 ).unsqueeze(-1)  # (B, T, num_heads, 1)
-
-            # ---- MUDD: layer 10 (N-1) ----
-            # Sources (4): x0, h7, h9, ve_bank0 (first value_embeds row; forward list ve[1]).
-            # No self-reference -> no fuse. Uses dense_w2[1, :, 1, :_mudd_L10]; column index
-            # _mudd_L (=3) is not layer-9's ve_gate here — that lives in dense_w2[0] only.
-            elif i == self.num_layers - 1:
-                dw1 = F.gelu(F.linear(x, self.dense_w1[1]))
-                dw_r = torch.einsum('BTd, dL -> BTL', dw1, self.dense_w2[1, :, 1, : self._mudd_L10])
-                dw_r = (dw_r + self.dense_bs[1, 1, : self._mudd_L10]) * self._mudd_scale
-                m_r0, m_r7, m_r9, m_rve = dw_r.split(1, dim=-1)
-                ve_bank0 = ve[1][None].to(dtype=x.dtype)  # (1, T, D), same VE as layer-1 attn
-                x = x + m_r0 * x0 + m_r7 * h7_snap + m_r9 * h9_snap + m_rve * ve_bank0
+                # Columns _mudd_L+1, +2: layer-10 resid/post gates (C=0 → attn, C=1 → mlp).
+                next_resid_attn_gate = dw[..., 0, self._mudd_L + 1].unsqueeze(-1)  # (B, T, 1)
+                next_post_attn_gate  = dw[..., 0, self._mudd_L + 2].unsqueeze(-1)
+                next_resid_mlp_gate  = dw[..., 1, self._mudd_L + 1].unsqueeze(-1)
+                next_post_mlp_gate   = dw[..., 1, self._mudd_L + 2].unsqueeze(-1)
+                # Columns _mudd_L+3, +4 (C=0): layer-10 x0/bigram injection lambdas.
+                next_x0_lambda_gate     = dw[..., 0, self._mudd_L + 3].unsqueeze(-1)
+                next_bigram_lambda_gate = dw[..., 0, self._mudd_L + 4].unsqueeze(-1)
 
             if i == 3:
                 skip_connection = x
@@ -1504,6 +1531,15 @@ class GPT(nn.Module):
                 # h7_snap and x_backout are the same tensor at this point; we keep
                 # two names because they play conceptually distinct roles downstream.
                 h7_snap = x
+
+        # Sources (5): x0, h7, h9, ve_bank0, skip_connection (layer-3 output).
+        # No self-reference -> no fuse. Uses dense_w2[1, :, 1, :_mudd_L10].
+        dw1 = F.gelu(F.linear(x, self.dense_w1[1]))
+        dw_r = torch.einsum('BTd, dL -> BTL', dw1, self.dense_w2[1, :, 1, : self._mudd_L10])
+        dw_r = (dw_r + self.dense_bs[1, 1, : self._mudd_L10]) * self._mudd_scale
+        m_r0, m_r7, m_r9, m_rve, m_rsk = dw_r.split(1, dim=-1)
+        ve_bank0 = ve[1][None].to(dtype=x.dtype)  # (1, T, D), same VE as layer-1 attn
+        x = x + m_r0 * x0 + m_r7 * h7_snap + m_r9 * h9_snap + m_rve * ve_bank0 + m_rsk * skip_connection
 
         x = norm(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
@@ -1712,8 +1748,8 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1400  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 15  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 1405  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     # Descriptive run_id for this iteration:

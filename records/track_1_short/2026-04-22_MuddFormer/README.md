@@ -9,11 +9,13 @@ Add MUDD (Multiway Dynamic Dense Connections, [Xiao et al. 2025](https://arxiv.o
      this_pr_v1    10   1430  83.2020   0.0326   -1.5019   0.0000   3.2783   0.0016   -0.0004    0.0040
 this_pr_v1-1415    10   1415  82.1446   0.0342   -2.5593   0.0000   3.2815   0.0012   +0.0027    0.9982
      this_pr_v2    10   1415  82.1289   0.0386   -2.5750   0.0000   3.2781   0.0010   -0.0007    0.0001
+     this_pr_v3    10   1415  81.9146   0.0418   -2.7893   0.0000   3.2780   0.0009   -0.0008    0.0000
 ```
 
 `Loss p` is the one-sample t-test against the 3.28 target:
 `scipy.stats.ttest_1samp(losses, 3.28, alternative="less").pvalue`
 (so smaller `p` = more confidently below 3.28; the rules require `p < 0.01`).
+- `this_pr_v3` at 1415 steps: `p = 0.0000` ✓ (best loss & time)
 - `this_pr_v2` at 1415 steps: `p = 0.0001` ✓
 - `this_pr_v1` at 1415 steps: `p = 0.9982` ✗ (v1 doesn't have enough headroom for the extra 15-step cut)
 
@@ -78,6 +80,42 @@ vs. v1 (`this_pr_v1` at 1430 steps):
 - The same MUDD-coef approach on the 3→6 skip connection (Larry's suggestion #5).
 - Tuning `lr_mul` / `betas` for the dense params; current values are a reasonable guess.
 - `dense_w1` is kaiming-init; small-init might learn faster given `dense_w2` starts at zero.
+
+## v3: dynamic layer-10 gates + skip_connection source (-2.79s, -65 steps)
+
+v3 pushes the "reuse the existing MUDD MLP" theme further: layer 9's MUDD now produces **6 additional per-token scalar gates** that replace the static per-layer scalars on layer 10, plus a **5th residual source** (`skip_connection` from layer 3) for the post-loop MUDD. All of these ride on the same `dense_w1` → `dense_w2` path with extra columns, keeping per-step overhead negligible.
+
+### Changes from v2
+
+1. **6 dynamic gates for layer 10, produced by layer 9's MUDD.**
+   `dense_w2[0]` extended from `(inter_dim, C=2, L+1=4)` to `(inter_dim, C=2, L+5=8)`. The 4 extra columns (beyond the existing ve_gate column) produce:
+   - `resid_attn[10]`, `post_attn[10]` (C=0 channel, cols L+1, L+2) — replace the static `resid_lambdas_attn[10]` and `post_lambdas_attn[10]`.
+   - `resid_mlp[10]`, `post_mlp[10]` (C=1 channel, cols L+1, L+2) — replace the static `resid_lambdas_mlp[10]` and `post_lambdas_mlp[10]`.
+   - `x0_lambda[10]`, `bigram_lambda[10]` (C=0 channel, cols L+3, L+4) — replace the static `x0_inject[10]` and `bigram_lambdas[10]`.
+
+   **Bias init** matches the static scalars they replace: `resid_attn/mlp` biased to `≈1.1^0.5`, `post_attn/mlp` to `1.0`, `x0_lambda` to `0`, `bigram_lambda` to `0.05` (all in pre-scaled domain, effective init = `bias * scale`). At init the model sees the same effective coefficients as before, but they can now vary per token.
+
+2. **`skip_connection` (layer-3 output) as a 5th source for post-loop MUDD.**
+   Layer 10's residual MUDD source set grows from `{x0, h7, h9, ve_bank0}` (v2) to `{x0, h7, h9, ve_bank0, skip_connection}`. `skip_connection` is the layer-3 hidden (a long-window snapshot, captured right after the layer-3 long-window attention). Same `dense_w1` → `dense_w2` path with one more `L` slot; nearly free.
+
+3. **Layer-10 MUDD moved post-loop.**
+   The `elif i == self.num_layers - 1:` branch is gone; the layer-10 MUDD residual is computed once after the main loop exits. This is a pure refactor (same arithmetic, cleaner control flow).
+
+### Effect
+
+vs. `baseline-1480` (target):
+- **`this_pr_v3` reaches loss 3.2780 in 81.91s — `-2.79s` wall-clock at strictly-better loss** (Δloss `-0.0008` vs baseline-1480; one-sample `p < 0.0001` vs the 3.28 target).
+
+vs. v2 (`this_pr_v2` at 1415 steps):
+- v3 saves another **0.21s** wall-clock (81.91s vs 82.13s) and slightly improves loss (3.2780 vs 3.2781), same step count. The wall-clock gain comes from moving layer-10 MUDD post-loop (removing the dead `elif` branch inside the compiled loop) and the per-token dynamic gates' small quality improvement.
+- Loss variance is tighter: σ = 0.0009 (v3) vs 0.0010 (v2).
+
+### Things still not tried
+
+- Putting MUDD on more than 2 layers (one extra mid-network block).
+- The same MUDD-coef VE-gate replacement on layers other than 10.
+- The same MUDD-coef approach on the 3→6 skip connection (Larry's suggestion #5).
+- Tuning `lr_mul` / `betas` for the dense params.
 
 Timing was on 8xH100.
 
