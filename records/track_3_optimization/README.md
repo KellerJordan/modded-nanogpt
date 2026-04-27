@@ -19,7 +19,7 @@ The following is a history of notable results, in particular, improvements to th
 
 | # | Steps to 3.28 | Description | Date | Log | Contributors |
 | - | - | - | - | - | - |
-| 1 | 3550 | [Muon](https://kellerjordan.github.io/posts/muon/) lr=.02 wd=.01 | 2026/04/26 | [log](results/c0ca36ae-1684-4362-aefb-c7654cf970ba.txt) | @kellerjordan0 |
+| 1 | 3600 | [Muon](https://kellerjordan.github.io/posts/muon/) lr=.02 wd=.01 | 2026/04/26 | [log](results/7b8270c5-a9cd-4a73-b7d8-5d86a2d1e428.txt) | @kellerjordan0 |
 | 2 | 5625 | AdamW lr=0.0015 wd=0.1 betas=(0.9, 0.95) warmup_steps=250 | 2026/04/26 | [log](results/a63a68d1-24aa-4a22-af9a-224e43209ea4.txt) | @kellerjordan0 |
 
 Many more non-SOTA results (e.g., from hyperparameter sweeps) can be found in `results/`.
