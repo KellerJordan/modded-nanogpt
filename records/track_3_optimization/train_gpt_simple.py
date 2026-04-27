@@ -185,18 +185,18 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     return X
 
 @torch.compile
-def muon_update(grad, momentum, beta=0.95, nesterov=True):
-    momentum.lerp_(grad, 1 - beta)
-    update = grad.lerp_(momentum, beta) if nesterov else momentum
+def muon_update(grad, momentum, mu=0.95, nesterov=True):
+    momentum.lerp_(grad, 1 - mu)
+    update = grad.lerp_(momentum, mu) if nesterov else momentum
     update = zeropower_via_newtonschulz5(update)
     update *= max(1, grad.size(-2) / grad.size(-1))**0.5
     return update
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -206,13 +206,13 @@ class Muon(torch.optim.Optimizer):
         for group in self.param_groups:
             params = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
-            for base_i in range(len(params))[::world_size]:
+            for base_i in range(0, len(params), world_size):
                 if base_i + rank < len(params):
                     p = params[base_i + rank]
                     state = self.state[p]
                     if len(state) == 0:
-                        state["momentum_buffer"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                        state["momentum"] = torch.zeros_like(p)
+                    update = muon_update(p.grad, state["momentum"], mu=group["mu"])
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
@@ -270,7 +270,6 @@ train_steps = 3550
 for name, p in model.named_parameters():
     if "proj" in name:
         p.data.zero_()
-    dist.broadcast(p.detach(), 0)
 
 # create the optimizer(s)
 optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
@@ -303,8 +302,10 @@ def set_hparams(step, cooldown_frac=0.7):
 #        Training and Validation       #
 ########################################
 
-training_time = 0
+for p in model.parameters():
+    dist.broadcast(p.detach(), 0)
 # start the clock
+training_time = 0
 dist.barrier()
 t0 = time.perf_counter()
 for step in range(train_steps + 1):
