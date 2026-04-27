@@ -1,21 +1,20 @@
-from pathlib import Path
 import re
 import matplotlib.pyplot as plt
 
 runs = {
-    'Muon (best, 3500 steps)': ('311d7833-8dfc-43ea-a55c-fd313a11c4a8.txt', '#d04a1f'),
-    'AdamW (best, 5625 steps)': ('a63a68d1-24aa-4a22-af9a-224e43209ea4.txt', '#1f77b4'),
+    'Muon (best, 3500 steps)': ('311d7833-8dfc-43ea-a55c-fd313a11c4a8', '#d04a1f'),
+    'AdamW (best, 5625 steps)': ('a63a68d1-24aa-4a22-af9a-224e43209ea4', '#1f77b4'),
 }
-out = Path('figure.png')
 pattern = re.compile(r'step:(\d+)/(\d+)\s+val_loss:([0-9.]+)')
+out = 'figure.png'
 
 plt.style.use('seaborn-v0_8-whitegrid')
 fig, ax = plt.subplots(figsize=(5.5, 4), dpi=180)
 
 for label, (logfile, color) in runs.items():
     steps, losses = [], []
-    path = Path('results') / logfile
-    with path.open() as f:
+    path = f'results/{logfile}.txt'
+    with open(path, 'r') as f:
         for line in f:
             m = pattern.search(line)
             if m:
@@ -55,4 +54,3 @@ ax.tick_params(axis='both', which='major', labelsize=10)
 fig.tight_layout()
 fig.savefig(out, bbox_inches='tight')
 print(out)
-
