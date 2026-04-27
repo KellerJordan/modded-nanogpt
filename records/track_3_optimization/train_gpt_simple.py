@@ -237,10 +237,10 @@ if dist.get_rank() == 0:
     print(logfile)
 def print0(s, console=False, log=True):
     if dist.get_rank() == 0:
-        with open(logfile, "a") as f:
-            if console:
-                print(s)
-            if log:
+        if console:
+            print(s)
+        if log:
+            with open(logfile, "a") as f:
                 print(s, file=f)
 
 # we begin by logging this file itself
