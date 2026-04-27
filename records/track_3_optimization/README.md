@@ -78,19 +78,16 @@ Aiming towards simplicity, for this benchmark we have removed the non-standard n
 Finally, we have replaced the sophisticated local-global pattern of attention by simple causal attention across contexts of 1024 tokens.
 
 
-## Technical notes and tips
+## Guidelines
 
-For future attempts:
-* For [AdamW](https://arxiv.org/abs/1711.05101), it seems that reasonable starting hparams are `lr=.0015, wd=.125, warmup_steps=250`.
-* For [PSGD Kron](https://github.com/evanatyourservice/kron_torch), it seems that reasonable starting hparams are `lr=.0005, weight_decay=.625`.
-
+General
 * Changes to the code should be concentrated to the `Optimization` and `Init & Optim Hyperparams` sections.
+* Results should be submitted in the form of logfiles, like the ones linked in the [results history](#results-history) section above. Logfiles must include the full code used by the run, such that if we replace `train_gpt_simple.py` by the code, then running the quickstart will reproduce the run (up to random seed variance). In particular, hardcoded hyperparameters are to be preferred as compared to command line arguments.
+
+On tuning hyperparameters:
 * Typically, the most sensitive hyperparameter is the weight decay, followed by the learning rate, and then everything else.
 * For a given hyperparameter change, in general it is not possible to tell whether it will have a positive or negative effect on the final val loss until the entire run completes. For example, the val loss at step 1000 does not strongly correlate with the final loss.
 On the other hand, especially for optimizers with a lot of hyperparameters where we are quite uncertain, it can often be a good strategy to say halve the entire run's step count (thereby getting worse than the target val loss), and then tune all hyperparameters for the shorter/quicker run, and then bring the step count back up, and retune just the weight decay and learning rate. Since often the optimal settings for the non-wd/lr hparams (like Adam betas) will be the same for shorter and longer runs.
 * On data: The baseline trains for 3550 * 524288 = ~2B tokens. The quickstart script downloads 4B tokens of FineWeb, allowing trainings up to 7600 steps. If you'd like to train for more steps than that, then you must get more tokens via something like `python data/cached_fineweb10B.py 100`, which will download the maximum 10B tokens. However, AdamW runs can reach the target val loss within around 3B tokens, so this should not be necessary except for pathologically inefficient optimizers.
-
-
-## Logfile guidelines
-
-Results should be submitted in the form of logfiles, like the ones linked in the [results history](#results-history) section above. Logfiles must include the full code used by the run, such that if we replace `train_gpt_simple.py` by the code, then running the quickstart will reproduce the run (up to random seed variance). In particular, hardcoded hyperparameters are to be preferred as compared to command line arguments.
+* For [AdamW](https://arxiv.org/abs/1711.05101), it seems that reasonable starting hparams are `lr=.0015, wd=.125, warmup_steps=250`.
+* For [PSGD Kron](https://github.com/evanatyourservice/kron_torch), it seems that reasonable starting hparams are `lr=.0005, weight_decay=.625`.
