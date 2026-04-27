@@ -15,7 +15,7 @@ torchrun --standalone --nproc_per_node=$(nvidia-smi -L | wc -l) records/track_3_
 
 ## Notable results history
 
-The following is a history of notable results, in particular, improvements to the best known hyperparameters for each optimizer.
+The following results each improved the best known hyperparameters for an optimizer on this benchmark.
 Many more non-SOTA results (e.g., from hyperparameter sweeps) can be found in `results/`.
 
 | # | Steps to 3.28 | Description | Date | Log | Contributors |
