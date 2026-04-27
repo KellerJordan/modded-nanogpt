@@ -126,7 +126,7 @@ class MLP(nn.Module):
 
     def forward(self, x: Tensor):
         x = self.fc(x)
-        x = F.relu(x).square()
+        x = x.relu().square()
         x = self.proj(x)
         return x
 
