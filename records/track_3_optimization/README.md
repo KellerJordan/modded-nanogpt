@@ -17,7 +17,7 @@ torchrun --standalone --nproc_per_node=$(nvidia-smi -L | wc -l) records/track_3_
 
 | # | Steps to 3.28 | Description | Date | Log | Contributors |
 | - | - | - | - | - | - |
-| 1 | 3550 | [Muon](https://kellerjordan.github.io/posts/muon/) baseline, lr=.02 wd=.01 | 2026/04/26 | [log](c0ca36ae-1684-4362-aefb-c7654cf970ba.txt) | @kellerjordan0 |
+| 1 | 3550 | [Muon](https://kellerjordan.github.io/posts/muon/) baseline, lr=.02 wd=.01 | 2026/04/26 | [log](logs/c0ca36ae-1684-4362-aefb-c7654cf970ba.txt) | @kellerjordan0 |
 
 
 ## Rules
