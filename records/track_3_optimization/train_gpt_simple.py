@@ -61,13 +61,6 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
-class Linear(nn.Linear):
-    def __init__(self, in_features, out_features):
-        super().__init__(in_features, out_features, bias=True)
-    
-    def forward(self, x):
-        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
-
 class RMSNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -75,6 +68,13 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         return (norm(x.float()) * self.gains).type_as(x)
+
+class Linear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=True)
+
+    def forward(self, x):
+        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
 
 class Rotary(nn.Module):
     def __init__(self, dim: int):
@@ -309,7 +309,7 @@ training_time = 0
 dist.barrier()
 t0 = time.perf_counter()
 for step in range(train_steps + 1):
-    
+
     # --------------- VALIDATION SECTION -----------------
     if step == train_steps or step % 125 == 0:
         # stop the clock
@@ -329,7 +329,7 @@ for step in range(train_steps + 1):
         # start the clock again
         dist.barrier()
         t0 = time.perf_counter()
-    
+
     if step == train_steps:
         break
 
