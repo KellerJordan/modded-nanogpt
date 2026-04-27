@@ -13,7 +13,7 @@ python data/cached_fineweb10B.py 40  # downloads 4B training tokens
 torchrun --standalone --nproc_per_node=$(nvidia-smi -L | wc -l) records/track_3_optimization/train_gpt_simple.py
 ```
 
-## Results history
+## Notable results history
 
 The following is a history of notable results, in particular, improvements to the best known hyperparameters for each optimizer.
 
