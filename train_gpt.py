@@ -1586,7 +1586,10 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1440  # number of steps to complete lr and ws schedule
+    # XSA-on-{1,3,4,7,8,10} reached val_loss 3.2746 ± 0.0007 at 1440 steps — 0.0044 below
+    # the ~3.279 baseline cluster. Spend that buffer on -30 steps. Expected save 1.6 s,
+    # more than cancels the +0.9 s wall-clock cost of the broader XSA application.
+    num_scheduled_iterations: int = 1410  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
