@@ -247,7 +247,7 @@ def print0(s, console=False, log=True):
 print0(code)
 print0("="*100)
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
-print0(f"Running on device_name={torch.cuda.get_device_name(dist.get_rank())} with world_size={dist.get_world_size()}")
+print0(f"Running on device_name={torch.cuda.get_device_name(device)} with world_size={dist.get_world_size()}")
 print0("="*100)
 
 val_tokens = 20 * 524288
