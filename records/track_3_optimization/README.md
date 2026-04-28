@@ -1,4 +1,4 @@
-# Modded-NanoGPT Optimizer Benchmark
+# Modded-NanoGPT Optimization Benchmark
 
 The goal of this benchmark is to collaboratively|competitively find efficient neural network optimizers.
 Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any means, here we aim to minimize *step count* by improving the optimization algorithm (⇒ methods that are slow in terms of wallclock are perfectly OK).
@@ -35,7 +35,7 @@ To be considered valid, new results must:
 
 New results have the freedom to modify:
 1. The optimization algorithm, even to something slow in terms of wallclock speed.
-2. The optimizer hyperparameters, including schedules.
+2. The optimization hyperparameters, including schedules thereof.
 3. The model initialization.
 
 We welcome not only new results which advance the global SOTA, but even just results which advance the per-optimizer SOTA,
@@ -55,14 +55,22 @@ https://chatgpt.com/share/69ed22e3-0870-83ea-a449-b4ce97d764f3). And more broadl
 
 How do these hundreds of optimizers compare - which ones are able to optimize neural networks in the fewest steps?
 The reality is that as a community, we simply don't know. Why not?
-Because typically, these papers all use their own unique experimental setups, making it challenging to verify whether their baselines are well-tuned or to make comparisons between papers.
+Because typically, these papers each use their own unique experimental setups, making it challenging to verify whether their baselines are well-tuned or to make comparisons between papers.
 
 For researchers interested in neural network optimization, this is daunting - a sea of methods, many of them claiming to be SOTA, and no shared infrastructure to sort signal from noise. As it stands, the burden is on the individual researcher to make sense of this madness. Calculating the outcome: If N different researchers publish N optimizer papers claiming SOTA, all of them unverifiable and mutually incomparable, then there are only two possibilities: Either (a) research grinds to a halt due to the Θ(N) growth in experiments that each researcher needs to conduct to get a private sense of the real SOTA, or (b) researchers start simply ignoring each other's papers.
+Neither of these are desireable outcomes, and today we are in some mix of the two.
 
-This benchmark aims to provide a simple, easily-accessible way communally shared way to filter signal from noise, thereby surfacing ignored papers and reducing the number of experiments that each researcher must do in order to get an accurate picture of the SOTA.
-Prior optimization benchmarks already exist, but often suffer from high barriers to entry due to strenuous requirements or high complexity.
+This benchmark aims to provide a simple, easily-accessible communally-shared way to filter signal from noise, aiming to surface ignored papers/ideas and reduce the number of experiments that each researcher must do in order to get an accurate picture of the SOTA.
+It is a collaborative|competitive benchmark, meaning that, for example, if anyone can find hyperparameters that enable AdamW
+to reach the target loss in fewer steps than Muon, then we the benchmark authors will be keen to include this result and promote it on social media
+within a short period of time, even though there is a conflict of interest since we are also Muon authors.
+In contrast, in historical cases where a paper proposing a new SOTA-claiming optimizer has later turned out to have been confounded by an undertuned baseline,
+it has often been difficult for such information to propagate through the community, due to the fact that negative results are typically not paper-worthy on their own,
+even if they disprove another paper which has hundreds of citations.
+
+Prior competitive optimization benchmarks already exist, but often suffer from high barriers to entry due to strenuous requirements or high complexity.
 This benchmark aims for maximum convenience in order to make new results as convenient/accessible as possible:
-The baseline code should be comprehensible with minimal effort, and experiments should not take more than ~10 minutes or cost more than ~$5.
+The baseline code should be comprehensible with minimal effort, and experiments should take no more than ~15 minutes and cost no more than ~$6.
 
 
 ## Addressing a potential critique
