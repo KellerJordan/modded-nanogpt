@@ -1299,9 +1299,10 @@ class GPT(nn.Module):
         veg = self.ve_gate_bank.unbind(0)
         attn_gates = [*ag[:6], None, *ag[6:]]
         ve_gates = [None, veg[0], veg[1], *self.gate_filler_nones, veg[2], veg[3], veg[4]]
-        # XSA only on the deep non-paired layers {7, 8, 10}; paired layers and MLP-only
-        # layer 6 get None (skipped). Self-bias is strongest in deep layers.
-        xsa_layers_set = {7, 8, 10}
+        # XSA on every non-paired attn layer {1, 3, 4, 7, 8, 10}; paired layers {0,2,5,9}
+        # and the MLP-only layer 6 are skipped. Broader application than {7,8,10} —
+        # tests whether shallower non-paired layers also benefit from self-bias removal.
+        xsa_layers_set = {1, 3, 4, 7, 8, 10}
         xsa_alpha_per_layer = self.xsa_alphas.unbind(0)
         xsa_alphas = [xsa_alpha_per_layer[i] if i in xsa_layers_set else None for i in range(self.num_layers)]
         assert len(attn_gates) == self.num_layers
