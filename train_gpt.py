@@ -1058,6 +1058,7 @@ class AttnArgs:
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
     train_max_seq_len: torch.Tensor
+    xsa_alpha: torch.Tensor | None  # per-head learnable XSA gate; None = disabled for this layer
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
@@ -1128,6 +1129,15 @@ class CausalSelfAttention(nn.Module):
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
+        # Gated XSA (arXiv:2603.09078 with learnable strength). Remove a per-head fraction
+        # tanh(α) of the y-component aligned with v̂. α zero-init → tanh(α)=0, so this is a
+        # strict no-op at step 0 (strict superset of master). Only on non-paired layers
+        # since v has shape (B,T,H,D) here; paired layers reshape v differently.
+        if attn_args.xsa_alpha is not None and not self.paired:
+            vn = F.normalize(v, dim=-1, eps=1e-4)
+            proj = (y * vn).sum(-1, keepdim=True)
+            alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(1, 1, self.num_heads, 1)
+            y = y - alpha * proj * vn
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
@@ -1243,6 +1253,10 @@ class GPT(nn.Module):
         # sqrt(1.1) per sublayer so cumulative per-layer scaling is 1.1
         self.resid_lambdas = nn.Parameter(torch.full((num_layers, 2), 1.1**0.5))
 
+        # Per-(layer, head) learnable XSA gate. Zero-init: tanh(0)=0 disables XSA at step 0.
+        # Only layers in xsa_layers (set in forward) actually receive a non-None alpha.
+        self.xsa_alphas = nn.Parameter(torch.zeros(num_layers, num_heads))
+
         pad = (-num_layers * 2 - 3) % dist.get_world_size()
         self.scalars = nn.Parameter(
             torch.cat(
@@ -1285,6 +1299,11 @@ class GPT(nn.Module):
         veg = self.ve_gate_bank.unbind(0)
         attn_gates = [*ag[:6], None, *ag[6:]]
         ve_gates = [None, veg[0], veg[1], *self.gate_filler_nones, veg[2], veg[3], veg[4]]
+        # XSA only on the deep non-paired layers {7, 8, 10}; paired layers and MLP-only
+        # layer 6 get None (skipped). Self-bias is strongest in deep layers.
+        xsa_layers_set = {7, 8, 10}
+        xsa_alpha_per_layer = self.xsa_alphas.unbind(0)
+        xsa_alphas = [xsa_alpha_per_layer[i] if i in xsa_layers_set else None for i in range(self.num_layers)]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
         qk_all = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])
@@ -1332,7 +1351,8 @@ class GPT(nn.Module):
                 key_offset=key_offset[i],
                 attn_gate_w=attn_gates[i],
                 ve_gate_w=ve_gates[i],
-                train_max_seq_len=train_max_seq_len
+                train_max_seq_len=train_max_seq_len,
+                xsa_alpha=xsa_alphas[i],
             )
             # Select weights from banks
             attn_idx = i - (i > 6) if i != 6 else None
@@ -1705,6 +1725,7 @@ class TrainingManager():
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "bigram_lambdas": {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "resid_lambdas":  {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
+            "xsa_alphas":     {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
@@ -1712,7 +1733,7 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas", "xsa_alphas",  # Small, fast
             "value_embeds", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "qk_bank", "vo_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
