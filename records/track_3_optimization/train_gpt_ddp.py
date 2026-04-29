@@ -1,5 +1,5 @@
 """
-train_gpt_simple.py
+train_gpt_ddp.py
 
 This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
 It was prepared as a simplified version of the speedrun for use in neural net optimization research.
@@ -19,6 +19,7 @@ from torch import Tensor, nn
 from torch.optim import AdamW
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from dion import NorMuon
 
 
@@ -166,63 +167,6 @@ class GPT(nn.Module):
 
 
 ########################################
-#              Optimizer               #
-########################################
-
-def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
-    assert G.ndim >= 2
-    X = G.bfloat16()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations, not optimizing for wallclock speed
-    a, b, c = 2, -1.5, 0.5
-    for _ in range(12):
-        A = X @ X.mT
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-    return X
-
-@torch.compile
-def muon_update(grad, momentum, mu=0.95, nesterov=True):
-    momentum.lerp_(grad, 1 - mu)
-    update = grad.lerp_(momentum, mu) if nesterov else momentum
-    update = zeropower_via_newtonschulz5(update)
-    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
-    return update
-
-class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
-        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
-        params = sorted(params, key=lambda x: x.size(), reverse=True)
-        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
-        super().__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self):
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
-        for group in self.param_groups:
-            params = group["params"]
-            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
-            for base_i in range(0, len(params), world_size):
-                if base_i + rank < len(params):
-                    p = params[base_i + rank]
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state["momentum"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum"], mu=group["mu"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
-                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
-
-
-########################################
 #                Setup                 #
 ########################################
 
@@ -319,12 +263,6 @@ mbs = 64
 train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
 val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
 
-model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
-model.compile(dynamic=False)
-flops_per_token = estimate_flops_per_token(model, num_layers=12, num_heads=6, head_dim=128, seq_len=1024)
-print0(f"Estimated FLOPs/token:{flops_per_token} using A100 BF16 peak:{A100_BF16_PEAK_FLOPS:.3e} FLOP/s per GPU")
-
-
 ########################################
 #       Init & Optim Hyperparams       #
 ########################################
@@ -332,23 +270,32 @@ print0(f"Estimated FLOPs/token:{flops_per_token} using A100 BF16 peak:{A100_BF16
 # we want to minimize this while still reaching 3.28 val loss
 train_steps = 3500
 
-# initialize model parameters
-for name, p in model.named_parameters():
+raw_model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
+raw_model.compile(dynamic=False)
+flops_per_token = estimate_flops_per_token(raw_model, num_layers=12, num_heads=6, head_dim=128, seq_len=1024)
+print0(f"Estimated FLOPs/token:{flops_per_token} using A100 BF16 peak:{A100_BF16_PEAK_FLOPS:.3e} FLOP/s per GPU")
+
+# initialize model parameters before DDP broadcasts them from rank 0
+for name, p in raw_model.named_parameters():
     if "proj" in name:
         p.data.zero_()
+
+model = DDP(raw_model, device_ids=[device.index], broadcast_buffers=False,
+            gradient_as_bucket_view=True, bucket_cap_mb=128)
+
 # create the optimizer(s)
-optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
-                    dict(params=[model.proj.weight], lr=1/320),
-                    dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
+optimizer1 = AdamW([dict(params=[raw_model.embed.weight], lr=0.3),
+                    dict(params=[raw_model.proj.weight], lr=1/320),
+                    dict(params=[p for p in raw_model.parameters() if p.ndim < 2], lr=0.01)],
                    betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
-optimizer2 = NorMuon([p for p in model.blocks.parameters() if p.ndim >= 2],
+optimizer2 = NorMuon([p for p in raw_model.blocks.parameters() if p.ndim >= 2],
                      distributed_mesh=dist.group.WORLD,
                      lr=0.025, mu=0.95, muon_beta2=0.95, weight_decay=0.0125,
                      nesterov=True, adjust_lr="spectral_norm",
-                     use_triton=True, use_polar_express=True)
+                     use_gram_newton_schulz=True)
 optimizers = [optimizer1, optimizer2]
 assert set(p for opt in optimizers for group in opt.param_groups
-           for p in group["params"]) == set(model.parameters())
+           for p in group["params"]) == set(raw_model.parameters())
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
@@ -370,8 +317,6 @@ def set_hparams(step, cooldown_frac=0.7):
 #        Training and Validation       #
 ########################################
 
-for p in model.parameters():
-    dist.broadcast(p.detach(), 0)
 # start the clock
 training_time = 0
 last_training_time = 0
@@ -390,7 +335,7 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             assert len(val_inputs) % mbs == 0
             for i in range(len(val_inputs) // mbs):
-                val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+                val_loss += raw_model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
         dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
         val_loss /= val_tokens
         mfu = estimate_a100_mfu(step, training_time, flops_per_token)
@@ -411,16 +356,19 @@ for step in range(train_steps + 1):
         inputs, targets = next(train_loader)
         # accumulate across microbatches in case we are running with fewer than 8 gpus
         assert len(inputs) % mbs == 0
-        for i in range(len(inputs) // mbs):
-            model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
-        for name, p in model.named_parameters():
+        num_microbatches = len(inputs) // mbs
+        for i in range(num_microbatches):
+            sync_context = nullcontext() if i == num_microbatches - 1 else model.no_sync()
+            with sync_context:
+                loss = model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+                (loss * dist.get_world_size()).backward()
+        for name, p in raw_model.named_parameters():
             assert p.grad is not None, name
-            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
         # set optimization hyperparameters and take a step
         set_hparams(step)
         for opt in optimizers:
             opt.step()
-        model.zero_grad(set_to_none=True)
+        raw_model.zero_grad(set_to_none=True)
     profiler.maybe_stop(train_step)
     approx_training_time = training_time + (time.perf_counter() - t0)
     step_time = approx_training_time - last_training_time
