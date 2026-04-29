@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 runs = {
     'Muon (best, 3500 steps)': ('311d7833-8dfc-43ea-a55c-fd313a11c4a8', '#d04a1f'),
     'AdamW (best, 5625 steps)': ('a63a68d1-24aa-4a22-af9a-224e43209ea4', '#1f77b4'),
-    'MuonH (best, 3300 steps)': ('275ee3b9-6110-49b8-92d9-a0e9137c3d31', '#2ca02c'),
+    'MuonH (best, 3300 steps)': ('3d5c5234-6059-4a99-9814-7a9d118c82fe', '#2ca02c'),
 }
 pattern = re.compile(r'step:(\d+)/(\d+)\s+val_loss:([0-9.]+)')
 out = 'figure.png'
