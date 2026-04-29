@@ -1058,7 +1058,7 @@ class AttnArgs:
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
     train_max_seq_len: torch.Tensor
-    xsa_alpha: torch.Tensor | None  # per-head learnable XSA gate; None = disabled for this layer
+    xsa_alpha: torch.Tensor | None
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
@@ -1129,10 +1129,9 @@ class CausalSelfAttention(nn.Module):
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
-        # Gated XSA (arXiv:2603.09078 with learnable strength). Remove a per-head fraction
-        # tanh(α) of the y-component aligned with v̂. α zero-init → tanh(α)=0, so this is a
-        # strict no-op at step 0 (strict superset of master). Only on non-paired layers
-        # since v has shape (B,T,H,D) here; paired layers reshape v differently.
+        # Gated XSA (arXiv:2603.09078) with learnable strength
+        # remove a per-head fraction tanh(α) of the y-component aligned with v̂
+        # only on non-paired layers since v has shape (B,T,H,D) here
         if attn_args.xsa_alpha is not None and not self.paired:
             vn = F.normalize(v, dim=-1, eps=1e-4)
             proj = (y * vn).sum(-1, keepdim=True)
@@ -1253,8 +1252,7 @@ class GPT(nn.Module):
         # sqrt(1.1) per sublayer so cumulative per-layer scaling is 1.1
         self.resid_lambdas = nn.Parameter(torch.full((num_layers, 2), 1.1**0.5))
 
-        # Per-(layer, head) learnable XSA gate. Zero-init: tanh(0)=0 disables XSA at step 0.
-        # Only layers in xsa_layers (set in forward) actually receive a non-None alpha.
+        # Per-(layer, head) learnable XSA gate; zero-init: tanh(0)=0 disables XSA at step 0
         self.xsa_alphas = nn.Parameter(torch.zeros(num_layers, num_heads))
 
         pad = (-num_layers * 2 - 3) % dist.get_world_size()
@@ -1299,9 +1297,7 @@ class GPT(nn.Module):
         veg = self.ve_gate_bank.unbind(0)
         attn_gates = [*ag[:6], None, *ag[6:]]
         ve_gates = [None, veg[0], veg[1], *self.gate_filler_nones, veg[2], veg[3], veg[4]]
-        # XSA on every non-paired attn layer {1, 3, 4, 7, 8, 10}; paired layers {0,2,5,9}
-        # and the MLP-only layer 6 are skipped. Broader application than {7,8,10} —
-        # tests whether shallower non-paired layers also benefit from self-bias removal.
+        # XSA on every non-paired attn layer {1, 3, 4, 7, 8, 10}; paired layers {0,2,5,9} and the MLP-only layer 6 are skipped
         xsa_layers_set = {1, 3, 4, 7, 8, 10}
         xsa_alpha_per_layer = self.xsa_alphas.unbind(0)
         xsa_alphas = [xsa_alpha_per_layer[i] if i in xsa_layers_set else None for i in range(self.num_layers)]
@@ -1586,9 +1582,6 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    # XSA-on-{1,3,4,7,8,10} reached val_loss 3.2746 ± 0.0007 at 1440 steps — 0.0044 below
-    # the ~3.279 baseline cluster. Spend that buffer on -30 steps. Expected save 1.6 s,
-    # more than cancels the +0.9 s wall-clock cost of the broader XSA application.
     num_scheduled_iterations: int = 1410  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
