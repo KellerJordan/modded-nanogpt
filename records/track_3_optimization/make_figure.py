@@ -2,6 +2,7 @@ import re
 import matplotlib.pyplot as plt
 
 runs = {
+    'norMuon (best, 3500 steps)': ('d8a057c6-8e2f-40d4-8330-eeaa933541d8', "#53ae67"),
     'Muon (best, 3500 steps)': ('311d7833-8dfc-43ea-a55c-fd313a11c4a8', '#d04a1f'),
     'AdamW (best, 5625 steps)': ('a63a68d1-24aa-4a22-af9a-224e43209ea4', '#1f77b4'),
 }
