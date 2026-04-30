@@ -366,4 +366,4 @@ for _ in range(num_trials):
         print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
                + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
 
-    dist.destroy_process_group()
+dist.destroy_process_group()
