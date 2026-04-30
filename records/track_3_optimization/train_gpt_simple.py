@@ -277,9 +277,9 @@ for _ in range(num_trials):
             if "proj" in name:
                 p.data.zero_()
             elif "embed" in name:
-                p.data.normal_()
+                p.data.normal_()  # default torch init
             else:
-                p.data.normal_(std=0.33**0.5 / p.size(-1)**0.5) # default torch init
+                p.data.normal_(std=0.33**0.5 / p.size(-1)**0.5)  # default torch init
         elif name.endswith("bias"):
             p.data.zero_()
         elif name.endswith("gains"):
