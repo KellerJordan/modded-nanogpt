@@ -11,6 +11,7 @@ with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
