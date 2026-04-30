@@ -363,7 +363,7 @@ for _ in range(num_trials):
         assert len(inputs) % mbs == 0
         num_microbatches = len(inputs) // mbs
         for i in range(num_microbatches):
-            with (nullcontext() if i == num_microbatches - 1 else model.no_sync()):
+            with (nullcontext() if i == num_microbatches - 1 else ddp_model.no_sync()):
                 (dist.get_world_size() * ddp_model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])).backward()
         # set optimization hyperparameters and take a step
         set_hparams(step)
