@@ -59,7 +59,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1
 ########################################
 
 def norm(x: Tensor):
-    return F.rms_norm(x, (x.size(-1),))
+    return F.rms_norm(x.float(), (x.size(-1),)).type_as(x)
 
 class RMSNorm(nn.Module):
     def __init__(self, dim):
@@ -67,7 +67,7 @@ class RMSNorm(nn.Module):
         self.gains = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return (norm(x.float()) * self.gains).type_as(x)
+        return norm(x) * self.gains.type_as(x)
 
 class Linear(nn.Linear):
     def __init__(self, in_features, out_features):
