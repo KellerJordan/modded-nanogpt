@@ -246,130 +246,111 @@ def print0(s, console=False, log=True):
 # we begin by logging this file itself
 print0(code)
 print0("="*100)
-print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
-       + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0("="*100)
 
 val_tokens = 20 * 524288
 batch_size = 8 * 64 * 1024
 mbs = 64
+train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
 val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
 
 model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
 
 
-num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
+########################################
+#       Init & Optim Hyperparams       #
+########################################
 
-for _ in range(num_trials):
+# we want to minimize this while still reaching 3.28 val loss
+train_steps = 3500
+muon_lr = 0.025
+muon_weight_decay = 0.0125
 
+# initialize model parameters
+for name, p in model.named_parameters():
+    if "proj" in name:
+        p.data.zero_()
 
-    ########################################
-    #       Init & Optim Hyperparams       #
-    ########################################
+# create the optimizer(s)
+optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
+                    dict(params=[model.proj.weight], lr=1/320),
+                    dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
+                   betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
+optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
+                  lr=muon_lr, weight_decay=muon_weight_decay)
+optimizers = [optimizer1, optimizer2]
+assert set(p for opt in optimizers for group in opt.param_groups
+           for p in group["params"]) == set(model.parameters())
+for opt in optimizers:
+    for group in opt.param_groups:
+        group["initial_lr"] = group["lr"]
 
-    # we want to minimize this while still reaching 3.28 val loss
-    train_steps = 3500
-
-    # initialize model parameters
-    for name, p in model.named_parameters():
-        if name.endswith("weight"):
-            if "proj" in name:
-                p.data.zero_()
-            elif "embed" in name:
-                p.data.normal_()  # default torch init
-            else:
-                p.data.normal_(std=0.33**0.5 / p.size(-1)**0.5)  # default torch init
-        elif name.endswith("bias"):
-            p.data.zero_()
-        elif name.endswith("gains"):
-            p.data.normal_(mean=1, std=0)
-        else:
-            raise Exception(f"Uninitialized parameter: {name}")
-
-    # create the optimizer(s)
-    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
-                        dict(params=[model.proj.weight], lr=1/320),
-                        dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
-                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
-    optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.025, weight_decay=0.0125)
-    optimizers = [optimizer1, optimizer2]
-    assert set(p for opt in optimizers for group in opt.param_groups
-               for p in group["params"]) == set(model.parameters())
+# learning rate schedule: stable then decay
+def set_hparams(step, cooldown_frac=0.7):
+    progress = step / train_steps
+    assert 0 <= progress < 1
+    if progress < 1 - cooldown_frac:
+        eta = 1.0
+    else:
+        eta = (1 - progress) / cooldown_frac
     for opt in optimizers:
         for group in opt.param_groups:
-            group["initial_lr"] = group["lr"]
-
-    # learning rate schedule: stable then decay
-    def set_hparams(step, cooldown_frac=0.7):
-        progress = step / train_steps
-        assert 0 <= progress < 1
-        if progress < 1 - cooldown_frac:
-            eta = 1.0
-        else:
-            eta = (1 - progress) / cooldown_frac
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * eta
+            group["lr"] = group["initial_lr"] * eta
 
 
-    ########################################
-    #        Training and Validation       #
-    ########################################
+########################################
+#        Training and Validation       #
+########################################
 
-    train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
-    for p in model.parameters():
-        dist.broadcast(p.detach(), 0)
-    # start the clock
-    training_time = 0
-    last_val_step = 0
-    dist.barrier()
-    t0 = time.perf_counter()
-    for step in range(train_steps + 1):
+for p in model.parameters():
+    dist.broadcast(p.detach(), 0)
+# start the clock
+training_time = 0
+dist.barrier()
+t0 = time.perf_counter()
+for step in range(train_steps + 1):
 
-        # --------------- VALIDATION SECTION -----------------
-        if step == train_steps or step % 125 == 0:
-            # stop the clock
-            dist.barrier()
-            time_since_last_val = time.perf_counter() - t0
-            step_avg = time_since_last_val / (step - last_val_step) if step > 0 else float("nan")
-            last_val_step = step
-            training_time += time_since_last_val
-            model.eval()
-            val_loss = 0
-            with torch.no_grad():
-                assert len(val_inputs) % mbs == 0
-                for i in range(len(val_inputs) // mbs):
-                    val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
-            dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
-            val_loss /= val_tokens
-            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
-                   + f" step_avg:{1000*step_avg:.2f}ms", console=True)
-            model.train()
-            # start the clock again
-            dist.barrier()
-            t0 = time.perf_counter()
+    # --------------- VALIDATION SECTION -----------------
+    if step == train_steps or step % 125 == 0:
+        # stop the clock
+        dist.barrier()
+        training_time += time.perf_counter() - t0
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            assert len(val_inputs) % mbs == 0
+            for i in range(len(val_inputs) // mbs):
+                val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+        dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+        val_loss /= val_tokens
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
+               + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
+        model.train()
+        # start the clock again
+        dist.barrier()
+        t0 = time.perf_counter()
 
-        if step == train_steps:
-            break
+    if step == train_steps:
+        break
 
-        # --------------- TRAINING SECTION -----------------
-        inputs, targets = next(train_loader)
-        # accumulate across microbatches in case we are running with fewer than 8 gpus
-        assert len(inputs) % mbs == 0
-        for i in range(len(inputs) // mbs):
-            model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
-        for name, p in model.named_parameters():
-            assert p.grad is not None, name
-            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-        # set optimization hyperparameters and take a step
-        set_hparams(step)
-        for opt in optimizers:
-            opt.step()
-        model.zero_grad(set_to_none=True)
-        approx_training_time = training_time + (time.perf_counter() - t0)
-        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
-               + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
+    # --------------- TRAINING SECTION -----------------
+    inputs, targets = next(train_loader)
+    # accumulate across microbatches in case we are running with fewer than 8 gpus
+    assert len(inputs) % mbs == 0
+    for i in range(len(inputs) // mbs):
+        model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+    for name, p in model.named_parameters():
+        assert p.grad is not None, name
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+    # set optimization hyperparameters and take a step
+    set_hparams(step)
+    for opt in optimizers:
+        opt.step()
+    model.zero_grad(set_to_none=True)
+    approx_training_time = training_time + (time.perf_counter() - t0)
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
+           + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
 
 dist.destroy_process_group()
