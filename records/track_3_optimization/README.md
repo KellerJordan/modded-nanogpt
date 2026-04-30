@@ -8,10 +8,12 @@ Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any
 The baseline can be run using the following command on any {1,2,4,8}x-{A,H}100 machine:
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
-pip install torch==2.10 huggingface_hub
+pip install torch==2.11 huggingface_hub
 python data/cached_fineweb10B.py 40  # downloads 4B training tokens
 torchrun --standalone --nproc_per_node=$(nvidia-smi -L | wc -l) records/track_3_optimization/train_gpt_simple.py
 ```
+
+Note: [Beware that](https://github.com/KellerJordan/modded-nanogpt/issues/268) on A100, using `torch==2.10` with `torch.compile` enabled will lead to `nan`s.
 
 ## Notable results history
 
@@ -32,7 +34,9 @@ Many more non-SOTA results (e.g., from hyperparameter sweeps) can be found in `r
 To be considered valid, new results must:
 1. Keep the same dataset, batch size, and architecture as the baseline.
 2. Not perform multiple forward-backward passes per step. Each step must correspond to a single forward-backward.
-3. Attain 3.28 val loss, thereby matching [Andrej Karpathy's GPT-2 replication](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
+3. Attain below 3.28 val loss, thereby matching [Andrej Karpathy's GPT-2 replication](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
+To ensure statistical significance, the run(s) are required to pass a one-sided z-test assuming σ=0.0016 that achieves p<.001 (hence 3.09σ = 0.005 delta below the target). E.g., for a single non-cherry-picked run, any val loss below 3.275 suffices, and for n=4 runs, any average below 3.2775 suffices. The general formula is that we require `(3.28 - mu) / n**0.5 < 0.005`, where `mu` is the average result over `n` non-cherry-picked runs.
+4. To ensure full reprodubility, all code needed to reproduce the run must be included in the logfile. In particular, third-party optimizer libraries should not be imported- instead, the necessary code should be copied in its entirety into the train script.
 
 New results have the freedom to modify:
 1. The optimization algorithm, even to something slow in terms of wallclock speed.
