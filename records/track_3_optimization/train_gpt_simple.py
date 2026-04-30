@@ -60,16 +60,13 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1
 #             Architecture             #
 ########################################
 
-def norm(x: Tensor):
-    return F.rms_norm(x, (x.size(-1),))
-
 class RMSNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.gains = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return (norm(x.float()) * self.gains).type_as(x)
+        return F.rms_norm(x, (x.size(-1),), weight=self.gains.type_as(x))
 
 class Linear(nn.Linear):
     def __init__(self, in_features, out_features):
@@ -111,7 +108,7 @@ class CausalSelfAttention(nn.Module):
         q = self.q(x).view(B, T, self.num_heads, self.head_dim)
         k = self.k(x).view(B, T, self.num_heads, self.head_dim)
         v = self.v(x).view(B, T, self.num_heads, self.head_dim)
-        q, k = norm(q), norm(k)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
         q, k = self.rotary(q), self.rotary(k)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
                                            v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
@@ -278,8 +275,10 @@ for _ in range(num_trials):
         if name.endswith("weight"):
             if "proj" in name:
                 p.data.zero_()
+            elif "embed" in name:
+                p.data.normal_()  # default torch init
             else:
-                p.data.normal_(std=0.33**0.5 / p.size(-1)**0.5) # default torch init
+                p.data.normal_(std=0.33**0.5 / p.size(-1)**0.5)  # default torch init
         elif name.endswith("bias"):
             p.data.zero_()
         elif name.endswith("gains"):
@@ -315,7 +314,6 @@ for _ in range(num_trials):
 
     ddp_model = DDP(model, device_ids=[device.index], broadcast_buffers=False,
                     gradient_as_bucket_view=True, bucket_cap_mb=128)
-
 
     ########################################
     #        Training and Validation       #
@@ -365,6 +363,9 @@ for _ in range(num_trials):
         for i in range(num_microbatches):
             with (nullcontext() if i == num_microbatches - 1 else ddp_model.no_sync()):
                 (dist.get_world_size() * ddp_model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])).backward()
+        for name, p in model.named_parameters():
+            assert p.grad is not None, name
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
         # set optimization hyperparameters and take a step
         set_hparams(step)
         for opt in optimizers:
