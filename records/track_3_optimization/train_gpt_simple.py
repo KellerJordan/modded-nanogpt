@@ -259,7 +259,7 @@ model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
 
 
-num_trials = 1
+num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
 
 for _ in range(num_trials):
 
