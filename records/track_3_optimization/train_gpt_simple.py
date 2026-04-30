@@ -246,8 +246,8 @@ def print0(s, console=False, log=True):
 # we begin by logging this file itself
 print0(code)
 print0("="*100)
-print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
-print0(f"Running on device_name={torch.cuda.get_device_name(device)} with world_size={dist.get_world_size()}")
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
+       + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
 print0("="*100)
 
 val_tokens = 20 * 524288
@@ -321,6 +321,7 @@ for _ in range(num_trials):
         dist.broadcast(p.detach(), 0)
     # start the clock
     training_time = 0
+    last_val_step = 0
     dist.barrier()
     t0 = time.perf_counter()
     for step in range(train_steps + 1):
@@ -329,7 +330,10 @@ for _ in range(num_trials):
         if step == train_steps or step % 125 == 0:
             # stop the clock
             dist.barrier()
-            training_time += time.perf_counter() - t0
+            time_since_last_val = time.perf_counter() - t0
+            step_avg = time_since_last_val / (step - last_val_step) if step > 0 else float("nan")
+            last_val_step = step
+            training_time += time_since_last_val
             model.eval()
             val_loss = 0
             with torch.no_grad():
@@ -339,7 +343,7 @@ for _ in range(num_trials):
             dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
             val_loss /= val_tokens
             print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
-                   + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
+                   + f" step_avg:{1000*step_avg:.2f}ms", console=True)
             model.train()
             # start the clock again
             dist.barrier()
