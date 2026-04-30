@@ -276,6 +276,8 @@ for _ in range(num_trials):
         if name.endswith("weight"):
             if "proj" in name:
                 p.data.zero_()
+            elif "embed" in name:
+                p.data.normal_()
             else:
                 p.data.normal_(std=0.33**0.5 / p.size(-1)**0.5) # default torch init
         elif name.endswith("bias"):
