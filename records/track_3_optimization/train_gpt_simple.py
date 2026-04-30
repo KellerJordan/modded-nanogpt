@@ -259,9 +259,9 @@ val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/finew
 model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
 warmup_inputs, warmup_targets = val_inputs[:mbs], val_targets[:mbs]
-for _ in range(10):
-    with torch.no_grad():
-        _ = model(warmup_inputs, warmup_targets)
+for i in range(10):
+    if dist.get_rank() == 0:
+        print("warmup step {i}")
     model(warmup_inputs, warmup_targets).backward()
     model.zero_grad(set_to_none=True)
 
