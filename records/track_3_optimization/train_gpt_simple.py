@@ -11,7 +11,6 @@ with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
 import time
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -19,11 +18,8 @@ from torch import Tensor, nn
 from torch.optim import AdamW
 import torch.nn.functional as F
 import torch.distributed as dist
-from dion import NorMuon
 
 
-os.environ["TORCHINDUCTOR_PERSISTENT_REDUCTIONS"] = "0"        
-os.environ["TORCHINDUCTOR_MIX_ORDER_REDUCTION"] = "0"
 ########################################
 #              Dataloader              #
 ########################################
@@ -247,65 +243,6 @@ def print0(s, console=False, log=True):
             with open(logfile, "a") as f:
                 print(s, file=f)
 
-class StepProfiler:
-    def __init__(self, start_step=20, end_step=25, trace_path="chrome_trace.json"):
-        assert start_step <= end_step
-        self.start_step = start_step
-        self.end_step = end_step
-        self.trace_path = trace_path
-        self.prof = None
-        self.active = False
-
-    def maybe_start(self, step):
-        if dist.get_rank() != 0 or step != self.start_step:
-            return
-        activities = [torch.profiler.ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
-        self.prof = torch.profiler.profile(
-            activities=activities,
-            record_shapes=True,
-            with_stack=True,
-        )
-        self.prof.__enter__()
-        self.active = True
-        print0(f"Started PyTorch profiler at step {step}; exporting to {self.trace_path}", console=True)
-
-    def step_context(self, step):
-        if self.active and self.start_step <= step <= self.end_step:
-            return torch.profiler.record_function(f"train_step_{step}")
-        return nullcontext()
-
-    def maybe_stop(self, step):
-        if not self.active or step != self.end_step:
-            return
-        assert self.prof is not None
-        torch.cuda.synchronize()
-        self.prof.__exit__(None, None, None)
-        self.prof.export_chrome_trace(self.trace_path)
-        self.active = False
-        print0(f"Exported PyTorch profiler trace to {self.trace_path}", console=True)
-
-A100_BF16_PEAK_FLOPS = 312e12
-
-def estimate_flops_per_token(model, num_layers: int, num_heads: int, head_dim: int, seq_len: int):
-    num_params = sum(p.numel() for p in model.parameters())
-    return 6 * num_params + 12 * num_layers * num_heads * head_dim * seq_len
-
-def estimate_a100_mfu(completed_steps: int, elapsed_seconds: float, flops_per_token: int):
-    if completed_steps <= 0 or elapsed_seconds <= 0:
-        return 0.0
-    achieved_flops = completed_steps * batch_size * flops_per_token / elapsed_seconds
-    peak_flops = dist.get_world_size() * A100_BF16_PEAK_FLOPS
-    return 100 * achieved_flops / peak_flops
-
-def estimate_a100_step_mfu(step_seconds: float, flops_per_token: int):
-    if step_seconds <= 0:
-        return 0.0
-    achieved_flops = batch_size * flops_per_token / step_seconds
-    peak_flops = dist.get_world_size() * A100_BF16_PEAK_FLOPS
-    return 100 * achieved_flops / peak_flops
-
 # we begin by logging this file itself
 print0(code)
 print0("="*100)
@@ -321,8 +258,6 @@ val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/finew
 
 model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
-flops_per_token = estimate_flops_per_token(model, num_layers=12, num_heads=6, head_dim=128, seq_len=1024)
-print0(f"Estimated FLOPs/token:{flops_per_token} using A100 BF16 peak:{A100_BF16_PEAK_FLOPS:.3e} FLOP/s per GPU")
 
 
 ########################################
@@ -336,16 +271,14 @@ train_steps = 3500
 for name, p in model.named_parameters():
     if "proj" in name:
         p.data.zero_()
+
 # create the optimizer(s)
 optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
                     dict(params=[model.proj.weight], lr=1/320),
                     dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
                    betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
-optimizer2 = NorMuon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                     distributed_mesh=dist.group.WORLD,
-                     lr=0.025, mu=0.95, muon_beta2=0.95, weight_decay=0.0125,
-                     nesterov=True, adjust_lr="spectral_norm",
-                     use_triton=True, use_polar_express=True)
+optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
+                  lr=0.025, weight_decay=0.0125)
 optimizers = [optimizer1, optimizer2]
 assert set(p for opt in optimizers for group in opt.param_groups
            for p in group["params"]) == set(model.parameters())
@@ -374,10 +307,8 @@ for p in model.parameters():
     dist.broadcast(p.detach(), 0)
 # start the clock
 training_time = 0
-last_training_time = 0
 dist.barrier()
 t0 = time.perf_counter()
-profiler = StepProfiler(start_step=20, end_step=25, trace_path="chrome_trace.json")
 for step in range(train_steps + 1):
 
     # --------------- VALIDATION SECTION -----------------
@@ -393,9 +324,8 @@ for step in range(train_steps + 1):
                 val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
         dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
         val_loss /= val_tokens
-        mfu = estimate_a100_mfu(step, training_time, flops_per_token)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
-               + f" step_avg:{1000*training_time/max(step, 1):.2f}ms mfu:{mfu:.2f}%", console=True)
+               + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
         dist.barrier()
@@ -405,29 +335,21 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    train_step = step + 1
-    profiler.maybe_start(train_step)
-    with profiler.step_context(train_step):
-        inputs, targets = next(train_loader)
-        # accumulate across microbatches in case we are running with fewer than 8 gpus
-        assert len(inputs) % mbs == 0
-        for i in range(len(inputs) // mbs):
-            model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
-        for name, p in model.named_parameters():
-            assert p.grad is not None, name
-            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-        # set optimization hyperparameters and take a step
-        set_hparams(step)
-        for opt in optimizers:
-            opt.step()
-        model.zero_grad(set_to_none=True)
-    profiler.maybe_stop(train_step)
+    inputs, targets = next(train_loader)
+    # accumulate across microbatches in case we are running with fewer than 8 gpus
+    assert len(inputs) % mbs == 0
+    for i in range(len(inputs) // mbs):
+        model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+    for name, p in model.named_parameters():
+        assert p.grad is not None, name
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+    # set optimization hyperparameters and take a step
+    set_hparams(step)
+    for opt in optimizers:
+        opt.step()
+    model.zero_grad(set_to_none=True)
     approx_training_time = training_time + (time.perf_counter() - t0)
-    step_time = approx_training_time - last_training_time
-    last_training_time = approx_training_time
-    mfu = estimate_a100_step_mfu(step_time, flops_per_token)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
-           + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms"
-           + f" step_time:{1000*step_time:.2f}ms mfu:{mfu:.2f}%", console=True, log=False)
+           + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
 
 dist.destroy_process_group()
