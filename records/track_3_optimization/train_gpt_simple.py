@@ -261,7 +261,9 @@ model.compile(dynamic=False)
 warmup_inputs, warmup_targets = val_inputs[:mbs], val_targets[:mbs]
 for i in range(10):
     if dist.get_rank() == 0:
-        print("warmup step {i}")
+        print(f"warmup step {i}")
+    warmup_inputs = torch.randint_like(warmup_inputs, high=50304)
+    warmup_targets = torch.randint_like(warmup_targets, high=50304)
     model(warmup_inputs, warmup_targets).backward()
     model.zero_grad(set_to_none=True)
 
