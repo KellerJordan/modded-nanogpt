@@ -20,9 +20,10 @@ Many more non-SOTA results (e.g., from hyperparameter sweeps) can be found in `r
 
 | # | Steps to 3.28 | Description | Date | Log | Contributors |
 | - | - | - | - | - | - |
-| 1 | 3600 | [Muon](https://kellerjordan.github.io/posts/muon/) lr=.02 wd=.01 | 2026/04/26 | [log](results/7b8270c5-a9cd-4a73-b7d8-5d86a2d1e428.txt) | @kellerjordan0 |
-| 2 | 5625 | AdamW lr=0.0015 wd=0.1 betas=(0.9, 0.95) warmup_steps=250 | 2026/04/26 | [log](results/a63a68d1-24aa-4a22-af9a-224e43209ea4.txt) | @kellerjordan0 |
-| 3 | 3500 | [Muon](https://kellerjordan.github.io/posts/muon/) lr=.025 wd=.0125 | 2026/04/26 | [log](results/311d7833-8dfc-43ea-a55c-fd313a11c4a8.txt) | @kellerjordan0 |
+| 1 | 3250 | Skylight-001: Muon + per-row variance norm + u/w-floor=0.35, lr=.0375 wd=.025 | 2026/04/29 | [log](results/23bb1400-4864-4f25-a5af-12443ea613bf.txt) | @kumarkrishna |
+| 2 | 3600 | [Muon](https://kellerjordan.github.io/posts/muon/) lr=.02 wd=.01 | 2026/04/26 | [log](results/7b8270c5-a9cd-4a73-b7d8-5d86a2d1e428.txt) | @kellerjordan0 |
+| 3 | 5625 | AdamW lr=0.0015 wd=0.1 betas=(0.9, 0.95) warmup_steps=250 | 2026/04/26 | [log](results/a63a68d1-24aa-4a22-af9a-224e43209ea4.txt) | @kellerjordan0 |
+| 4 | 3500 | [Muon](https://kellerjordan.github.io/posts/muon/) lr=.025 wd=.0125 | 2026/04/26 | [log](results/311d7833-8dfc-43ea-a55c-fd313a11c4a8.txt) | @kellerjordan0 |
 
 <img width="60%" src="figure.png"/>
 
