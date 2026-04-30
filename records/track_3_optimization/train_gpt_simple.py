@@ -18,6 +18,7 @@ from torch import Tensor, nn
 from torch.optim import AdamW
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 ########################################
@@ -311,6 +312,9 @@ for _ in range(num_trials):
             for group in opt.param_groups:
                 group["lr"] = group["initial_lr"] * eta
 
+    ddp_model = DDP(model, device_ids=[device.index], broadcast_buffers=False,
+                    gradient_as_bucket_view=True, bucket_cap_mb=128)
+
 
     ########################################
     #        Training and Validation       #
@@ -356,8 +360,10 @@ for _ in range(num_trials):
         inputs, targets = next(train_loader)
         # accumulate across microbatches in case we are running with fewer than 8 gpus
         assert len(inputs) % mbs == 0
-        for i in range(len(inputs) // mbs):
-            model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+        num_microbatches = len(inputs) // mbs
+        for i in range(num_microbatches):
+            with (nullcontext() if i == num_microbatches - 1 else model.no_sync()):
+                (dist.get_world_size() * ddp_model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])).backward()
         for name, p in model.named_parameters():
             assert p.grad is not None, name
             dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
