@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 runs = {
     'Muon (best, 3500 steps)': ('311d7833-8dfc-43ea-a55c-fd313a11c4a8', '#d04a1f'),
     'AdamW (best, 5625 steps)': ('a63a68d1-24aa-4a22-af9a-224e43209ea4', '#1f77b4'),
+    'NorMuonH (best, 3275 steps)': ('f45b5dcf-16bb-4e83-b5c7-4ef4981f0e9f', '#2ca02c'),
 }
 pattern = re.compile(r'step:(\d+)/(\d+)\s+val_loss:([0-9.]+)')
 out = 'figure.png'
@@ -43,7 +44,7 @@ ax.annotate(
     fontsize=9,
 )
 
-ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/04/26', pad=12, fontsize=12)
+ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/04/30', pad=12, fontsize=12)
 ax.set_xlabel('Training step', fontsize=11)
 ax.set_ylabel('Validation loss', fontsize=11)
 ax.legend(frameon=True)
