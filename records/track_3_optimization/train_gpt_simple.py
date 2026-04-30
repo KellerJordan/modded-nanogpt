@@ -255,13 +255,15 @@ batch_size = 8 * 64 * 1024
 mbs = 64
 val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
 
+# create model, compile, and warmup kernels
 model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
+warmup_inputs, warmup_targets = val_inputs[:mbs], val_targets[:mbs]
 for _ in range(10):
-    model(val_inputs[:mbs], val_targets[:mbs]).backward()
     with torch.no_grad():
-        _ = model(val_inputs[:mbs], val_targets[:mbs])
-model.zero_grad(set_to_none=True)
+        _ = model(warmup_inputs, warmup_targets)
+    model(warmup_inputs, warmup_targets).backward()
+    model.zero_grad(set_to_none=True)
 
 
 num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
