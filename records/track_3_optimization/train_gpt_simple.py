@@ -363,9 +363,6 @@ for _ in range(num_trials):
         for i in range(num_microbatches):
             with (nullcontext() if i == num_microbatches - 1 else ddp_model.no_sync()):
                 (dist.get_world_size() * ddp_model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])).backward()
-        for name, p in model.named_parameters():
-            assert p.grad is not None, name
-            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
         # set optimization hyperparameters and take a step
         set_hparams(step)
         for opt in optimizers:
