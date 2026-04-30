@@ -268,6 +268,9 @@ for _ in range(num_trials):
     #       Init & Optim Hyperparams       #
     ########################################
 
+    # we want to minimize this while still reaching 3.28 val loss
+    train_steps = 3500
+
     # initialize model parameters
     for name, p in model.named_parameters():
         if name.endswith("weight"):
@@ -295,9 +298,6 @@ for _ in range(num_trials):
     for opt in optimizers:
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
-
-    # we want to minimize this while still reaching 3.28 val loss
-    train_steps = 3500
 
     # learning rate schedule: stable then decay
     def set_hparams(step, cooldown_frac=0.7):
