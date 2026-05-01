@@ -20,8 +20,13 @@ for label, (logfile, color) in runs.items():
         for line in f:
             m = pattern.search(line)
             if m:
-                steps.append(int(m.group(1)))
-                losses.append(float(m.group(3)))
+                step = int(m.group(1))
+                loss = float(m.group(3))
+                if step == 0:
+                    # there may be multiple runs in the logfile, take the last one
+                    steps, losses = [], []
+                steps.append(step)
+                losses.append(loss)
     if not steps:
         raise RuntimeError(f'No loss curve found in {path}')
 
