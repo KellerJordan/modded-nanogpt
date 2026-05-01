@@ -51,7 +51,7 @@ ax.annotate(
 )
 
 ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/04/30', pad=12, fontsize=12)
-ax.set_xlabel('Training step', fontsize=11)
+ax.set_xlabel('Training step (0.5M bsz)', fontsize=11)
 ax.set_ylabel('Validation loss', fontsize=11)
 ax.legend(frameon=True)
 ax.set_xlim(0, 6000)
