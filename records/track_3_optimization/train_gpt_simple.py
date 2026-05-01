@@ -270,17 +270,18 @@ for _ in range(num_trials):
 
     # initialize model parameters
     for name, p in model.named_parameters():
+        w = p.data
         if name.endswith("weight"):
             if "proj" in name:
-                p.data.zero_()
+                w.zero_()
             elif "embed" in name:
-                p.data.normal_()  # default torch init
+                w.normal_()  # default torch init
             else:
-                p.data.normal_(std=0.33**0.5 / p.size(-1)**0.5)  # default torch init
+                w.normal_(std=0.33**0.5 / p.size(-1)**0.5)  # default torch init
         elif name.endswith("bias"):
-            p.data.zero_()
+            w.zero_()
         elif name.endswith("gains"):
-            p.data.normal_(mean=1, std=0)
+            w.normal_(mean=1, std=0)
         else:
             raise Exception(f"Uninitialized parameter: {name}")
 
