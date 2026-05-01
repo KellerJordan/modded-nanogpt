@@ -20,11 +20,11 @@ Note: [Beware that](https://github.com/KellerJordan/modded-nanogpt/issues/268) o
 The following results each improved the best known hyperparameters for an optimizer on this benchmark.
 Many more non-SOTA results (e.g., from hyperparameter sweeps) can be found in `results/`.
 
-| # | Steps to 3.28 | Description | Date | Log | Contributors |
-| - | - | - | - | - | - |
-| 1 | 3600 | [Muon](https://kellerjordan.github.io/posts/muon/) lr=.02 wd=.01 | 2026/04/26 | [log](results/7b8270c5-a9cd-4a73-b7d8-5d86a2d1e428.txt) | @kellerjordan0 |
-| 2 | 5625 | AdamW lr=0.0015 wd=0.1 betas=(0.9, 0.95) warmup_steps=250 | 2026/04/26 | [log](results/a63a68d1-24aa-4a22-af9a-224e43209ea4.txt) | @kellerjordan0 |
-| 3 | 3500 | [Muon](https://kellerjordan.github.io/posts/muon/) lr=.025 wd=.0125 | 2026/04/26 | [log](results/311d7833-8dfc-43ea-a55c-fd313a11c4a8.txt) | @kellerjordan0 |
+| # | Steps to 3.28 | Evidence | Description | Date | Log | Contributors |
+| - | - | - | - | - | - | - |
+| 1 | 3600 | 3.27765 (n=1) | [Muon](https://kellerjordan.github.io/posts/muon/) lr=.02 wd=.01 | 2026/04/26 | [log](results/7b8270c5-a9cd-4a73-b7d8-5d86a2d1e428.txt) | @kellerjordan0 |
+| 2 | 5625 | 3.27903 (n=1) | AdamW lr=0.0015 wd=0.1 betas=(0.9, 0.95) warmup_steps=250 | 2026/04/26 | [log](results/a63a68d1-24aa-4a22-af9a-224e43209ea4.txt) | @kellerjordan0 |
+| 3 | 3500 | 3.27673 (n=1) | [Muon](https://kellerjordan.github.io/posts/muon/) lr=.025 wd=.0125 | 2026/04/26 | [log](results/311d7833-8dfc-43ea-a55c-fd313a11c4a8.txt) | @kellerjordan0 |
 
 <img width="60%" src="figure.png"/>
 
