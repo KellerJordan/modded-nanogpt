@@ -22,9 +22,9 @@ Many more non-SOTA results (e.g., from hyperparameter sweeps) can be found in `r
 
 | # | Steps to 3.28 | Evidence | Description | Date | Log | Contributors |
 | - | - | - | - | - | - | - |
-| 1 | 3600 | 3.27765 (n=1) | [Muon](https://kellerjordan.github.io/posts/muon/) lr=.02 wd=.01 | 2026/04/26 | [log](results/7b8270c5-a9cd-4a73-b7d8-5d86a2d1e428.txt) | @kellerjordan0 |
+| 1 | 3600 | 3.27765 (n=1) | [Muon](https://kellerjordan.github.io/posts/muon/) with aux Adam, lr=.02 wd=.01 | 2026/04/26 | [log](results/7b8270c5-a9cd-4a73-b7d8-5d86a2d1e428.txt) | @kellerjordan0 |
 | 2 | 5625 | 3.27903 (n=1) | AdamW lr=0.0015 wd=0.1 betas=(0.9, 0.95) warmup_steps=250 | 2026/04/26 | [log](results/a63a68d1-24aa-4a22-af9a-224e43209ea4.txt) | @kellerjordan0 |
-| 3 | 3500 | 3.27673 (n=1) | [Muon](https://kellerjordan.github.io/posts/muon/) lr=.025 wd=.0125 | 2026/04/26 | [log](results/311d7833-8dfc-43ea-a55c-fd313a11c4a8.txt) | @kellerjordan0 |
+| 3 | 3500 | 3.27673 (n=1) | [Muon](https://kellerjordan.github.io/posts/muon/) with aux Adam, lr=.025 wd=.0125 | 2026/04/26 | [log](results/311d7833-8dfc-43ea-a55c-fd313a11c4a8.txt) | @kellerjordan0 |
 | 4 | 4875 | 3.27414 (n=5) | [AdamH](https://psychedelic-sunstone-851.notion.site/Fantastic-Pretraining-Optimizers-and-Where-to-Find-Them-2-1-Hyperball-Optimization-2e924306e6f280e7a5ffee00eb40a0dd) (Adam preconditioning + hyperball constraint on hidden matrices) with per-module init std (attn.proj std=.026, mlp.proj std=.031, mlp.fc std=.031, qkv default), lr=.018 betas=(0.9, 0.95) warmup_steps=250 h_cooldown_frac=1.0 aux_cooldown_frac=.4 | 2026/04/30 | [log](results/20260430_adamh/7533dd87-107f-4a4f-8229-acbec0fb00ac.txt) | @kaiyue-wen |
 
 <img width="60%" src="figure.png"/>
