@@ -296,23 +296,24 @@ for _ in range(num_trials):
     # qkv weights keep their default init. The vocab head (proj.weight) and all "proj" biases are
     # zeroed so initial logits are 0.
     for name, p in model.named_parameters():
+        w = p.data
         if name.endswith("weight"):
             if "embed" in name:
-                p.data.normal_()  # default torch init
+                w.normal_()  # default torch init
             else:
-                p.data.normal_(std=0.33**0.5 / p.size(-1)**0.5)  # default torch init
+                w.normal_(std=0.33**0.5 / p.size(-1)**0.5)  # default torch init
         elif name.endswith("bias"):
-            p.data.zero_()
+            w.zero_()
         elif name.endswith("gains"):
-            p.data.normal_(mean=1, std=0)
+            w.normal_(mean=1, std=0)
         else:
             raise Exception(f"Uninitialized parameter: {name}")
         if name.endswith(".attn.proj.weight"):
-            p.data.mul_(1.25)
+            w.mul_(1.25)
         elif name.endswith(".mlp.proj.weight"):
-            p.data.mul_(3.0)
+            w.mul_(3.0)
         elif name.endswith(".mlp.fc.weight"):
-            p.data.mul_(1.5)
+            w.mul_(1.5)
 
     # create the optimizer(s)
     optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
