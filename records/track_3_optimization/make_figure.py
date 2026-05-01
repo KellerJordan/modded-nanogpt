@@ -6,7 +6,7 @@ runs = {
     'AdamW (best, 5625 steps)': ('a63a68d1-24aa-4a22-af9a-224e43209ea4', '#1f77b4'),
     'MuonH (best, 3325 steps)': ('20260430_muonh/9319c798-6643-464a-b407-b05468e468f5', '#2ca02c'),
     'AdamH (best, 4875 steps)': ('20260430_adamh/7533dd87-107f-4a4f-8229-acbec0fb00ac', '#9467bd'),
-    'Muon² (best, 3325 steps)': ('bb903816-ea27-4f5f-8028-c963d38c6a7f', '#e377c2'),
+    'Muon² (best, 3325 steps)': ('20260501_muonsq/bb903816-ea27-4f5f-8028-c963d38c6a7f', '#e377c2'),
 }
 pattern = re.compile(r'step:(\d+)/(\d+)\s+val_loss:([0-9.]+)')
 out = 'figure.png'
