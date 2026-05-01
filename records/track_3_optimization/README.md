@@ -1,7 +1,7 @@
 # Modded-NanoGPT Optimization Benchmark
 
 The goal of this benchmark is to collaboratively|competitively find efficient neural network optimizers.
-Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any means, here we aim to minimize *step count* by improving the optimization algorithm (⇒ methods that are slow in terms of wallclock are perfectly OK).
+Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any means, here we aim to minimize *step count* by improving the optimization algorithm (⇒ methods that are slow in terms of wallclock are perfectly OK). [[Longform announcement](https://x.com/kellerjordan0/status/2049193527440187494)]
 
 ## Quickstart
 
