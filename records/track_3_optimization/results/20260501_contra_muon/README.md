@@ -7,4 +7,4 @@ Everything else follows PR 274 NorMuon-lite with row/column variance normalizati
 This run set uses `CONTRA_MUON=0.4`, `lr=0.0375`, `u/w-floor=0.35`, and
 terminates at 3225 steps. Across 16 non-cherry-picked seeds, the step 3225
 mean validation loss is 3.27854062. Under the Track 3 README's one-sided
-z-test with `sigma=0.0016`, this gives `p=0.000131920034357`.
+z-test with `sigma=0.0013`, this gives `z=4.4904` and `p=3.55e-6`.
