@@ -219,19 +219,18 @@ class Muon(torch.optim.Optimizer):
 def normuon_update(grad, momentum, second_momentum, mu=0.95, nesterov=True):
     momentum.lerp_(grad, 1 - mu)
     update = grad.lerp_(momentum, mu) if nesterov else momentum
-    update = zeropower_via_newtonschulz5(update).float()
+    update = zeropower_via_newtonschulz5(update)
+    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
 
     norm = update.norm(dim=(-2,-1), keepdim=True)
     v_mean = torch.mean(update * update, dim=-1, keepdim=True) if grad.size(-2) >= grad.size(-1) else torch.mean(update * update, dim=-2, keepdim=True)
-    second_momentum.lerp_(v_mean, 1 - 0.95)
-    step_size = 1 / second_momentum.sqrt().clamp_min(1e-10)
+    second_momentum.lerp_(v_mean.float(), 1 - 0.95)
+    step_size = second_momentum.clamp_min(1e-10).rsqrt().bfloat16()
 
     update.mul_(step_size)
     norm_new = update.norm(dim=(-2,-1), keepdim=True)
     update.mul_(norm / (norm_new.clamp_min(1e-10)))
-    update = update.bfloat16()
 
-    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
     return update
 
 
@@ -317,7 +316,7 @@ for _ in range(num_trials):
     ########################################
 
     # we want to minimize this while still reaching 3.28 val loss
-    train_steps = 3290
+    train_steps = 3325
 
     # initialize model parameters
     for name, p in model.named_parameters():
@@ -342,7 +341,7 @@ for _ in range(num_trials):
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
                        betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
     optimizer2 = NorMuon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.025, weight_decay=0.025)
+                      lr=0.03, weight_decay=0.025)
     optimizers = [optimizer1, optimizer2]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())
