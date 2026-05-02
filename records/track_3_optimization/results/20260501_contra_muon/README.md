@@ -4,6 +4,10 @@ Contra Muon (https://github.com/nilin/contra-muon) modifies the Muon Newton-Schu
 
 Everything else follows PR 274 NorMuon-lite with row/column variance normalization and u/w-floor postprocessing.
 
+Note: the archived scripts/logs print `muon_weight_decay=0.025`, but `Muon.step`
+does not use the stored `weight_decay` param-group value. The effective Muon
+weight decay for these runs is therefore zero.
+
 This run set uses `CONTRA_MUON=0.4`, `lr=0.0375`, `u/w-floor=0.35`, and
 terminates at 3225 steps. Across 16 non-cherry-picked seeds, the step 3225
 mean validation loss is 3.27854062. Under the Track 3 README's one-sided
