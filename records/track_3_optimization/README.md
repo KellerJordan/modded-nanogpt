@@ -41,7 +41,7 @@ which the PR appeared.
 <table>
   <tr>
     <td width="50%"><img src="figure.png" width="100%"></td>
-    <td width="50%"><img src="figure_zoom.png" width="100%"></td>
+    <td width="50%"><img src="zoomed_figure.png" width="100%"></td>
   </tr>
 </table>
 
