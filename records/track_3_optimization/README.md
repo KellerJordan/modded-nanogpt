@@ -55,7 +55,7 @@ For a new result to be considered valid, the rules are as follows:
 3. The submitted run(s) must attain below 3.28 val loss, thereby matching [Andrej Karpathy's GPT-2 replication](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 To ensure statistical significance, the run(s) are required to pass a one-sided z-test assuming σ=0.0013 that achieves p<.001 (hence 3.09σ = 0.004 delta below the target). E.g., for a single non-cherry-picked run, any val loss below 3.276 suffices, and for n=4 runs, any average below 3.278 suffices. The general formula is that we require `(3.28 - mu) * n**0.5 >= 0.004`, where `mu` is the average result over `n` non-cherry-picked runs. (Note: My first three results failed to follow this rule)
 4. To ensure full reprodubility, all code needed to reproduce the run must be included in the logfile. In particular, third-party optimizer libraries must not be imported; instead, the necessary code must be copied in its entirety into the train script. It's okay if this leads to thousands of extra lines, in the case of complex third-party libraries.
-5. Early-stopping based on val loss (or any other form of per-run decision based on val loss) is not allowed.
+5. Per-run early-stopping based on val loss (or any other form of per-run decision based on val loss) is not allowed.
 
 New results have the freedom to modify:
 1. The optimization algorithm, even to something slow in terms of wallclock speed.
