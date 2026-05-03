@@ -37,6 +37,7 @@ which the PR appeared.
 | 7 | 3325 | 3.2752 (n=1)✓ | [Muon²](https://arxiv.org/abs/2604.09967) with aux Adam, lr=.10 wd=.0125 β₂=.95 ε=1e-10 | 2026/04/29 | [log](results/20260501_muonsq/bb903816-ea27-4f5f-8028-c963d38c6a7f.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/266) | @wilsoncwu |
 | 8 | 3250 | 3.2778 (n=10)✓ | [NorMuon](https://arxiv.org/abs/2510.05491)[H](https://psychedelic-sunstone-851.notion.site/Fantastic-Pretraining-Optimizers-and-Where-to-Find-Them-2-1-Hyperball-Optimization-2e924306e6f280e7a5ffee00eb40a0dd) (Muon NS direction + Adafactor-style row/col variance preconditioning, then hyperball constraint on hidden matrices) with per-module init std (attn.proj std=.026, mlp.proj std=.031, mlp.fc std=.031, qkv default), lr=.018 mu=0.95 beta2=0.95 h_cooldown_frac=1.0 aux_cooldown_frac=.4 | 2026/04/30 | [log](results/20260430_normuonh/f45b5dcf-16bb-4e83-b5c7-4ef4981f0e9f.txt)| [PR](https://github.com/KellerJordan/modded-nanogpt/pull/273) | @kaiyue-wen |
 | 9 | 3250 | 3.2771 (n=8)✓ | NorMuon with aux Adam + u/w-floor (wd-free strategy that clamps ‖u‖\_F / ‖w‖\_F to 0.35), lr=.0375 | 2026/04/29 | [log](results/20260501_skylight001/f78af80a-2ba3-4cf7-b9f7-e6e56ff2c54d.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/274) | @kumarkrishna |
+| 10 | 3300 | 3.2771 (n=10)✓ | NorMuon lr=0.035 wd=0.025 | 2026/04/03 | [log](results/e0d0185f-ccb8-426d-8265-a4e762ec69f6.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/276) | @lliu606 |
 
 <table>
   <tr>

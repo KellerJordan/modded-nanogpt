@@ -20,6 +20,7 @@ logfiles = {
     7: ('Muon²', '#e377c2'),
     8: ('NorMuonH', '#32CD32'),
     9: 'NorMuon with update-clamping strategy',
+    10: ('NorMuon', '#7e1e56'),
 }
 readme_rows = {}
 row_pattern = re.compile(
