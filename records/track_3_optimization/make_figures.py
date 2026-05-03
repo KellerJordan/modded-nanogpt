@@ -10,11 +10,11 @@ logfiles = {
     # key: number in README results history
     # value: (label, color)
     6: ('Muon', '#ffa500'),
-    2: ('AdamW', '#1f77b4'),
+    #2: ('AdamW', '#1f77b4'),
     5: ('MuonH', '#2ca02c'),
-    4: ('AdamH', '#9467bd'),
+    #4: ('AdamH', '#9467bd'),
     7: ('Muon²', '#e377c2'),
-    8: ('NorMuonH', '#32CD32'),
+    #8: ('NorMuonH', '#32CD32'),
 }
 readme_rows = {}
 row_pattern = re.compile(
@@ -99,7 +99,7 @@ for number, (label, color) in logfiles.items():
 # Generate figure
 plt.style.use('seaborn-v0_8-whitegrid')
 plt.rcParams['font.family'] = 'DejaVu Sans'
-fig, ax = plt.subplots(figsize=(5.5, 4), dpi=180)
+fig, ax = plt.subplots(figsize=(5.5, 4), dpi=300)
 for label, _, _, steps, losses, color in results.values():
     ax.plot(
         steps,
@@ -145,7 +145,7 @@ zoom_losses = [
     for step, loss in zip(steps, losses)
     if zoom_min_step <= step <= zoom_max_step
 ]
-fig, ax = plt.subplots(figsize=(5.5, 4), dpi=180)
+fig, ax = plt.subplots(figsize=(5.5, 4), dpi=300)
 for label, _, evidence, steps, losses, color in zoom_results:
     evidence = re.sub(r'[✓✔✅]', '', evidence).strip()
     ax.plot(
