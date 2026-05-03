@@ -65,6 +65,11 @@ New results have the freedom to modify:
 We welcome not only new results which advance the global SOTA, but even just results which advance the per-optimizer SOTA,
 e.g., better hyperparameters for AdamW (even if it still isn't beating the baseline).
 
+AI-based submissions are also completely welcome; you can use AI to write the entire PR if you want, a human does not even need to be aware
+that a submission was created, as long as it follows the above rules. That being said, it would be polite if you ask your AI to 
+simplify any code it writes, since a tendency of AI-based results is to include techniques that neither help nor hurt, but add complexity, which
+makes the code more difficult for future humans (and AIs) to understand.
+
 
 ------
 ------
