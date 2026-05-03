@@ -5,7 +5,7 @@ Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any
 
 ## Quickstart
 
-The baseline can be run using the following command on any {1,2,4,8}x-{A,H}100 machine:
+The baseline setup (Muon with aux Adam) can be run using the following command on any {1,2,4,8}x-{A,H}100 machine:
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install torch==2.11 huggingface_hub

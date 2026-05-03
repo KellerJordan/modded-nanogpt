@@ -46,7 +46,7 @@ def color_from_title(title):
 
 def format_evidence(evidence, steps_to_target):
     evidence = re.sub(r'[✓✔✅Ⓧ]', '', evidence).strip()
-    return re.sub(r'\((n=\d+)\)', f'(steps={steps_to_target}, \\1)', evidence)
+    return re.sub(r'\((n=\d+)\)', f'in {steps_to_target} steps (\\1)', evidence)
 
 
 def add_legend(ax, legend_entries):
@@ -66,7 +66,7 @@ def add_legend(ax, legend_entries):
         text = VPacker(
             children=[
                 TextArea(label, textprops={'fontsize': label_size}),
-                TextArea(evidence, textprops={'fontsize': 8}),
+                TextArea(evidence, textprops={'fontsize': 7}),
             ],
             align='left',
             pad=0,
