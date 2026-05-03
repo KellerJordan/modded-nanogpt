@@ -20,8 +20,11 @@ Note: [Beware that](https://github.com/KellerJordan/modded-nanogpt/issues/268) o
 The following results each improved the best known hyperparameters for an optimizer on this benchmark.
 Many more non-SOTA results (e.g., from hyperparameter sweeps) can be found in `results/`.
 
-Note: To reproduce any of these runs, simply rip their python script out of their logfile (take everything before `===`), and then run it using the quickstart above.
+Notes:
+* To reproduce any of these runs, simply rip their python script out of their logfile (take everything before `===`), and then run it using the quickstart above.
 If it fails to reproduce (i.e., we get statistical evidence that its mean is above 3.28), then please report that, as it will be grounds to remove the run from the history.
+* The number in the leftmost column reflects the order in which these runs were accepted. This does not necessarily line up with the Date column, which is the date at
+which the PR appeared.
 
 | # | Steps to 3.28 | Evidence | Description | Date | Log | PR | Contributors |
 | - | -             | -        | -           | -    | -   | -  | -            |
@@ -33,6 +36,7 @@ If it fails to reproduce (i.e., we get statistical evidence that its mean is abo
 | 6 | 3375 | 3.2788 (n=20)✓ | [Muon](https://kellerjordan.github.io/posts/muon/) with aux Adam, lr=.025 wd=.025 | 2026/05/01 | [log](results/51ece938-03c5-4343-8dcc-3f3336b07008.txt) | N/A | @nilin, @alint77 |
 | 7 | 3325 | 3.2752 (n=1)✓ | [Muon²](https://arxiv.org/abs/2604.09967) with aux Adam, lr=.10 wd=.0125 β₂=.95 ε=1e-10 | 2026/04/29 | [log](results/20260501_muonsq/bb903816-ea27-4f5f-8028-c963d38c6a7f.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/266) | @wilsoncwu |
 | 8 | 3250 | 3.27798 (n=10)✓ | [NorMuonH](https://psychedelic-sunstone-851.notion.site/Fantastic-Pretraining-Optimizers-and-Where-to-Find-Them-2-1-Hyperball-Optimization-2e924306e6f280e7a5ffee00eb40a0dd) (Muon NS direction + Adafactor-style row/col variance preconditioning, then hyperball constraint on hidden matrices) with per-module init std (attn.proj std=.026, mlp.proj std=.031, mlp.fc std=.031, qkv default), lr=.018 mu=0.95 beta2=0.95 h_cooldown_frac=1.0 aux_cooldown_frac=.4 | 2026/04/30 | [log](results/f45b5dcf-16bb-4e83-b5c7-4ef4981f0e9f.txt)| [PR](https://github.com/KellerJordan/modded-nanogpt/pull/273) | @kaiyue-wen |
+| 9 | 3250 | 3.2771 (n=8)✓ | Muon with aux Adam + per-row variance EMA on Newton-Schulz update (NorMuon-lite) + u/w-floor (scale up update when ‖u‖_F / ‖w‖_F < 0.35), lr=.0375 wd=.025 | 2026/04/29 | [log](results/20260501_skylight001/f78af80a-2ba3-4cf7-b9f7-e6e56ff2c54d.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/274) | @kumarkrishna |
 
 <img width="60%" src="figure.png"/>
 
