@@ -5,17 +5,33 @@ import matplotlib.pyplot as plt
 
 # Extract results
 logfiles = {
-    'Muon (best, 3375 steps)': ('51ece938-03c5-4343-8dcc-3f3336b07008', '#ffa500'),
-    'AdamW (best, 5625 steps)': ('a63a68d1-24aa-4a22-af9a-224e43209ea4', '#1f77b4'),
-    'MuonH (best, 3325 steps)': ('20260430_muonh/9319c798-6643-464a-b407-b05468e468f5', '#2ca02c'),
-    'AdamH (best, 4875 steps)': ('20260430_adamh/7533dd87-107f-4a4f-8229-acbec0fb00ac', '#9467bd'),
-    'Muon² (best, 3325 steps)': ('20260501_muonsq/bb903816-ea27-4f5f-8028-c963d38c6a7f', '#e377c2'),
-    'NorMuonH (best, 3275 steps)': ('20260430_normuonh/f45b5dcf-16bb-4e83-b5c7-4ef4981f0e9f', '#32CD32'),
+    # key: number in README results history
+    # value: (label, color)
+    6: ('Muon (best, 3375 steps)', '#ffa500'),
+    2: ('AdamW (best, 5625 steps)', '#1f77b4'),
+    5: ('MuonH (best, 3325 steps)', '#2ca02c'),
+    4: ('AdamH (best, 4875 steps)', '#9467bd'),
+    7: ('Muon² (best, 3325 steps)', '#e377c2'),
+    8: ('NorMuonH (best, 3250 steps)', '#32CD32'),
 }
+readme_rows = {}
+row_pattern = re.compile(
+    r'^\|\s*(\d+)\s*\|.*?\|\s*\[log\]\((results/[^)]+)\)'
+)
+with open('README.md', 'r') as f:
+    for line in f:
+        m = row_pattern.search(line)
+        if m:
+            number = int(m.group(1))
+            logfile = m.group(2).removeprefix('results/').removesuffix('.txt')
+            readme_rows[number] = logfile
 pattern = re.compile(r'step:(\d+)/(\d+)\s+val_loss:([0-9.]+)')
 max_step = 0
 results = {}
-for label, (logfile, color) in logfiles.items():
+for number, (label, color) in logfiles.items():
+    if number not in readme_rows:
+        raise RuntimeError(f'No results-history row found in README for #{number}')
+    logfile = readme_rows[number]
     steps, losses = [], []
     path = f'results/{logfile}.txt'
     with open(path, 'r') as f:
