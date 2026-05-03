@@ -21,6 +21,7 @@ logfiles = {
     8: ('NorMuonH', '#32CD32'),
     9: 'NorMuon with update-clamping strategy',
     10: ('NorMuon', '#7e1e56'),
+    11: 'Nor-Contra-Muon with update-clamping strategy',
 }
 readme_rows = {}
 row_pattern = re.compile(
