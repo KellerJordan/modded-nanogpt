@@ -2,8 +2,9 @@ import re
 import math
 import matplotlib.pyplot as plt
 
-runs = {
-    #'Muon (old best, 3500 steps)': ('311d7833-8dfc-43ea-a55c-fd313a11c4a8', '#d04a1f'),
+
+# Extract results
+logfiles = {
     'Muon (best, 3375 steps)': ('51ece938-03c5-4343-8dcc-3f3336b07008', '#ffa500'),
     'AdamW (best, 5625 steps)': ('a63a68d1-24aa-4a22-af9a-224e43209ea4', '#1f77b4'),
     'MuonH (best, 3325 steps)': ('20260430_muonh/9319c798-6643-464a-b407-b05468e468f5', '#2ca02c'),
@@ -12,13 +13,9 @@ runs = {
     'NorMuonH (best, 3275 steps)': ('20260430_normuonh/f45b5dcf-16bb-4e83-b5c7-4ef4981f0e9f', '#32CD32'),
 }
 pattern = re.compile(r'step:(\d+)/(\d+)\s+val_loss:([0-9.]+)')
-out = 'figure.png'
-
-plt.style.use('seaborn-v0_8-whitegrid')
-fig, ax = plt.subplots(figsize=(5.5, 4), dpi=180)
-
 max_step = 0
-for label, (logfile, color) in runs.items():
+results = {}
+for label, (logfile, color) in logfiles.items():
     steps, losses = [], []
     path = f'results/{logfile}.txt'
     with open(path, 'r') as f:
@@ -36,7 +33,13 @@ for label, (logfile, color) in runs.items():
         raise RuntimeError(f'No loss curve found in {path}')
 
     max_step = max(max_step, max(steps))
+    results[label] = (steps, losses, color)
 
+
+# Generate figure
+plt.style.use('seaborn-v0_8-whitegrid')
+fig, ax = plt.subplots(figsize=(5.5, 4), dpi=180)
+for label, (steps, losses, color) in results.items():
     ax.plot(
         steps,
         losses,
@@ -46,7 +49,6 @@ for label, (logfile, color) in runs.items():
         label=label,
         color=color,
     )
-
 ax.axhline(3.28, color='gray', linestyle='--', linewidth=1.5)
 ax.annotate(
     'target=3.28',
@@ -56,7 +58,6 @@ ax.annotate(
     color='gray',
     fontsize=9,
 )
-
 ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/05/01', pad=12, fontsize=12)
 ax.set_xlabel('Training steps @ 0.5M bsz', fontsize=11)
 ax.set_ylabel('Validation loss', fontsize=11)
@@ -64,7 +65,7 @@ ax.legend(frameon=True)
 ax.set_xlim(0, math.ceil(max_step / 1000) * 1000)
 ax.set_ylim(3.15, 4.0)
 ax.tick_params(axis='both', which='major', labelsize=10)
-
 fig.tight_layout()
+out = 'figure.png'
 fig.savefig(out, bbox_inches='tight')
 print(out)
