@@ -341,7 +341,7 @@ for _ in range(num_trials):
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
                        betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
     optimizer2 = NorMuon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.03, weight_decay=0.025)
+                      lr=0.035, weight_decay=0.025)
     optimizers = [optimizer1, optimizer2]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())
