@@ -20,7 +20,7 @@ logfiles = {
     8: 'NorMuonH',
     9: 'NorMuon w/ update clamping',
     10: 'NorMuon',
-    11: 'Nor-Contra-Muon w/ update clamping',
+    11: 'Contra-NorMuon w/ update clamping',
 }
 readme_rows = {}
 row_pattern = re.compile(
