@@ -111,7 +111,7 @@ ax.annotate(
     color='gray',
     fontsize=9,
 )
-ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/05/01', pad=5, fontsize=11.5)
+ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/05/01', pad=11, fontsize=11)
 ax.set_xlabel('Training steps @ 0.5M bsz', fontsize=11)
 ax.set_ylabel('Validation loss', fontsize=11)
 ax.legend(frameon=True)
@@ -157,7 +157,7 @@ ax.annotate(
     color='gray',
     fontsize=9,
 )
-ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/05/01', pad=5, fontsize=11.5)
+ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/05/01', pad=11, fontsize=11)
 ax.set_xlabel('Training steps @ 0.5M bsz', fontsize=11)
 ax.set_ylabel('Validation loss', fontsize=11)
 ax.legend(frameon=True)
