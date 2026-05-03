@@ -1,20 +1,25 @@
 import re
 import math
+import colorsys
+import hashlib
 from collections import defaultdict
 from pathlib import Path
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.offsetbox import AnchoredOffsetbox, DrawingArea, HPacker, TextArea, VPacker
 
 
 # Extract results
 logfiles = {
     # key: number in README results history
-    # value: (label, color)
+    # value: label or (label, color)
     6: ('Muon', '#ffa500'),
-    2: ('AdamW', '#1f77b4'),
+    # 2: ('AdamW', '#1f77b4'),
     5: ('MuonH', '#2ca02c'),
     4: ('AdamH', '#9467bd'),
     7: ('Muon²', '#e377c2'),
     8: ('NorMuonH', '#32CD32'),
+    9: 'NorMuon with update-clamping strategy',
 }
 readme_rows = {}
 row_pattern = re.compile(
@@ -30,6 +35,62 @@ with open('README.md', 'r') as f:
             logfile = m.group(4).removeprefix('results/').removesuffix('.txt')
             readme_rows[number] = (steps_to_target, evidence, logfile)
 pattern = re.compile(r'step:(\d+)/(\d+)\s+val_loss:([0-9.]+)')
+
+
+def color_from_title(title):
+    digest = hashlib.md5(title.encode('utf-8')).hexdigest()
+    hue = int(digest[:8], 16) / 0xffffffff
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.65, 0.8)
+    return f'#{round(255 * r):02x}{round(255 * g):02x}{round(255 * b):02x}'
+
+
+def format_evidence(evidence, steps_to_target):
+    evidence = re.sub(r'[✓✔✅Ⓧ]', '', evidence).strip()
+    return re.sub(r'\((n=\d+)\)', f'(steps={steps_to_target}, \\1)', evidence)
+
+
+def add_legend(ax, legend_entries):
+    rows = []
+    for label, evidence, color in legend_entries:
+        handle = DrawingArea(26, 18, 0, 0)
+        handle.add_artist(Line2D(
+            [3, 13, 23],
+            [9, 9, 9],
+            marker='o',
+            markevery=[1],
+            markersize=3.5,
+            linewidth=2.2,
+            color=color,
+        ))
+        label_size = 7 if len(label) > 25 else 9
+        text = VPacker(
+            children=[
+                TextArea(label, textprops={'fontsize': label_size}),
+                TextArea(evidence, textprops={'fontsize': 8}),
+            ],
+            align='left',
+            pad=0,
+            sep=1,
+        )
+        rows.append(HPacker(
+            children=[handle, text],
+            align='center',
+            pad=0,
+            sep=5,
+        ))
+    legend = AnchoredOffsetbox(
+        loc='upper right',
+        child=VPacker(children=rows, align='left', pad=0, sep=3),
+        frameon=True,
+        pad=0.15,
+        borderpad=0.75,
+    )
+    legend.patch.set_alpha(plt.rcParams['legend.framealpha'])
+    legend.patch.set_edgecolor(plt.rcParams['legend.edgecolor'])
+    legend.patch.set_linewidth(1.0)
+    if plt.rcParams['legend.fancybox']:
+        legend.patch.set_boxstyle('round,pad=0.15,rounding_size=0.2')
+    ax.add_artist(legend)
 
 
 def get_logfile_paths(logfile):
@@ -73,7 +134,12 @@ def average_runs(runs):
 
 max_step = 0
 results = {}
-for number, (label, color) in logfiles.items():
+for number, entry in logfiles.items():
+    if isinstance(entry, tuple):
+        label, color = entry
+    else:
+        label = entry
+        color = color_from_title(label)
     if number not in readme_rows:
         raise RuntimeError(f'No results-history row found in README for #{number}')
     steps_to_target, evidence, logfile = readme_rows[number]
@@ -93,21 +159,22 @@ for number, (label, color) in logfiles.items():
     steps, losses = zip(*kept_points)
 
     max_step = max(max_step, max(steps))
-    results[number] = (f'{label} ({steps_to_target} steps)', steps_to_target, evidence, steps, losses, color)
+    results[number] = (label, steps_to_target, evidence, steps, losses, color)
 
 
 # Generate figure
 plt.style.use('seaborn-v0_8-whitegrid')
 plt.rcParams['font.family'] = 'DejaVu Sans'
 fig, ax = plt.subplots(figsize=(5.5, 4), dpi=300)
-for label, _, _, steps, losses, color in results.values():
+legend_entries = []
+for label, steps_to_target, evidence, steps, losses, color in results.values():
+    legend_entries.append((label, f'→ {format_evidence(evidence, steps_to_target)}', color))
     ax.plot(
         steps,
         losses,
         marker='o',
         markersize=3.5,
         linewidth=2.2,
-        label=label,
         color=color,
     )
 ax.axhline(3.28, color='gray', linestyle='--', linewidth=1.5)
@@ -122,14 +189,12 @@ ax.annotate(
 ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/05/01', pad=11, fontsize=11)
 ax.set_xlabel('Training steps @ 0.5M bsz', fontsize=11)
 ax.set_ylabel('Validation loss', fontsize=11)
-ax.legend(frameon=True)
+add_legend(ax, legend_entries)
 ax.set_xlim(0, math.ceil(max_step / 1000) * 1000)
 ax.set_ylim(3.15, 4.0)
 ax.tick_params(axis='both', which='major', labelsize=10)
 fig.tight_layout()
-out = 'figure.png'
-fig.savefig(out, bbox_inches='tight')
-print(out)
+fig.savefig('figure.png', bbox_inches='tight')
 
 
 # Generate zoomed-in figure
@@ -146,15 +211,15 @@ zoom_losses = [
     if zoom_min_step <= step <= zoom_max_step
 ]
 fig, ax = plt.subplots(figsize=(5.5, 4), dpi=300)
-for label, _, evidence, steps, losses, color in zoom_results:
-    evidence = re.sub(r'[✓✔✅]', '', evidence).strip()
+legend_entries = []
+for label, steps_to_target, evidence, steps, losses, color in zoom_results:
+    legend_entries.append((label, f'→ {format_evidence(evidence, steps_to_target)}', color))
     ax.plot(
         steps,
         losses,
         marker='o',
         markersize=3.5,
         linewidth=2.2,
-        label=f'{label}\n→ {evidence}',
         color=color,
     )
 ax.axhline(3.28, color='gray', linestyle='--', linewidth=1.5)
@@ -169,13 +234,11 @@ ax.annotate(
 ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/05/01', pad=11, fontsize=11)
 ax.set_xlabel('Training steps @ 0.5M bsz', fontsize=11)
 ax.set_ylabel('Validation loss', fontsize=11)
-ax.legend(frameon=True)
+add_legend(ax, legend_entries)
 ax.set_xlim(zoom_min_step, zoom_max_step)
 if zoom_losses:
     zoom_margin = 0.01
     ax.set_ylim(min(zoom_losses) - zoom_margin, max(zoom_losses) + zoom_margin)
 ax.tick_params(axis='both', which='major', labelsize=10)
 fig.tight_layout()
-out = 'figure_zoom.png'
-fig.savefig(out, bbox_inches='tight')
-print(out)
+fig.savefig('zoomed_figure.png', bbox_inches='tight')
