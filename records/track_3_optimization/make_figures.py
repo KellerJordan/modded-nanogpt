@@ -10,11 +10,11 @@ logfiles = {
     # key: number in README results history
     # value: (label, color)
     6: ('Muon', '#ffa500'),
-    #2: ('AdamW', '#1f77b4'),
+    2: ('AdamW', '#1f77b4'),
     5: ('MuonH', '#2ca02c'),
-    #4: ('AdamH', '#9467bd'),
+    4: ('AdamH', '#9467bd'),
     7: ('Muon²', '#e377c2'),
-    #8: ('NorMuonH', '#32CD32'),
+    8: ('NorMuonH', '#32CD32'),
 }
 readme_rows = {}
 row_pattern = re.compile(
