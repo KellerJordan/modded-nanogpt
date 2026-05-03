@@ -9,12 +9,12 @@ import matplotlib.pyplot as plt
 logfiles = {
     # key: number in README results history
     # value: (label, color)
-    6: ('Muon (best, 3375 steps)', '#ffa500'),
-    2: ('AdamW (best, 5625 steps)', '#1f77b4'),
-    5: ('MuonH (best, 3325 steps)', '#2ca02c'),
-    4: ('AdamH (best, 4875 steps)', '#9467bd'),
-    7: ('Muon² (best, 3325 steps)', '#e377c2'),
-    8: ('NorMuonH (best, 3250 steps)', '#32CD32'),
+    6: ('Muon', '#ffa500'),
+    2: ('AdamW', '#1f77b4'),
+    5: ('MuonH', '#2ca02c'),
+    4: ('AdamH', '#9467bd'),
+    7: ('Muon²', '#e377c2'),
+    8: ('NorMuonH', '#32CD32'),
 }
 readme_rows = {}
 row_pattern = re.compile(
@@ -83,9 +83,17 @@ for number, (label, color) in logfiles.items():
     if not runs:
         raise RuntimeError(f'No loss curve found for results/{logfile}.txt')
     steps, losses = average_runs(runs)
+    kept_points = [
+        (step, loss)
+        for step, loss in zip(steps, losses)
+        if step <= steps_to_target
+    ]
+    if not kept_points:
+        raise RuntimeError(f'No loss curve points found at or before step {steps_to_target} for results/{logfile}.txt')
+    steps, losses = zip(*kept_points)
 
     max_step = max(max_step, max(steps))
-    results[number] = (label, steps_to_target, evidence, steps, losses, color)
+    results[number] = (f'{label} ({steps_to_target} steps)', steps_to_target, evidence, steps, losses, color)
 
 
 # Generate figure
@@ -139,13 +147,14 @@ zoom_losses = [
 ]
 fig, ax = plt.subplots(figsize=(5.5, 4), dpi=180)
 for label, _, evidence, steps, losses, color in zoom_results:
+    evidence = re.sub(r'[✓✔✅]', '', evidence).strip()
     ax.plot(
         steps,
         losses,
         marker='o',
         markersize=3.5,
         linewidth=2.2,
-        label=f'{label}\n{evidence}',
+        label=f'{label}\n→ {evidence}',
         color=color,
     )
 ax.axhline(3.28, color='gray', linestyle='--', linewidth=1.5)
