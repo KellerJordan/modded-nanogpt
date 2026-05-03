@@ -18,10 +18,10 @@ logfiles = {
     5: ('MuonH', '#2ca02c'),
     4: ('AdamH', '#9467bd'),
     7: ('Muon²', '#e377c2'),
-    8: ('NorMuonH', '#32CD32'),
-    9: 'NorMuon with update-clamping strategy',
-    10: ('NorMuon', '#7e1e56'),
-    11: 'Nor-Contra-Muon with update-clamping strategy',
+    8: 'NorMuonH',
+    9: 'NorMuon w/ update clamping',
+    10: 'NorMuon',
+    11: ('Nor-Contra-Muon w/ update clamping', '#395c4c'),
 }
 readme_rows = {}
 row_pattern = re.compile(
