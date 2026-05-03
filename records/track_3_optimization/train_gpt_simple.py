@@ -316,7 +316,7 @@ for _ in range(num_trials):
     ########################################
 
     # we want to minimize this while still reaching 3.28 val loss
-    train_steps = 3325
+    train_steps = 3300
 
     # initialize model parameters
     for name, p in model.named_parameters():
