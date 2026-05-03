@@ -325,7 +325,8 @@ for _ in range(num_trials):
     for step in range(train_steps + 1):
 
         # --------------- VALIDATION SECTION -----------------
-        if step == train_steps or step % 125 == 0:
+        val_step_freq = 125 if step / train_steps < 0.9 else 25
+        if step == train_steps or step % val_step_freq == 0:
             # stop the clock
             dist.barrier()
             time_since_last_val = time.perf_counter() - t0
