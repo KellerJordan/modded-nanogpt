@@ -1,7 +1,6 @@
 import re
 import math
-import colorsys
-import hashlib
+import random
 from collections import defaultdict
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -12,16 +11,16 @@ from matplotlib.offsetbox import AnchoredOffsetbox, DrawingArea, HPacker, TextAr
 # Extract results
 logfiles = {
     # key: number in README results history
-    # value: label or (label, color)
-    6: ('Muon', '#ffa500'),
-    # 2: ('AdamW', '#1f77b4'),
-    5: ('MuonH', '#2ca02c'),
-    4: ('AdamH', '#9467bd'),
-    7: ('Muon²', '#e377c2'),
+    # value: label
+    6: 'Muon',
+    # 2: 'AdamW',
+    5: 'MuonH',
+    4: 'AdamH',
+    7: 'Muon²',
     8: 'NorMuonH',
     9: 'NorMuon w/ update clamping',
     10: 'NorMuon',
-    11: ('Nor-Contra-Muon w/ update clamping', '#395c4c'),
+    11: 'Nor-Contra-Muon w/ update clamping',
 }
 readme_rows = {}
 row_pattern = re.compile(
@@ -37,13 +36,6 @@ with open('README.md', 'r') as f:
             logfile = m.group(4).removeprefix('results/').removesuffix('.txt')
             readme_rows[number] = (steps_to_target, evidence, logfile)
 pattern = re.compile(r'step:(\d+)/(\d+)\s+val_loss:([0-9.]+)')
-
-
-def color_from_title(title):
-    digest = hashlib.md5(title.encode('utf-8')).hexdigest()
-    hue = int(digest[:8], 16) / 0xffffffff
-    r, g, b = colorsys.hsv_to_rgb(hue, 0.65, 0.8)
-    return f'#{round(255 * r):02x}{round(255 * g):02x}{round(255 * b):02x}'
 
 
 def format_evidence(evidence, steps_to_target):
@@ -134,14 +126,19 @@ def average_runs(runs):
     return steps, losses
 
 
+plt.style.use('seaborn-v0_8-whitegrid')
+plt.rcParams['font.family'] = 'DejaVu Sans'
+color_cycle = [
+    *plt.colormaps['tab20'].colors,
+    *plt.colormaps['tab20b'].colors,
+    *plt.colormaps['tab20c'].colors,
+]
+random.Random(0).shuffle(color_cycle)
+
 max_step = 0
 results = {}
-for number, entry in logfiles.items():
-    if isinstance(entry, tuple):
-        label, color = entry
-    else:
-        label = entry
-        color = color_from_title(label)
+for i, (number, label) in enumerate(logfiles.items()):
+    color = color_cycle[i % len(color_cycle)]
     if number not in readme_rows:
         raise RuntimeError(f'No results-history row found in README for #{number}')
     steps_to_target, evidence, logfile = readme_rows[number]
@@ -165,8 +162,6 @@ for number, entry in logfiles.items():
 
 
 # Generate figure
-plt.style.use('seaborn-v0_8-whitegrid')
-plt.rcParams['font.family'] = 'DejaVu Sans'
 fig, ax = plt.subplots(figsize=(5.5, 4), dpi=300)
 legend_entries = []
 for label, steps_to_target, evidence, steps, losses, color in results.values():
