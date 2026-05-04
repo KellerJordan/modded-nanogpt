@@ -13,6 +13,7 @@ logfiles = {
     # key: number in README results history
     # value: label
     # 2: 'AdamW',
+    12: 'Muon',
     5: 'MuonH',
     4: 'AdamH',
     7: 'Muon²',
@@ -20,7 +21,6 @@ logfiles = {
     9: 'NorMuon w/ update clamping',
     10: 'NorMuon',
     11: 'ContraNorMuon w/ update clamping',
-    12: 'Muon',
 }
 readme_rows = {}
 row_pattern = re.compile(
