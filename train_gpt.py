@@ -1058,6 +1058,10 @@ class AttnArgs:
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
     train_max_seq_len: torch.Tensor
+    # Optional: per-(B, T, H, 1) ve_gate produced by the previous MUDD layer's extra
+    # "L+1" gate column. When provided, the layer's attention uses it directly instead
+    # of computing the gate from x and ve via ve_gate_w.
+    precomputed_ve_gate: torch.Tensor | None = None
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
@@ -1072,7 +1076,12 @@ class CausalSelfAttention(nn.Module):
         assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
         # Weights are stored in parameter banks and passed via forward()
 
-    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor):
+    def forward(self, x: Tensor|tuple[Tensor, Tensor], attn_args: AttnArgs, qkvo_w: Tensor):
+        # MUDD v-only add mode: x is a tuple (x_residual, v_mudd) where v_mudd (B, T, H, D_head)
+        # is added to the baseline V derived from x_residual (saves a per-channel matmul).
+        is_mudd = isinstance(x, tuple)
+        if is_mudd:
+            x, v_mudd = x
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
@@ -1086,6 +1095,8 @@ class CausalSelfAttention(nn.Module):
         train_max_seq_len = attn_args.train_max_seq_len
 
         q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        if is_mudd:
+            v = v + v_mudd
         max_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         q, k = norm(q), norm(k) # QK norm @Grad62304977
@@ -1098,8 +1109,12 @@ class CausalSelfAttention(nn.Module):
                 k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:]
 
             if ve is not None:
-                # gate pattern g(x[:6] + ve[:6]) by @photomz
-                ve_gate_out = 2 * torch.sigmoid(F.linear(torch.cat([x[..., :6], ve[None, ..., :6]], dim=-1), ve_gate_w)).view(B, T, self.num_heads, 1)
+                if attn_args.precomputed_ve_gate is not None:
+                    # ve_gate produced by the previous MUDD layer's extra L+1 gate column.
+                    ve_gate_out = attn_args.precomputed_ve_gate + 2.0
+                else:
+                    # gate pattern g(x[:6] + ve[:6]) by @photomz
+                    ve_gate_out = 2 * torch.sigmoid(F.linear(torch.cat([x[..., :6], ve[None, ..., :6]], dim=-1), ve_gate_w)).view(B, T, self.num_heads, 1)
                 v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
 
         else:
@@ -1243,21 +1258,96 @@ class GPT(nn.Module):
         # sqrt(1.1) per sublayer so cumulative per-layer scaling is 1.1
         self.resid_lambdas = nn.Parameter(torch.full((num_layers, 2), 1.1**0.5))
 
-        pad = (-num_layers * 2 - 3) % dist.get_world_size()
+        # backout_lambda was removed: legacy `x -= backout_lambda * x_7` is now absorbed
+        # into MUDD via dense_bs[1, 1, 1] = -0.5 (layer-10 / residual / source-h7).
+        pad = (-num_layers * 2 - 2) % dist.get_world_size()
         self.scalars = nn.Parameter(
             torch.cat(
                 [
                     *[torch.tensor([0.5, 1.0]) for _ in range(num_layers)],  # SA lambdas
                     torch.zeros(1), # smear_lambda
-                    0.5*torch.ones(1), # backout_lambda
                     -1.5 * torch.ones(1),  # skip_lambda -> σ(-1.5) ≈ 0.18
                     torch.ones(pad),
                 ]
             )
         )
+        self._init_mudd(num_layers, model_dim)
+
         # Auto-label parameters
         for name, param in self.named_parameters():
             param.label = name.replace('.weight', '')
+
+    def _init_mudd(self, num_layers: int, model_dim: int):
+        """
+        MUDD trimmed for speedrun: only layers {N-2, N-1} consume MUDD signals.
+        Connectivity is fixed (no longer driven by a generic per-layer source dict):
+
+          - layer N-2 (=9):  produces v_mudd (-> layer-10 V), residual delta, ve_gate
+                             (-> layer-10 attn), and 6 layer-10 scalar gates:
+                             resid_attn, post_attn, resid_mlp, post_mlp, x0_lambda,
+                             bigram_lambda. Sources: {x0, h7, current x}.
+                             "current x" is a self-reference and is fused as (1+m_r9)*x.
+          - layer N-1 (=10): produces residual delta only.
+                             Sources: {x0, h7, h9, ve_bank0, skip_connection}.
+                             dense_bs[1, 1, 1] = -0.5 absorbs the legacy backout.
+                             ve_bank0 is the first value-embed slice (layer-1 attn ve).
+                             skip_connection is the layer-3 output (long-window snapshot).
+
+        dense_w2[0] layout (C=2, L_with_gate=8):
+          cols 0..2 (L=3): source coefficients for v_mudd (C=0) and residual (C=1).
+          col 3 (_mudd_L): ve_gate for layer 10's attention (both C channels → num_heads).
+          cols 4..5 (_mudd_L+1, +2): resid/post lambda gates.
+              C=0 → resid_attn[10], post_attn[10]; C=1 → resid_mlp[10], post_mlp[10].
+          cols 6..7 (_mudd_L+3, +4): x0/bigram injection gates (C=0 only).
+              C=0 → x0_lambda[10], bigram_lambda[10]; C=1 unused (zero).
+        dense_w2[1] only uses cols 0..4 (C=1 channel, 5 sources); extra cols stay zero.
+        """
+        num_mudd_layers = 2  # layers N-2 and N-1
+        self._mudd_C = 2     # 0 = v_mudd, 1 = residual delta
+        self._mudd_L = 3     # 3 sources on layer N-2 (x0, h7, x_self); gate at index _mudd_L
+        self._mudd_L10 = 5   # layer N-1 residual: x0, h7, h9, ve_bank0, skip_connection
+        # Extend L by 5: column _mudd_L (=3) is the ve_gate for layer 10's attention;
+        # columns _mudd_L+1, +2 produce layer-10 resid/post gates for attn (C=0) and
+        # mlp (C=1); columns _mudd_L+3, +4 in C=0 produce layer-10 x0/bigram lambdas.
+        self._mudd_L_with_gate = self._mudd_L + 5  # 3 + 5 = 8
+        self._mudd_scale = 0.2 / math.sqrt(self._mudd_L)
+        # inter_dim is the shared MLP-hidden width used by both MUDD layers.
+        # Rounded up to the nearest multiple of 64 (matching the original heuristic
+        # `(C*L) // 64 + 1) * 64`); for (C, L) = (2, 3) this is 64; for (2, 4) still 64.
+        # _initer_block = 64
+        # inter_dim = (self._mudd_C * self._mudd_L_with_gate // _initer_block + 1) * _initer_block
+        inter_dim = 64
+        self.dense_w1 = nn.Parameter(torch.empty(num_mudd_layers, inter_dim, model_dim))
+        self.dense_w1.reshape = (num_mudd_layers * (inter_dim // 8), 8, model_dim)
+        for j in range(num_mudd_layers):
+            nn.init.kaiming_uniform_(self.dense_w1.data[j], a=math.sqrt(5))
+        self.dense_w2 = nn.Parameter(torch.zeros(
+            num_mudd_layers, inter_dim, self._mudd_C, self._mudd_L_with_gate
+        ))
+        self.dense_w2.reshape = (num_mudd_layers * inter_dim, self._mudd_C, self._mudd_L_with_gate)
+        # Bias init: most entries zero.  All gate biases are in pre-scaled domain
+        # (effective init = bias * scale).
+        # - [1, 1, 1] = -4.34: legacy backout absorbed into MUDD (layer 10, residual, h7).
+        # - [0, :, _mudd_L] = 0: ve_gate for layer 10 starts at 0.
+        # - [0, 0, _mudd_L+1/+2]: layer-10 resid_attn / post_attn gates
+        # - [0, 1, _mudd_L+1/+2]: layer-10 resid_mlp  / post_mlp  gates
+        # - [0, 0, _mudd_L+3/+4]: layer-10 x0_lambda  / bigram_lambda gates
+        bs_init = torch.zeros(num_mudd_layers, self._mudd_C, self._mudd_L_with_gate)
+        bs_init[1, 1, 1] = -4.34  # [layer 10, residual, source h7]
+        bs_init[0, 0, self._mudd_L + 1] = 1.1**0.5 / self._mudd_scale  # resid_attn[10]
+        bs_init[0, 0, self._mudd_L + 2] = 1.0 / self._mudd_scale       # post_attn[10]
+        bs_init[0, 1, self._mudd_L + 1] = 1.1**0.5 / self._mudd_scale  # resid_mlp[10]
+        bs_init[0, 1, self._mudd_L + 2] = 1.0 / self._mudd_scale       # post_mlp[10]
+        bs_init[0, 0, self._mudd_L + 3] = 0.0                          # x0_lambda[10] (init 0)
+        bs_init[0, 0, self._mudd_L + 4] = 0.05 / self._mudd_scale      # bigram_lambda[10]
+        self.dense_bs = nn.Parameter(bs_init)
+        # The (B, T, C) extra-column gate is broadcast to (B, T, num_heads, 1) by
+        # repeat_interleave so each C channel covers num_heads // C heads.
+        assert self.attn.num_heads % self._mudd_C == 0, (
+            f"num_heads ({self.attn.num_heads}) must be divisible by _mudd_C ({self._mudd_C}) "
+            f"so the (B, T, C) MUDD gate can tile evenly across heads."
+        )
+        self._mudd_gate_repeat = self.attn.num_heads // self._mudd_C
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
@@ -1273,8 +1363,8 @@ class GPT(nn.Module):
         # ---- Unbind parameters (avoid select_backward kernels) ----
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
         smear_lambda = self.scalars[2 * self.num_layers]
-        backout_lambda = self.scalars[2 * self.num_layers + 1]
-        skip_lambda = self.scalars[2 * self.num_layers + 2]
+        # backout_lambda removed; legacy backout absorbed into MUDD layer-10 dense_bs.
+        skip_lambda = self.scalars[2 * self.num_layers + 1]
         resid_lambdas_attn = self.resid_lambdas[:, 0].bfloat16().unbind(0)
         resid_lambdas_mlp  = self.resid_lambdas[:, 1].bfloat16().unbind(0)
         post_lambdas_attn = self.post_lambdas[:, 0].bfloat16().unbind(0)
@@ -1317,9 +1407,31 @@ class GPT(nn.Module):
         # Layer 0: bigram already injected above, so only x0 component
         x0_inject = (x0 * x0_lambdas[0],) + tuple(x0 * x0_lambdas[i] + x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
         skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
-        
+
+        # ---- MUDD state ----
+        # Connectivity is fixed for the trimmed (last-2-layer) MUDD variant:
+        #   layer 9  : reads {x0, h7, x_self}, writes v_mudd (-> layer-10 V) + residual delta
+        #   layer 10 : reads {x0, h7, h9, ve_bank0}, writes residual delta only
+        # We cache only h7 (set after layer 7) and h9 (set after layer 9) explicitly.
+        h7_snap = None
+        h9_snap = None
+        v_mudd = None  # (B, T, H, D_head) v-only additive correction from layer 9 -> layer 10
+        # ve_gate produced by the previous MUDD layer's extra L+1 column,
+        # consumed by the *next* layer's attention (e.g. layer 9 -> layer 10).
+        next_ve_gate = None
+        # Layer-10 gates, produced by layer-9 MUDD and consumed at layer 10.
+        next_resid_attn_gate = None
+        next_post_attn_gate = None
+        next_resid_mlp_gate = None
+        next_post_mlp_gate = None
+        next_x0_lambda_gate = None
+        next_bigram_lambda_gate = None
+
         # ---- Transformer layers ----
-        x_backout = None
+        # x_backout: snapshot of the residual at end of layer 7. Used as the *attention
+        # input* for layers 8/9/10 (a separate trick from the legacy backout subtraction,
+        # which has been absorbed into MUDD's dense_bs init).
+        x0 = x.clone()
         skip_connection = None
         for i in range(self.num_layers):
             yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
@@ -1332,8 +1444,10 @@ class GPT(nn.Module):
                 key_offset=key_offset[i],
                 attn_gate_w=attn_gates[i],
                 ve_gate_w=ve_gates[i],
-                train_max_seq_len=train_max_seq_len
+                train_max_seq_len=train_max_seq_len,
+                precomputed_ve_gate=next_ve_gate,
             )
+            next_ve_gate = None  # consumed by this layer; will be re-set by MUDD below
             # Select weights from banks
             attn_idx = i - (i > 6) if i != 6 else None
             qkvo_w = attn_weights[attn_idx] if attn_idx is not None else None
@@ -1347,17 +1461,86 @@ class GPT(nn.Module):
             if i == 6:
                 x = x + skip_gate_out * skip_connection
             else:
-                attn_in = x_backout if x_backout is not None else x
-                attn_out = attn(norm(attn_in), attn_args, qkvo_w)
-                x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
-            x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+                attn_in = h7_snap if h7_snap is not None else x
+                if v_mudd is not None:
+                    attn_out = attn((norm(attn_in), v_mudd), attn_args, qkvo_w)
+                    v_mudd = None
+                else:
+                    attn_out = attn(norm(attn_in), attn_args, qkvo_w)
+                if next_resid_attn_gate is not None:
+                    x0_inj = next_x0_lambda_gate * x0 + next_bigram_lambda_gate * x0_bigram
+                    x = next_resid_attn_gate * x + next_post_attn_gate * attn_out + x0_inj
+                    next_resid_attn_gate = None
+                    next_post_attn_gate = None
+                    next_x0_lambda_gate = None
+                    next_bigram_lambda_gate = None
+                else:
+                    x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
+            if next_resid_mlp_gate is not None:
+                x = next_resid_mlp_gate * x + next_post_mlp_gate * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+                next_resid_mlp_gate = None
+                next_post_mlp_gate = None
+            else:
+                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+
+            # ---- MUDD: layer 9 (N-2) ----
+            # Sources (L=3): x0, h7, current x (self-reference for residual channel).
+            # Produces both V-mudd (added into layer-10 V via attn(x, v_mudd)) and a
+            # residual delta. The self contribution to the residual is fused as
+            #   x_new = (1 + m_r9) * x + m_r0 * x0 + m_r7 * h7
+            # which matches the reviewer's `(1 + m9) * x` suggestion exactly.
+            if i == self.num_layers - 2:
+                dw1 = F.gelu(F.linear(x, self.dense_w1[0]))
+                # dense_w2[0] shape: (inter_dim, C=2, L+5=8). First L(=3) cols are
+                # source coefficients; col L is ve_gate; cols L+1..L+4 are layer-10
+                # gates (attn/mlp lambdas and x0/bigram injection).
+                dw = torch.einsum('BTd, dCL -> BTCL', dw1, self.dense_w2[0])
+                dw = (dw + self.dense_bs[0]) * self._mudd_scale  # (B, T, 2, 8)
+                # V-mudd channel (C=0), first L source columns
+                m_v0, m_v7, m_v9 = dw[..., 0, :self._mudd_L].split(1, dim=-1)
+                v_mudd_raw = 1.15 * (m_v0 * x0 + m_v7 * h7_snap + m_v9 * x)
+                v_mudd = v_mudd_raw.view(
+                    v_mudd_raw.size(0), v_mudd_raw.size(1),
+                    self.attn.num_heads, self.attn.head_dim,
+                )
+                # Residual delta channel (C=1) with self-reference fused, first L cols
+                m_r0, m_r7, m_r9 = dw[..., 1, :self._mudd_L].split(1, dim=-1)
+                # Snapshot h9 BEFORE applying the layer-9 residual update, so that
+                # layer 10 sees the same h9 the original generic-loop version saw.
+                h9_snap = x
+                x = (1 + m_r9) * x + m_r0 * x0 + m_r7 * h7_snap
+                # Extra columns from the MUDD gate output:
+                # Column _mudd_L (=3): ve_gate for layer 10's attention (B, T, C=2),
+                #   tiled to (B, T, num_heads, 1).
+                ve_gate_extra = dw[..., self._mudd_L]  # (B, T, C)
+                next_ve_gate = ve_gate_extra.repeat_interleave(
+                    self._mudd_gate_repeat, dim=-1
+                ).unsqueeze(-1)  # (B, T, num_heads, 1)
+                # Columns _mudd_L+1, +2: layer-10 resid/post gates (C=0 → attn, C=1 → mlp).
+                next_resid_attn_gate = dw[..., 0, self._mudd_L + 1].unsqueeze(-1)  # (B, T, 1)
+                next_post_attn_gate  = dw[..., 0, self._mudd_L + 2].unsqueeze(-1)
+                next_resid_mlp_gate  = dw[..., 1, self._mudd_L + 1].unsqueeze(-1)
+                next_post_mlp_gate   = dw[..., 1, self._mudd_L + 2].unsqueeze(-1)
+                # Columns _mudd_L+3, +4 (C=0): layer-10 x0/bigram injection lambdas.
+                next_x0_lambda_gate     = dw[..., 0, self._mudd_L + 3].unsqueeze(-1)
+                next_bigram_lambda_gate = dw[..., 0, self._mudd_L + 4].unsqueeze(-1)
+
             if i == 3:
                 skip_connection = x
             if i == 7:
-                x_backout = x
+                # h7_snap and x_backout are the same tensor at this point; we keep
+                # two names because they play conceptually distinct roles downstream.
+                h7_snap = x
 
-        # back out contributions from first 7 layers
-        x -= backout_lambda * x_backout
+        # Sources (5): x0, h7, h9, ve_bank0, skip_connection (layer-3 output).
+        # No self-reference -> no fuse. Uses dense_w2[1, :, 1, :_mudd_L10].
+        dw1 = F.gelu(F.linear(x, self.dense_w1[1]))
+        dw_r = torch.einsum('BTd, dL -> BTL', dw1, self.dense_w2[1, :, 1, : self._mudd_L10])
+        dw_r = (dw_r + self.dense_bs[1, 1, : self._mudd_L10]) * self._mudd_scale
+        m_r0, m_r7, m_r9, m_rve, m_rsk = dw_r.split(1, dim=-1)
+        ve_bank0 = ve[1][None].to(dtype=x.dtype)  # (1, T, D), same VE as layer-1 attn
+        x = x + m_r0 * x0 + m_r7 * h7_snap + m_r9 * h9_snap + m_rve * ve_bank0 + m_rsk * skip_connection
+
         x = norm(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
@@ -1565,10 +1748,14 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1440  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 1405  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
+    # Descriptive run_id for this iteration:
+    #   - explicit sparse connectivity refactor (no generic loop)
+    #   - (1 + m_r9) * x self-reference fuse on layer 9
+    #   - backout_lambda fully removed (slot dropped from self.scalars; absorbed into MUDD bias init)
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
@@ -1709,11 +1896,22 @@ class TrainingManager():
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
 
+        # ---- MUDD parameter overrides ----
+        self.param_table.update({
+            "dense_w1":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25},
+            "dense_w2":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25},
+            "dense_bs":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25, "wd_mul": 0.0},
+        })
+
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "dense_bs", 
+            "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+        ] + [
+            "dense_w2",
             "value_embeds", "bigram_embed",  # Medium
+            "dense_w1",
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "qk_bank", "vo_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
         ]
@@ -1901,6 +2099,9 @@ model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.qk_bank.data = model.qk_bank.data.bfloat16()
 model.vo_bank.data = model.vo_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
+model.dense_w1.data = model.dense_w1.data.bfloat16()
+model.dense_w2.data = model.dense_w2.data.bfloat16()
+model.dense_bs.data = model.dense_bs.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
