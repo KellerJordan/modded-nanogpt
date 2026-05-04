@@ -133,7 +133,7 @@ color_cycle = [
     *plt.colormaps['tab20b'].colors,
     *plt.colormaps['tab20c'].colors,
 ]
-random.Random(0).shuffle(color_cycle)
+random.Random(46).shuffle(color_cycle)
 
 max_step = 0
 results = {}
