@@ -12,15 +12,12 @@ from matplotlib.offsetbox import AnchoredOffsetbox, DrawingArea, HPacker, TextAr
 logfiles = {
     # key: number in README results history
     # value: label
-    # 2: 'AdamW',
-    12: 'Muon',
-    5: 'MuonH',
-    4: 'AdamH',
-    7: 'Muon²',
+    # Only include methods reaching 3.28 in ≤ 3250 steps.
     8: 'NorMuonH',
     9: 'NorMuon w/ update clamp-min',
     10: 'NorMuon',
     11: 'ContraNorMuon w/ update clamp-min',
+    13: 'NorMuonH + MuLoCo',
 }
 readme_rows = {}
 row_pattern = re.compile(
@@ -183,7 +180,7 @@ ax.annotate(
     color='gray',
     fontsize=9,
 )
-ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/05/01', pad=11, fontsize=11)
+ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/05/04', pad=11, fontsize=11)
 ax.set_xlabel('Training steps @ 0.5M bsz', fontsize=11)
 ax.set_ylabel('Validation loss', fontsize=11)
 add_legend(ax, legend_entries)
@@ -228,7 +225,7 @@ ax.annotate(
     color='gray',
     fontsize=9,
 )
-ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/05/01', pad=11, fontsize=11)
+ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/05/04', pad=11, fontsize=11)
 ax.set_xlabel('Training steps @ 0.5M bsz', fontsize=11)
 ax.set_ylabel('Validation loss', fontsize=11)
 add_legend(ax, legend_entries)
