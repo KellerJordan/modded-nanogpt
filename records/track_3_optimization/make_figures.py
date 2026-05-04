@@ -196,7 +196,7 @@ fig.savefig('figure.png', bbox_inches='tight')
 
 # Generate zoomed-in figure
 zoom_min_step = 3000
-zoom_max_step = 3500
+zoom_max_step = 3400
 zoom_results = [
     result for result in results.values()
     if result[1] < zoom_max_step
