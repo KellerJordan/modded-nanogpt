@@ -33,7 +33,6 @@ from torch import Tensor, nn
 
 dynamo.config.recompile_limit = 64
 
-
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -114,6 +113,85 @@ def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
     ctx.set_materialize_grads(False)
 
 mm_op.register_autograd(backward, setup_context=setup_context)
+
+@torch.library.custom_op("nanogpt::mm_t", mutates_args=())
+def mm_t_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
+    @torch.compile
+    def impl(x: Tensor, w: Tensor):
+        assert x.is_contiguous() and w.is_contiguous()
+        assert x.shape[1] == w.shape[0]
+        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+        w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
+        w_f8_col_major = w_f8.T.contiguous().T
+        out = torch._scaled_mm(
+            x_f8,
+            w_f8_col_major,
+            out_dtype=torch.bfloat16,
+            scale_a=x.new_tensor(x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(w_s, dtype=torch.float32),
+            use_fast_accum=True,
+        )
+        return out, x_f8, w_f8
+
+    return impl(x, w)
+
+@mm_t_op.register_fake
+def _(x: Tensor, w: Tensor, *_):
+    assert x.ndim == w.ndim == 2
+    assert x.shape[1] == w.shape[0]
+    assert x.device == w.device
+    assert x.is_contiguous() and w.is_contiguous()
+    return x @ w, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+
+@torch.library.custom_op("nanogpt::mm_t_backward", mutates_args=())
+def mm_t_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
+    @torch.compile
+    def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
+        assert grad.is_contiguous()
+        x_scale = grad.new_tensor(x_s, dtype=torch.float32)
+        w_scale = grad.new_tensor(w_s, dtype=torch.float32)
+        grad_scale = grad.new_tensor(grad_s, dtype=torch.float32)
+        grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
+        grad_x = torch._scaled_mm(
+            grad_f8,
+            w_f8.T,
+            out_dtype=torch.bfloat16,
+            scale_a=grad_scale,
+            scale_b=w_scale,
+            use_fast_accum=False,
+        )
+        grad_w = torch._scaled_mm(
+            x_f8.T.contiguous(),
+            grad_f8.T.contiguous().T,
+            out_dtype=torch.float32,
+            scale_a=x_scale,
+            scale_b=grad_scale,
+            use_fast_accum=False,
+        )
+        return grad_x, grad_w
+
+    return impl(g, x_f8, w_f8)
+
+@mm_t_backward_op.register_fake
+def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
+    return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
+
+def backward_t(ctx, grad_out: Tensor, *_):
+    x_f8, w_f8 = ctx.saved_tensors
+    x_s, w_s, grad_s = ctx.scales
+    grad_x, grad_w = torch.ops.nanogpt.mm_t_backward(
+        grad_out, x_f8, w_f8, x_s, w_s, grad_s
+    )
+    return grad_x, grad_w, None, None, None
+
+def setup_context_t(ctx: torch.autograd.function.FunctionCtx, inputs, output):
+    *_, x_s, w_s, grad_s = inputs
+    _, x_f8, w_f8 = output
+    ctx.save_for_backward(x_f8, w_f8)
+    ctx.scales = x_s, w_s, grad_s
+    ctx.set_materialize_grads(False)
+
+mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 
 # -----------------------------------------------------------------------------
 # Triton kernel for symmetric matrix multiplication by @byronxu99
@@ -773,9 +851,20 @@ class DistAdam(torch.optim.Optimizer):
         lm_head_state = self.state[lm_head]
         embed_state = self.state[embed]
         embed_state['step'] = lm_head_state['step']
-        embed_state['exp_avg'] = lm_head_state['exp_avg'].clone()
-        embed_state['exp_avg_sq'] = lm_head_state['exp_avg_sq'].clone()
-        embed.data.copy_(lm_head.data)
+        if lm_head.shape == embed.shape:
+            embed_state['exp_avg'] = lm_head_state['exp_avg'].clone()
+            embed_state['exp_avg_sq'] = lm_head_state['exp_avg_sq'].clone()
+            embed.data.copy_(lm_head.data)
+            return
+
+        rank = dist.get_rank()
+        rank_size = embed.shape[0] // self.world_size
+        for key in ('exp_avg', 'exp_avg_sq'):
+            gathered = torch.empty((lm_head.shape[0], lm_head.shape[1]), dtype=lm_head_state[key].dtype, device=lm_head_state[key].device)
+            dist.all_gather_into_tensor(gathered, lm_head_state[key].contiguous())
+            transposed = gathered.mT.contiguous()
+            embed_state[key] = transposed[rank * rank_size:(rank + 1) * rank_size].clone()
+        embed.data.copy_(lm_head.data.mT)
 
     @torch.compile
     @torch.no_grad()
@@ -842,7 +931,7 @@ def norm(x: Tensor):
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
         super().__init__(in_features, out_features, bias=False)
-        self.use_fp8 = False # turn off fp8 for now -> requires tuning of scales which hasnt been done on medium track
+        self.use_fp8 = use_fp8
         self.x_s = x_s
         self.w_s = w_s
         self.grad_s = grad_s
@@ -858,6 +947,28 @@ class CastedLinear(nn.Linear):
             return out.reshape(*x.shape[:-1], -1)
         else:
             return F.linear(x, self.weight.type_as(x))
+
+class CastedLinearT(nn.Module):
+    def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
+        super().__init__()
+        self.use_fp8 = use_fp8
+        self.x_s = x_s
+        self.w_s = w_s
+        self.grad_s = grad_s
+        self.weight = nn.Parameter(torch.empty(in_features, out_features, dtype=torch.bfloat16))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        with torch.no_grad():
+            self.weight.zero_()  # @Grad62304977 and others
+
+    def forward(self, x: Tensor):
+        if self.use_fp8 and self.training:
+            _x = x.flatten(0, -2)
+            out: Tensor = torch.ops.nanogpt.mm_t(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
+            return out.reshape(*x.shape[:-1], -1)
+        else:
+            return x @ self.weight.type_as(x)
 
 
 # -----------------------------------------------------------------------------
@@ -1064,7 +1175,7 @@ class GPT(nn.Module):
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
 
-        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=0.75/448)
+        self.lm_head = CastedLinearT(model_dim, vocab_size, use_fp8=use_fp8, x_s=32/448, w_s=2.25/448, grad_s=1.5/448)
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
         self.lm_head.weight.label = 'lm_head'
 
@@ -1145,7 +1256,7 @@ class GPT(nn.Module):
         if self.split_embed:
             x = self.embed(input_seq)
         else:
-            x = F.embedding(input_seq, self.lm_head.weight)
+            x = F.embedding(input_seq, self.lm_head.weight.mT)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
         # dropping first layer updates this to .12 ... 012
@@ -1192,7 +1303,7 @@ class GPT(nn.Module):
         if not self.training:
             loss = 0
             for i in range(4):
-                logits: Tensor = F.linear(x.flatten(end_dim=1).chunk(4)[i], self.lm_head.weight.bfloat16()).float()
+                logits: Tensor = F.linear(x.flatten(end_dim=1).chunk(4)[i], self.lm_head.weight.mT.bfloat16()).float()
                 logits = 23 * torch.sigmoid((logits + 5) / 7.5)
                 loss += F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq.chunk(4)[i], reduction="mean")/4
             return loss
@@ -1419,18 +1530,18 @@ def get_ws(step: int):
 # learning rate schedule: tied to batch size schedule, with cooldown at the end.
 def get_lr(step: int):
     if step > args.num_scheduled_iterations:
-        return 0.1
-    lr_max = 1.0
+        return args.decay_floor
     x = step / args.num_scheduled_iterations
+    lr_max = 1.0
     if x > 1/12:
-       lr_max = 1.52  # (16/8)**0.6
+        lr_max = 1.52  # (16/8)**0.6
     if x > 2/12:
         lr_max = 1.73  # (24/8)**0.5
     if x > 3/12:
         lr_max = 2.0
     if x >= 1 - args.cooldown_frac:
         w = (1 - x) / args.cooldown_frac
-        lr = lr_max * w + (1 - w) * 0.1
+        lr = lr_max * w + (1 - w) * args.decay_floor
         return lr
     return lr_max
 
@@ -1481,9 +1592,9 @@ class TrainingManager():
         muon_params = [p for p in model.parameters() if getattr(p, 'label', None) in muon_labels]
         assert set(getattr(p, 'label', None) for p in model.parameters()) == set(adam_labels + scalar_labels + muon_labels), "All params must have label"
 
-        self.adam_opt = DistAdam(adam_params, adam_labels, lr=0.004, betas=(0.8, 0.95), eps=1e-8, weight_decay=0.005)
+        self.adam_opt = DistAdam(adam_params, adam_labels, lr=args.adam_lr, betas=(0.8, 0.95), eps=1e-8, weight_decay=0.005)
         self.scalar_opt = DistAdam(scalar_params, scalar_labels, lr=0.008, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.005)
-        self.muon_opt = NorMuon(muon_params, lr=0.015, momentum=0.95, beta2=0.95, weight_decay=1.2)
+        self.muon_opt = NorMuon(muon_params, lr=args.muon_lr, momentum=0.95, beta2=0.95, weight_decay=1.2)
         self.optimizers = [self.adam_opt, self.scalar_opt, self.muon_opt]
         # split after odd number step
         self.split_step = math.ceil(args.split_embed_frac * args.num_scheduled_iterations) | 1
@@ -1542,8 +1653,8 @@ class TrainingManager():
 
     def advance_schedule(self, step: int):
         self.ws_short, new_ws_long = get_ws(step)
-        # only apply yarn for first few
-        if new_ws_long != self.ws_long and new_ws_long<=13:
+        # apply yarn on every window size transition
+        if new_ws_long != self.ws_long:
             self.model.yarn.apply(self.ws_long, new_ws_long)
 
         new_batch_size = get_bs(step)
@@ -1625,10 +1736,13 @@ class Hyperparameters:
     num_scheduled_iterations: int = 4700  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
-    cooldown_frac: float = 0.70  # fraction of num_scheduled_iterations spent cooling down the learning rate
+    cooldown_frac: float = 0.70
+    decay_floor: float = 0.1
     split_embed_frac: float = 2/3/4
+    muon_lr: float = 0.012
+    adam_lr: float = 0.004
     # evaluation and logging
-    run_id: str = f"{uuid.uuid4()}"
+    run_id: str = os.environ.get("RUN_ID", f"{uuid.uuid4()}")
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # attention masking
@@ -1699,7 +1813,7 @@ for m in model.modules():
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+model = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
 ########################################
@@ -1780,7 +1894,7 @@ for step in range(train_steps + 1):
 
     if last_step:
         if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            log = dict(step=step, code=code, model=model.state_dict(), optimizers=training_manager.get_state())
             os.makedirs(f"logs/{run_id}", exist_ok=True)
             torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
