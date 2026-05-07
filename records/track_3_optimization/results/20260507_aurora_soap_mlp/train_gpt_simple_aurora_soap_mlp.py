@@ -19,6 +19,10 @@ Builds on record #11 (Contra-Muon + NorMuon-lite + u/w-floor, 3225 steps) with t
    precondition_frequency=10.
 
 Result: 3200 steps to reach ≤3.28 val loss (n=4, mean=3.27677, margin=0.00646 ≥ 0.004).
+
+Note: schedule_steps=3225 sets the LR cooldown horizon (matching the logged runs),
+while train_steps=3200 is the stopping point. MUON_WEIGHT_DECAY=0.025 is stored in the
+optimizer defaults for config parity with the logged runs but is not applied in step().
 """
 
 import os
@@ -44,6 +48,7 @@ SEED = int(os.environ.get("SEED", "0"))
 CONTRA_MUON = 0.4
 MU = 0.95
 MUON_LR = 0.0375
+MUON_WEIGHT_DECAY = 0.025  # stored in optimizer defaults but not applied in step()
 TARGET_UW = 0.35
 SOAP_BETA2 = 0.90
 SOAP_PRECOND_FREQ = 10
@@ -433,10 +438,9 @@ print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.ve
 print0(f"Running on device_name={torch.cuda.get_device_name(device)} with world_size={dist.get_world_size()}")
 print0(f"Using seed={SEED}")
 print0(f"Aurora polar + SOAP-MLP + Contra-Muon + NorMuon-lite + u/w-floor")
-print0(f"  CONTRA_MUON={CONTRA_MUON}, MU={MU}, LR={MUON_LR}, TARGET_UW={TARGET_UW}")
+print0(f"  CONTRA_MUON={CONTRA_MUON}, MU={MU}, LR={MUON_LR}, WD={MUON_WEIGHT_DECAY}, TARGET_UW={TARGET_UW}")
 print0(f"  SOAP: beta2={SOAP_BETA2}, precond_freq={SOAP_PRECOND_FREQ}")
 print0(f"  Aurora: pp_iterations={PP_ITERATIONS}, pp_beta={PP_BETA}")
-print0("="*100)
 
 val_tokens = 20 * 524288
 batch_size = 8 * 64 * 1024
@@ -452,8 +456,14 @@ model.compile(dynamic=False)
 #       Init & Optim Hyperparams       #
 ########################################
 
-# we want to minimize this while still reaching 3.28 val loss
+# schedule_steps sets the LR cooldown horizon; train_steps is when we stop.
+# The original logs were produced with train_steps=schedule_steps=3225;
+# we stop at 3200 (where ≤3.28 is already reached) but keep the 3225-step
+# schedule so the cooldown shape is identical to the logged runs.
+schedule_steps = 3225
 train_steps = 3200
+print0(f"  schedule_steps={schedule_steps}, train_steps={train_steps}")
+print0("="*100)
 val_regular_interval = 125
 extra_val_steps = {3100, 3125, 3150, 3175, 3200}
 
@@ -468,7 +478,7 @@ optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
                     dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
                    betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
 optimizer2 = Muon([(n, p) for n, p in model.blocks.named_parameters() if p.ndim >= 2],
-                  lr=MUON_LR, weight_decay=0, mu=MU)
+                  lr=MUON_LR, weight_decay=MUON_WEIGHT_DECAY, mu=MU)
 optimizers = [optimizer1, optimizer2]
 assert set(p for opt in optimizers for group in opt.param_groups
            for p in group["params"]) == set(model.parameters())
@@ -476,9 +486,10 @@ for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
-# learning rate schedule: stable then decay
+# learning rate schedule: stable then linear decay
+# Uses schedule_steps (not train_steps) so cooldown shape matches the logged runs.
 def set_hparams(step, cooldown_frac=0.7):
-    progress = step / train_steps
+    progress = step / schedule_steps
     assert 0 <= progress < 1
     if progress < 1 - cooldown_frac:
         eta = 1.0
@@ -519,7 +530,7 @@ for step in range(train_steps + 1):
                 val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
         dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
         val_loss /= val_tokens
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
+        print0(f"step:{step}/{schedule_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
                + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
@@ -548,7 +559,7 @@ for step in range(train_steps + 1):
         opt.step()
     model.zero_grad(set_to_none=True)
     approx_training_time = training_time + (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
+    print0(f"step:{step+1}/{schedule_steps} train_time:{approx_training_time:.3f}s"
            + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
 
 dist.destroy_process_group()

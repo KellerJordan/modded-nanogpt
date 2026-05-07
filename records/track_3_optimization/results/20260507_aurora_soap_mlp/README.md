@@ -4,15 +4,15 @@
 
 ## Evidence
 
-Mean val loss at step 3200: **3.27677** (n=4, `(3.28 - 3.27677) * sqrt(4) = 0.00646 ≥ 0.004` ✓)
+Mean val loss at step 3200: **3.27599** (n=4, `(3.28 - 3.27599) * sqrt(4) = 0.00801 ≥ 0.004` ✓)
 
 | Seed | Val Loss @ 3200 |
 |-----:|:---------------:|
-| 0 | 3.27710 |
-| 1 | 3.27515 |
-| 2 | 3.27574 |
-| 3 | 3.27909 |
-| **Mean** | **3.27677** |
+| 0 | 3.27408 |
+| 1 | 3.27632 |
+| 2 | 3.27517 |
+| 3 | 3.27841 |
+| **Mean** | **3.27599** |
 
 ## Description
 
@@ -32,6 +32,10 @@ Builds on record #11 (Contra-Muon + NorMuon-lite + u/w-floor, 3225 steps) with t
 Base hyperparameters unchanged from #11:
 `MUON_LR=0.0375`, `MU=0.95`, `CONTRA_MUON=0.4`, `TARGET_UW=0.35`, `cooldown_frac=0.7`.
 
+Note: `schedule_steps=3225` sets the LR cooldown horizon (same as #11), while
+`train_steps=3200` is the stopping point. `MUON_WEIGHT_DECAY=0.025` is stored in the
+optimizer defaults for config parity but is not applied in the Muon `step()` method.
+
 ## Key Insight
 
 Aurora and SOAP-MLP are orthogonal improvements:
@@ -43,10 +47,10 @@ Neither interferes with the other. SOAP operates before NS, Aurora operates duri
 ## Files
 
 - `train_gpt_simple_aurora_soap_mlp.py` — Single-file training script (drop-in replacement)
-- `0bf50e1a-*.txt` — Seed 0 log
-- `075cbb6d-*.txt` — Seed 1 log
-- `1b5902c4-*.txt` — Seed 2 log
-- `61277b94-*.txt` — Seed 3 log
+- `4f53e1ac-*.txt` — Seed 0 log
+- `f450bccf-*.txt` — Seed 1 log
+- `959cfa09-*.txt` — Seed 2 log
+- `f94f1b15-*.txt` — Seed 3 log
 
 ## Credits
 
