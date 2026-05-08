@@ -40,6 +40,7 @@ which the PR appeared.
 | 10 | 3250 | 3.2789 (n=20)✓ | NorMuon lr=0.035 wd=0.025, end 50 steps early | 2026/05/03 | [log](results/20260503_normuon/e0d0185f-ccb8-426d-8265-a4e762ec69f6.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/276) | @lliu606 |
 | 11 | 3225 | 3.2785 (n=16)✓ | Setup from #9 plus [Contra-Muon](https://github.com/nilin/contra-muon) technique | 2026/05/01 | [log](results/20260501_contra_muon/08cd60f9-99e2-4e28-b1ac-19136dd42a05.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/275) | @nilin |
 | 12 | 3325 | 3.2790 (n=20)✓ | Muon with aux Adam, lr=.035 wd=.025 following #10, end 25 steps early following #8 | 2026/05/03 | [log](results/1bd8db7a-f3a3-4195-856d-cab7e0816443.txt) | N/A | @kellerjordan0 |
+| 13 | 3175 | 3.2772 (n=6)✓ | [KL-SOAP](https://arxiv.org/abs/2509.03378) with hyperball constraint on hidden matrices, precondition_frequency=1, lr=.018, beta1=.95, beta2=.95, shampoo_beta=.95, aux Adam, and per-module init std (attn.proj std=.026, mlp.proj std=.031, mlp.fc std=.031, qkv default) | 2026/05/08 | [log](results/20260508_klsoap_h/klsoap-h-pf1-K3175-seed-1.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/289) | @kaiyue-wen |
 
 <table>
   <tr>

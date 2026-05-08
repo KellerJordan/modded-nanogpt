@@ -21,6 +21,7 @@ logfiles = {
     9: 'NorMuon w/ update clamp-min',
     10: 'NorMuon',
     11: 'ContraNorMuon w/ update clamp-min',
+    13: 'KL-SOAP-H',
 }
 readme_rows = {}
 row_pattern = re.compile(
@@ -108,7 +109,7 @@ def plot_results(ax, plot_results, target_label_x):
         color='gray',
         fontsize=9,
     )
-    ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/05/04', pad=11, fontsize=11)
+    ax.set_title('Modded-NanoGPT Optimization Benchmark as of 2026/05/08', pad=11, fontsize=11)
     ax.set_xlabel('Training steps @ 0.5M bsz', fontsize=11)
     ax.set_ylabel('Validation loss', fontsize=11)
     add_legend(ax, legend_entries)
