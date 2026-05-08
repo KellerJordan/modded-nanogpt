@@ -1,18 +1,20 @@
 # Aurora + SOAP-MLP + Contra-Muon + NorMuon-lite + u/w-floor
 
-**3200 steps** to reach ≤3.28 val loss.
+**3175 steps** to reach ≤3.28 val loss.
 
 ## Evidence
 
-Mean val loss at step 3200: **3.27599** (n=4, `(3.28 - 3.27599) * sqrt(4) = 0.00801 ≥ 0.004` ✓)
+Mean val loss at step 3175: **3.27735** (n=4, `(3.28 - 3.27735) * sqrt(4) = 0.00530 ≥ 0.004` ✓)
 
-| Seed | Val Loss @ 3200 |
+| Seed | Val Loss @ 3175 |
 |-----:|:---------------:|
-| 0 | 3.27408 |
-| 1 | 3.27632 |
-| 2 | 3.27517 |
-| 3 | 3.27841 |
-| **Mean** | **3.27599** |
+| 0 | 3.27543 |
+| 1 | 3.27766 |
+| 2 | 3.27653 |
+| 3 | 3.27978 |
+| **Mean** | **3.27735** |
+
+Step 3150 does not pass (mean 3.27912, margin 0.00175 < 0.004).
 
 ## Description
 
@@ -33,8 +35,10 @@ Base hyperparameters unchanged from #11:
 `MUON_LR=0.0375`, `MU=0.95`, `CONTRA_MUON=0.4`, `TARGET_UW=0.35`, `cooldown_frac=0.7`.
 
 Note: `schedule_steps=3225` sets the LR cooldown horizon (same as #11), while
-`train_steps=3200` is the stopping point. `MUON_WEIGHT_DECAY=0.025` is stored in the
-optimizer defaults for config parity but is not applied in the Muon `step()` method.
+`train_steps=3200` is the stopping point. Val loss is evaluated every 25 steps from 3100
+onward; the earliest step that passes the significance test is 3175.
+`MUON_WEIGHT_DECAY=0.025` is stored in the optimizer defaults for config parity but is
+not applied in the Muon `step()` method.
 
 ## Key Insight
 
