@@ -54,6 +54,7 @@ If it fails to reproduce (i.e., we get statistical evidence that its mean is abo
 | 18 | 3225 | 3.2776 (n=9)✓ | [PMuon](results/20260507_pmuon/README.md) (Muon + bilateral streaming covariance power preconditioning), lr=.035 wd=.025 γ=.3 β=.95 | 2026/05/07 | [log](results/20260507_pmuon/54fc0541-7a62-4772-a8f8-d3a46ad10dba.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/285) | @zzp1012 |
 | 19 | 3125 | 3.2780 (n=6)✓ | Setup from #8, with NorMuonH replaced by [KL-SOAP](https://arxiv.org/abs/2509.03378) with hyperball optimization, precondition_frequency=1, lr=.018, beta1=.95, beta2=.9, shampoo_beta=.9  | 2026/05/08 | [log](results/20260508_klsoap_h_clean_tuple_sweep/b1095_sh090/klsoap-h-b1095_sh090-K3125-seed-1.full.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/290) | @kaiyue-wen |
 | 20 | 3030(!) | 3.2790 (n=30)✓ | Setup from #16, plus interpolation between Contra-Muon and new method Soft-Muon, plus tuned lr schedule inherited from thingy | 2026/05/09 | [log](results/20260509_contra_soft_muon/03c36e81-e2e5-4916-bf16-0141999b1dbb.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/291) | @nilin |
+| 21 | 3040 | 3.2781 (n=5)✓ | KL-SOAP-H from #19 with power LR decay (`lr_power=1.5`), nonzero LR floors, a 3125-step schedule horizon, and a fixed 3040-step stop | 2026/05/11 | [log](results/20260511_klsoap_h_lr_power_decay/01906576-8b3d-4bd2-a73f-23997f602ec1.txt) | TBD | @chenchenygu |
 
 <table>
   <tr>
