@@ -181,35 +181,6 @@ ATTN_TRUST_MIN_GRAD_ALIGN = 0.00
 ATTN_TRUST_POWER = 1.00
 ```
 
-## Lineage and credits
-
-This run should be read as an initializer experiment on top of a credited
-optimizer lineage. The main inherited pieces are:
-
-- [PR #274 / Skylight-001](https://github.com/KellerJordan/modded-nanogpt/pull/274)
-  by [@kumarkrishna](https://github.com/kumarkrishna): NorMuon-lite row/column
-  variance normalization, `u/w` floor postprocessing, and the `lr=0.0375` Muon
-  setup used by this branch of Track 3 optimizers.
-- [PR #275 / Contra-Muon](https://github.com/KellerJordan/modded-nanogpt/pull/275)
-  by [@nilin](https://github.com/nilin): the Contra-Muon update term.
-- [PR #278 / MLP SOAP preconditioning](https://github.com/KellerJordan/modded-nanogpt/pull/278)
-  by [@samacqua](https://github.com/samacqua): SOAP-style Shampoo-basis
-  preconditioning for MLP matrices. This lineage also applies the same
-  SOAP-like machinery to attention V matrices.
-- [PR #283 / Trustlight](https://github.com/KellerJordan/modded-nanogpt/pull/283):
-  the bounded/trust-gated attention SOAP lineage credited by PR #294. In this
-  run the trust-gate code remains present, but attention projection SOAP is not
-  selected because `SOAP_PARAM_MODE="mlp_plus_v"`.
-- [PR #287 / power-law LR schedule](https://github.com/KellerJordan/modded-nanogpt/pull/287)
-  by [@yash-oai](https://github.com/yash-oai): the split power-law cooldown
-  schedule constants and form.
-- [PR #291](https://github.com/KellerJordan/modded-nanogpt/pull/291) by
-  [@nilin](https://github.com/nilin): the Contra-Muon to Soft-Muon setup that
-  PR #294 builds on.
-- [PR #294 / Dampen radial gradient component](https://github.com/KellerJordan/modded-nanogpt/pull/294)
-  by [@nilin](https://github.com/nilin): outward radial damping and post-step
-  radius correction, inherited directly here.
-
 ## PR #294 versus this run
 
 PR #294 adds a Track 3 result named "Dampen radial gradient component".
@@ -285,19 +256,6 @@ Intuition: with the radius fixed exactly, the tangent-only floor spends the same
 minimum angular budget from the first optimizer step, instead of inheriting small
 per-seed radius differences from random normal initialization.
 
-## Source audit
-
-Each original UUID experiment log begins with the full source code that was run.
-For seeds `0`, `1`, and `2`, the first 965 lines of each UUID log match
-`train_gpt_i_exact_frobenius_init.py` byte-for-byte.
-
-The SHA256 hash of the train script and all three logged 965-line source
-snippets is:
-
-```text
-91855b7325cfcb958a43db3110368944e7206ee31c81e6f4843d25b051f31b32
-```
-
 ## Reproduction
 
 This record was run sequentially on 4x H100. The local result directory combines
@@ -324,35 +282,31 @@ INSTALL_REQS=1 DOWNLOAD_DATA=1 RUN_MODE=h100 SEEDS="0 1 2" GPUS_PER_RUN=4 \
 ./records/track_3_optimization/results/20260514_hyperball_radial_experiments/i_exact_frobenius_init/run.sh
 ```
 
-If requirements and FineWeb shards are already present, use:
+## Lineage and credits
 
-```bash
-RUN_MODE=h100 SEEDS="0 1 2" GPUS_PER_RUN=4 \
-./records/track_3_optimization/results/20260514_hyperball_radial_experiments/i_exact_frobenius_init/run.sh
-```
+This run should be read as an initializer experiment on top of a credited
+optimizer lineage. The main inherited pieces are:
 
-By default, `run.sh` uses `SEEDS="0"`, `DATA_TOKENS=20`, installs the packages
-listed in `PIP_PACKAGES`, auto-detects visible GPUs, and writes outputs into
-this result folder. Override environment variables as needed, for example:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 RUN_MODE=h100 SEEDS="0 1 2" GPUS_PER_RUN=4 \
-INSTALL_REQS=0 DOWNLOAD_DATA=0 \
-./records/track_3_optimization/results/20260514_hyperball_radial_experiments/i_exact_frobenius_init/run.sh
-```
-
-The original runs used:
-
-```text
-run_mode=h100
-gpus_per_run=4
-parallel_seeds=0
-data_tokens=20
-install_reqs=1
-download_data=1
-check_data=1
-nccl_debug=WARN
-torch_nccl_async_error_handling=1
-pytorch_cuda_alloc_conf=expandable_segments:True
-cuda_device_max_connections=1
-```
+- [PR #274 / Skylight-001](https://github.com/KellerJordan/modded-nanogpt/pull/274)
+  by [@kumarkrishna](https://github.com/kumarkrishna): NorMuon-lite row/column
+  variance normalization, `u/w` floor postprocessing, and the `lr=0.0375` Muon
+  setup used by this branch of Track 3 optimizers.
+- [PR #275 / Contra-Muon](https://github.com/KellerJordan/modded-nanogpt/pull/275)
+  by [@nilin](https://github.com/nilin): the Contra-Muon update term.
+- [PR #278 / MLP SOAP preconditioning](https://github.com/KellerJordan/modded-nanogpt/pull/278)
+  by [@samacqua](https://github.com/samacqua): SOAP-style Shampoo-basis
+  preconditioning for MLP matrices. This lineage also applies the same
+  SOAP-like machinery to attention V matrices.
+- [PR #283 / Trustlight](https://github.com/KellerJordan/modded-nanogpt/pull/283):
+  the bounded/trust-gated attention SOAP lineage credited by PR #294. In this
+  run the trust-gate code remains present, but attention projection SOAP is not
+  selected because `SOAP_PARAM_MODE="mlp_plus_v"`.
+- [PR #287 / power-law LR schedule](https://github.com/KellerJordan/modded-nanogpt/pull/287)
+  by [@yash-oai](https://github.com/yash-oai): the split power-law cooldown
+  schedule constants and form.
+- [PR #291](https://github.com/KellerJordan/modded-nanogpt/pull/291) by
+  [@nilin](https://github.com/nilin): the Contra-Muon to Soft-Muon setup that
+  PR #294 builds on.
+- [PR #294 / Dampen radial gradient component](https://github.com/KellerJordan/modded-nanogpt/pull/294)
+  by [@nilin](https://github.com/nilin): outward radial damping and post-step
+  radius correction, inherited directly here.
