@@ -1230,8 +1230,10 @@ class GPT(nn.Module):
         with torch.no_grad():
             self.embed.weight.copy_(self.lm_head.weight.T)
 
-        self.bigram_embed = nn.Embedding(args.bigram_vocab_size, model_dim)
+        self.bigram_embed = nn.Embedding(args.bigram_vocab_size, args.bigram_dim)
         nn.init.zeros_(self.bigram_embed.weight)
+        bigram_sign_table = torch.randn(args.bigram_sign_table_rows, args.bigram_dim).sign().to(torch.bfloat16)
+        self.register_buffer('bigram_sign_table', bigram_sign_table)
 
         self.post_lambdas = nn.Parameter(torch.ones(num_layers, 2))
 
@@ -1297,7 +1299,26 @@ class GPT(nn.Module):
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
         
-        x0_bigram = self.bigram_embed(bigram_input_seq)[None]
+        # Bigram embeddings: Each embedding is shared across dozens of bigrams as ~50k*50k bigrams
+        # are mapped into fewer rows. Use the following 'trick' (Chen et al. 2015, "Compressing Neural
+        # Networks with the Hashing Trick") to allow 1 embedding to still carry a distinguishable
+        # meaning for each of its bigrams:
+        # - Suppose g_j is (bigram j)'s optimal embedding, i.e. the learned vector if there were no
+        #   hash collisions with other bigrams
+        # - In the forward pass, multiply the embedding with a random +/-1 sign pattern s_j
+        #   (fixed for each j). The learned embedding will become g_j*s_j. In the forward pass
+        #   we use (g_j*s_j)*s_j=g_j and thus end up using the optimal embedding g_j -> multiplying
+        #   with s_j didn't change what the forward pass effectively computes!
+        # - Now, if there are other bigrams i sharing the same embedding, we end up with a learned
+        #   embedding Σ_i(g_i*s_i). However, in the forward pass, we 'recover' j's optimal
+        #   embedding because the cross-terms (s_i*s_j) for i≠j roughly cancel each other out
+        #   (since we picked random signs), leading to (Σ_i(g_i*s_i))*s_j ~ g_j
+        # - In other words, we 'hide' 50k*50k optimal embeddings g_j inside fewer rows (note: we could
+        #   draw s_j from a Sylvester-Hadamard matrix for better cancellation but results were similar)
+        sign_idx = torch.zeros_like(input_seq)
+        sign_idx[1:] = (input_seq[:-1] ^ input_seq[1:]) % self.bigram_sign_table.shape[0]  # (8192,)
+        bigram_signs = self.bigram_sign_table[sign_idx]                                    # (seq, bigram_dim)
+        x0_bigram = (self.bigram_embed(bigram_input_seq) * bigram_signs)[None]             # (1, seq, bigram_dim)
 
         # Value embeddings - always computed (not precomputed)
         ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
@@ -1311,11 +1332,12 @@ class GPT(nn.Module):
         x = x0 = norm(x[None])
 
         # Initialize residual stream with pre-layer-0 bigram injection
-        x = x + x0_bigram * bigram_lambdas[0]
+        x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + x0_bigram * bigram_lambdas[0]
 
         # Precompute x0/bigram injection (added to attention output each layer)
         # Layer 0: bigram already injected above, so only x0 component
-        x0_inject = (x0 * x0_lambdas[0],) + tuple(x0 * x0_lambdas[i] + x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
+        x0_inject = tuple(x0 * x0_lambdas[i] for i in range(self.num_layers))
+        bg_inject = (None,) + tuple(x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
         skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
         
         # ---- Transformer layers ----
@@ -1350,6 +1372,8 @@ class GPT(nn.Module):
                 attn_in = x_backout if x_backout is not None else x
                 attn_out = attn(norm(attn_in), attn_args, qkvo_w)
                 x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
+                if bg_inject[i] is not None:
+                    x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + bg_inject[i]
             x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
             if i == 3:
                 skip_connection = x
@@ -1573,7 +1597,9 @@ class Hyperparameters:
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
-    bigram_vocab_size: int = 50304 * 5
+    bigram_vocab_size: int = 50304 * 14
+    bigram_dim: int = 192
+    bigram_sign_table_rows: int = 8192  # prefer a power of 2 (values ~500-15000 gave similar results)
 
 args = Hyperparameters()
 
@@ -1903,6 +1929,7 @@ model.vo_bank.data = model.vo_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
+dist.broadcast(model.bigram_sign_table, 0)  # buffer, not in parameters()
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
