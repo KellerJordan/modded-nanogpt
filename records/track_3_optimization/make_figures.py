@@ -215,7 +215,6 @@ for suffix in ["wr", "best"]:
             17: '#11 + Aurora',
             18: 'PMuon',
             19: 'KL-SOAP',
-            21: 'KL-SOAP-H LR power decay',
         }
     else:
         assert False
