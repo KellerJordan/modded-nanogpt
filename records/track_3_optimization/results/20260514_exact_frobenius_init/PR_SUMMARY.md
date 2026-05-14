@@ -63,15 +63,14 @@ Same-seed comparison versus PR #294 logs for seeds `0`, `1`, and `2`
 
 ## Caveat
 
-Because H100 compute was limited, this record only runs three seeds. That is not
+Because H100 compute was limited (GPU poor), this record only runs three seeds. That is not
 enough to claim that exact Frobenius initialization is statistically better than
 PR #294's official 11-seed result. The same-seed signal is still useful: seeds
 `0` and `1` improve, seed `2` regresses, and the three-seed mean improves by
 about `0.00039`, which roughly corresponds to `8-10` training steps using the
 Track 3 README's `0.0045` validation-loss-per-100-steps heuristic.
 
-This does not contradict PR #294's official result: PR #294 clears the Track 3
-condition at step `2990` using all 11 reported seeds. The comparison here is
+PR #294 clears the Track 3 condition at step `2990` using all 11 reported seeds. The comparison here is
 narrower because only seeds `0`, `1`, and `2` were rerun for this experiment; on
 that three-seed subset, this run clears the precision condition at step `3010`,
 while PR #294's seeds `0`, `1`, and `2` clear it at step `3020`.
