@@ -23,7 +23,7 @@ def get_results(logfiles):
     max_date = ''
     results = {}
     for i, (number, label) in enumerate(logfiles.items()):
-        label = f"#{number}: {label}"
+        # label = f"#{number}: {label}"
         color = color_cycle[i % len(color_cycle)]
         if number not in readme_rows:
             raise RuntimeError(f'No results-history row found in README for #{number}')
@@ -69,10 +69,13 @@ def add_legend(ax, legend_entries):
             linewidth=2.2,
             color=color,
         ))
-        label_size = 6.5 if len(label) > 25 else 8
+        label_lines = label.splitlines()
+        label_texts = [TextArea(label_lines[0], textprops={'fontsize': 8})]
+        if len(label_lines) > 1:
+            label_texts.append(TextArea('\n'.join(label_lines[1:]), textprops={'fontsize': 6.5}))
         text = VPacker(
             children=[
-                TextArea(label, textprops={'fontsize': label_size}),
+                *label_texts,
                 TextArea(evidence, textprops={'fontsize': 6.5}),
             ],
             align='left',
@@ -102,6 +105,17 @@ def add_legend(ax, legend_entries):
     legend.set_in_layout(False)
     ax.add_artist(legend)
     return legend
+
+
+def shift_legend_left_half_width(ax, legend, anchor_x=1.25, anchor_y=1.01, width_fraction=0.9):
+    ax.figure.canvas.draw()
+    renderer = ax.figure.canvas.get_renderer()
+    legend_width = legend.get_window_extent(renderer=renderer).width
+    axes_width = ax.get_window_extent(renderer=renderer).width
+    legend.set_bbox_to_anchor(
+        (anchor_x - width_fraction * legend_width / axes_width, anchor_y),
+        transform=ax.transAxes,
+    )
 
 
 def plot_results(ax, plot_results, target_label_x, title_date):
@@ -216,6 +230,7 @@ for suffix in ["wr", "best"]:
             18: 'PMuon',
             19: 'KL-SOAP',
             21: 'Shampoo',
+            22: 'Ortho',
         }
     else:
         assert False
@@ -225,9 +240,10 @@ for suffix in ["wr", "best"]:
     # Generate figure
     fig, ax = plt.subplots(figsize=(5.5, 4), dpi=300)
     legend = plot_results(ax, results.values(), 0, title_date)
-    ax.set_xlim(0, math.ceil(max_step / 1000) * 1000)
+    ax.set_xlim(0, 5500)
     ax.set_ylim(3.2, 3.85)
     fig.tight_layout()
+    shift_legend_left_half_width(ax, legend)
     fig.savefig(f'img/figure_{suffix}.png', bbox_inches='tight', bbox_extra_artists=[legend])
 
     # Generate zoomed-in figure
@@ -250,4 +266,5 @@ for suffix in ["wr", "best"]:
         zoom_margin = 0.01
         ax.set_ylim(min(zoom_losses) - zoom_margin, max(zoom_losses) + zoom_margin)
     fig.tight_layout()
+    shift_legend_left_half_width(ax, legend)
     fig.savefig(f'img/zoomed_figure_{suffix}.png', bbox_inches='tight', bbox_extra_artists=[legend])
