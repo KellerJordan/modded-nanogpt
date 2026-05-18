@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy, init_fp8_amax_bufs
+from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
@@ -157,24 +157,18 @@ mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 # -----------------------------------------------------------------------------
 # FP8 pre-quantized MLP weights for Triton kernel
 
-_FP8_ACT_SCALE = 16.0 / torch.finfo(torch.float8_e4m3fn).max  # ~0.036
-_FP8_ACT_SCALE_INV = 1.0 / _FP8_ACT_SCALE  # ~28.0
-
 def quantize_weights_fp8(model):
-    """Pre-quantize MLP weight bank to FP8 for use in linear_relu_square Triton kernel."""
+    """Pre-quantize MLP up-projection weights to FP8 for the Triton MLP kernel."""
     E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
     with torch.no_grad():
-        if model._mlp_bank_f8 is None:
-            model._mlp_bank_f8 = torch.zeros_like(model.mlp_bank, dtype=torch.float8_e4m3fn)
-            model._mlp_bank_scales = torch.ones(24, dtype=torch.float32, device=model.mlp_bank.device)
-            model._fp8_layer_amaxes = torch.zeros(12, dtype=torch.float32, device=model.mlp_bank.device)
-            model._fp8_scale_buf = torch.ones(1, dtype=torch.float32, device=model.mlp_bank.device)
-        # Vectorized: compute all 24 scales and quantize in bulk
-        flat = model.mlp_bank.view(24, -1)
+        if model._mlp_fc_f8 is None:
+            model._mlp_fc_f8 = torch.zeros_like(model.mlp_bank[:, 0], dtype=torch.float8_e4m3fn)
+            model._mlp_fc_scales = torch.ones(12, dtype=torch.float32, device=model.mlp_bank.device)
+            model._mlp_dequant_scale_buf = torch.ones(1, dtype=torch.float32, device=model.mlp_bank.device)
+        flat = model.mlp_bank[:, 0].view(12, -1)
         scales = flat.abs().amax(dim=1).clamp(min=1e-12) / E4M3_MAX
-        # Store pure weight scales (act_scale is dynamic, computed per-call)
-        model._mlp_bank_scales[:] = scales.float()
-        model._mlp_bank_f8[:] = (model.mlp_bank / scales.view(12, 2, 1, 1)).to(torch.float8_e4m3fn)
+        model._mlp_fc_scales[:] = scales.float()
+        model._mlp_fc_f8[:] = (model.mlp_bank[:, 0] / scales.view(12, 1, 1)).to(torch.float8_e4m3fn)
 
 # -----------------------------------------------------------------------------
 # Polar Express
@@ -1246,8 +1240,8 @@ class GPT(nn.Module):
         # Transposed weight storage for faster gradient accumulation
         self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
 
-        self._mlp_bank_f8 = None
-        self._mlp_bank_scales = None
+        self._mlp_fc_f8 = None
+        self._mlp_fc_scales = None
 
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
 
@@ -1319,12 +1313,10 @@ class GPT(nn.Module):
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
         # FP8 pre-quantized weights for Triton kernel (no _scaled_mm, no fusion breakage)
-        use_mlp_fp8 = self.training and self._mlp_bank_f8 is not None and not os.environ.get("DISABLE_MLP_FP8")
-        fp8_skip_last = int(os.environ.get("FP8_SKIP_LAST", "0"))
+        use_mlp_fp8 = self.training and self._mlp_fc_f8 is not None
         if use_mlp_fp8:
-            mlp_f8_all = self._mlp_bank_f8.flatten(0, 1).unbind(0)
-            mlp_fc_f8 = mlp_f8_all[0::2]
-            mlp_fc_scales = [self._mlp_bank_scales[i*2:i*2+1] for i in range(12)]
+            mlp_fc_f8 = self._mlp_fc_f8.unbind(0)
+            mlp_fc_scales = [self._mlp_fc_scales[i:i+1] for i in range(12)]
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
@@ -1371,9 +1363,9 @@ class GPT(nn.Module):
             qkvo_w = attn_weights[attn_idx] if attn_idx is not None else None
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
-            use_fp8_here = use_mlp_fp8 and i < (12 - fp8_skip_last)
+            use_fp8_here = use_mlp_fp8
             if use_fp8_here:
-                fc_f8, fc_s = mlp_fc_f8[i], mlp_fc_scales[i]
+                fc_f8, fc_scale = mlp_fc_f8[i], mlp_fc_scales[i]
 
             # Select attention variant for this layer
             attn = self.attn_paired if i in self.paired_head_layers else self.attn
@@ -1389,8 +1381,8 @@ class GPT(nn.Module):
             if use_fp8_here:
                 amax = normed.detach().abs().max().clamp(min=1e-12)
                 x_f8 = (normed.detach() * (448.0 / amax)).to(torch.float8_e4m3fn)
-                self._fp8_scale_buf.copy_(fc_s).mul_(amax).div_(448.0)
-                mlp_args = (c_fc, c_proj, fc_f8, self._fp8_scale_buf, x_f8)
+                self._mlp_dequant_scale_buf.copy_(fc_scale).mul_(amax).div_(448.0)
+                mlp_args = (c_fc, c_proj, fc_f8, self._mlp_dequant_scale_buf, x_f8)
             else:
                 mlp_args = (c_fc, c_proj)
             x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(normed, *mlp_args)
@@ -2027,11 +2019,6 @@ for step in range(train_steps + 1):
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-        # Log per-layer FP8 activation amaxes (from current scaling)
-        if hasattr(model._orig_mod, '_fp8_layer_amaxes') and model._orig_mod._fp8_layer_amaxes is not None:
-            amaxes = model._orig_mod._fp8_layer_amaxes
-            amax_str = ' '.join(f'{a:.2f}' for a in amaxes.tolist())
-            print0(f"  fp8_act_amaxes: [{amax_str}]")
         model.train()
         # start the clock again
         torch.cuda.synchronize()
