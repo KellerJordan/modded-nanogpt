@@ -155,20 +155,20 @@ def setup_context_t(ctx: torch.autograd.function.FunctionCtx, inputs, output):
 mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 
 # -----------------------------------------------------------------------------
-# FP8 pre-quantized MLP weights for Triton kernel
+# FP8 MLP up-projection weight cache for the Triton kernel
 
 def quantize_weights_fp8(model):
-    """Pre-quantize MLP up-projection weights to FP8 for the Triton MLP kernel."""
+    """Refresh the FP8 copy of the MLP up-projection weights after optimizer steps."""
     E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
     with torch.no_grad():
-        if model._mlp_fc_f8 is None:
-            model._mlp_fc_f8 = torch.zeros_like(model.mlp_bank[:, 0], dtype=torch.float8_e4m3fn)
-            model._mlp_fc_scales = torch.ones(12, dtype=torch.float32, device=model.mlp_bank.device)
+        if model._mlp_up_proj_f8 is None:
+            model._mlp_up_proj_f8 = torch.zeros_like(model.mlp_bank[:, 0], dtype=torch.float8_e4m3fn)
+            model._mlp_up_proj_scales = torch.ones(12, dtype=torch.float32, device=model.mlp_bank.device)
             model._mlp_dequant_scale_buf = torch.ones(1, dtype=torch.float32, device=model.mlp_bank.device)
         flat = model.mlp_bank[:, 0].view(12, -1)
         scales = flat.abs().amax(dim=1).clamp(min=1e-12) / E4M3_MAX
-        model._mlp_fc_scales[:] = scales.float()
-        model._mlp_fc_f8[:] = (model.mlp_bank[:, 0] / scales.view(12, 1, 1)).to(torch.float8_e4m3fn)
+        model._mlp_up_proj_scales[:] = scales.float()
+        model._mlp_up_proj_f8[:] = (model.mlp_bank[:, 0] / scales.view(12, 1, 1)).to(torch.float8_e4m3fn)
 
 # -----------------------------------------------------------------------------
 # Polar Express
@@ -1240,8 +1240,8 @@ class GPT(nn.Module):
         # Transposed weight storage for faster gradient accumulation
         self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
 
-        self._mlp_fc_f8 = None
-        self._mlp_fc_scales = None
+        self._mlp_up_proj_f8 = None
+        self._mlp_up_proj_scales = None
 
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
 
@@ -1312,11 +1312,10 @@ class GPT(nn.Module):
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
-        # FP8 pre-quantized weights for Triton kernel (no _scaled_mm, no fusion breakage)
-        use_mlp_fp8 = self.training and self._mlp_fc_f8 is not None
+        use_mlp_fp8 = self.training and self._mlp_up_proj_f8 is not None and not os.environ.get("DISABLE_FP8", False)
         if use_mlp_fp8:
-            mlp_fc_f8 = self._mlp_fc_f8.unbind(0)
-            mlp_fc_scales = [self._mlp_fc_scales[i:i+1] for i in range(12)]
+            mlp_up_proj_f8 = self._mlp_up_proj_f8.unbind(0)
+            mlp_up_proj_scales = [self._mlp_up_proj_scales[i:i+1] for i in range(12)]
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
@@ -1363,9 +1362,8 @@ class GPT(nn.Module):
             qkvo_w = attn_weights[attn_idx] if attn_idx is not None else None
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
-            use_fp8_here = use_mlp_fp8
-            if use_fp8_here:
-                fc_f8, fc_scale = mlp_fc_f8[i], mlp_fc_scales[i]
+            if use_mlp_fp8:
+                up_proj_f8, up_proj_scale = mlp_up_proj_f8[i], mlp_up_proj_scales[i]
 
             # Select attention variant for this layer
             attn = self.attn_paired if i in self.paired_head_layers else self.attn
@@ -1378,11 +1376,11 @@ class GPT(nn.Module):
                 attn_out = attn(norm(attn_in), attn_args, qkvo_w)
                 x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
             normed = norm(x)
-            if use_fp8_here:
+            if use_mlp_fp8:
                 amax = normed.detach().abs().max().clamp(min=1e-12)
                 x_f8 = (normed.detach() * (448.0 / amax)).to(torch.float8_e4m3fn)
-                self._mlp_dequant_scale_buf.copy_(fc_scale).mul_(amax).div_(448.0)
-                mlp_args = (c_fc, c_proj, fc_f8, self._mlp_dequant_scale_buf, x_f8)
+                self._mlp_dequant_scale_buf.copy_(up_proj_scale).mul_(amax).div_(448.0)
+                mlp_args = (c_fc, c_proj, up_proj_f8, self._mlp_dequant_scale_buf, x_f8)
             else:
                 mlp_args = (c_fc, c_proj)
             x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(normed, *mlp_args)
