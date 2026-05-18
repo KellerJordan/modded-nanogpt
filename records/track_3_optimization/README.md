@@ -6,7 +6,7 @@ Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any
 [Longform announcement](https://x.com/kellerjordan0/status/2049193527440187494)
 
 Thank you to everyone who's contributed results so far:
-@kaiyue-wen, @nilin, @alint77, @wilsoncwu, @kumarkrishna, @lliu606, @bentherien, @Sam_Acqua, @zhehangdu, @SPThole, @liyang2019, and @zzp1012.
+@kaiyue-wen, @nilin, @alint77, @wilsoncwu, @kumarkrishna, @lliu606, @bentherien, @Sam_Acqua, @zhehangdu, @SPThole, @liyang2019, @zzp1012, and @wakamex.
 
 
 ## Quickstart
@@ -55,6 +55,7 @@ If it fails to reproduce (i.e., we get statistical evidence that its mean is abo
 | 19 | 3125 | 3.2780 (n=6)✓ | Setup from #8, with NorMuonH replaced by [KL-SOAP](https://arxiv.org/abs/2509.03378) with hyperball optimization, precondition_frequency=1, lr=.018, beta1=.95, beta2=.9, shampoo_beta=.9  | 2026/05/08 | [log](results/20260508_klsoap_h_clean_tuple_sweep/b1095_sh090/klsoap-h-b1095_sh090-K3125-seed-1.full.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/290) | @kaiyue-wen |
 | 20 | 3030(!) | 3.2790 (n=30)✓ | Setup from #16, plus interpolation between Contra-Muon and new method Soft-Muon, plus tuned lr schedule inherited from thingy | 2026/05/09 | [log](results/20260509_contra_soft_muon/03c36e81-e2e5-4916-bf16-0141999b1dbb.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/291) | @nilin |
 | 21 | 4100 | 3.2776 (n=4)✓ | Shampoo(power=-1/4, lr=0.0015, betas=(.9, .95), weight_decay=0.2, precond_freq=5) | 2026/05/13 | [log](results/20260513_shampoo_1_4_power/503575c5-6dde-425a-b461-2df4d99db974.txt) | N/A | @kellerjordan0 |
+| 22 | 3000(!) | 3.2778 (n=9)✓ | Setup from #20, plus a SODA-style hidden-matrix anchor correction toward initialization, faded out with a cosine schedule from step 2000 to 2750 | 2026/05/18 | [log](results/20260518_soda_fade_3000_n9/README.md) | N/A | @wakamex |
 
 <table>
   <tr>
