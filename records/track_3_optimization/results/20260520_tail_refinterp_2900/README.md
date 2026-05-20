@@ -134,7 +134,7 @@ What worked:
 - Late-only Tempered Polar was better than perturbing the full trajectory.
 - The late radial and `TARGET_UW=0.400` retune improved the exact-2900 endpoint.
 - Tail velocity with negative gamma helped versus earlier final-weight probes.
-- The step-2375 reference interpolation was the decisive move, especially on
+- The step-2375 reference interpolation was very helpful, especially on
   weak seeds.
 
 What did not work:
