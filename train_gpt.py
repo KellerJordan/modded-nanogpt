@@ -1059,7 +1059,7 @@ class AttnArgs:
     ve_gate_w: torch.Tensor
     train_max_seq_len: torch.Tensor
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+flash_attn_interface = get_kernel('kernels-community/flash-attn3', version=1).flash_attn_interface
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
@@ -1299,22 +1299,8 @@ class GPT(nn.Module):
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
         
-        # Bigram embeddings: Each embedding is shared across dozens of bigrams as ~50k*50k bigrams
-        # are mapped into fewer rows. Use the following 'trick' (Chen et al. 2015, "Compressing Neural
-        # Networks with the Hashing Trick") to allow 1 embedding to still carry a distinguishable
-        # meaning for each of its bigrams:
-        # - Suppose g_j is (bigram j)'s optimal embedding, i.e. the learned vector if there were no
-        #   hash collisions with other bigrams
-        # - In the forward pass, multiply the embedding with a random +/-1 sign pattern s_j
-        #   (fixed for each j). The learned embedding will become g_j*s_j. In the forward pass
-        #   we use (g_j*s_j)*s_j=g_j and thus end up using the optimal embedding g_j -> multiplying
-        #   with s_j didn't change what the forward pass effectively computes!
-        # - Now, if there are other bigrams i sharing the same embedding, we end up with a learned
-        #   embedding Σ_i(g_i*s_i). However, in the forward pass, we 'recover' j's optimal
-        #   embedding because the cross-terms (s_i*s_j) for i≠j roughly cancel each other out
-        #   (since we picked random signs), leading to (Σ_i(g_i*s_i))*s_j ~ g_j
-        # - In other words, we 'hide' 50k*50k optimal embeddings g_j inside fewer rows (note: we could
-        #   draw s_j from a Sylvester-Hadamard matrix for better cancellation but results were similar)
+        # Use sign-trick to better compress multiple bigrams into a shared bigram embedding row
+        # (details in https://github.com/KellerJordan/modded-nanogpt/pull/299 by @trianxy)
         sign_idx = torch.zeros_like(input_seq)
         sign_idx[1:] = (input_seq[:-1] ^ input_seq[1:]) % self.bigram_sign_table.shape[0]  # (8192,)
         bigram_signs = self.bigram_sign_table[sign_idx]                                    # (seq, bigram_dim)
@@ -1597,7 +1583,7 @@ class Hyperparameters:
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
-    bigram_vocab_size: int = 50304 * 14
+    bigram_vocab_size: int = 50304 * 15
     bigram_dim: int = 192
     bigram_sign_table_rows: int = 8192  # prefer a power of 2 (values ~500-15000 gave similar results)
 
