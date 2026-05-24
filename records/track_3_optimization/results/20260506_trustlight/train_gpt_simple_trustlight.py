@@ -1,0 +1,680 @@
+"""
+idea_10e_attnproj_bounded_trust_floor_soapish.py
+
+This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
+It was prepared as a simplified version of the speedrun for use in neural net optimization research.
+
+Contra Muon (https://github.com/nilin/contra-muon):
+Newton-Schulz momentum update subtracts CONTRA_MUON / 2 times the operator-normalized
+momentum gradient before the PR 274 NorMuon-lite row/column variance normalization and
+u/w-floor postprocessing. Here CONTRA_MUON=0.4, so the subtracted component is 0.2 times
+the normalized gradient.
+
+This prototype keeps PR 278 MLP SOAP unchanged. For attention-output SOAP, it
+keeps the tail-cap from step 0, then blends SOAP with raw momentum using a
+geometric trust gate. Unlike idea 10c, it gives attention SOAP a bounded early
+floor and cap: enough SOAP to recover some fast-start benefit, never enough to
+let full whitening dominate the trajectory.
+"""
+
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import uuid
+import time
+from pathlib import Path
+
+import torch
+from torch import Tensor, nn
+from torch.optim import AdamW
+import torch.nn.functional as F
+import torch.distributed as dist
+
+# cuDNN SDPA can fail to build an execution plan for this compiled causal-attention
+# layout on some PyTorch/CUDA/cuDNN combinations. Leave Flash/mem-efficient/math SDPA
+# enabled and only remove the cuDNN backend from consideration.
+torch.backends.cuda.enable_cudnn_sdp(False)
+
+SEED = int(os.environ.get("SEED", "0"))
+EXPERIMENT_NAME = "idea_10e_attnproj_bounded_trust_floor_soapish"
+EXPERIMENT_INTUITION = "Tail-cap attention SOAP from step 0, with a bounded early trust floor to regain speed without the full-SOAP bad path."
+CONTRA_MUON = 0.4
+MU = 0.95
+MUON_LR = 0.0375
+MUON_WEIGHT_DECAY = 0.025
+TARGET_UW = 0.35
+NOR_BETA2 = 0.95
+SOAP_BETA2 = 0.90
+SOAP_PRECONDITION_FREQUENCY = 10
+SOAP_DENOM_POWER = 0.50
+SOAP_BLEND = 1.00
+SOAP_UPDATE_BEFORE_USE = False
+SOAP_PARAM_MODE = "mlp_plus_attn_proj"
+ATTN_SOAP_DENOM_FLOOR = float(os.environ.get("ATTN_SOAP_DENOM_FLOOR", "0.20"))
+ATTN_EARLY_TRUST_FLOOR = float(os.environ.get("ATTN_EARLY_TRUST_FLOOR", "0.45"))
+ATTN_EARLY_TRUST_CAP = float(os.environ.get("ATTN_EARLY_TRUST_CAP", "0.85"))
+ATTN_TRUST_FLOOR_END_STEP = int(os.environ.get("ATTN_TRUST_FLOOR_END_STEP", "1375"))
+ATTN_TRUST_FLOOR_FADE_END_STEP = int(os.environ.get("ATTN_TRUST_FLOOR_FADE_END_STEP", "1625"))
+ATTN_TRUST_MIN_AGREE = float(os.environ.get("ATTN_TRUST_MIN_AGREE", "0.20"))
+ATTN_TRUST_MIN_GRAD_ALIGN = float(os.environ.get("ATTN_TRUST_MIN_GRAD_ALIGN", "0.00"))
+ATTN_TRUST_POWER = float(os.environ.get("ATTN_TRUST_POWER", "1.00"))
+
+# Exploratory compute-saving screen. Disable for official evidence runs because
+# the benchmark rules disallow per-run early stopping based on val loss.
+EARLY_STOP = os.environ.get("EARLY_STOP", "0") == "1"
+EARLY_STOP_CATASTROPHIC_STEPS = int(os.environ.get("EARLY_STOP_CATASTROPHIC_STEPS", "125"))
+EARLY_STOP_CATASTROPHIC_MARGIN = float(os.environ.get("EARLY_STOP_CATASTROPHIC_MARGIN", "0.50"))
+EARLY_STOP_GRACE_STEPS = int(os.environ.get("EARLY_STOP_GRACE_STEPS", "1000"))
+EARLY_STOP_MARGIN = float(os.environ.get("EARLY_STOP_MARGIN", "0.03"))
+EARLY_STOP_PATIENCE = int(os.environ.get("EARLY_STOP_PATIENCE", "2"))
+TARGET_VAL_LOSS = float(os.environ.get("TARGET_VAL_LOSS", "0"))
+TRAIN_PROGRESS_INTERVAL = int(os.environ.get("TRAIN_PROGRESS_INTERVAL", "0"))
+SOTA_VAL_BY_STEP = {
+    125: 4.51874, 250: 4.05652, 375: 3.90008, 500: 3.81916,
+    625: 3.76341, 750: 3.72655, 875: 3.69846, 1000: 3.66557,
+    1125: 3.63985, 1250: 3.60786, 1375: 3.58225, 1500: 3.54816,
+    1625: 3.52684, 1750: 3.49950, 1875: 3.47572, 2000: 3.45172,
+    2125: 3.42949, 2250: 3.40805, 2375: 3.38724, 2500: 3.36632,
+    2625: 3.34535, 2750: 3.32580, 2875: 3.30741, 3000: 3.29107,
+    3100: 3.28049, 3125: 3.27861, 3150: 3.27720, 3175: 3.27659,
+}
+
+
+########################################
+#              Dataloader              #
+########################################
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2]) # number of tokens (claimed)
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    files = sorted(Path.cwd().glob(filename_pattern))
+    assert batch_size % world_size == 0
+    local_batch_size = batch_size // world_size
+    file_iter = iter(files)
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    while True:
+        if pos + batch_size + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+        buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        pos += batch_size
+        yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
+
+
+########################################
+#             Architecture             #
+########################################
+
+def norm(x: Tensor):
+    return F.rms_norm(x, (x.size(-1),))
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gains = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return (norm(x.float()) * self.gains).type_as(x)
+
+class Linear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=True)
+
+    def forward(self, x):
+        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        # half-truncate RoPE (w/ base freq tuning)
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        self.register_buffer("angular_freq", torch.cat([angular_freq, angular_freq.new_zeros(dim//4)]))
+
+    def forward(self, x_BTHD: Tensor):
+        pos = torch.arange(x_BTHD.size(1), dtype=torch.float32, device=x_BTHD.device)
+        theta = torch.outer(pos, self.angular_freq)[None, :, None, :]
+        cos, sin = theta.cos(), theta.sin()
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, head_dim=128):
+        super().__init__()
+        self.num_heads = dim // head_dim
+        self.head_dim = head_dim
+        hdim = self.num_heads * self.head_dim
+        self.q = Linear(dim, hdim)
+        self.k = Linear(dim, hdim)
+        self.v = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+        self.rotary = Rotary(head_dim)
+
+    def forward(self, x: Tensor):
+        B, T = x.size(0), x.size(1)
+        q = self.q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.v(x).view(B, T, self.num_heads, self.head_dim)
+        q, k = norm(q), norm(k)
+        q, k = self.rotary(q), self.rotary(k)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
+                                           v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+        y = self.proj(y)
+        return y
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.fc = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+
+    def forward(self, x: Tensor):
+        x = self.fc(x)
+        x = x.relu().square()
+        x = self.proj(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.attn = CausalSelfAttention(dim)
+        self.mlp = MLP(dim)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+
+    def forward(self, x: Tensor):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
+        self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
+        self.proj = Linear(model_dim, vocab_size)
+        self.norm1 = RMSNorm(model_dim)
+        self.norm2 = RMSNorm(model_dim)
+
+    def forward(self, inputs: Tensor, targets: Tensor):
+        x = self.norm1(self.embed(inputs))
+        for block in self.blocks:
+            x = block(x)
+        logits = self.proj(self.norm2(x)).float()
+        logits = 15 * logits * (logits.square() + 15**2).rsqrt()
+        return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
+
+
+########################################
+#              Optimizer               #
+########################################
+
+def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
+    assert G.ndim >= 2
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Perform the NS iterations, not optimizing for wallclock speed
+    a, b, c = 2, -1.5, 0.5
+    for _ in range(12):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+def scale_to_unit_operator_norm(G: Tensor, eps: float = 1e-10) -> Tensor:
+    X = G.float()
+    v = torch.ones(X.size(-1), dtype=X.dtype, device=X.device)
+    v = v / torch.clamp(v.norm(), min=eps)
+    for _ in range(5):
+        u = X @ v
+        u = u / torch.clamp(u.norm(), min=eps)
+        v = X.mT @ u
+        v = v / torch.clamp(v.norm(), min=eps)
+    op_norm = torch.clamp((X @ v).norm(), min=eps)
+    return G / op_norm.to(G.dtype)
+
+def should_soap_param(name: str) -> bool:
+    is_mlp_fc = name.endswith(".mlp.fc.weight")
+    is_mlp_proj = name.endswith(".mlp.proj.weight")
+    is_attn_proj = name.endswith(".attn.proj.weight")
+    is_qkv = (
+        name.endswith(".attn.q.weight")
+        or name.endswith(".attn.k.weight")
+        or name.endswith(".attn.v.weight")
+    )
+    if SOAP_PARAM_MODE == "mlp_all":
+        return is_mlp_fc or is_mlp_proj
+    if SOAP_PARAM_MODE == "mlp_fc":
+        return is_mlp_fc
+    if SOAP_PARAM_MODE == "mlp_proj":
+        return is_mlp_proj
+    if SOAP_PARAM_MODE == "mlp_plus_attn_proj":
+        return is_mlp_fc or is_mlp_proj or is_attn_proj
+    if SOAP_PARAM_MODE == "mlp_plus_qkv":
+        return is_mlp_fc or is_mlp_proj or is_qkv
+    if SOAP_PARAM_MODE == "all_hidden":
+        return is_mlp_fc or is_mlp_proj or is_attn_proj or is_qkv
+    raise ValueError(f"unknown SOAP_PARAM_MODE={SOAP_PARAM_MODE}")
+
+def is_attn_proj_param(name: str) -> bool:
+    return name.endswith(".attn.proj.weight")
+
+def tensor_cosine(a: Tensor, b: Tensor, eps: float = 1e-8) -> Tensor:
+    a_f, b_f = a.float(), b.float()
+    return (a_f * b_f).sum() / (a_f.norm() * b_f.norm()).clamp_min(eps)
+
+def trust_gate(raw: Tensor, soap: Tensor, grad: Tensor, eps: float = 1e-8) -> Tensor:
+    # SOAP is trusted when it still points with raw momentum and is at least as
+    # gradient-aligned as raw momentum. This catches stale whitening bases.
+    raw_grad = tensor_cosine(raw, grad, eps)
+    soap_grad = tensor_cosine(soap, grad, eps)
+    soap_raw = tensor_cosine(soap, raw, eps)
+
+    agree_gate = ((soap_raw - ATTN_TRUST_MIN_AGREE) / (1 - ATTN_TRUST_MIN_AGREE)).clamp(0, 1)
+    denom = (raw_grad - ATTN_TRUST_MIN_GRAD_ALIGN).clamp_min(eps)
+    grad_gate = ((soap_grad - ATTN_TRUST_MIN_GRAD_ALIGN) / denom).clamp(0, 1)
+    gate = (agree_gate * grad_gate).clamp(0, 1)
+    if ATTN_TRUST_POWER != 1.0:
+        gate = gate.pow(ATTN_TRUST_POWER)
+    return gate
+
+def early_trust_floor_for_step(step: int) -> float:
+    if ATTN_TRUST_FLOOR_FADE_END_STEP <= ATTN_TRUST_FLOOR_END_STEP:
+        return 0.0 if step >= ATTN_TRUST_FLOOR_FADE_END_STEP else ATTN_EARLY_TRUST_FLOOR
+    if step < ATTN_TRUST_FLOOR_END_STEP:
+        return ATTN_EARLY_TRUST_FLOOR
+    if step >= ATTN_TRUST_FLOOR_FADE_END_STEP:
+        return 0.0
+    return ATTN_EARLY_TRUST_FLOOR * (
+        ATTN_TRUST_FLOOR_FADE_END_STEP - step
+    ) / (ATTN_TRUST_FLOOR_FADE_END_STEP - ATTN_TRUST_FLOOR_END_STEP)
+
+def bounded_trust_gate(gate: Tensor, step: int) -> Tensor:
+    floor = early_trust_floor_for_step(step)
+    cap = ATTN_EARLY_TRUST_CAP if step < ATTN_TRUST_FLOOR_FADE_END_STEP else 1.0
+    return gate.clamp(min=floor, max=cap)
+
+def norm_preserving_blend(raw: Tensor, soap: Tensor, gate: Tensor, eps: float = 1e-8) -> Tensor:
+    blended = raw + (soap - raw) * gate.to(raw.dtype)
+    raw_norm = raw.float().norm().clamp_min(eps)
+    blended_norm = blended.float().norm().clamp_min(eps)
+    return (blended * (raw_norm / blended_norm).to(blended.dtype)).to(raw.dtype)
+
+def soap_eigenbasis(mat: Tensor) -> Tensor:
+    try:
+        _, q = torch.linalg.eigh(mat + 1e-30 * torch.eye(mat.size(0), device=mat.device))
+    except RuntimeError:
+        _, q = torch.linalg.eigh(mat.double() + 1e-30 * torch.eye(mat.size(0), device=mat.device))
+        q = q.float()
+    return torch.flip(q, [1])
+
+def soap_basis_qr(row_gg, col_gg, q_row, q_col, exp_avg_sq):
+    row_eig = torch.diag(q_row.T @ row_gg @ q_row)
+    row_sort = torch.argsort(row_eig, descending=True)
+    q_row = q_row[:, row_sort]
+    exp_avg_sq = exp_avg_sq.index_select(0, row_sort)
+    q_row, _ = torch.linalg.qr(row_gg @ q_row)
+
+    col_eig = torch.diag(q_col.T @ col_gg @ q_col)
+    col_sort = torch.argsort(col_eig, descending=True)
+    q_col = q_col[:, col_sort]
+    exp_avg_sq = exp_avg_sq.index_select(1, col_sort)
+    q_col, _ = torch.linalg.qr(col_gg @ q_col)
+    return q_row, q_col, exp_avg_sq
+
+def soap_precondition_momentum(update, state, beta2=SOAP_BETA2, eps=1e-8,
+                               blend=SOAP_BLEND, denom_floor_ratio=0.0):
+    update_f = update.float()
+    if state["q_row"] is None:
+        return update
+    q_row, q_col = state["q_row"], state["q_col"]
+    projected = q_row.T @ update_f @ q_col
+    state["exp_avg_sq"].mul_(beta2).add_(projected.square(), alpha=1 - beta2)
+    denom = state["exp_avg_sq"].clamp_min(eps * eps).pow(SOAP_DENOM_POWER)
+    if denom_floor_ratio > 0:
+        denom_floor = denom.float().square().mean().sqrt().mul(denom_floor_ratio).clamp_min(eps)
+        denom = denom.clamp_min(denom_floor.to(denom.dtype))
+    precond = q_row @ (projected / denom) @ q_col.T
+    if blend != 1.0:
+        precond = blend * precond + (1 - blend) * update_f
+    precond.mul_(update_f.norm() / precond.norm().clamp_min(eps))
+    return precond.to(update.dtype)
+
+def soap_update_preconditioner(grad, state, shampoo_beta=SOAP_BETA2, precondition_frequency=SOAP_PRECONDITION_FREQUENCY):
+    grad_f = grad.float()
+    state["row_gg"].lerp_(grad_f @ grad_f.T, 1 - shampoo_beta)
+    state["col_gg"].lerp_(grad_f.T @ grad_f, 1 - shampoo_beta)
+    if state["q_row"] is None:
+        state["q_row"] = soap_eigenbasis(state["row_gg"])
+        state["q_col"] = soap_eigenbasis(state["col_gg"])
+    elif state["soap_step"] > 0 and state["soap_step"] % precondition_frequency == 0:
+        state["q_row"], state["q_col"], state["exp_avg_sq"] = soap_basis_qr(
+            state["row_gg"], state["col_gg"], state["q_row"], state["q_col"], state["exp_avg_sq"]
+        )
+    state["soap_step"] += 1
+
+# NorMuon-lite (port from track_1 2025-10-24): per-row variance EMA on top of NS,
+# normalize each row by 1/sqrt(EMA), then renormalize Frobenius back to original.
+# This is Adam-style 2nd moment but per-ROW (not per-element), preserving Muon's spectral
+# structure while adaptively reweighting between rows.
+def muon_update(update, second_moment, beta2=NOR_BETA2):
+    normalized_grad = scale_to_unit_operator_norm(update.clone())
+    update = zeropower_via_newtonschulz5(update)
+    opower_frobenius_norm = update.norm()
+
+    # https://github.com/nilin/contra-muon
+    update = update - CONTRA_MUON / 2 * normalized_grad
+    update = update * opower_frobenius_norm / torch.clamp(update.norm(), min=1e-10)
+    update *= max(1, update.size(-2) / update.size(-1))**0.5
+    # Per-row variance (or per-col if matrix is wide). Keep along the longer dim.
+    if update.size(-2) >= update.size(-1):
+        per_row_var = (update * update).mean(dim=-1, keepdim=True)  # shape (..., m, 1)
+    else:
+        per_row_var = (update * update).mean(dim=-2, keepdim=True)  # shape (..., 1, n)
+    second_moment.lerp_(per_row_var.float(), 1 - beta2)
+    vnorm = update.norm()
+    update = update * second_moment.clamp_min(1e-10).rsqrt().to(update.dtype)
+    vnorm_new = update.norm().clamp_min(1e-10)
+    update = update * (vnorm / vnorm_new)
+    return update
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, named_params, lr=0.02, weight_decay=0, mu=0.95):
+        assert isinstance(named_params, list) and len(named_params) >= 1
+        self.soap_params = {p for n, p in named_params if should_soap_param(n)}
+        self.attn_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_proj_param(n)}
+        self.step_count = 0
+        params = sorted([p for _, p in named_params], key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        for group in self.param_groups:
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum"] = torch.zeros_like(p)
+                        if p in self.soap_params:
+                            state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+                            state["row_gg"] = torch.zeros(p.size(0), p.size(0), dtype=torch.float32, device=p.device)
+                            state["col_gg"] = torch.zeros(p.size(1), p.size(1), dtype=torch.float32, device=p.device)
+                            state["q_row"] = None
+                            state["q_col"] = None
+                            state["soap_step"] = 0
+                        # Second-moment buffer matches per-row-or-col shape.
+                        if p.size(-2) >= p.size(-1):
+                            state["second_moment"] = torch.zeros((*p.shape[:-1], 1),
+                                dtype=torch.float32, device=p.device)
+                        else:
+                            state["second_moment"] = torch.zeros((*p.shape[:-2], 1, p.shape[-1]),
+                                dtype=torch.float32, device=p.device)
+                    grad = p.grad
+                    state["momentum"].lerp_(grad, 1 - group["mu"])
+                    momentum_update = grad.lerp(state["momentum"], group["mu"])
+                    is_attn_soap = p in self.attn_soap_params
+                    use_soap = p in self.soap_params
+                    if use_soap and SOAP_UPDATE_BEFORE_USE:
+                        soap_update_preconditioner(grad, state)
+                    if use_soap:
+                        if is_attn_soap:
+                            soap_update = soap_precondition_momentum(
+                                momentum_update, state, blend=1.0,
+                                denom_floor_ratio=ATTN_SOAP_DENOM_FLOOR
+                            )
+                            gate = bounded_trust_gate(
+                                trust_gate(momentum_update, soap_update, grad),
+                                self.step_count
+                            )
+                            momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
+                        else:
+                            momentum_update = soap_precondition_momentum(momentum_update, state, blend=SOAP_BLEND)
+                    update = muon_update(momentum_update, state["second_moment"])
+                    # u/w-floor. If u/w would be below TARGET (0.35), scale UP to maintain 0.35.
+                    # If u/w >= TARGET (early training when weights are small), leave update alone.
+                    p_fro = p.float().norm().clamp_min(1e-8)
+                    u_fro = update.float().norm().clamp_min(1e-8)
+                    cur_uw = u_fro / p_fro
+                    scale = torch.where(cur_uw < TARGET_UW, TARGET_UW * p_fro / u_fro, torch.ones_like(p_fro))
+                    update = update * scale.to(update.dtype)
+                    # WD set to 0 — u/w target replaces wd's role (smaller updates as p grows).
+                    p.add_(update, alpha=-group["lr"])
+                    if use_soap and not SOAP_UPDATE_BEFORE_USE:
+                        soap_update_preconditioner(grad, state)
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+        self.step_count += 1
+
+
+########################################
+#                Setup                 #
+########################################
+
+# torchrun sets these env variables
+device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+torch.cuda.set_device(device)
+torch.manual_seed(SEED)
+dist.init_process_group(backend="nccl", device_id=device)
+dist.barrier()
+# this code can be run equivalently with 1, 2, 4, or 8 gpus.
+assert 8 % dist.get_world_size() == 0
+
+# logging setup
+if dist.get_rank() == 0:
+    log_dir = Path(os.environ.get("LOG_DIR", "logs"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logfile = str(log_dir / f"{uuid.uuid4()}.txt")
+    print(logfile, flush=True)
+def print0(s, console=False, log=True):
+    if dist.get_rank() == 0:
+        if console:
+            print(s, flush=True)
+        if log:
+            with open(logfile, "a") as f:
+                print(s, file=f)
+
+# we begin by logging this file itself
+print0(code)
+print0("="*100)
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
+print0(f"Running on device_name={torch.cuda.get_device_name(device)} with world_size={dist.get_world_size()}")
+print0(f"Using seed={SEED}")
+print0(f"Experiment={EXPERIMENT_NAME}")
+print0(f"Intuition={EXPERIMENT_INTUITION}")
+print0("Contra Muon modifies Muon by subtracting CONTRA_MUON/2 times the operator-normalized momentum gradient.")
+print0("This script retains the PR 274 NorMuon-lite row/column variance normalization and u/w-floor postprocessing.")
+print0("MLP SOAP stays on all run; attention projection SOAP is tail-capped with a bounded early trust floor.")
+print0("Schedule cools to zero at train_steps=3175, matching PR 278 v18.")
+print0(f"Using contra_muon={CONTRA_MUON}")
+print0(f"Using opnorm_grad_subtraction={CONTRA_MUON / 2}")
+print0(f"Using mu={MU}")
+print0(f"Using muon_lr={MUON_LR}")
+print0(f"Using muon_weight_decay={MUON_WEIGHT_DECAY}")
+print0(f"Using target_uw={TARGET_UW}")
+print0(f"Using nor_beta2={NOR_BETA2}")
+print0(f"Using soap_beta2={SOAP_BETA2}")
+print0(f"Using soap_precondition_frequency={SOAP_PRECONDITION_FREQUENCY}")
+print0(f"Using soap_denom_power={SOAP_DENOM_POWER}")
+print0(f"Using soap_blend={SOAP_BLEND}")
+print0(f"Using soap_update_before_use={SOAP_UPDATE_BEFORE_USE}")
+print0(f"Using soap_param_mode={SOAP_PARAM_MODE}")
+print0(f"Using attn_soap_denom_floor={ATTN_SOAP_DENOM_FLOOR}")
+print0(f"Using attn_early_trust_floor={ATTN_EARLY_TRUST_FLOOR}")
+print0(f"Using attn_early_trust_cap={ATTN_EARLY_TRUST_CAP}")
+print0(f"Using attn_trust_floor_end_step={ATTN_TRUST_FLOOR_END_STEP}")
+print0(f"Using attn_trust_floor_fade_end_step={ATTN_TRUST_FLOOR_FADE_END_STEP}")
+print0(f"Using attn_trust_min_agree={ATTN_TRUST_MIN_AGREE}")
+print0(f"Using attn_trust_min_grad_align={ATTN_TRUST_MIN_GRAD_ALIGN}")
+print0(f"Using attn_trust_power={ATTN_TRUST_POWER}")
+print0(f"Using target_val_loss={TARGET_VAL_LOSS}")
+print0("="*100)
+
+val_tokens = 20 * 524288
+batch_size = 8 * 64 * 1024
+mbs = 64
+train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
+
+model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
+model.compile(dynamic=False)
+
+
+########################################
+#       Init & Optim Hyperparams       #
+########################################
+
+# we want to minimize this while still reaching 3.28 val loss
+train_steps = 3175
+val_regular_interval = 125
+tail_val_start_step = 3000
+tail_val_interval = 2
+extra_val_steps = {3100, 3125, 3150, 3175}
+
+# initialize model parameters
+for name, p in model.named_parameters():
+    if "proj" in name:
+        p.data.zero_()
+
+# create the optimizer(s)
+optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
+                    dict(params=[model.proj.weight], lr=1/320),
+                    dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
+                   betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
+# Skylight-001: NorMuon-lite (per-row variance) + u/w-floor=0.35 + lr=0.0375 + wd=0.025.
+optimizer2 = Muon([(n, p) for n, p in model.blocks.named_parameters() if p.ndim >= 2],
+                  lr=MUON_LR, weight_decay=MUON_WEIGHT_DECAY, mu=MU)
+optimizers = [optimizer1, optimizer2]
+assert set(p for opt in optimizers for group in opt.param_groups
+           for p in group["params"]) == set(model.parameters())
+for opt in optimizers:
+    for group in opt.param_groups:
+        group["initial_lr"] = group["lr"]
+
+# learning rate schedule: stable then decay
+def set_hparams(step, cooldown_frac=0.7):
+    progress = step / train_steps
+    assert 0 <= progress < 1
+    if progress < 1 - cooldown_frac:
+        eta = 1.0
+    else:
+        eta = (1 - progress) / cooldown_frac
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * eta
+
+
+########################################
+#        Training and Validation       #
+########################################
+
+for p in model.parameters():
+    dist.broadcast(p.detach(), 0)
+# start the clock
+early_stop_bad_points = 0
+training_time = 0
+dist.barrier()
+t0 = time.perf_counter()
+for step in range(train_steps + 1):
+
+    # --------------- VALIDATION SECTION -----------------
+    should_validate = (
+        step == train_steps
+        or (step > 0 and step % val_regular_interval == 0)
+        or (step >= tail_val_start_step and step % tail_val_interval == 0)
+        or step in extra_val_steps
+    )
+    if should_validate:
+        # stop the clock
+        dist.barrier()
+        training_time += time.perf_counter() - t0
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            assert len(val_inputs) % mbs == 0
+            for i in range(len(val_inputs) // mbs):
+                val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+        dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+        val_loss /= val_tokens
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
+               + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
+        current_val_loss = float(val_loss.item())
+        if TARGET_VAL_LOSS > 0 and current_val_loss <= TARGET_VAL_LOSS:
+            print0(f"target_reached step:{step}/{train_steps} val_loss:{current_val_loss:.5f} "
+                   + f"target_val_loss:{TARGET_VAL_LOSS:.5f}", console=True)
+            break
+        if EARLY_STOP and step < train_steps and step in SOTA_VAL_BY_STEP:
+            sota_val_loss = SOTA_VAL_BY_STEP[step]
+            sota_gap = current_val_loss - sota_val_loss
+            catastrophically_behind = (
+                step >= EARLY_STOP_CATASTROPHIC_STEPS
+                and sota_gap > EARLY_STOP_CATASTROPHIC_MARGIN
+            )
+            meaningfully_behind = step >= EARLY_STOP_GRACE_STEPS and sota_gap > EARLY_STOP_MARGIN
+            early_stop_bad_points = early_stop_bad_points + 1 if meaningfully_behind else 0
+            if catastrophically_behind or early_stop_bad_points >= EARLY_STOP_PATIENCE:
+                reason = "catastrophic_gap" if catastrophically_behind else "patience_gap"
+                print0(f"early_stop:{reason} step:{step}/{train_steps} val_loss:{current_val_loss:.5f} "
+                       + f"sota_mean:{sota_val_loss:.5f} gap:{sota_gap:.5f} "
+                       + f"bad_points:{early_stop_bad_points}/{EARLY_STOP_PATIENCE}", console=True)
+                break
+        model.train()
+        # start the clock again
+        dist.barrier()
+        t0 = time.perf_counter()
+
+    if step == train_steps:
+        break
+
+    # --------------- TRAINING SECTION -----------------
+    inputs, targets = next(train_loader)
+    # accumulate across microbatches in case we are running with fewer than 8 gpus
+    assert len(inputs) % mbs == 0
+    for i in range(len(inputs) // mbs):
+        loss = model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+        # NaN guard: catch divergence the step it happens, not 750 steps later.
+        if not torch.isfinite(loss).all():
+            raise RuntimeError(f"non-finite train loss at step {step} mb {i}: {loss.item()}")
+        loss.backward()
+    for name, p in model.named_parameters():
+        assert p.grad is not None, name
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+    # set optimization hyperparameters and take a step
+    set_hparams(step)
+    for opt in optimizers:
+        opt.step()
+    model.zero_grad(set_to_none=True)
+    if TRAIN_PROGRESS_INTERVAL > 0 and (step + 1) % TRAIN_PROGRESS_INTERVAL == 0:
+        approx_training_time = training_time + (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
+               + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
+
+dist.destroy_process_group()

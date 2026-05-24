@@ -3,8 +3,6 @@ train_gpt_simple.py
 
 This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
 It was prepared as a simplified version of the speedrun for use in neural net optimization research.
-In particular, we remove non-standard parameters (e.g., value embeddings) in order to simplfy experiments.
-See the speedrun repo for a full list of contributors.
 """
 
 import os
@@ -17,39 +15,9 @@ from pathlib import Path
 
 import torch
 from torch import Tensor, nn
+from torch.optim import AdamW
 import torch.nn.functional as F
 import torch.distributed as dist
-
-
-########################################
-#                Setup                 #
-########################################
-
-# torchrun sets these env variables
-device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
-dist.barrier()
-# this code can be run equivalently with 1, 2, 4, or 8 gpus.
-assert 8 % dist.get_world_size() == 0
-
-# logging setup
-if dist.get_rank() == 0:
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{uuid.uuid4()}.txt"
-    print(logfile)
-def print0(s, console=False):
-    if dist.get_rank() == 0:
-        with open(logfile, "a") as f:
-            if console:
-                print(s)
-            print(s, file=f)
-
-# we begin by logging this file itself
-print0(code)
-print0("="*100)
-print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
-print0("="*100)
 
 
 ########################################
@@ -69,17 +37,15 @@ def _load_data_shard(file: Path):
     return tokens
 
 def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
     files = sorted(Path.cwd().glob(filename_pattern))
-    assert batch_size % world_size == 0
-    local_batch_size = batch_size // world_size
+    assert batch_size % dist.get_world_size() == 0
+    local_batch_size = batch_size // dist.get_world_size()
     file_iter = iter(files)
     tokens, pos = _load_data_shard(next(file_iter)), 0
     while True:
         if pos + batch_size + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
-        buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
+        buf = tokens[pos + dist.get_rank() * local_batch_size:][:local_batch_size + 1]
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
         pos += batch_size
@@ -90,25 +56,30 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1
 #             Architecture             #
 ########################################
 
-def norm(x: Tensor):
-    return F.rms_norm(x, (x.size(-1),))
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gains = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return F.rms_norm(x, (x.size(-1),), weight=self.gains.type_as(x))
 
 class Linear(nn.Linear):
     def __init__(self, in_features, out_features):
-        super().__init__(in_features, out_features, bias=False)
-    
+        super().__init__(in_features, out_features, bias=True)
+
     def forward(self, x):
-        return F.linear(x, self.weight.bfloat16())
+        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
 
 class Rotary(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         # half-truncate RoPE (w/ base freq tuning)
         angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
-        self.angular_freq = nn.Buffer(torch.cat([angular_freq, angular_freq.new_zeros(dim//4)]))
+        self.register_buffer("angular_freq", torch.cat([angular_freq, angular_freq.new_zeros(dim//4)]))
 
     def forward(self, x_BTHD: Tensor):
-        pos = torch.arange(x_BTHD.size(1), dtype=torch.float, device=x_BTHD.device)
+        pos = torch.arange(x_BTHD.size(1), dtype=torch.float32, device=x_BTHD.device)
         theta = torch.outer(pos, self.angular_freq)[None, :, None, :]
         cos, sin = theta.cos(), theta.sin()
         x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
@@ -133,7 +104,7 @@ class CausalSelfAttention(nn.Module):
         q = self.q(x).view(B, T, self.num_heads, self.head_dim)
         k = self.k(x).view(B, T, self.num_heads, self.head_dim)
         v = self.v(x).view(B, T, self.num_heads, self.head_dim)
-        q, k = norm(q), norm(k)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
         q, k = self.rotary(q), self.rotary(k)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
                                            v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
@@ -150,7 +121,7 @@ class MLP(nn.Module):
 
     def forward(self, x: Tensor):
         x = self.fc(x)
-        x = F.relu(x).square()
+        x = x.relu().square()
         x = self.proj(x)
         return x
 
@@ -159,10 +130,12 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(dim)
         self.mlp = MLP(dim)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
 
     def forward(self, x: Tensor):
-        x = x + self.attn(norm(x))
-        x = x + self.mlp(norm(x))
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
 class GPT(nn.Module):
@@ -171,13 +144,15 @@ class GPT(nn.Module):
         self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
         self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
         self.proj = Linear(model_dim, vocab_size)
+        self.norm1 = RMSNorm(model_dim)
+        self.norm2 = RMSNorm(model_dim)
 
     def forward(self, inputs: Tensor, targets: Tensor):
-        x = norm(self.embed(inputs))
+        x = self.norm1(self.embed(inputs))
         for block in self.blocks:
             x = block(x)
-        logits = self.proj(norm(x)).float()
-        logits = 15 * logits * torch.rsqrt(logits.square() + 225)
+        logits = self.proj(self.norm2(x)).float()
+        logits = 15 * logits * (logits.square() + 15**2).rsqrt()
         return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
 
 
@@ -193,14 +168,9 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
 
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations
-    for a, b, c in [
-        (4.0848, -6.8946, 2.9270),
-        (3.9505, -6.3029, 2.6377),
-        (3.7418, -5.5913, 2.3037),
-        (2.8769, -3.1427, 1.2046),
-        (2.8366, -3.0525, 1.2012),
-    ]:
+    # Perform the NS iterations, not optimizing for wallclock speed
+    a, b, c = 2, -1.5, 0.5
+    for _ in range(12):
         A = X @ X.mT
         B = b * A + c * A @ A
         X = a * X + B @ X
@@ -210,18 +180,18 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     return X
 
 @torch.compile
-def muon_update(grad, momentum, beta=0.95, nesterov=True):
-    momentum.lerp_(grad, 1 - beta)
-    update = grad.lerp_(momentum, beta) if nesterov else momentum
+def muon_update(grad, momentum, mu=0.95, nesterov=True):
+    momentum.lerp_(grad, 1 - mu)
+    update = grad.lerp_(momentum, mu) if nesterov else momentum
     update = zeropower_via_newtonschulz5(update)
     update *= max(1, grad.size(-2) / grad.size(-1))**0.5
     return update
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -231,108 +201,172 @@ class Muon(torch.optim.Optimizer):
         for group in self.param_groups:
             params = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
-            for base_i in range(len(params))[::world_size]:
+            for base_i in range(0, len(params), world_size):
                 if base_i + rank < len(params):
                     p = params[base_i + rank]
                     state = self.state[p]
                     if len(state) == 0:
-                        state["momentum_buffer"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                        state["momentum"] = torch.zeros_like(p)
+                    update = muon_update(p.grad, state["momentum"], mu=group["mu"])
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
 
 ########################################
-#            Initialization            #
+#                Setup                 #
 ########################################
+
+# torchrun sets these env variables
+device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+torch.cuda.set_device(device)
+dist.init_process_group(backend="nccl", device_id=device)
+dist.barrier()
+# this code can be run equivalently with 1, 2, 4, or 8 gpus.
+assert 8 % dist.get_world_size() == 0
+
+# logging setup
+if dist.get_rank() == 0:
+    os.makedirs("logs", exist_ok=True)
+    logfile = f"logs/{uuid.uuid4()}.txt"
+    print(logfile)
+def print0(s, console=False, log=True):
+    if dist.get_rank() == 0:
+        if console:
+            print(s)
+        if log:
+            with open(logfile, "a") as f:
+                print(s, file=f)
+
+# we begin by logging this file itself
+print0(code)
+print0("="*100)
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
+       + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
+print0("="*100)
+
+val_tokens = 20 * 524288
+batch_size = 8 * 64 * 1024
+mbs = 64
+val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
 
 model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
 
-for name, param in model.named_parameters():
-    if name.endswith("weight") and "proj" in name:
-        param.data.zero_()
-    dist.broadcast(param.detach(), 0)
 
-# collect the parameters to optimize
-hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
-embed_params = [*model.embed.parameters()]
-head_params = [model.proj.weight]
+num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
 
-# init the optimizer(s)
-adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_params, lr=0.3)]
-optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.02, weight_decay=0.01)
-optimizers = [optimizer1, optimizer2]
-for opt in optimizers:
-    for group in opt.param_groups:
-        group["initial_lr"] = group["lr"]
-
-train_steps = 3800
-
-# learning rate schedule: stable then decay
-def get_lr(step: int, cooldown_frac=0.7):
-    x = step / train_steps # progress in training
-    assert 0 <= x < 1
-    if x < 1 - cooldown_frac:
-        return 1.0
-    else:
-        return (1 - x) / cooldown_frac
+for _ in range(num_trials):
 
 
-########################################
-#        Training and Validation       #
-########################################
+    ########################################
+    #       Init & Optim Hyperparams       #
+    ########################################
 
-train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size=8*64*1024)
-training_time = 0
-# start the clock
-dist.barrier()
-t0 = time.perf_counter()
-for step in range(train_steps + 1):
-    is_last_step = (step == train_steps)
+    # we want to minimize this while still reaching 3.28 val loss
+    train_steps = 3350
 
-    # --------------- VALIDATION SECTION -----------------
-    if is_last_step or step % 125 == 0:
-        # stop the clock
-        dist.barrier()
-        training_time += time.perf_counter() - t0
-        model.eval()
-        val_tokens = 10485760
-        val_loader = distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens)
-        val_loss = 0
-        with torch.no_grad():
-            inputs, targets = next(val_loader)
-            for i in range(len(inputs) // 64):
-                val_loss += model(inputs[64*i:64*i+64], targets[64*i:64*i+64])
-        dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
-        val_loss /= val_tokens
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
-               + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
-        model.train()
-        # start the clock again
-        dist.barrier()
-        t0 = time.perf_counter()
-        if is_last_step:
-            break
+    # initialize model parameters
+    for name, p in model.named_parameters():
+        w = p.data
+        if name.endswith("weight"):
+            if "proj" in name:
+                w.zero_()
+            elif "embed" in name:
+                w.normal_()  # default torch init
+            else:
+                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+        elif name.endswith("bias"):
+            w.zero_()
+        elif name.endswith("gains"):
+            w.normal_(mean=1, std=0)
+        else:
+            raise Exception(f"Uninitialized parameter: {name}")
 
-    # --------------- TRAINING SECTION -----------------
-    inputs, targets = next(train_loader)
-    # accumulate across microbatches in case we are running with fewer than 8 gpus
-    for i in range(len(inputs) // 64):
-        model(inputs[64*i:64*i+64], targets[64*i:64*i+64]).backward()
-    for name, param in model.named_parameters():
-        assert param.grad is not None, name
-        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-    # set optimization hyperparameters and take a step
+    # create the optimizer(s)
+    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
+                        dict(params=[model.proj.weight], lr=1/320),
+                        dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
+                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
+    optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
+                      lr=0.035, weight_decay=0.025)
+    optimizers = [optimizer1, optimizer2]
+    assert set(p for opt in optimizers for group in opt.param_groups
+               for p in group["params"]) == set(model.parameters())
     for opt in optimizers:
         for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
-        opt.step()
-    model.zero_grad(set_to_none=True)
-    approx_training_time = training_time + (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
-           + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True)
+            group["initial_lr"] = group["lr"]
+
+    # learning rate schedule: stable then decay
+    def set_hparams(step, cooldown_frac=0.7):
+        progress = step / train_steps
+        assert 0 <= progress < 1
+        if progress < 1 - cooldown_frac:
+            eta = 1.0
+        else:
+            eta = (1 - progress) / cooldown_frac
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * eta
+
+
+    ########################################
+    #        Training and Validation       #
+    ########################################
+
+    train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+    for p in model.parameters():
+        dist.broadcast(p.detach(), 0)
+    # start the clock
+    training_time = 0
+    last_val_step = 0
+    dist.barrier()
+    t0 = time.perf_counter()
+    for step in range(train_steps + 1):
+
+        # --------------- VALIDATION SECTION -----------------
+        val_step_freq = 125 if step / train_steps < 0.9 else 25
+        if step == train_steps or step % val_step_freq == 0:
+            # stop the clock
+            dist.barrier()
+            time_since_last_val = time.perf_counter() - t0
+            step_avg = time_since_last_val / (step - last_val_step) if step > 0 else float("nan")
+            last_val_step = step
+            training_time += time_since_last_val
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                assert len(val_inputs) % mbs == 0
+                for i in range(len(val_inputs) // mbs):
+                    val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+            dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+            val_loss /= val_tokens
+            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
+                   + f" step_avg:{1000*step_avg:.2f}ms", console=True)
+            model.train()
+            # start the clock again
+            dist.barrier()
+            t0 = time.perf_counter()
+
+        if step == train_steps:
+            break
+
+        # --------------- TRAINING SECTION -----------------
+        inputs, targets = next(train_loader)
+        # accumulate across microbatches in case we are running with fewer than 8 gpus
+        assert len(inputs) % mbs == 0
+        for i in range(len(inputs) // mbs):
+            model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+        for name, p in model.named_parameters():
+            assert p.grad is not None, name
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        # set optimization hyperparameters and take a step
+        set_hparams(step)
+        for opt in optimizers:
+            opt.step()
+        model.zero_grad(set_to_none=True)
+        approx_training_time = training_time + (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
+               + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
 
 dist.destroy_process_group()
