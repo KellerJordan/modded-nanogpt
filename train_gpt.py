@@ -1055,9 +1055,7 @@ class AttnArgs:
     yarn: Yarn
     key_offset: bool
     attn_gate_w: torch.Tensor
-    # aux_v: extra (B, T, model_dim) tensor added to V after qkv linear.
     aux_v: torch.Tensor | None
-    # xsa_alpha: (num_heads,) per-head learnable XSA strength
     xsa_alpha: torch.Tensor | None
     train_max_seq_len: torch.Tensor
 
@@ -1263,11 +1261,9 @@ class GPT(nn.Module):
         # sqrt(1.1) per sublayer so cumulative per-layer scaling is 1.1
         self.resid_lambdas = nn.Parameter(torch.full((num_layers, 2), 1.1**0.5))
 
-        # Per-(layer, head) learnable XSA gate @KellerJordan; zero-init -> tanh(0)=0 disables XSA at step 0
+        # Per-(layer, head) learnable XSA gate; zero-init -> tanh(0)=0 disables XSA at step 0
         self.xsa_alphas = nn.Parameter(torch.zeros(num_layers, self.num_heads))
 
-        # backout_lambda was removed: legacy `x -= backout_lambda * x_7` is now absorbed
-        # into MUDD via mudd_b2[1, 1, 1] = -0.5 (layer-10 / residual / source-h7).
         pad = (-num_layers * 2 - 2) % dist.get_world_size()
         self.scalars = nn.Parameter(
             torch.cat(
@@ -1298,7 +1294,7 @@ class GPT(nn.Module):
         Post-loop produces 5 residual coefs over
           {cache[0], cache[7], cache[9], ve_bank0, cache[3]}.
         """
-        num_mudd_layers = 2  # layers N-2 and N-1
+        num_mudd_layers = 2
         self._mudd_scale = 0.1
         mudd_dim = 64
         max_num_coef = 14
