@@ -53,7 +53,7 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@manikbhandari](https://github.com/manikbhandari), [@andrewbriand](https://x.com/andrewbriand8), [@jrauvola](https://x.com/Joshrav21),
 [@soren_dunn_](https://x.com/soren_dunn_), [@photon_mz](https://x.com/photon_mz), [@srashedll](https://x.com/srashedll), [@dhrvji](https://x.com/dhrvji),
 [@EmmettBicker](https://github.com/EmmettBicker), [@dualverse-ai](https://github.com/dualverse-ai), [@sisovicm](https://x.com/sisovicm),
-[@moof2x](https://github.com/moof2x), [@samacqua](https://github.com/samacqua)
+[@moof2x](https://github.com/moof2x), [@samacqua](https://github.com/samacqua), [@Lisennlp](https://github.com/Lisennlp)
 
 
 ---
@@ -185,7 +185,8 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 77 | 1.435 minutes | [Replace partitioned hyperconnections with single saved activation](https://x.com/classiclarryd/status/2030465730718908884) | 03/06/26 | [log](records/track_1_short/2026-03-06_SimplifyHC/0ab4a843-8c3a-4fb4-9fff-8e1d39852646.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/241) | @classiclarryd
 78 | 1.426 minutes | [Tighten bounds on fa3 max_num_docs to match fineweb distribution](https://x.com/classiclarryd/status/2038077427180851240) | 03/22/26 | [log](records/track_1_short/2026-03-22_VarlenMaxDocs/combined/2026-03-22_20-07-32_time-186_secs_06-mbeta2-max-docs_227ce8.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/246) | @ChrisJMcCormick
 79 | 1.411 minutes | Fuse Cross Entropy Fwd/Bwk Kernel, to avoid recalc on softcap sigmoid | 04/04/26 | [log](records/track_1_short/2026-04-04_FuseCEFwdAndBwd/runs/19ad9161-37c0-4985-8dd4-6db4e27f34b4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/251) | @andrewbriand8
-80 | 1.406 minutes | In Muon orthogonize Q and K matrices in pairs of heads, instead of across the full 6 head matrix  | 04/08/26 | [log](records/track_1_short/2026-04-08_PairedHeadMuon/logs/split_qk0-1480.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/253) | samacqua
+80 | 1.406 minutes | In Muon orthogonize Q and K matrices in pairs of heads, instead of across the full 6 head matrix  | 04/08/26 | [log](records/track_1_short/2026-04-08_PairedHeadMuon/logs/split_qk0-1480.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/253) | @samacqua
+81 | 1.363 minutes | MUDD Skip Connections | 04/22/26 | [log](records/track_1_short/2026-04-22_MuddFormer/this_pr_v3),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/259) | @Lisennlp
 ## Rules
 
 New records must:
