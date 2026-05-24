@@ -1049,17 +1049,17 @@ class Yarn(nn.Module):
 
 @dataclass(slots=True)
 class AttnArgs:
-    sa_lambdas: torch.Tensor
+    sa_lambdas: torch.Tensora
     seqlens: torch.Tensor
     bm_size: int
     yarn: Yarn
     key_offset: bool
     attn_gate_w: torch.Tensor
     # aux_v: extra (B, T, model_dim) tensor added to V after qkv linear.
-    # Carries the precomputed ve_gate * ve term and (for layer 10) v_mudd.
     aux_v: torch.Tensor | None
-    train_max_seq_len: torch.Tensor
+    # xsa_alpha: (num_heads,) per-head learnable XSA strength
     xsa_alpha: torch.Tensor | None
+    train_max_seq_len: torch.Tensor
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
@@ -1124,9 +1124,8 @@ class CausalSelfAttention(nn.Module):
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
-        # Gated XSA (arXiv:2603.09078) with learnable strength
-        # remove a per-head fraction tanh(α) of the y-component aligned with v̂
-        # only on non-paired layers since v has shape (B,T,H,D) here
+        # Gated XSA (arXiv:2603.09078) with learnable strength: subtract per-head fraction tanh(α)
+        # of y aligned with v̂. Non-paired only (v shape doesn't line up for paired layers).
         if attn_args.xsa_alpha is not None and not self.paired:
             vn = F.normalize(v, dim=-1, eps=1e-4)
             proj = (y * vn).sum(-1, keepdim=True)
@@ -1182,8 +1181,6 @@ class GPT(nn.Module):
 
     def init_attn(self, model_dim, head_dim, num_heads, num_layers, max_seq_len):
         # Cache layers for skip / backout snapshots taken at end of loop iter.
-        # h9 is captured explicitly inside the MUDD block (timing differs), so it's
-        # not in this list.
         self.cache_layers = [3, 7]
 
         # Attention modules (no learned params -- weights come from qk_bank/vo_bank)
@@ -1266,10 +1263,12 @@ class GPT(nn.Module):
         # sqrt(1.1) per sublayer so cumulative per-layer scaling is 1.1
         self.resid_lambdas = nn.Parameter(torch.full((num_layers, 2), 1.1**0.5))
 
-        # Per-(layer, head) learnable XSA gate; zero-init: tanh(0)=0 disables XSA at step 0
-        self.xsa_alphas = nn.Parameter(torch.zeros(num_layers, num_heads))
+        # Per-(layer, head) learnable XSA gate @KellerJordan; zero-init -> tanh(0)=0 disables XSA at step 0
+        self.xsa_alphas = nn.Parameter(torch.zeros(num_layers, self.num_heads))
 
-        pad = (-num_layers * 2 - 3) % dist.get_world_size()
+        # backout_lambda was removed: legacy `x -= backout_lambda * x_7` is now absorbed
+        # into MUDD via mudd_b2[1, 1, 1] = -0.5 (layer-10 / residual / source-h7).
+        pad = (-num_layers * 2 - 2) % dist.get_world_size()
         self.scalars = nn.Parameter(
             torch.cat(
                 [
@@ -1299,7 +1298,7 @@ class GPT(nn.Module):
         Post-loop produces 5 residual coefs over
           {cache[0], cache[7], cache[9], ve_bank0, cache[3]}.
         """
-        num_mudd_layers = 2
+        num_mudd_layers = 2  # layers N-2 and N-1
         self._mudd_scale = 0.1
         mudd_dim = 64
         max_num_coef = 14
@@ -1346,7 +1345,6 @@ class GPT(nn.Module):
         # ---- Unbind parameters (avoid select_backward kernels) ----
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
         smear_lambda = self.scalars[2 * self.num_layers]
-        # backout_lambda removed; legacy backout absorbed into MUDD layer-10 mudd_b2.
         skip_lambda = self.scalars[2 * self.num_layers + 1]
         resid_lambdas_attn = self.resid_lambdas[:, 0].bfloat16().unbind(0)
         resid_lambdas_mlp  = self.resid_lambdas[:, 1].bfloat16().unbind(0)
@@ -1358,10 +1356,9 @@ class GPT(nn.Module):
         veg = self.ve_gate_bank.unbind(0)
         attn_gates = [*ag[:6], None, *ag[6:]]
         ve_gates = [None, veg[0], veg[1], *self.gate_filler_nones, veg[2], veg[3], veg[4]]
-        # XSA on every non-paired attn layer {1, 3, 4, 7, 8, 10}; paired layers {0,2,5,9} and the MLP-only layer 6 are skipped
-        xsa_layers_set = {1, 3, 4, 7, 8, 10}
+        # XSA on non-paired attn layers only; paired {0,2,5,9} and MLP-only layer 6 skipped
         xsa_alpha_per_layer = self.xsa_alphas.unbind(0)
-        xsa_alphas = [xsa_alpha_per_layer[i] if i in xsa_layers_set else None for i in range(self.num_layers)]
+        xsa_alphas = [xsa_alpha_per_layer[j] if j in {1, 3, 4, 7, 8, 10} else None for j in range(self.num_layers)]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
         qk_all = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])
@@ -1399,22 +1396,9 @@ class GPT(nn.Module):
         # cache[0] = residual stream after bigram injection (input to layer 0).
         cache = {0: x}
         for i in range(self.num_layers):
-            yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
-            attn_args = AttnArgs(
-                ve=ve[i],
-                sa_lambdas=sa_lambdas[i],
-                seqlens=seqlens,
-                bm_size=bm_sizes[i],
-                yarn=yarn,
-                key_offset=key_offset[i],
-                attn_gate_w=attn_gates[i],
-                ve_gate_w=ve_gates[i],
-                train_max_seq_len=train_max_seq_len,
-                xsa_alpha=xsa_alphas[i],
-            )
-            # Select weights from banks
-            attn_idx = i - (i > 6) if i != 6 else None
-            qkvo_w = attn_weights[attn_idx] if attn_idx is not None else None
+            is_paired = i in self.paired_head_layers
+            yarn = self.yarn_paired_head if is_paired else self.yarn
+            attn = self.attn_paired if is_paired else self.attn
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
             mu = None
@@ -1454,6 +1438,7 @@ class GPT(nn.Module):
                     key_offset=key_offset[i],
                     attn_gate_w=attn_gates[i],
                     aux_v=aux_v,
+                    xsa_alpha=xsa_alphas[i],
                     train_max_seq_len=train_max_seq_len,
                 )
                 attn_out = attn(attn_in_normed, attn_args, qkvo_w)
@@ -1683,8 +1668,8 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1410  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 1375  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
@@ -1842,7 +1827,10 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas", "xsa_alphas",  # Small, fast
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "mudd_b2", "xsa_alphas",
+            "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+        ] + [
+            "mudd_w2",
             "value_embeds", "bigram_embed",  # Medium
             "mudd_w1",
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
