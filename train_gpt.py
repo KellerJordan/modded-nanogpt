@@ -1049,7 +1049,7 @@ class Yarn(nn.Module):
 
 @dataclass(slots=True)
 class AttnArgs:
-    sa_lambdas: torch.Tensora
+    sa_lambdas: torch.Tensor
     seqlens: torch.Tensor
     bm_size: int
     yarn: Yarn
