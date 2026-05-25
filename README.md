@@ -20,7 +20,7 @@ This improvement in training speed has been brought about by the following techn
 * Flash Attention 3 with long-short sliding window attention pattern (inspired by Gemma 2) and window size warmup with YaRN
 * Align training batch starts with EoS and set a max document length
 * Accumulate gradients for 2 steps for embedding and lm_head before updating parameters
-* Backout, with single activation input for last 3 attention layers
+* Single activation input for last 3 attention layers
 * Polar Express implementation in Muon
 * Smear module to enable 1 token look back
 * Sparse attention gate
@@ -35,6 +35,8 @@ This improvement in training speed has been brought about by the following techn
 * Additional gating on value embeddings and skip connection
 * Paired head attention
 * Bigram hash embedding
+* MUDD skip connections to residual stream and attention values
+* Learnable XSA
 
 As well as many systems optimizations.
 
@@ -53,7 +55,8 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@manikbhandari](https://github.com/manikbhandari), [@andrewbriand](https://x.com/andrewbriand8), [@jrauvola](https://x.com/Joshrav21),
 [@soren_dunn_](https://x.com/soren_dunn_), [@photon_mz](https://x.com/photon_mz), [@srashedll](https://x.com/srashedll), [@dhrvji](https://x.com/dhrvji),
 [@EmmettBicker](https://github.com/EmmettBicker), [@dualverse-ai](https://github.com/dualverse-ai), [@sisovicm](https://x.com/sisovicm),
-[@moof2x](https://github.com/moof2x), [@samacqua](https://github.com/samacqua), [@Lisennlp](https://github.com/Lisennlp)
+[@moof2x](https://github.com/moof2x), [@samacqua](https://github.com/samacqua), [@Lisennlp](https://github.com/Lisennlp),
+[@_djdumpling](https://x.com/_djdumpling)
 
 
 ---
@@ -187,6 +190,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 79 | 1.411 minutes | Fuse Cross Entropy Fwd/Bwk Kernel, to avoid recalc on softcap sigmoid | 04/04/26 | [log](records/track_1_short/2026-04-04_FuseCEFwdAndBwd/runs/19ad9161-37c0-4985-8dd4-6db4e27f34b4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/251) | @andrewbriand8
 80 | 1.406 minutes | In Muon orthogonize Q and K matrices in pairs of heads, instead of across the full 6 head matrix  | 04/08/26 | [log](records/track_1_short/2026-04-08_PairedHeadMuon/logs/split_qk0-1480.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/253) | @samacqua
 81 | 1.363 minutes | MUDD Skip Connections | 04/22/26 | [log](records/track_1_short/2026-04-22_MuddFormer/this_pr_v3),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/259) | @Lisennlp
+82 | 1.353 minutes | Learnable XSA | 04/22/26 | [log](records/track_1_short/2026-04-29_XSAGatedLayers/this_pr_v1-s1410/06563169-6435-48ba-a1ad-f3e61bfcc573.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/264) | @_djdumpling
 ## Rules
 
 New records must:
