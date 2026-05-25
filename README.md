@@ -190,7 +190,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 79 | 1.411 minutes | Fuse Cross Entropy Fwd/Bwk Kernel, to avoid recalc on softcap sigmoid | 04/04/26 | [log](records/track_1_short/2026-04-04_FuseCEFwdAndBwd/runs/19ad9161-37c0-4985-8dd4-6db4e27f34b4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/251) | @andrewbriand8
 80 | 1.406 minutes | In Muon orthogonize Q and K matrices in pairs of heads, instead of across the full 6 head matrix  | 04/08/26 | [log](records/track_1_short/2026-04-08_PairedHeadMuon/logs/split_qk0-1480.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/253) | @samacqua
 81 | 1.363 minutes | MUDD Skip Connections | 04/22/26 | [log](records/track_1_short/2026-04-22_MuddFormer/this_pr_v3),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/259) | @Lisennlp
-82 | 1.353 minutes | Learnable XSA | 04/22/26 | [log](records/track_1_short/2026-04-29_XSAGatedLayers/this_pr_v1-s1410/06563169-6435-48ba-a1ad-f3e61bfcc573.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/264) | @_djdumpling
+82 | 1.353 minutes | Learnable XSA | 04/29/26 | [log](records/track_1_short/2026-04-29_XSAGatedLayers/this_pr_v1-s1410/06563169-6435-48ba-a1ad-f3e61bfcc573.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/264) | @_djdumpling
 ## Rules
 
 New records must:
