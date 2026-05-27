@@ -1054,7 +1054,6 @@ class AttnArgs:
     bm_size: int
     yarn: Yarn
     key_offset: bool
-    attn_gate_w: torch.Tensor
     aux_v: torch.Tensor | None
     xsa_alpha: torch.Tensor | None
     train_max_seq_len: torch.Tensor
@@ -1077,7 +1076,7 @@ class CausalSelfAttention(nn.Module):
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
         # unpack attention args
-        aux_v, attn_gate_w = attn_args.aux_v, attn_args.attn_gate_w
+        aux_v = attn_args.aux_v
         sa_lambdas, key_offset = attn_args.sa_lambdas, attn_args.key_offset
         seqlens, bm_size = attn_args.seqlens, attn_args.bm_size
         train_max_seq_len, yarn = attn_args.train_max_seq_len, attn_args.yarn
@@ -1125,11 +1124,10 @@ class CausalSelfAttention(nn.Module):
         # Gated XSA (arXiv:2603.09078) with learnable strength: subtract per-head fraction tanh(α)
         # of y aligned with v̂. Non-paired only (v shape doesn't line up for paired layers).
         if attn_args.xsa_alpha is not None and not self.paired:
-            vn = F.normalize(v, dim=-1, eps=1e-4)
-            proj = (y * vn).sum(-1, keepdim=True)
+            dot = (y * v).sum(-1, keepdim=True)
+            denom = v.square().sum(-1, keepdim=True).clamp_min(1e-8)
             alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(1, 1, self.num_heads, 1)
-            y = y - alpha * proj * vn
-        y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
+            y = y - alpha * (dot / denom) * v
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
@@ -1193,8 +1191,7 @@ class GPT(nn.Module):
         # spherical gaussian init by @photomz
         self.value_embeds = nn.Parameter(0.01 * torch.randn(5 * self.vocab_size, model_dim, dtype=torch.bfloat16))
 
-        # parameter banks for attention and value embedding gate weights
-        self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
+        # parameter bank for value embedding gate weights
         self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 unique gates
         self.gate_filler_nones = [None] * (num_layers - 6)
 
@@ -1348,14 +1345,11 @@ class GPT(nn.Module):
         post_lambdas_mlp  = self.post_lambdas[:, 1].bfloat16().unbind(0)
         x0_lambdas = self.x0_lambdas.bfloat16().unbind(0)
         bigram_lambdas = self.bigram_lambdas.bfloat16().unbind(0)
-        ag = self.attn_gate_bank.unbind(0)
         veg = self.ve_gate_bank.unbind(0)
-        attn_gates = [*ag[:6], None, *ag[6:]]
         ve_gates = [None, veg[0], veg[1], *self.gate_filler_nones, veg[2], veg[3], veg[4]]
         # XSA on non-paired attn layers only; paired {0,2,5,9} and MLP-only layer 6 skipped
         xsa_alpha_per_layer = self.xsa_alphas.unbind(0)
         xsa_alphas = [xsa_alpha_per_layer[j] if j in {1, 3, 4, 7, 8, 10} else None for j in range(self.num_layers)]
-        assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
         qk_all = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])
         vo_flat = self.vo_bank[:self._num_attn_layers * 2].view(self._num_attn_layers, 2, *self.vo_bank.shape[1:]).flatten(1, 2)
@@ -1432,7 +1426,6 @@ class GPT(nn.Module):
                     bm_size=bm_sizes[i],
                     yarn=yarn,
                     key_offset=key_offset[i],
-                    attn_gate_w=attn_gates[i],
                     aux_v=aux_v,
                     xsa_alpha=xsa_alphas[i],
                     train_max_seq_len=train_max_seq_len,
@@ -1800,7 +1793,6 @@ class TrainingManager():
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
-            "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
@@ -1823,7 +1815,7 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "mudd_b2", "xsa_alphas",
+            "scalars", "smear_gate", "skip_gate", "ve_gate_bank", "mudd_b2", "xsa_alphas",
             "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
         ] + [
             "mudd_w2",
@@ -2011,7 +2003,6 @@ model: nn.Module = GPT(
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
         m.weight.data = m.weight.data.bfloat16()
-model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.qk_bank.data = model.qk_bank.data.bfloat16()
 model.vo_bank.data = model.vo_bank.data.bfloat16()
