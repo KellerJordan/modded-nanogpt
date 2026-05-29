@@ -89,8 +89,46 @@ Some old parameter slots are still present in the file because this was an exper
 
 - `xsa-baseline-s1385/`: 10 baseline logs at `1375 + 10 = 1385` total steps.
 - `xsa-baseline-1335/`: 9 matched-step XSA baseline logs at `1315 + 20 = 1335` total steps.
-- `this_pr/`: 11 logs matching `xsaexp8_10_dc_muddgate_ag3710_s1315e20_mglr015_`* at `1315 + 20 = 1335` total steps.
-- Root `train_gpt.py`: submitted training code.
+- `this_pr_v1/`: 11 logs matching `xsaexp8_10_dc_muddgate_ag3710_s1315e20_mglr015_`* at `1315 + 20 = 1335` total steps.
+- `this_pr_v2/`: 10 logs matching `xsaexp8_10_dc_muddgatelr01_ag310_s1315e10_`* at `1315 + 10 = 1325` total steps.
+- Root `train_gpt.py`: current submitted training code.
 - Root `dc_triton_kernels.py`: DC correction kernel included in each PR log.
 
 Timing environment from the logs: 8x NVIDIA H100 80GB HBM3, Python 3.12.3, PyTorch `2.10.0+cu128`, Triton `3.6.0`, driver `580.159.03`.
+
+## v2 update: gate-generated DC and 1325 steps
+
+The latest `train_gpt.py` moves the PR from the older `this_pr_v1` sweep to `this_pr_v2`. The submitted schedule is now `1315 + 10 = 1325` total steps instead of `1315 + 20 = 1335`, and the DC weights are no longer standalone trainable banks. The layer-10 post-only DC path is still the same Triton correction after FA3, but its two per-token, per-head tensors now come directly from the MUDD gate:
+
+```text
+dc_weights[10] = (post_gate[..., 29:35], post_gate[..., 35:41])
+```
+
+`dc_gate` only validates the shape, RMS-normalizes the first tensor across heads, and returns contiguous `(post_w1, post_w2)`. This removes the old `dc_w1_bank` / `dc_w2_bank` parameters and their optimizer entries, so DC is now part of the sparse MUDD-gated control path rather than a separate MLP.
+
+The MUDD gate layout is also more explicit and narrower:
+
+- The pre gate is generated from `x0` and has 26 coefficients: XSA for layers `1, 3`, attention gate for layer `3`, and x0/bigram injection gates for layers `0..3`.
+- The post gate is generated at the start of layer `4` and has 41 coefficients: XSA for layers `4, 7`, attention gate for layer `10`, x0/bigram injection gates for layers `4, 5, 7, 8, 9`, the layer-3 skip coefficient, and the layer-10 DC tensors.
+- The final-layer x0/bigram injection is now handled by the existing layer-10 MUDD block through `mu[10]` and `mu[11]`, not by the generic MUDD gate.
+- Static `attn_gate_bank`, `skip_gate`, `x0_lambdas`, `bigram_lambdas`, `xsa_alphas`, and the standalone DC banks are gone from the active parameter table. The old `skip_gate` RNG draw is still burned to preserve the initialization stream.
+- `mudd_gate_*` optimizer `lr_mul` is reduced from `0.15` to `0.1`. Gate bias init is also smaller: attention starts at `0.25`, bigram at `0.025`, skip at `0.5`, and DC `w1` starts at `1.0` while DC `w2` starts at `0`.
+- FA3 loading now tries `kernels-community/flash-attn3` first and falls back to `varunneal/flash-attention-3`.
+
+Updated results:
+
+```text
+                     Runs  Steps  Time mean  Time sd  Time delta  Loss mean  Loss sd  Loss p
+xsa-baseline-s1385     10   1385    81.2187   0.0681      0.0000     3.2784  0.0013  2.17e-03
+xsa-baseline-s1335       9   1335    78.5576   0.0401     -2.6611     3.2848  0.0017  1.00e+00
+this_pr_v1-s1335       11   1335    78.9669   0.0425     -2.2518     3.2771  0.0012  8.15e-06
+this_pr_v2-s1325       10   1325    77.7050   0.0297     -3.5137     3.2781  0.0010  7.76e-05
+```
+
+`Time delta` is still relative to `xsa-baseline-s1385`, and `Loss p` uses the same one-sample `loss < 3.28` t-test as above.
+
+`this_pr_v2` passes the `p < 0.01` rule with `p = 7.76e-05`. Compared with the valid 1385-step XSA baseline, it is **3.51s faster** on the same 8xH100 setup. The mean loss is slightly lower than that valid baseline by `-0.00033`, but this difference is not statistically significant in the current samples (two-sided Welch `p = 0.536`).
+
+The stricter quality comparison is against `xsa-baseline-1335`, which already has 10 more steps than v2. Even with fewer steps, v2 is **0.85s faster** and has mean loss lower by about **0.00669** (two-sided Welch `p = 1.45e-07`). Compared with v1, v2 trades about `+0.00094` mean loss for **1.26s** less wall-clock; the v1-v2 loss gap is not significant at 5% in this sample (two-sided Welch `p = 0.066`).
+
+The practical read is that v1 had the best mean loss, while v2 is the better submitted speedrun point: it removes the standalone DC parameter path, cuts 10 extension steps, keeps the target pass, and improves total wall-clock speed.

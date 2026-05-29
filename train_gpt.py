@@ -62,15 +62,6 @@ dist.init_process_group(backend="cuda:nccl,cpu:gloo", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
-
-try:
-    _fa3_mod = get_kernel("kernels-community/flash-attn3")
-except BaseException as exc:
-    print(f"[rank{rank}] kernels-community/flash-attn3 load failed: {type(exc).__name__}: {exc}", flush=True)
-    _fa3_mod = get_kernel("varunneal/flash-attention-3", trust_remote_code=True)
-flash_attn_interface = getattr(_fa3_mod, "flash_attn_interface", _fa3_mod)
-
-
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 # Transposed layout by @ChrisJMcCormick allows for faster gradient accumulation.
@@ -1075,7 +1066,14 @@ class AttnArgs:
     xsa_alpha: torch.Tensor | None
     train_max_seq_len: torch.Tensor
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+
+try:
+    _fa3_mod = get_kernel("kernels-community/flash-attn3")
+except BaseException as exc:
+    print(f"[rank{rank}] kernels-community/flash-attn3 load failed: {type(exc).__name__}: {exc}", flush=True)
+    _fa3_mod = get_kernel("varunneal/flash-attention-3", trust_remote_code=True)
+flash_attn_interface = getattr(_fa3_mod, "flash_attn_interface", _fa3_mod)
+
 
 def dc_gate(
     x: Tensor,
@@ -1083,11 +1081,9 @@ def dc_gate(
     num_heads: int,
 ) -> tuple[Tensor, Tensor]:
     dc_w1, dc_w2 = dc_w
-    hidden = F.gelu(F.linear(x, dc_w1.type_as(x)), approximate="tanh")
-    raw_w = F.linear(hidden, dc_w2.type_as(hidden)).view(x.size(0), x.size(1), 2, num_heads)
-    post_w1, post_w2 = raw_w.unbind(dim=2)
-    post_w1 = F.rms_norm(post_w1.float(), (num_heads,), eps=1.0e-6).type_as(post_w1)
-    return post_w1, post_w2
+    assert dc_w1.shape == dc_w2.shape == (x.size(0), x.size(1), num_heads)
+    post_w1 = F.rms_norm(dc_w1.float(), (num_heads,), eps=1.0e-6).type_as(x)
+    return post_w1.contiguous(), dc_w2.type_as(x).contiguous()
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
@@ -1218,7 +1214,7 @@ class GPT(nn.Module):
         
         self.xsa_layers = [1, 3, 4, 7]
         self.dc_layers = [10]
-        self.attn_gate_layers = [3, 7, 10]
+        self.attn_gate_layers = [3, 10]
         self.init_mudd_gate(model_dim)
 
         # Auto-label parameters
@@ -1242,11 +1238,7 @@ class GPT(nn.Module):
         self.value_embeds = nn.Parameter(0.01 * torch.randn(5 * self.vocab_size, model_dim, dtype=torch.bfloat16))
 
         # parameter banks for attention and value embedding gate weights
-        self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
         self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 unique gates
-        dc_hidden_dim = num_heads * 2
-        self.dc_w1_bank = nn.Parameter(torch.empty(num_layers - 1, dc_hidden_dim, model_dim))
-        self.dc_w2_bank = nn.Parameter(torch.empty(num_layers - 1, 2 * num_heads, dc_hidden_dim))
         self.gate_filler_nones = [None] * (num_layers - 6)
 
         # Parameter banks for sharded optimization, by @chrisjmccormick
@@ -1277,11 +1269,6 @@ class GPT(nn.Module):
             self.qk_bank[num_qk_groups:].zero_()
             self.vo_bank[:num_vo_real].uniform_(-bound, bound)
             self.vo_bank[num_vo_real:].zero_()
-            dc_w1_std = math.sqrt(2.0 / (model_dim + dc_hidden_dim))
-            dc_w2_init = math.sqrt(1.0 / dc_hidden_dim) * 2.0 / (num_heads + 2.0) * 0.01
-            self.dc_w1_bank.normal_(0.0, dc_w1_std)
-            self.dc_w2_bank.zero_()
-            self.dc_w2_bank[:, :num_heads, :dc_hidden_dim].normal_(0.0, dc_w2_init)
 
     def init_mlp(self, model_dim):
         # MLP bank: stores c_fc and c_proj for all MLP layers
@@ -1301,24 +1288,18 @@ class GPT(nn.Module):
         self.smear_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.smear_gate.weight)
 
-        self.skip_gate = nn.Linear(12, 1, bias=False)
-        nn.init.zeros_(self.skip_gate.weight)
+        # Preserve the RNG stream from the removed skip_gate Linear init.
+        skip_gate_rng_burn = torch.empty(1, 12)
+        nn.init.kaiming_uniform_(skip_gate_rng_burn, a=math.sqrt(5))
 
         self.bigram_embed = nn.Embedding(args.bigram_vocab_size, model_dim)
         nn.init.zeros_(self.bigram_embed.weight)
 
         self.post_lambdas = nn.Parameter(torch.ones(num_layers, 2))
 
-        # Per-layer injection coefficients for x0 and bigram
-        self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
-        self.bigram_lambdas = nn.Parameter(0.05 * torch.ones(num_layers))
-
         # Per-sublayer residual scaling: [num_layers, 2] where [:,0]=attn, [:,1]=mlp
         # sqrt(1.1) per sublayer so cumulative per-layer scaling is 1.1
         self.resid_lambdas = nn.Parameter(torch.full((num_layers, 2), 1.1**0.5))
-
-        # Per-(layer, head) learnable XSA gate; zero-init -> tanh(0)=0 disables XSA at step 0
-        self.xsa_alphas = nn.Parameter(torch.zeros(num_layers, self.num_heads))
 
         pad = (-num_layers * 2 - 2) % dist.get_world_size()
         self.scalars = nn.Parameter(
@@ -1386,78 +1367,51 @@ class GPT(nn.Module):
     def init_mudd_gate(self, model_dim: int):
         self._mudd_gate_scale = 0.1
         mudd_gate_dim = 64
-        # Layer 4's XSA is consumed before layer 6 exists, so it stays in the x0-generated group.
-        self._mudd_gate_pre_xsa_layers = (1, 3, 4)
-        self._mudd_gate_post_xsa_layers = (7,)
-        self._mudd_gate_pre_attn_layers = (3,)
-        self._mudd_gate_post_attn_layers = (10,)
-        self._mudd_gate_pre_inject_layers = (0, 1, 2, 3, 4, 5)
-        self._mudd_gate_post_inject_layers = (7, 8, 9, 10)
-        self._mudd_gate_pre_num_coef = (
-            len(self._mudd_gate_pre_xsa_layers) * self.num_heads
-            + len(self._mudd_gate_pre_attn_layers) * self.num_heads
-            + len(self._mudd_gate_pre_inject_layers) * 2
-        )
-        self._mudd_gate_post_num_coef = (
-            len(self._mudd_gate_post_xsa_layers) * self.num_heads
-            + len(self._mudd_gate_post_attn_layers) * self.num_heads
-            + len(self._mudd_gate_post_inject_layers) * 2
-            + 1
-        )
-        max_num_coef = max(self._mudd_gate_pre_num_coef, self._mudd_gate_post_num_coef)
+        assert self.num_heads == 6
+        # Fixed gate layouts. The post gate is generated at the start of layer 4.
+        # pre:  xsa[1,3] 12 + attn[3] 6 + inject[0..3] 8 = 26
+        # post: xsa[4,7] 12 + attn[10] 6 + inject[4,5,7,8,9] 10 + skip 1 + dc[10] 12 = 41
+        self._mudd_gate_pre_num_coef = 26
+        self._mudd_gate_post_num_coef = 41
+        max_num_coef = 41
         self.mudd_gate_w1 = nn.Parameter(torch.empty(2, mudd_gate_dim, model_dim))
         self.mudd_gate_w2 = nn.Parameter(torch.zeros(2, max_num_coef, mudd_gate_dim))
         for j in range(2):
             nn.init.kaiming_uniform_(self.mudd_gate_w1.data[j], a=math.sqrt(5))
 
         bs_init = torch.zeros(2, max_num_coef)
-
-        def fill_gate_bias(row, xsa_layers, attn_layers, inject_layers, include_skip=False):
-            offset = len(xsa_layers) * self.num_heads
-            bs_init[row, offset:offset + len(attn_layers) * self.num_heads].fill_(0.5 / self._mudd_gate_scale)
-            offset += len(attn_layers) * self.num_heads
-            for layer in inject_layers:
-                offset += 1  # x0 lambda starts from 0.
-                bs_init[row, offset].fill_(0.05 / self._mudd_gate_scale)
-                offset += 1
-            if include_skip:
-                bs_init[row, offset].fill_(1.0 / self._mudd_gate_scale)
-
-        fill_gate_bias(
-            0,
-            self._mudd_gate_pre_xsa_layers,
-            self._mudd_gate_pre_attn_layers,
-            self._mudd_gate_pre_inject_layers,
-        )
-        fill_gate_bias(
-            1,
-            self._mudd_gate_post_xsa_layers,
-            self._mudd_gate_post_attn_layers,
-            self._mudd_gate_post_inject_layers,
-            include_skip=True,
-        )
+        attn_gate_bias = 0.25 / self._mudd_gate_scale
+        bigram_gate_bias = 0.025 / self._mudd_gate_scale
+        skip_gate_bias = 0.5 / self._mudd_gate_scale
+        dc_w1_gate_bias = 1.0 / self._mudd_gate_scale
+        bs_init[0, 12:18].fill_(attn_gate_bias)     # pre attn[3]
+        bs_init[0, 19:26:2].fill_(bigram_gate_bias) # pre bigram gates for layers 0..3
+        bs_init[1, 12:18].fill_(attn_gate_bias)     # post attn[10]
+        bs_init[1, 19:28:2].fill_(bigram_gate_bias) # post bigram gates for layers 4,5,7,8,9
+        bs_init[1, 28].fill_(skip_gate_bias)
+        bs_init[1, 29:35].fill_(dc_w1_gate_bias)    # post dc[10] w1, output starts at 1.0
         self.mudd_gate_b2 = nn.Parameter(bs_init)
 
     def forward_mudd_gate(self, x, id, num_coef):
         x = F.gelu(F.linear(x, self.mudd_gate_w1[id]))
         return (F.linear(x, self.mudd_gate_w2[id, :num_coef]) + self.mudd_gate_b2[id, :num_coef]) * self._mudd_gate_scale
 
-    def unpack_mudd_gate(self, gate, xsa_layers, attn_layers, inject_layers, xsa_alphas, attn_gates, x0_gates, bigram_gates, include_skip=False):
-        offset = 0
-        for layer in xsa_layers:
-            xsa_alphas[layer] = gate[..., offset:offset + self.num_heads]
-            offset += self.num_heads
-        for layer in attn_layers:
-            attn_gates[layer] = gate[..., offset:offset + self.num_heads]
-            offset += self.num_heads
-        for layer in inject_layers:
+    def unpack_pre_mudd_gate(self, gate, xsa_alphas, attn_gates, x0_gates, bigram_gates):
+        xsa_alphas[1] = gate[..., 0:6] # 6 means 6 heads
+        xsa_alphas[3] = gate[..., 6:12]
+        attn_gates[3] = gate[..., 12:18]
+        for layer, offset in zip((0, 1, 2, 3), range(18, 26, 2)):
             x0_gates[layer] = gate[..., offset:offset + 1]
-            offset += 1
-            bigram_gates[layer] = gate[..., offset:offset + 1]
-            offset += 1
-        if include_skip:
-            return gate[..., offset:offset + 1]
-        return None
+            bigram_gates[layer] = gate[..., offset + 1:offset + 2]
+
+    def unpack_post_mudd_gate(self, gate, xsa_alphas, attn_gates, x0_gates, bigram_gates):
+        xsa_alphas[4] = gate[..., 0:6]
+        xsa_alphas[7] = gate[..., 6:12]
+        attn_gates[10] = gate[..., 12:18]
+        for layer, offset in zip((4, 5, 7, 8, 9), range(18, 28, 2)):
+            x0_gates[layer] = gate[..., offset:offset + 1]
+            bigram_gates[layer] = gate[..., offset + 1:offset + 2]
+        return gate[..., 28:29]
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
@@ -1481,9 +1435,7 @@ class GPT(nn.Module):
         attn_gates = [None] * self.num_layers
         veg = self.ve_gate_bank.unbind(0)
         ve_gates = [None, veg[0], veg[1], *self.gate_filler_nones, veg[2], veg[3], veg[4]]
-        dcw1 = self.dc_w1_bank.unbind(0)
-        dcw2 = self.dc_w2_bank.unbind(0)
-        dc_weights = [*(zip(dcw1[:6], dcw2[:6])), None, *(zip(dcw1[6:], dcw2[6:]))]
+        dc_weights = [None] * self.num_layers
         xsa_alphas = [None] * self.num_layers
         x0_gates = [None] * self.num_layers
         bigram_gates = [None] * self.num_layers
@@ -1514,11 +1466,8 @@ class GPT(nn.Module):
         x = x0 = norm(x[None])
 
         pre_gate = self.forward_mudd_gate(x0, id=0, num_coef=self._mudd_gate_pre_num_coef)
-        self.unpack_mudd_gate(
+        self.unpack_pre_mudd_gate(
             pre_gate,
-            self._mudd_gate_pre_xsa_layers,
-            self._mudd_gate_pre_attn_layers,
-            self._mudd_gate_pre_inject_layers,
             xsa_alphas,
             attn_gates,
             x0_gates,
@@ -1528,6 +1477,7 @@ class GPT(nn.Module):
         # Initialize residual stream with pre-layer-0 bigram injection
         x = x + x0_bigram * bigram_gates[0]
         skip_gate_out = None
+        post_skip_gate = None
 
         # cache[k] is the layer-k snapshot used downstream by MUDD.
         # cache[0] = residual stream after bigram injection (input to layer 0).
@@ -1540,20 +1490,20 @@ class GPT(nn.Module):
             c_proj = mlp_projs[i]
             mu = None
 
-            # Skip attention on layer 6 @YouJiacheng
-            if i == 6:
+            if i == 4:
                 post_gate = self.forward_mudd_gate(x, id=1, num_coef=self._mudd_gate_post_num_coef)
-                post_skip_gate = self.unpack_mudd_gate(
+                post_skip_gate = self.unpack_post_mudd_gate(
                     post_gate,
-                    self._mudd_gate_post_xsa_layers,
-                    self._mudd_gate_post_attn_layers,
-                    self._mudd_gate_post_inject_layers,
                     xsa_alphas,
                     attn_gates,
                     x0_gates,
                     bigram_gates,
-                    include_skip=True,
                 )
+                dc_weights[10] = (post_gate[..., 29:35], post_gate[..., 35:41])
+
+            # Skip attention on layer 6 @YouJiacheng
+            if i == 6:
+                assert post_skip_gate is not None
                 skip_gate_out = torch.sigmoid(skip_lambda) * post_skip_gate
                 x = x + skip_gate_out * cache[3]
             else:
@@ -1595,7 +1545,7 @@ class GPT(nn.Module):
                 attn_out = attn(attn_in_normed, attn_args, qkvo_w, dc_w)
 
                 if mu is not None:
-                    x0_inject = cache[0] * x0_gates[i] + x0_bigram * bigram_gates[i]
+                    x0_inject = cache[0] * mu[10] + x0_bigram * mu[11]
                     x = mu[8] * x + mu[9] * attn_out + x0_inject
                 else:
                     x0_inject = x0 * x0_gates[i] if i == 0 else x0 * x0_gates[i] + x0_bigram * bigram_gates[i]
@@ -1822,7 +1772,7 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
     num_scheduled_iterations: int = 1315  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 20  # number of steps to continue training at final lr and ws
+    num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
@@ -1956,16 +1906,11 @@ class TrainingManager():
             "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
-            "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
-            "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "post_lambdas":   {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "x0_lambdas":     {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "bigram_lambdas": {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "resid_lambdas":  {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
-            "xsa_alphas":     {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
@@ -1975,22 +1920,16 @@ class TrainingManager():
             "mudd_w1":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25},
             "mudd_w2":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25},
             "mudd_b2":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25, "wd_mul": 0.0},
-            "mudd_gate_w1": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.15},
-            "mudd_gate_w2": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.15},
-            "mudd_gate_b2": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.15, "wd_mul": 0.0},
+            "mudd_gate_w1": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1},
+            "mudd_gate_w2": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1},
+            "mudd_gate_b2": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
         })
-        dc_lr_mul = dc_w2_lr_mul = 0.25
-        self.param_table.update({
-            "dc_w1_bank": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": dc_lr_mul, "wd_mul": 0.0},
-            "dc_w2_bank": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": dc_w2_lr_mul, "wd_mul": 0.0},
-        })
-        dc_work_order = ["dc_w1_bank", "dc_w2_bank"]
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", *dc_work_order, "mudd_b2", "mudd_gate_b2", "xsa_alphas",
-            "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+            "scalars", "smear_gate", "ve_gate_bank", "mudd_b2", "mudd_gate_b2",
+            "post_lambdas", "resid_lambdas",  # Small, fast
         ] + [
             "mudd_w2", "mudd_gate_w2",
             "value_embeds", "bigram_embed",  # Medium
@@ -2177,10 +2116,7 @@ model: nn.Module = GPT(
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
         m.weight.data = m.weight.data.bfloat16()
-model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
-model.dc_w1_bank.data = model.dc_w1_bank.data.bfloat16()
-model.dc_w2_bank.data = model.dc_w2_bank.data.bfloat16()
 model.qk_bank.data = model.qk_bank.data.bfloat16()
 model.vo_bank.data = model.vo_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
