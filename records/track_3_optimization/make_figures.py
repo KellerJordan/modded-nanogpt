@@ -229,7 +229,7 @@ for suffix in ["wr", "best"]:
             13: '#8 + MuLoCo',
             14: '#11 + SOAP-Muon on MLP',
             16: '#14 + SOAP-Muon on attn proj w/ trust gate',
-            20: '#16 + tuned lr sched + Soft-Muon',
+            20: '#16 + power law lr sched + Soft-Muon',
         }
     elif suffix == "best":
         logfiles = {
