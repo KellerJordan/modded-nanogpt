@@ -58,6 +58,7 @@ If it fails to reproduce (i.e., we get statistical evidence that its mean is abo
 | 21 | 4100 | 3.2776 (n=4)✓ | Shampoo(lr=0.0015, wd=0.2, betas=(.9, .95), precond_freq=5, power=-1/4) | 12,406 | 2026/05/13 | [log](results/20260513_shampoo_1_4_power/503575c5-6dde-425a-b461-2df4d99db974.txt) | N/A | @kellerjordan0 |
 | 22 | 8225 | 3.2774 (n=4)✓ | Ortho(lr=.03, wd=.015) == Muon(lr=.03, wd=.015, mu=0) == Shampoo(lr=0.03, wd=0.015, betas=(0, 0), precond_freq=1, power=-1/4) | 372 | 2026/05/17 | [log](results/20260517_ortho/d5098d67-7c1b-47b4-8833-80960d633d33.txt) | N/A | @kellerjordan0 |
 | 23 | 3075 | 3.2790 (n=30)✓ | [Muown](https://arxiv.org/abs/2605.10797) (Muon with integrated row-norm control), direction_scale=0.2, power LR cooldown, V-norm schedule | 558 | 2026/05/10 | [log](results/20260508_muown/a26c8aa2-993d-443f-b931-845724d07015.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/288) | @fhueb, @kcc-lion (note: Muown authors) |
+| 24 | 3175 | 3.2782 (n=10)✓ | Setup from #11, with split LR cooldown: aux AdamW cooldown_frac=0.4 and matrix cooldown_frac=0.8 | 450 | 2026/05/09 | [log](results/20260509_contra_muon_split_cooldown/c1af0bd1-6999-44d1-a618-3d1234ea32f0.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/292) | @zhiweixx |
 
 <table>
   <tr>
