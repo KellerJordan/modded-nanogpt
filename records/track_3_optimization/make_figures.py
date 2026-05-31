@@ -1,6 +1,7 @@
 import re
 import math
 import random
+import argparse
 from collections import defaultdict
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -8,14 +9,25 @@ from matplotlib.lines import Line2D
 from matplotlib.offsetbox import AnchoredOffsetbox, DrawingArea, HPacker, TextArea, VPacker
 
 
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    '--colors',
+    choices=('pyplot', 'extended'),
+    default='pyplot',
+    help='Color cycle to use: pyplot default, or the previous shuffled extended palette.',
+)
+args = parser.parse_args()
+
 plt.style.use('seaborn-v0_8-whitegrid')
 plt.rcParams['font.family'] = 'DejaVu Sans'
-color_cycle = [
+extended_color_cycle = [
     *plt.colormaps['tab20'].colors,
     *plt.colormaps['tab20b'].colors,
     *plt.colormaps['tab20c'].colors,
 ]
-random.Random(46).shuffle(color_cycle)
+random.Random(46).shuffle(extended_color_cycle)
+pyplot_color_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+color_cycle = pyplot_color_cycle if args.colors == 'pyplot' else extended_color_cycle
 
 
 def get_results(logfiles):
@@ -70,9 +82,11 @@ def add_legend(ax, legend_entries):
             color=color,
         ))
         label_lines = label.splitlines()
-        label_texts = [TextArea(label_lines[0], textprops={'fontsize': 8})]
-        if len(label_lines) > 1:
-            label_texts.append(TextArea('\n'.join(label_lines[1:]), textprops={'fontsize': 6.5}))
+        title_size = 6.5 if any(len(line) > 25 for line in label_lines) else 8
+        label_texts = [
+            TextArea(line, textprops={'fontsize': title_size})
+            for line in label_lines
+        ]
         text = VPacker(
             children=[
                 *label_texts,
@@ -107,7 +121,7 @@ def add_legend(ax, legend_entries):
     return legend
 
 
-def shift_legend_left_half_width(ax, legend, anchor_x=1.25, anchor_y=1.01, width_fraction=0.9):
+def shift_legend_left_half_width(ax, legend, anchor_x=0.95, anchor_y=1.01, width_fraction=0.9):
     ax.figure.canvas.draw()
     renderer = ax.figure.canvas.get_renderer()
     legend_width = legend.get_window_extent(renderer=renderer).width
@@ -220,15 +234,15 @@ for suffix in ["wr", "best"]:
     elif suffix == "best":
         logfiles = {
             12: 'Muon',
-            4: 'AdamH',
-            8: 'NorMuonH',
+            4: 'Adam-Hyperball',
+            8: 'NorMuon-Hyperball',
             9: 'NorMuon w/ update clamp-min',
             10: 'NorMuon',
             16: '#11 + SOAP-Muon',
             15: 'Newton-Muon',
             17: '#11 + Aurora',
             18: 'PMuon',
-            19: 'KL-SOAP',
+            19: 'KLSOAP-Hyperball',
             21: 'Shampoo',
             22: 'Ortho',
         }
@@ -240,7 +254,7 @@ for suffix in ["wr", "best"]:
     # Generate figure
     fig, ax = plt.subplots(figsize=(5.5, 4), dpi=300)
     legend = plot_results(ax, results.values(), 0, title_date)
-    ax.set_xlim(0, 5500)
+    ax.set_xlim(0, 3800)
     ax.set_ylim(3.2, 3.85)
     fig.tight_layout()
     shift_legend_left_half_width(ax, legend)
