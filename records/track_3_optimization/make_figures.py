@@ -223,28 +223,27 @@ for suffix in ["wr", "best"]:
         logfiles = {
             1: 'Muon (bad hparams)',
             3: 'Muon (less bad hparams)',
-            5: 'MuonH',
-            9: 'NorMuon w/ update clamp-min',
-            11: '#9 + Contra-Muon',
+            5: 'Muon-Hyperball',
+            9: 'NorMuon-UpdateClampMin',
+            11: '#9 + ContraMuon',
             13: '#8 + MuLoCo',
-            14: '#11 + SOAP-Muon on MLP',
-            16: '#14 + SOAP-Muon on attn proj w/ trust gate',
-            20: '#16 + power law lr sched + Soft-Muon',
+            14: '#11 + SOAPMuon on MLP',
+            16: '#14 + SOAPMuon on attn proj w/ trust gate',
+            20: '#16 + power law lr sched + SoftMuon',
         }
     elif suffix == "best":
         logfiles = {
-            12: 'Muon',
+            12: 'Muon-W',
             4: 'Adam-Hyperball',
-            8: 'NorMuon-Hyperball',
-            9: 'NorMuon w/ update clamp-min',
-            10: 'NorMuon',
-            16: '#11 + SOAP-Muon',
-            15: 'Newton-Muon',
+            9: '#9: NorMuon-UpdateClampMin',
+            11: '#11: #9 + ContraMuon',
+            16: '#11 + SOAPMuon',
             17: '#11 + Aurora',
-            18: 'PMuon',
+            15: 'NewtonMuon-W',
             19: 'KLSOAP-Hyperball',
-            21: 'Shampoo',
-            22: 'Ortho',
+            21: 'Shampoo-W',
+            22: 'Ortho-W',
+            23: 'Muon-RowNormControl',
         }
     else:
         assert False
