@@ -201,7 +201,7 @@ def average_runs(runs):
 
 readme_rows = {}
 row_pattern = re.compile(
-    r'^\|\s*(\d+)\s*\|\s*(\d+)[^|]*\|\s*([^|]+?)\s*\|[^|]*\|\s*(\d{4}/\d{2}/\d{2})\s*\|\s*\[log\]\((results/[^)]+)\)'
+    r'^\|\s*(\d+)\s*\|\s*(\d+)[^|]*\|\s*([^|]+?)\s*\|[^|]*\|[^|]*\|\s*(\d{4}/\d{2}/\d{2})\s*\|\s*\[log\]\((results/[^)]+)\)'
 )
 with open('README.md', 'r') as f:
     for line in f:
