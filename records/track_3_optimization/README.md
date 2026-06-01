@@ -6,10 +6,10 @@ Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any
 [Longform announcement](https://x.com/kellerjordan0/status/2049193527440187494)
 
 Thank you to everyone who's contributed results so far:
-@kaiyue-wen, @nilin, @alint77, @wilsoncwu, @kumarkrishna, @lliu606, @zhenghaoxu-gatech, @bentherien, @samacqua, @zhehangdu, @SPThole, @liyang2019, @zzp1012, @yash-oai, @fhueb, @kcc-lion, @zhiweixx, @chenchenygu, @breskanu, and @fangzhou_wu.
+@kaiyue-wen, @nilin, @alint77, @wilsoncwu, @kumarkrishna, @lliu606, @zhenghaoxu-gatech, @bentherien, @samacqua, @zhehangdu, @SPThole, @liyang2019, @zzp1012, @fhueb, @kcc-lion, @zhiweixx, @chenchenygu, @breskanu, and @fangzhou_wu.
 
 
-## Benchmark definition tl;dr
+## Benchmark definition Tl;dr
 
 Runs submitted to this benchmark are considered valid only if they meet the following conditions:
 * They must not modify the dataset, batch size, or architecture used by the baseline. It also must not perform more than one forward-backward pass per step.
@@ -67,6 +67,7 @@ Note: [Beware that](https://github.com/KellerJordan/modded-nanogpt/issues/268) o
 | 26 | 3090 | 3.2785 (n=10)✓ | SinkSOAP: Gram-Sinkhorn SOAP-style preconditioning with NorMuon postconditioner, lr=0.04 wd=0.025, does not use power lr schedule | 735 | 2026/05/14 | [log](results/20260514_sinksoap/d0155dd0-f77d-48a9-8eb4-453f894b9476.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/298) | @lliu606, @zhenghaoxu-gatech |
 | 27 | 3125 | 3.2782 (n=6)✓ | Setup from #19, with KL-SOAP replaced by [SOAP](https://proceedings.iclr.cc/paper_files/paper/2025/file/e988664070e9591f93fdcf605f7dc623-Paper-Conference.pdf) with hyperball optimization, w.o. bias correction, precondition_frequency=1, lr=.018, beta1=.95, beta2=.9, and tuned lr schedule | 608 | 2026/05/18 | [log](results/20260518_soaph/SOAPH_run1.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/302) | Nikita Breskanu @breskanu |
 | 28 | 3175 | 3.2790 (n=25)✓ | [DynMuon](https://arxiv.org/pdf/2605.17109) (p: 0.25 -> -0.25, tau=0.04, w=0.04, lr=0.02, wd=0.025) | 562 | 2026/05/19 | [log](results/20260519_dynmuon/50172610-d038-4f90-9a12-b9a0853f035d.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/304) | @fangzhou_wu |
+| 29 | 2990(!) | 3.2787 (n=11)✓ | Setup from #20, plus radial brake: dampens outward radial updates before the u/w floor, then corrects post-step radius drift | 873 | 2026/05/11 | [log](results/20260511_dampen_radial_gradient_component/00882c75-914d-4340-8e0b-dcffcb18b73d.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/294) | @nilin |
 
 Notes:
 * To reproduce any of these runs, simply rip their python script out of their logfile (take everything before `===`), and then run it using the quickstart above.
