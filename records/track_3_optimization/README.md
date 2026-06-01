@@ -28,10 +28,9 @@ Many more non-SOTA results (e.g., from hyperparameter sweeps) can be found in `r
 
 Notes:
 * To reproduce any of these runs, simply rip their python script out of their logfile (take everything before `===`), and then run it using the quickstart above.
-If it fails to reproduce (i.e., we get statistical evidence that its mean is above 3.28), then please report that, as it will be grounds to remove the run from the history.
+If it fails to reproduce (i.e., we get statistical evidence that its mean is above 3.28), then please raise an issue to let us know, as it will be grounds to remove the run from the history.
 * The number in the leftmost column reflects the order in which these runs were accepted. This does not necessarily line up with the Date column, which is the date at which the PR appeared.
 * The (!) symbol next to the step count indicates a result that sets a new global step-count record (across all optimizers).
-* The Code LOC column counts physical lines before the `===` separator in the linked logfile; for entries importing vendored third-party optimizer code, it also includes vendored implementation Python files, excluding tests and examples.
 
 | # | Steps to 3.28 | Evidence | Description | Lines of Code | Date | Log | PR | Contributors |
 | - | -             | -        | -           | -             |  -   | -   | -  | -            |
