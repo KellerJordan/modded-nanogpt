@@ -37,12 +37,6 @@ Note: [Beware that](https://github.com/KellerJordan/modded-nanogpt/issues/268) o
 
 ## Notable results history
 
-Notes:
-* To reproduce any of these runs, simply rip their python script out of their logfile (take everything before `===`), and then run it using the quickstart above.
-If it fails to reproduce (i.e., we get statistical evidence that its mean is above 3.28), then please raise an issue to let us know, as it will be grounds to remove the run from the history.
-* The number in the leftmost column reflects the order in which these runs were accepted. This does not necessarily line up with the Date column, which is the date at which the PR appeared.
-* The (!) symbol next to the step count indicates a new world record.
-
 | # | Steps to 3.28 | Evidence | Description | Lines of Code | Date | Log | PR | Contributors |
 | - | -             | -        | -           | -             |  -   | -   | -  | -            |
 | 1 | 3600(!) | 3.2777 (n=1)Ⓧ | [Muon](https://kellerjordan.github.io/posts/muon/) with aux Adam, lr=.02 wd=.01 | 355 | 2026/04/26 | [log](results/7b8270c5-a9cd-4a73-b7d8-5d86a2d1e428.txt) | N/A | @kellerjordan0 |
@@ -73,6 +67,12 @@ If it fails to reproduce (i.e., we get statistical evidence that its mean is abo
 | 26 | 3090 | 3.2785 (n=10)✓ | SinkSOAP: Gram-Sinkhorn SOAP-style preconditioning with NorMuon postconditioner, lr=0.04 wd=0.025, does not use power lr schedule | 735 | 2026/05/14 | [log](results/20260514_sinksoap/d0155dd0-f77d-48a9-8eb4-453f894b9476.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/298) | @lliu606, @zhenghaoxu-gatech |
 | 27 | 3125 | 3.2782 (n=6)✓ | Setup from #19, with KL-SOAP replaced by [SOAP](https://proceedings.iclr.cc/paper_files/paper/2025/file/e988664070e9591f93fdcf605f7dc623-Paper-Conference.pdf) with hyperball optimization, w.o. bias correction, precondition_frequency=1, lr=.018, beta1=.95, beta2=.9, and tuned lr schedule | 608 | 2026/05/18 | [log](results/20260518_soaph/SOAPH_run1.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/302) | Nikita Breskanu @breskanu |
 | 28 | 3175 | 3.2790 (n=25)✓ | [DynMuon](https://arxiv.org/pdf/2605.17109) (p: 0.25 -> -0.25, tau=0.04, w=0.04, lr=0.02, wd=0.025) | 562 | 2026/05/19 | [log](results/20260519_dynmuon/50172610-d038-4f90-9a12-b9a0853f035d.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/304) | @fangzhou_wu |
+
+Notes:
+* To reproduce any of these runs, simply rip their python script out of their logfile (take everything before `===`), and then run it using the quickstart above.
+If it fails to reproduce (i.e., we get statistical evidence that its mean is above 3.28), then please raise an issue to let us know, as it will be grounds to remove the run from the history.
+* The number in the leftmost column reflects the order in which these runs were accepted. This does not necessarily line up with the Date column, which is the date at which the PR appeared.
+* The (!) symbol next to the step count indicates a new world record.
 
 <table>
   <tr>
