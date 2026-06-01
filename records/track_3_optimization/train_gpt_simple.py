@@ -213,6 +213,368 @@ class Muon(torch.optim.Optimizer):
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
 
+
+
+
+
+def gram_eigenbasis(C: Tensor, eps: float = 1e-6) -> Tensor:
+    """
+    Eigenbasis for symmetric PSD Gram matrix.
+    Returns eigenvectors sorted by descending eigenvalue.
+    """
+    C = C.float()
+    C = 0.5 * (C + C.T)
+
+    if eps > 0:
+        eye = torch.eye(C.shape[0], device=C.device, dtype=C.dtype)
+        C = C + eps * eye
+
+    evals, evecs = torch.linalg.eigh(C)
+    idx = torch.argsort(evals, descending=True)
+    return evecs[:, idx]
+
+
+def sinkhorn_energy_balance_rect_no_scale(
+    A: Tensor,
+    steps: int = 10,
+    eps: float = 1e-8,
+) -> Tensor:
+    """
+    Sinkhorn-balance elementwise energy A^2.
+
+    For A in R^{m x n}:
+
+        B = A^2 + eps
+        Pi = Dr B Dc
+
+    target rectangular marginals:
+
+        Pi 1_n ~= (1/m) 1_m
+        Pi^T 1_m ~= (1/n) 1_n
+
+    Lift back:
+
+        A_bal = Dr^{1/2} A Dc^{1/2}
+
+    No RMS/Frobenius scaling here.
+    """
+    assert A.ndim == 2
+
+    out_dtype = A.dtype
+    A = A.float()
+
+    m, n = A.shape
+    B = A.square() + eps
+
+    target_r = torch.full(
+        (m,),
+        1.0 / m,
+        device=A.device,
+        dtype=torch.float32,
+    )
+    target_c = torch.full(
+        (n,),
+        1.0 / n,
+        device=A.device,
+        dtype=torch.float32,
+    )
+
+    r = torch.ones(m, device=A.device, dtype=torch.float32)
+    c = torch.ones(n, device=A.device, dtype=torch.float32)
+
+    for _ in range(steps):
+        r = target_r / (B @ c + eps)
+        c = target_c / (B.T @ r + eps)
+
+    A_bal = r.sqrt()[:, None] * A * c.sqrt()[None, :]
+
+    return A_bal.to(out_dtype)
+
+
+def scale_update_like_muon(update: Tensor, eps: float = 1e-8) -> Tensor:
+    """
+    Match original Muon's final Frobenius norm:
+
+        ||update||_F ~= sqrt(min(m, n)) * sqrt(max(1, m / n))
+
+    This equals sqrt(m), but we keep the Muon expression.
+    """
+    assert update.ndim == 2
+
+    m, n = update.shape
+
+    target_norm = (min(m, n) ** 0.5) * (max(1.0, m / n) ** 0.5)
+
+    update_norm = update.float().norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+
+    return update * (target_norm / update_norm).to(update.dtype)
+
+
+def normuon_postcondition_update(
+    update: Tensor,
+    second_momentum: Tensor,
+    beta: float = 0.95,
+    eps: float = 1e-10,
+) -> Tensor:
+    """
+    NorMuon-style postconditioner applied to an already preconditioned update.
+
+    Important:
+    - This does NOT call zeropower again.
+    - It preserves the incoming Frobenius norm.
+    - Therefore call this AFTER scale_update_like_muon(update).
+
+    For m >= n:
+        v_mean shape [m, 1], row-wise energy.
+
+    For m < n:
+        v_mean shape [1, n], column-wise energy.
+    """
+    assert update.ndim == 2
+
+    out_dtype = update.dtype
+    X = update.float()
+
+    m, n = X.shape
+
+    norm = X.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+
+    if m >= n:
+        v_mean = torch.mean(X * X, dim=-1, keepdim=True)  # [m, 1]
+    else:
+        v_mean = torch.mean(X * X, dim=-2, keepdim=True)  # [1, n]
+
+    second_momentum.lerp_(v_mean.to(second_momentum.dtype), 1.0 - beta)
+
+    step_size = 1.0 / second_momentum.float().sqrt().clamp_min(eps)
+
+    X = X * step_size
+
+    norm_new = X.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    X = X * (norm / norm_new)
+
+    return X.to(out_dtype)
+
+
+def gram_sinkhorn_normuon_update(
+    grad: Tensor,
+    momentum: Tensor,
+    left_gram: Tensor,
+    right_gram: Tensor,
+    second_momentum: Tensor,
+    mu: float = 0.95,
+    gram_beta: float = 0.95,
+    normuon_beta: float = 0.95,
+    nesterov: bool = True,
+    sinkhorn_steps: int = 10,
+    eps: float = 1e-8,
+    normuon_eps: float = 1e-10,
+    apply_normuon: bool = True,
+) -> Tensor:
+    """
+    Gram-Sinkhorn update + NorMuon postconditioner.
+
+    Order:
+
+        1. momentum
+        2. EMA GG^T and G^T G
+        3. U, V from Gram eigenspaces
+        4. A = U^T M V
+        5. Sinkhorn on A^2
+        6. update = U A_bal V^T
+        7. scale update to Muon Frobenius norm
+        8. NorMuon postconditioner, preserving that norm
+    """
+    assert grad.ndim == 2
+    assert momentum.shape == grad.shape
+
+    G = grad.float()
+    m, n = G.shape
+
+    # Momentum EMA.
+    momentum.lerp_(grad, 1.0 - mu)
+
+    if nesterov:
+        M = grad.float().lerp(momentum.float(), mu)
+    else:
+        M = momentum.float()
+
+    # EMA Gram matrices.
+    left_gram.lerp_(G @ G.T, 1.0 - gram_beta)
+    right_gram.lerp_(G.T @ G, 1.0 - gram_beta)
+
+    # Bases from EMA Grams.
+    U = gram_eigenbasis(left_gram, eps=eps)
+    V = gram_eigenbasis(right_gram, eps=eps)
+
+    # Project momentum/update into Gram feature basis.
+    A = U.T @ M @ V
+
+    # Sinkhorn energy balancing, no scale restoration.
+    A_bal = sinkhorn_energy_balance_rect_no_scale(
+        A,
+        steps=sinkhorn_steps,
+        eps=eps,
+    ).float()
+
+    # Reconstruct matrix update.
+    update = U @ A_bal @ V.T
+
+    # First align final matrix update scale to Muon.
+    update = scale_update_like_muon(update, eps=eps)
+
+    # Then apply NorMuon-style postconditioner.
+    # It preserves the norm, so final scale remains Muon-aligned.
+    if apply_normuon and (m != n):
+        update = normuon_postcondition_update(
+            update,
+            second_momentum=second_momentum,
+            beta=normuon_beta,
+            eps=normuon_eps,
+        )
+
+    return update.to(grad.dtype)
+
+
+class SinkSOAP(torch.optim.Optimizer):
+    """
+    Gram-Sinkhorn-Muon + NorMuon postconditioner.
+
+    State per 2D parameter:
+
+        momentum:        [m, n]
+        left_gram:       [m, m]
+        right_gram:      [n, n]
+        second_momentum: [m, 1] if m >= n else [1, n]
+
+    Final update scale is aligned to original Muon Frobenius norm before
+    NorMuon postconditioning.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 0.02,
+        weight_decay: float = 0.0,
+        mu: float = 0.95,
+        gram_beta: float = 0.95,
+        normuon_beta: float = 0.95,
+        sinkhorn_steps: int = 10,
+        nesterov: bool = True,
+        eps: float = 1e-8,
+        normuon_eps: float = 1e-10,
+        apply_normuon: bool =True,
+    ):
+        assert isinstance(params, list)
+        assert len(params) >= 1
+        assert isinstance(params[0], torch.nn.Parameter)
+
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+
+        defaults = dict(
+            lr=lr,
+            weight_decay=weight_decay,
+            mu=mu,
+            gram_beta=gram_beta,
+            normuon_beta=normuon_beta,
+            sinkhorn_steps=sinkhorn_steps,
+            nesterov=nesterov,
+            eps=eps,
+            normuon_eps=normuon_eps,
+            apply_normuon=apply_normuon,
+        )
+
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        for group in self.param_groups:
+            params = group["params"]
+
+            if world_size > 1:
+                pad_len = (world_size - len(params) % world_size) % world_size
+                params_pad = params + [torch.empty_like(params[-1])] * pad_len
+            else:
+                params_pad = params
+
+            for base_i in range(0, len(params_pad), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+
+                    if p.grad is None:
+                        continue
+
+                    if p.grad.ndim != 2:
+                        raise ValueError(
+                            "GramSinkhornNorMuon currently only supports 2D parameters. "
+                            f"Got parameter with shape {tuple(p.shape)}."
+                        )
+
+                    state = self.state[p]
+                    m, n = p.shape
+
+                    if len(state) == 0:
+                        state["momentum"] = torch.zeros_like(p)
+
+                        state["left_gram"] = torch.zeros(
+                            (m, m),
+                            device=p.device,
+                            dtype=torch.float32,
+                        )
+
+                        state["right_gram"] = torch.zeros(
+                            (n, n),
+                            device=p.device,
+                            dtype=torch.float32,
+                        )
+
+                        if m >= n:
+                            state["second_momentum"] = torch.zeros(
+                                (m, 1),
+                                device=p.device,
+                                dtype=torch.float32,
+                            )
+                        else:
+                            state["second_momentum"] = torch.zeros(
+                                (1, n),
+                                device=p.device,
+                                dtype=torch.float32,
+                            )
+
+                    update = gram_sinkhorn_normuon_update(
+                        grad=p.grad,
+                        momentum=state["momentum"],
+                        left_gram=state["left_gram"],
+                        right_gram=state["right_gram"],
+                        second_momentum=state["second_momentum"],
+                        mu=group["mu"],
+                        gram_beta=group["gram_beta"],
+                        normuon_beta=group["normuon_beta"],
+                        nesterov=group["nesterov"],
+                        sinkhorn_steps=group["sinkhorn_steps"],
+                        eps=group["eps"],
+                        normuon_eps=group["normuon_eps"],
+                        apply_normuon=group["apply_normuon"],
+                    )
+
+                    p.mul_(1.0 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+
+                if world_size > 1:
+                    dist.all_gather(
+                        params_pad[base_i : base_i + world_size],
+                        params_pad[base_i + rank],
+                    )
+
+
 ########################################
 #                Setup                 #
 ########################################
@@ -264,7 +626,7 @@ for _ in range(num_trials):
     ########################################
 
     # we want to minimize this while still reaching 3.28 val loss
-    train_steps = 3350
+    train_steps = 3125
 
     # initialize model parameters
     for name, p in model.named_parameters():
@@ -288,8 +650,8 @@ for _ in range(num_trials):
                         dict(params=[model.proj.weight], lr=1/320),
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
                        betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
-    optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.035, weight_decay=0.025)
+    optimizer2 = SinkSOAP([p for p in model.blocks.parameters() if p.ndim >= 2],
+                      lr=0.04, weight_decay=0.025)
     optimizers = [optimizer1, optimizer2]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())
@@ -325,8 +687,8 @@ for _ in range(num_trials):
     for step in range(train_steps + 1):
 
         # --------------- VALIDATION SECTION -----------------
-        val_step_freq = 125 if step / train_steps < 0.9 else 25
-        if step == train_steps or step % val_step_freq == 0:
+        val_step_freq = 125 if step / train_steps < 0.94 else 25
+        if step == train_steps or step % val_step_freq == 0 or step == 3080 or step == 3085 or step == 3090:
             # stop the clock
             dist.barrier()
             time_since_last_val = time.perf_counter() - t0
