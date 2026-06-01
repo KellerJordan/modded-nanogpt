@@ -11,11 +11,11 @@ Thank you to everyone who's contributed results so far:
 
 ## Benchmark definition Tl;dr
 
-Runs submitted to this benchmark are considered valid only if they meet the following conditions:
+Runs submitted to this benchmark are considered valid if they meet the following conditions:
 * They must not modify the dataset, batch size, or architecture used by the baseline. It also must not perform more than one forward-backward pass per step.
 * They must attain below 3.28 val loss, thereby matching [Andrej Karpathy's GPT-2 replication](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
-Beyond that, runs are completely free to arbitrarily modify the optimization algorithm and hyperparameters.
+Beyond those constraints, runs are completely free to arbitrarily modify the optimization algorithm and hyperparameters.
 The general goal is to achieve 3.28 in the fewest steps possible. But we also accept academic results
 which add to our knowledge of neural network optimization without setting a new record
 (e.g., baselines for optimizers from the literature).
