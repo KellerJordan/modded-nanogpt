@@ -97,6 +97,8 @@ Figure 1. World-record progression.
 </table>
 Figure 2. Per-optimizer best.
 
+<br/>
+
 ![Optimizer Comparison](img/muon_shampoo_ssd.png)
 Figure 3. Comparison between Shampoo and Muon, which both reduce to Spectral Descent when momentum is removed.
 
