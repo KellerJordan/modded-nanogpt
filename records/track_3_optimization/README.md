@@ -70,7 +70,7 @@ Note: [Beware that](https://github.com/KellerJordan/modded-nanogpt/issues/268) o
 
 Notes:
 * To reproduce any of these runs, simply rip their python script out of their logfile (take everything before `===`), and then run it using the quickstart above.
-If it fails to reproduce (i.e., we get statistical evidence that its mean is above 3.28), then please raise an issue to let us know, as it will be grounds to remove the run from the history.
+If it fails to reproduce (i.e., we get statistical evidence that its mean is above 3.28), then please raise an issue to let us know, as this will be grounds to remove the run from the history.
 * The number in the leftmost column reflects the order in which these runs were accepted. This does not necessarily line up with the Date column, which is the date at which the PR appeared.
 * The (!) symbol next to the step count indicates a new world record.
 
