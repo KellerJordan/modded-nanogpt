@@ -61,6 +61,7 @@ If it fails to reproduce (i.e., we get statistical evidence that its mean is abo
 | 24 | 3175 | 3.2782 (n=10)✓ | Setup from #11, with split LR cooldown: aux AdamW cooldown_frac=0.4 and matrix cooldown_frac=0.8 | 450 | 2026/05/09 | [log](results/20260509_contra_muon_split_cooldown/c1af0bd1-6999-44d1-a618-3d1234ea32f0.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/292) | @zhiweixx |
 | 25 | 3040 | 3.2781 (n=5)✓ | Setup from #19 KL-SOAP-H, plus power LR decay over a 3125-step horizon with nonzero Adam/KL-SOAP LR floors | 536 | 2026/05/11 | [log](results/20260511_klsoap_h_lr_power_decay/01906576-8b3d-4bd2-a73f-23997f602ec1.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/293) | @chenchenygu |
 | 26 | 3090 | 3.2785 (n=10)✓ | SinkSOAP: Gram-Sinkhorn SOAP-style preconditioning with NorMuon postconditioner, lr=0.04 wd=0.025, does not use power lr schedule | 735 | 2026/05/14 | [log](results/20260514_sinksoap/d0155dd0-f77d-48a9-8eb4-453f894b9476.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/298) | @lliu606 |
+| 27 | 3125 | 3.2782 (n=6)✓ | Setup from #19, with KL-SOAP replaced by [SOAP](https://proceedings.iclr.cc/paper_files/paper/2025/file/e988664070e9591f93fdcf605f7dc623-Paper-Conference.pdf) with hyperball optimization, w.o. bias correction, precondition_frequency=1, lr=.018, beta1=.95, beta2=.9, and tuned lr schedule | 608 | 2026/05/18 | [log](results/20260518_soaph/SOAPH_run1.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/302) | @breskanu |
 
 <table>
   <tr>
