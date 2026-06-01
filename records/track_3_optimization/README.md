@@ -9,6 +9,20 @@ Thank you to everyone who's contributed results so far:
 @kaiyue-wen, @nilin, @alint77, @wilsoncwu, @kumarkrishna, @lliu606, @zhenghaoxu-gatech, @bentherien, @samacqua, @zhehangdu, @SPThole, @liyang2019, @zzp1012, @yash-oai, @fhueb, @kcc-lion, @zhiweixx, @chenchenygu, @breskanu, and @fangzhou_wu.
 
 
+## Benchmark definition tl;dr
+
+For a run submitted to this benchmark to be considered valid, it must meet the following conditions.
+* The run must not modify the dataset, batch size, or architecture used by the baseline. It also must not perform more than one forward-backward pass per step.
+* The run must attain below 3.28 val loss, thereby matching [Andrej Karpathy's GPT-2 replication](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
+
+Beyond that, runs are completely free to arbitrarily modify the optimization algorithm and hyperparameters.
+The general goal is to achieve 3.28 in the fewest steps possible. But we also accept academic results
+which add to our knowledge of neural network optimization without setting a new record
+(e.g., baselines for optimizers from the literature).
+
+The precise rules around statistical significance etc. can be found [below](#rules).
+
+
 ## Quickstart
 
 The baseline setup (Muon with aux Adam) can be run using the following command on any {1,2,4,8}x-{A,H}100 machine:
