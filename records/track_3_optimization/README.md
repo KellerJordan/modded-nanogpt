@@ -23,9 +23,6 @@ Note: [Beware that](https://github.com/KellerJordan/modded-nanogpt/issues/268) o
 
 ## Notable results history
 
-The following results each improved the best known hyperparameters for an optimizer on this benchmark.
-Many more non-SOTA results (e.g., from hyperparameter sweeps) can be found in `results/`.
-
 Notes:
 * To reproduce any of these runs, simply rip their python script out of their logfile (take everything before `===`), and then run it using the quickstart above.
 If it fails to reproduce (i.e., we get statistical evidence that its mean is above 3.28), then please raise an issue to let us know, as it will be grounds to remove the run from the history.
