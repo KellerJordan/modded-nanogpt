@@ -12,6 +12,11 @@ Standard Attention steps are the documented record numbers (see
 `records/track_3_optimization/README.md`). Parallax's records follow the benchmark's convention: the
 first eval-grid step at which the **seed-mean** val_loss first drops below 3.28 (i.e. average seeds, then threshold).
 
+<p align="center">
+  <img src="imgs/parallax_all_zoom.png" width="49%" />
+  <img src="imgs/attention_all_zoom.png" width="49%" />
+</p>
+
 | Algo (Track-3 record) | Script | Attn steps | PLX steps | % boost |
 | - | - | - | - | - |
 | **SOAP-H** ([#27](https://github.com/KellerJordan/modded-nanogpt/pull/302)) | `rec27_soaph.py` | 3125 | **2880** (n=4) | **7.84%** |
