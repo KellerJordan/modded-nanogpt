@@ -23,9 +23,8 @@ from torch import Tensor, nn
 from torch.optim import AdamW
 import torch.nn.functional as F
 import sys as _sys
-_sys.path.insert(0, _os.environ.get('PARALLAX_PATH', ''))
-from parallax.triton.parallax_func import parallax_func
-@torch.compiler.disable
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from parallax_op import parallax_func
 def _parallax_attn(q,r,k,v,sc):
     return parallax_func(q,r,k,v,sc)
 import torch.distributed as dist
@@ -199,7 +198,7 @@ def _initial_orthogonal_matrix(matrix: Tensor) -> Tensor:
     return torch.flip(q, dims=[1]).contiguous()
 
 
-# @torch.compile  # eager
+@torch.compile
 def soap_update(
     grad: Tensor,
     momentum_buffer: Tensor,
@@ -454,7 +453,7 @@ mbs = 16  # eager mem; grad-accum neutral
 val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
 
 model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
-# model.compile(...)  # eager
+model.compile(dynamic=False)
 
 
 num_trials = 1

@@ -24,12 +24,10 @@ from torch import Tensor, nn
 from torch.optim import AdamW
 import torch.nn.functional as F
 import sys as _sys
-_sys.path.insert(0, _os.environ.get('PARALLAX_PATH', ''))
-from parallax.triton.parallax_func import parallax_func  # Parallax local-linear attention
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from parallax_op import parallax_func  # compile-safe wrapper around the upstream Triton kernel
 
-@torch.compiler.disable
 def _parallax_attn(q, r, k, v, scale):
-    # custom Triton autograd kernel: keep it out of the inductor graph
     return parallax_func(q, r, k, v, scale)
 import torch.distributed as dist
 
@@ -244,7 +242,7 @@ def scale_to_unit_operator_norm(G: Tensor, eps: float = 1e-10) -> Tensor:
     sigma = (X @ v).norm()
     return X / torch.clamp(sigma, min=eps)
 
-# @torch.compile  # eager for Parallax
+@torch.compile
 def muon_update(grad, momentum, mu=0.95, nesterov=True, pp_iterations=2, pp_beta=0.5):
     """Aurora polar + Contra-Muon correction + spectral aspect-ratio scale."""
     momentum.lerp_(grad, 1 - mu)
@@ -345,7 +343,7 @@ mbs = 16  # was 64; reduced for eager Parallax memory (grad-accum keeps effectiv
 val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
 
 model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
-# model.compile(dynamic=False)  # eager for Parallax
+model.compile(dynamic=False)
 
 
 num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1

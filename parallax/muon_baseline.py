@@ -23,9 +23,8 @@ from torch import Tensor, nn
 from torch.optim import AdamW
 import torch.nn.functional as F
 import sys as _sys
-_sys.path.insert(0, _os.environ.get('PARALLAX_PATH', ''))
-from parallax.triton.parallax_func import parallax_func
-@torch.compiler.disable
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from parallax_op import parallax_func
 def _parallax_attn(q,r,k,v,s):
     return parallax_func(q,r,k,v,s)
 import torch.distributed as dist
@@ -194,7 +193,7 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
         X = X.mT
     return X
 
-# @torch.compile  # eager
+@torch.compile
 def muon_update(grad, momentum, mu=0.95, nesterov=True):
     momentum.lerp_(grad, 1 - mu)
     update = grad.lerp_(momentum, mu) if nesterov else momentum
@@ -628,7 +627,7 @@ mbs = 16  # eager memory; grad-accum keeps effective batch
 val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
 
 model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
-# model.compile(dynamic=False)  # eager
+model.compile(dynamic=False)
 
 
 num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1

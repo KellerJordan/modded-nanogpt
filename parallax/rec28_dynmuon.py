@@ -26,9 +26,8 @@ from torch import Tensor, nn
 from torch.optim import AdamW
 import torch.nn.functional as F
 import sys as _sys
-_sys.path.insert(0, _os.environ.get('PARALLAX_PATH', ''))
-from parallax.triton.parallax_func import parallax_func
-@torch.compiler.disable
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from parallax_op import parallax_func
 def _parallax_attn(q,r,k,v,sc):
     return parallax_func(q,r,k,v,sc)
 import torch.distributed as dist
@@ -229,7 +228,7 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
 
 
 
-# @torch.compile  # eager for Parallax
+@torch.compile
 def muon_update(grad, momentum, mu=0.95, nesterov=True):
    momentum.lerp_(grad, 1 - mu)
    update = grad.lerp_(momentum, mu) if nesterov else momentum
@@ -415,7 +414,7 @@ val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/finew
 
 
 model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
-# model.compile(dynamic=False)  # eager for Parallax
+model.compile(dynamic=False)
 
 
 

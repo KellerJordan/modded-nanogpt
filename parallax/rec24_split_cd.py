@@ -31,9 +31,8 @@ from torch import Tensor, nn
 from torch.optim import AdamW
 import torch.nn.functional as F
 import sys as _sys
-_sys.path.insert(0, _os.environ.get('PARALLAX_PATH', ''))
-from parallax.triton.parallax_func import parallax_func
-@torch.compiler.disable
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from parallax_op import parallax_func
 def _parallax_attn(q,r,k,v,sc):
     return parallax_func(q,r,k,v,sc)
 import torch.distributed as dist
@@ -236,7 +235,7 @@ def scale_to_unit_operator_norm(G: Tensor, eps: float = 1e-10) -> Tensor:
 # normalize each row by 1/sqrt(EMA), then renormalize Frobenius back to original.
 # This is Adam-style 2nd moment but per-ROW (not per-element), preserving Muon's spectral
 # structure while adaptively reweighting between rows.
-# @torch.compile  # eager
+@torch.compile
 def muon_update(grad, momentum, second_moment, mu=0.95, beta2=0.95, nesterov=True):
     momentum.lerp_(grad, 1 - mu)
     update = grad.lerp_(momentum, mu) if nesterov else momentum
@@ -350,7 +349,7 @@ train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin",
 val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
 
 model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
-# model.compile(...)  # eager
+model.compile(dynamic=False)
 
 
 ########################################
