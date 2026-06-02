@@ -13,8 +13,8 @@ Standard Attention steps are the documented record numbers (see
 first eval-grid step at which the **seed-mean** val_loss first drops below 3.28 (i.e. average seeds, then threshold).
 
 <p align="left">
-  <img src="imgs/parallax_all_zoom.png" width="40%" />
-  <img src="imgs/attention_all_zoom.png" width="40%" />
+  <img src="imgs/parallax_all_zoom.png" width="49%" />
+  <img src="imgs/attention_all_zoom.png" width="49%" />
 </p>
 
 | Algo (Track-3 record) | Script | Attn steps | PLX steps | % boost |
