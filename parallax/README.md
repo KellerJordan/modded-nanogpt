@@ -23,19 +23,21 @@ params per layer ($\approx$ +7M / +6% for the 124M model here).
 `records/track_3_optimization/README.md`). `Parallax steps` follow the benchmark's convention: the
 first eval-grid step (val every 125 steps, then every 25 past 94% of training) at which the
 **seed-mean** val_loss first drops below 3.28 (i.e. average seeds, then threshold — as
-`make_figures.py` does). **% boost = (vanilla − parallax) / vanilla.**
+`make_figures.py` does). **% boost = (vanilla − parallax) / vanilla.** The bracketed **#N** is the
+algorithm's Track-3 *leaderboard record index* (its row in `records/track_3_optimization/README.md`,
+ordered by acceptance — **not** a PR number); each links to the upstream PR that added that record.
 
-| Algo (benchmark ID) | Script | Vanilla attn steps | Parallax steps | % boost |
+| Algo (Track-3 record) | Script | Vanilla attn steps | Parallax steps | % boost |
 | - | - | - | - | - |
-| **SOAP-H (#27)**            | `rec27_soaph.py`       | 3125 | **2900** (n=4) | **7.20%** |
-| **DynMuon (#28)**           | `rec28_dynmuon.py`     | 3175 | **2975** (n=3) | **6.30%** |
-| Aurora (#17)                | `rec17_aurora.py`      | 3175 | 3025 (n=1)       | 4.72% |
-| trustlight (#16)            | `rec16_trustlight.py`  | 3125 | 3052 (n=1)       | 2.34% |
-| SinkSOAP (#26)              | `rec26_sinksoap.py`    | 3090 | 3025 (n=1)       | 2.10% |
-| SOAP-MLP (#14)              | `rec14_soap_mlp.py`    | 3150 | 3100 (n=1)       | 1.59% |
-| split-cooldown (#24)        | `rec24_split_cd.py`    | 3175 | 3125 (n=1)       | 1.57% |
-| Contra-Soft-Muon (#20)      | `rec20_contra_soft.py` | 3030 | 3000 (n=1)       | 0.99% |
-| Vanilla Muon (baseline)     | `muon_baseline.py`     | ~3400 | 3325 (n=1)      | ~2% |
+| **SOAP-H** ([#27](https://github.com/KellerJordan/modded-nanogpt/pull/302)) | `rec27_soaph.py` | 3125 | **2900** (n=4) | **7.20%** |
+| **DynMuon** ([#28](https://github.com/KellerJordan/modded-nanogpt/pull/304)) | `rec28_dynmuon.py` | 3175 | **2975** (n=3) | **6.30%** |
+| Aurora ([#17](https://github.com/KellerJordan/modded-nanogpt/pull/284)) | `rec17_aurora.py` | 3175 | 3025 (n=1) | 4.72% |
+| trustlight ([#16](https://github.com/KellerJordan/modded-nanogpt/pull/283)) | `rec16_trustlight.py` | 3125 | 3052 (n=1) | 2.34% |
+| SinkSOAP ([#26](https://github.com/KellerJordan/modded-nanogpt/pull/298)) | `rec26_sinksoap.py` | 3090 | 3025 (n=1) | 2.10% |
+| SOAP-MLP ([#14](https://github.com/KellerJordan/modded-nanogpt/pull/278)) | `rec14_soap_mlp.py` | 3150 | 3100 (n=1) | 1.59% |
+| split-cooldown ([#24](https://github.com/KellerJordan/modded-nanogpt/pull/292)) | `rec24_split_cd.py` | 3175 | 3125 (n=1) | 1.57% |
+| Contra-Soft-Muon ([#20](https://github.com/KellerJordan/modded-nanogpt/pull/291)) | `rec20_contra_soft.py` | 3030 | 3000 (n=1) | 0.99% |
+| Vanilla Muon (baseline) | `muon_baseline.py` | ~3400 | 3325 (n=1) | ~2% |
 
 Notes:
 - 124M / seq-1024 is Parallax's *weak* regime (its design edge is recall / long-context / scale), so
@@ -65,7 +67,7 @@ per seed: `results/<variant>/seed<N>.txt`. Each line is
 
 For the **vanilla-attention baseline** trajectory of each, use the corresponding official record log
 already in this repo under `records/track_3_optimization/` (the benchmark ID in the table above).
-These Parallax runs are eager / single-seed (except #27 n=4, #28 n=3), so a vanilla-vs-Parallax
+These Parallax runs are eager / single-seed (except SOAP-H n=4, DynMuon n=3), so a vanilla-vs-Parallax
 overlay is not a perfectly matched A/B across harness/seed.
 
 ## How to run
