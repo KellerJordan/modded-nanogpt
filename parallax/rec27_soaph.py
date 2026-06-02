@@ -443,7 +443,7 @@ print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.ve
        + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
 print0("="*100)
 
-train_seed = int(os.environ.get("SOAP_SEED", "1"))
+train_seed = int(os.environ.get("SEED", "1"))
 torch.manual_seed(train_seed)
 torch.cuda.manual_seed_all(train_seed)
 print0(f"Using seed={train_seed}", console=True)
