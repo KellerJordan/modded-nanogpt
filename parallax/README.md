@@ -21,15 +21,17 @@ params per layer ($\approx$ +7M / +6% for the 124M model here).
 
 `Vanilla attn steps` are the documented record numbers (see
 `records/track_3_optimization/README.md`). `Parallax steps` follow the benchmark's convention: the
-first eval-grid step (val every 125 steps, then every 25 past 94% of training) at which the
-**seed-mean** val_loss first drops below 3.28 (i.e. average seeds, then threshold — as
-`make_figures.py` does). **% boost = (vanilla − parallax) / vanilla.** The bracketed **#N** is the
+first eval-grid step at which the **seed-mean** val_loss first drops below 3.28 (i.e. average seeds,
+then threshold — as `make_figures.py` does). The multi-seed runs (SOAP-H n=4, DynMuon n=3) eval
+every **5 steps** in the 2800–3100 crossing window to pin the step precisely; single-seed rows use
+the coarser default grid (every 125, then every 25 past 90%). **% boost = (vanilla − parallax) /
+vanilla.** The bracketed **#N** is the
 algorithm's Track-3 *leaderboard record index* (its row in `records/track_3_optimization/README.md`,
 ordered by acceptance — **not** a PR number); each links to the upstream PR that added that record.
 
 | Algo (Track-3 record) | Script | Vanilla attn steps | Parallax steps | % boost |
 | - | - | - | - | - |
-| **SOAP-H** ([#27](https://github.com/KellerJordan/modded-nanogpt/pull/302)) | `rec27_soaph.py` | 3125 | **2900** (n=4) | **7.20%** |
+| **SOAP-H** ([#27](https://github.com/KellerJordan/modded-nanogpt/pull/302)) | `rec27_soaph.py` | 3125 | **2880** (n=4) | **7.84%** |
 | **DynMuon** ([#28](https://github.com/KellerJordan/modded-nanogpt/pull/304)) | `rec28_dynmuon.py` | 3175 | **2975** (n=3) | **6.30%** |
 | Aurora ([#17](https://github.com/KellerJordan/modded-nanogpt/pull/284)) | `rec17_aurora.py` | 3175 | 3025 (n=1) | 4.72% |
 | trustlight ([#16](https://github.com/KellerJordan/modded-nanogpt/pull/283)) | `rec16_trustlight.py` | 3125 | 3052 (n=1) | 2.34% |
@@ -40,6 +42,10 @@ ordered by acceptance — **not** a PR number); each links to the upstream PR th
 | Vanilla Muon (baseline) | `muon_baseline.py` | ~3400 | 3325 (n=1) | ~2% |
 
 Notes:
+- SOAP-H + Parallax's **2880** (n=4 seed-mean) is below the best current Track-3 record
+  ([#30](https://github.com/KellerJordan/modded-nanogpt/pull/300), 2930) — but this adds +7M params
+  vs. that optimizer-only record, so it is **not yet** an apples-to-apples SOTA claim; the
+  param-matched control below is needed first.
 - 124M / seq-1024 is Parallax's *weak* regime (its design edge is recall / long-context / scale), so
   these are conservative numbers.
 - A param-matched control (widen MLP by the same +7M, no Parallax) is the right way to confirm the
@@ -53,10 +59,10 @@ per seed: `results/<variant>/seed<N>.txt`. Each line is
 `records/track_3_optimization/results/`**, so the benchmark's `make_figures.py` regex
 (`step:(\d+)/(\d+)\s+val_loss:([0-9.]+)`) parses them directly and averages the seeds in a subdir.
 
-| variant | logs | crossing(s) |
-|---|---|---|
-| `rec27_soaph/`    | `seed{0..3}.txt` | 2925 / 2875 / 2875 / 2875 |
-| `rec28_dynmuon/`  | `seed{0..2}.txt` | 2950 / 2975 / 2975 |
+| variant | logs | per-seed crossing | seed-mean crossing |
+|---|---|---|---|
+| `rec27_soaph/`    | `seed{0..3}.txt` | 2910 / 2865 / 2870 / 2860 | **2880** |
+| `rec28_dynmuon/`  | `seed{0..2}.txt` | 2950 / 2975 / 2975 | — (n=3, pending 4th) |
 | `rec17_aurora/`   | `seed0.txt` | 3025 |
 | `rec16_trustlight/` | `seed0.txt` | 3052 |
 | `rec26_sinksoap/` | `seed0.txt` | 3025 |
