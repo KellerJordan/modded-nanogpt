@@ -6,7 +6,7 @@ Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any
 [Longform announcement](https://x.com/kellerjordan0/status/2049193527440187494)
 
 Thank you to everyone who's contributed results so far:
-@kaiyue-wen, @nilin, @alint77, @wilsoncwu, @kumarkrishna, @lliu606, @zhenghaoxu-gatech, @bentherien, @samacqua, @zhehangdu, @SPThole, @liyang2019, @zzp1012, @fhueb, @kcc-lion, @zhiweixx, @chenchenygu, @breskanu, @fangzhou_wu, @eliebak, @wakamex, and @varunneal.
+@kaiyue-wen, @nilin, @alint77, @wilsoncwu, @kumarkrishna, @lliu606, @zhenghaoxu-gatech, @bentherien, @samacqua, @zhehangdu, @SPThole, @liyang2019, @zzp1012, @fhueb, @kcc-lion, @zhiweixx, @chenchenygu, @breskanu, @fangzhou_wu, @eliebak, @wakamex, @varunneal, and @tomoqt.
 
 
 ## Benchmark definition Tl;dr
@@ -67,11 +67,12 @@ Note: [Beware that](https://github.com/KellerJordan/modded-nanogpt/issues/268) o
 | 26 | 3090 | 3.2785 (n=10)✓ | SinkSOAP: Gram-Sinkhorn SOAP-style preconditioning with NorMuon postconditioner, lr=0.04 wd=0.025, does not use power lr schedule | 2026/05/14 | [log](results/20260514_sinksoap/d0155dd0-f77d-48a9-8eb4-453f894b9476.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/298) by @lliu606, @zhenghaoxu-gatech |
 | 27 | 3125 | 3.2782 (n=6)✓ | Setup from #19, with KL-SOAP replaced by [SOAP](https://proceedings.iclr.cc/paper_files/paper/2025/file/e988664070e9591f93fdcf605f7dc623-Paper-Conference.pdf) with hyperball optimization, w.o. bias correction, precondition_frequency=1, lr=.018, beta1=.95, beta2=.9, and tuned lr schedule | 2026/05/18 | [log](results/20260518_soaph/SOAPH_run1.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/302) by Nikita Breskanu @breskanu |
 | 28 | 3175 | 3.2790 (n=25)✓ | [DynMuon](https://arxiv.org/pdf/2605.17109) (p: 0.25 -> -0.25, tau=0.04, w=0.04, lr=0.02, wd=0.025) | 2026/05/19 | [log](results/20260519_dynmuon/50172610-d038-4f90-9a12-b9a0853f035d.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/304) by @fangzhou_wu |
-| 29 | 2990(!) | 3.2787 (n=11)✓ | Setup from #20, plus radial brake: dampens outward radial updates before the u/w floor, then corrects post-step radius drift | 2026/05/11 | [log](results/20260511_dampen_radial_gradient_component/00882c75-914d-4340-8e0b-dcffcb18b73d.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/294) by @nilin |
+| 29 | 2990(!) | 3.2787 (n=11)✓ | Setup from #20, plus radial brake: dampens outward radial updates before the u/w floor | 2026/05/11 | [log](results/20260511_dampen_radial_gradient_component/00882c75-914d-4340-8e0b-dcffcb18b73d.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/294) by @nilin |
 | 30 | 2930(!) | 3.2784 (n=16)✓ | Setup from #29, plus Aurora row-balanced polar on wide `mlp.proj` matrices, Soft-Muon/NorMuon-lite disabled, Contra-Muon ramp extended to step 2500, and Muon momentum warmup/cooldown from track 1 | 2026/05/14 | [log](results/20260514_aurora_proj_pruned_extended_contra/d198124d-5e7f-4743-a683-0eb936a40dbe.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/300) by @eliebak |
 | 31 | 2995 | 3.2789 (n=20)✓ | Setup from #23 Muown, plus NorMuon-style normalization, Contra-Muon, and power-law cooldown | 2026/05/15 | [log](results/20260515_contranormuown/0f117ad6-2342-40f0-9e00-20cec55f6021.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/301) by @fhueb, @kcc-lion |
 | 32 | 3000 | 3.2778 (n=9)✓ | Setup from #20, plus a SODA-style hidden-matrix anchor correction toward initialization, faded out with a cosine schedule from step 2000 to 2750 | 2026/05/18 | [log](results/20260518_soda_fade_3000_n9/README.md) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/303) by @wakamex |
 | 33 | 3400 | 3.2767 (n=5)✓ | PSGD with Kronecker whitening preconditioners, Hyperball, lr=.025 linearly decayed over the full run, precond_lr=1.0, beta=0.95 | 2026/05/28 | [log](results/20260527_psgd/README.md) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/316) by @varunneal |
+| 34 | 2925(!) | 3.2781 (n=8)✓ | Setup from #30, plus late capped RRE vector extrapolation from step 2820 to 2925 with k=4, damping=.875, and max relative update=.001 | 2026/05/20 | [log](results/20260520_rre_extrapolation_pr300_2925/README.md) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/305) by @tomoqt |
 
 Notes:
 * To reproduce any of these runs, simply rip their python script out of their logfile (take everything before `===`), and then run it using the quickstart above.
