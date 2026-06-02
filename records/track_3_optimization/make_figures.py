@@ -200,19 +200,23 @@ def average_runs(runs):
 
 
 readme_rows = {}
-row_pattern = re.compile(
-    r'^\|\s*(\d+)\s*\|\s*(\d+)[^|]*\|\s*([^|]+?)\s*\|[^|]*\|[^|]*\|\s*(\d{4}/\d{2}/\d{2})\s*\|\s*\[log\]\((results/[^)]+)\)'
-)
+log_link_pattern = re.compile(r'\[log\]\((results/[^)]+)\)')
 with open('README.md', 'r') as f:
     for line in f:
-        m = row_pattern.search(line)
-        if m:
-            number = int(m.group(1))
-            steps_to_target = int(m.group(2))
-            evidence = m.group(3).strip()
-            date = m.group(4)
-            logfile = m.group(5).removeprefix('results/').removesuffix('.txt')
-            readme_rows[number] = (steps_to_target, evidence, date, logfile)
+        if not (line.startswith('| ') and len(line) > 2 and line[2].isdigit()):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip('|').split('|')]
+        if len(cells) != 7:
+            raise RuntimeError(f'Expected 7 columns in README results row: {line}')
+        number, steps, evidence, _description, date, log_cell, _authorship = cells
+        m = log_link_pattern.search(log_cell)
+        if not m:
+            raise RuntimeError(f'No log link found in README results row: {line}')
+        steps_m = re.match(r'\d+', steps)
+        if not steps_m:
+            raise RuntimeError(f'No step count found in README results row: {line}')
+        logfile = m.group(1).removeprefix('results/').removesuffix('.txt')
+        readme_rows[int(number)] = (int(steps_m.group()), evidence, date, logfile)
 pattern = re.compile(r'step:(\d+)/(\d+)\s+val_loss:([0-9.]+)')
 
 for suffix in ["wr", "best"]:
