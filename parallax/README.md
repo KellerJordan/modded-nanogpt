@@ -33,10 +33,10 @@ SOAP-H + Parallax's **2880** (n=4) is below the best current Track-3 record ([#3
 
 ## Logs (`results/`)
 
-| variant | logs | per-seed crossing | seed-mean crossing |
-|---|---|---|---|
-| `rec27_soaph/`    | `seed{0..3}.txt` | 2910 / 2865 / 2870 / 2860 | **2880** |
-| `rec28_dynmuon/`  | `seed{0..2}.txt` | 2950 / 2975 / 2975 | — (n=3, pending 4th) |
+| variant | logs | per-seed crossing |
+|---|---|---|
+| `rec27_soaph/`    | `seed{0..3}.txt` | 2910 / 2865 / 2870 / 2860 |
+| `rec28_dynmuon/`  | `seed{0..2}.txt` | 2950 / 2975 / 2975 |
 | `rec17_aurora/`   | `seed0.txt` | 3025 |
 | `rec16_trustlight/` | `seed0.txt` | 3052 |
 | `rec26_sinksoap/` | `seed0.txt` | 3025 |
