@@ -9,6 +9,18 @@ The kernel is exposed via:
   * ``parallax_func`` — public wrapper, ``@torch.compiler.allow_in_graph``ed
     so Dynamo emits a single graph node for the call.
 
+Also forces AOTAutograd's min-cut partitioner to **save** rather than
+**recompute** activations across the forward/backward boundary
+(``recomputable_ops = OrderedSet()``). Without this, Inductor's joint-graph
+lowering hits a stride/recompute interaction (pytorch/pytorch#159469-family)
+that produces deterministic NaN gradients in the attention backward —
+reproduced under MHA + GQA with multiple optimizers (SOAP-H, DynMuon).
+Side effects: small memory bump for saved activations; affects all
+``torch.compile`` invocations in the process, not just the parallax op.
+Acceptable here because there's no user-level ``torch.utils.checkpoint``
+in the codebase, so the partitioner's recompute heuristic wasn't yielding
+much memory anyway.
+
 Drop-in for the upstream ``parallax.triton.parallax_func.parallax_func``.
 """
 
@@ -23,6 +35,32 @@ import torch
 _PARALLAX_PATH = os.environ.get('PARALLAX_PATH', '')
 if _PARALLAX_PATH and _PARALLAX_PATH not in sys.path:
     sys.path.insert(0, _PARALLAX_PATH)
+
+
+# Force AOTAutograd's min-cut partitioner to save (not recompute) activations
+# across the fwd/bwd boundary. See module docstring for why.
+try:
+    import torch._functorch.partitioners as _ptn
+
+    _ORIG_GET_DEFAULT_OP_LIST = _ptn.get_default_op_list
+
+    def _no_recompute_op_list():
+        op_types = _ORIG_GET_DEFAULT_OP_LIST()
+        try:
+            op_types.recomputable_ops.clear()
+        except (AttributeError, TypeError):
+            from dataclasses import replace
+            try:
+                from torch.utils._ordered_set import OrderedSet
+            except ImportError:
+                OrderedSet = set
+            op_types = replace(op_types, recomputable_ops=OrderedSet())
+        return op_types
+
+    _ptn.get_default_op_list = _no_recompute_op_list
+except Exception as _e:  # noqa: BLE001
+    print(f"[parallax_op] partitioner patch skipped: {type(_e).__name__}: {_e}",
+          file=sys.stderr)
 
 from parallax.triton.parallax_fwd import parallax_fwd as _parallax_fwd  # noqa: E402
 from parallax.triton.parallax_bwd import parallax_bwd as _parallax_bwd  # noqa: E402
