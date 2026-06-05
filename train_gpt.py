@@ -1059,7 +1059,7 @@ class AttnArgs:
     xsa_alpha: torch.Tensor | None
     train_max_seq_len: torch.Tensor
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+flash_attn_interface = get_kernel('kernels-community/flash-attn3', version=1).flash_attn_interface
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
@@ -1248,8 +1248,10 @@ class GPT(nn.Module):
         self.skip_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.skip_gate.weight)
 
-        self.bigram_embed = nn.Embedding(args.bigram_vocab_size, model_dim)
+        self.bigram_embed = nn.Embedding(args.bigram_vocab_size, args.bigram_dim)
         nn.init.zeros_(self.bigram_embed.weight)
+        bigram_sign_table = torch.randn(args.bigram_sign_table_rows, args.bigram_dim).sign().to(torch.bfloat16)
+        self.register_buffer('bigram_sign_table', bigram_sign_table)
 
         self.post_lambdas = nn.Parameter(torch.ones(num_layers, 2))
 
@@ -1367,7 +1369,12 @@ class GPT(nn.Module):
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
         
-        x0_bigram = self.bigram_embed(bigram_input_seq)[None]
+        # Use sign-trick to better compress multiple bigrams into a shared bigram embedding row
+        # (details in https://github.com/KellerJordan/modded-nanogpt/pull/299 by @trianxy)
+        sign_idx = torch.zeros_like(input_seq)
+        sign_idx[1:] = (input_seq[:-1] ^ input_seq[1:]) % self.bigram_sign_table.shape[0]  # (8192,)
+        bigram_signs = self.bigram_sign_table[sign_idx]                                    # (seq, bigram_dim)
+        x0_bigram = (self.bigram_embed(bigram_input_seq) * bigram_signs)[None]             # (1, seq, bigram_dim)
 
         # Value embeddings - always computed (not precomputed)
         ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
@@ -1381,11 +1388,12 @@ class GPT(nn.Module):
         x = x0 = norm(x[None])
 
         # Initialize residual stream with pre-layer-0 bigram injection
-        x = x + x0_bigram * bigram_lambdas[0]
+        x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + x0_bigram * bigram_lambdas[0]
 
         # Precompute x0/bigram injection (added to attention output each layer)
         # Layer 0: bigram already injected above, so only x0 component
-        x0_inject = (x0 * x0_lambdas[0],) + tuple(x0 * x0_lambdas[i] + x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
+        x0_inject = tuple(x0 * x0_lambdas[i] for i in range(self.num_layers))
+        bg_inject = (None,) + tuple(x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
         skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
 
         # cache[k] is the layer-k snapshot used downstream by MUDD.
@@ -1440,9 +1448,12 @@ class GPT(nn.Module):
                 attn_out = attn(attn_in_normed, attn_args, qkvo_w)
 
                 if mu is not None:
-                    x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0] + mu[11] * x0_bigram
+                    x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0] 
+                    x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + mu[11] * x0_bigram
                 else:
                     x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
+                    if bg_inject[i] is not None:
+                        x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + bg_inject[i]
 
             if mu is not None:
                 x = mu[12] * x + mu[13] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
@@ -1676,7 +1687,9 @@ class Hyperparameters:
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
-    bigram_vocab_size: int = 50304 * 5
+    bigram_vocab_size: int = 50304 * 15
+    bigram_dim: int = 192
+    bigram_sign_table_rows: int = 8192  # prefer a power of 2 (values ~500-15000 gave similar results)
 
 args = Hyperparameters()
 
@@ -2021,6 +2034,7 @@ model.mudd_w2.data = model.mudd_w2.data.bfloat16()
 model.mudd_b2.data = model.mudd_b2.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
+dist.broadcast(model.bigram_sign_table, 0)  # buffer, not in parameters()
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
