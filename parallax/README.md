@@ -78,3 +78,57 @@ unchanged under compile, only wall-clock per step.
      (imported from the local `parallax_op.py`).
 
 The optimizer, data, batch size, and architecture are otherwise **unchanged** from the record.
+
+## Param-controlled study: ContraNorMuon + Parallax (identical params via MLP-trim)
+
+The Results table above adds the probe projection `W_R` (~+7M at 124M scale) on top of each
+record, so part of the speedup could be "more parameters" rather than "the Parallax mechanism".
+This section isolates the mechanism on the **ContraNorMuon (Muown)** optimizer by funding `W_R`
+**param-neutrally**, so the total parameter count is byte-for-byte the vanilla baseline.
+
+### Funding `W_R` for free: trim the MLP, don't touch the KV heads
+
+The cheapest place to recover `W_R`'s cost is **optimizer-dependent**:
+
+* **SOAP-H** (PR to this repo): GQA on `k`/`v` (`H_kv=3`) gives back the params and still wins.
+* **ContraNorMuon**: GQA-3 **fails** — halving the KV heads costs more than the probe buys, and the
+  run never reaches val<3.28 at 2900 steps. The knob that works here is **trimming the MLP**:
+  `hdim = 7*dim//2` (3.5× instead of 4×) frees exactly `2·dim·(4dim − 3.5dim)·n_layer = +7.08M`,
+  which cancels `W_R`'s `dim·dim·n_layer = +7.08M`. `q`, `k`, `v`, the probe `r`, and the output
+  projection all stay at full 6 heads.
+
+### Result — same params, the mechanism still wins
+
+`train_steps = lr_schedule_steps = 2900`; numbers are the seed-mean simple crossing
+(first eval-grid step where the averaged val_loss drops below 3.28), same convention as the table above.
+
+| config (identical parameter count) | script | steps to seed-mean val<3.28 |
+|---|---|---|
+| ContraNorMuon record (vanilla attention) | — | ~2995 |
+| ContraNorMuon @2900, **no Parallax** (MLP-4×), n=4 | `rec31_contranormuon_base.py` | **never crosses** (seed-mean 3.2845) |
+| ContraNorMuon @2900, **+Parallax, param-neutral** (MLP-3.5× + `W_R`), n=40 | `rec31_contranormuon_plx.py` | **2840** (seed-mean 3.27742) |
+
+At **identical parameters** the same-horizon baseline never reaches the target while the
+Parallax variant crosses at 2840 — and against the ~2995 record that is **~155 steps / ~5.2%**,
+entirely parameter-free.
+
+### Statistical strength & horizon sweep
+
+The leaderboard's validity test is `(3.28 − seed_mean)·√n ≥ 0.004`. At 2900 (n=40) the margin is
+**0.0163 ≈ 4× the bar**. Sweeping the (jointly set) `train_steps = lr_schedule_steps` horizon:
+
+| horizon | n | seed-mean @ horizon | `(3.28−μ)·√n` | seed-mean crossing |
+|---|---|---|---|---|
+| 2875 | 20 | 3.27881 | 0.0053 | 2838 |
+| **2900** | 40 | 3.27742 | **0.0163** | **2839–2840** |
+| 2925 | 12 | 3.27608 | 0.0136 | 2843 |
+| 2950 | 12 | 3.27481 | 0.0180 | 2851 |
+
+The crossing is **non-monotone** with a minimum near 2900 (longer horizons lower the final loss but
+keep the LR higher mid-cooldown, so the threshold is reached later). **2875** is the shortest horizon
+that still clears the `0.004` margin (thin, 0.0053); **2900** is the safe, well-separated submission.
+
+Both scripts are self-contained copies of the ContraNorMuon training script with only the Parallax
+patch (`self.r` + `parallax_func`) and the 3.5× MLP differing between them; optimizer, data, and batch
+size are unchanged. Logs: `results/rec31_contranormuon_plx/seed{0..39}.txt`,
+`results/rec31_contranormuon_base/seed{0..3}.txt`.
