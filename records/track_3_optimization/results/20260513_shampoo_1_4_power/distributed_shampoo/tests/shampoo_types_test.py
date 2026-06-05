@@ -368,7 +368,7 @@ class DistributedConfigSubclassesTest(unittest.TestCase):
     def test_illegal_target_parameter_dimensionality(
         self,
         cls: type[DistributedConfig],
-        target_parameter_dimensionality: int,
+        target_parameter_dimensionality: int | float,
         error_msg: str,
     ) -> None:
         # Create required arguments for specific config classes.
