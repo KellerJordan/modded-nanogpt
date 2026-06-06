@@ -191,7 +191,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 80 | 1.406 minutes | [In Muon orthogonize Q and K matrices in pairs of heads, instead of across the full 6 head matrix](https://x.com/classiclarryd/status/2046046809609457904)  | 04/08/26 | [log](records/track_1_short/2026-04-08_PairedHeadMuon/logs/split_qk0-1480.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/253) | @samacqua
 81 | 1.363 minutes | [MUDD Skip Connections](https://x.com/classiclarryd/status/2058486428255035457) | 04/22/26 | [log](records/track_1_short/2026-04-22_MuddFormer/this_pr_v3),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/259) | @Lisennlp
 82 | 1.353 minutes | [Learnable XSA](https://x.com/classiclarryd/status/2058975556520329302) | 04/29/26 | [log](records/track_1_short/2026-04-29_XSAGatedLayers/this_pr_v1-s1410/06563169-6435-48ba-a1ad-f3e61bfcc573.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/264) | @_djdumpling
-83 | 1.328 minutes | [Sign Trick on Bigram Embed] | 05/20/26 | [log](records/track_1_short/2026-05-20_BigramsSignTrick/pr299/0cf91274-eda8-49cd-9a97-9369f730f271.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/299) | @TrianX
+83 | 1.328 minutes | [Sign Trick on Bigram Embed](https://x.com/classiclarryd/status/2063061926092099868) | 05/20/26 | [log](records/track_1_short/2026-05-20_BigramsSignTrick/pr299/0cf91274-eda8-49cd-9a97-9369f730f271.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/299) | @TrianX
 ## Rules
 
 New records must:
