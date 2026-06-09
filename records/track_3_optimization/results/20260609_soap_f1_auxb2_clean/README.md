@@ -8,7 +8,7 @@ schedule/momentum tuning, on a **cleaned-up** stack (seven redundant geometry mo
 
 Reaches **3.28 val loss in 2755 steps over n=8 seeds (0–7)** — mean 3.278565, significance
 `(3.28 − mean)·√8 = 0.00406 ≥ 0.004` (just clears the bar; 2760 clears comfortably at 0.0051) — while
-**shrinking the stack to 910 lines** (smaller and ~17% faster per step). This is **−20 steps below the
+**shrinking the stack to 910 lines** (smaller and ~19% faster per step). This is **−20 steps below the
 prior 2775 boundary** at lower loss and far simpler code.
 
 Relative to the **2875 base (PR [#311](https://github.com/KellerJordan/modded-nanogpt/pull/311),
@@ -27,7 +27,7 @@ all-hidden, every-step SOAP is in.
 
 Every constant that differs from the PR #311 code is listed. The parenthetical is the approximate effect
 on the first-passing boundary where measured; the removals are loss-neutral (verified identity / within
-GPU noise) and their win is **998 → 910 lines (−88) + ~17% faster/step**. Cumulative (n=8):
+GPU noise) and their win is **998 → 910 lines (−88) + ~19% faster/step**. Cumulative (n=8):
 **2875 → 2830 → 2800 → 2775 → 2755.**
 
 **Added / changed — local accuracy levers:**
