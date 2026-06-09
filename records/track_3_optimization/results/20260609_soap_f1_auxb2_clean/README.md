@@ -1,10 +1,11 @@
-# Record: Track 3 Optimization -- SOAP-f1 + aux-β2, clean -- 2755 steps (n=8)
+# Record: Track 3 Optimization -- aux-β2 + SOAP-f1, clean -- 2755 steps (n=8)
 
 ## TL;DR
 
 Not a new optimizer: this is the existing **SOAP-Muon** (PR [#278](https://github.com/KellerJordan/modded-nanogpt/pull/278))
-with SOAP **extended to all hidden matrices and refreshed every step**, plus an auxiliary-β2 split and
-schedule/momentum tuning, on a **cleaned-up** stack (seven redundant geometry modules removed).
+with an **auxiliary-β2 split** (longer 2nd-moment memory for the 1-D params — the single biggest lever),
+SOAP **extended to all hidden matrices and refreshed every step**, and schedule/momentum tuning, on a
+**cleaned-up** stack (seven redundant geometry modules removed).
 
 Reaches **3.28 val loss in 2755 steps over n=8 seeds (0–7)** — mean 3.278565, significance
 `(3.28 − mean)·√8 = 0.00406 ≥ 0.004` (just clears the bar; 2760 clears comfortably at 0.0051) — while
