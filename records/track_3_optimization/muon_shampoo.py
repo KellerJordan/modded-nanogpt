@@ -82,15 +82,15 @@ def add_legend(ax, legend_entries):
             color=color,
         ))
         label_lines = label.splitlines()
-        title_size = 6.5 if any(len(line) > 25 for line in label_lines) else 8
+        first_label_line = next((i for i, line in enumerate(label_lines) if line.strip()), 0)
         label_texts = [
-            TextArea(line, textprops={'fontsize': title_size})
-            for line in label_lines
+            TextArea(line, textprops={'fontsize': 8.5 if i == first_label_line else 7})
+            for i, line in enumerate(label_lines)
         ]
         text = VPacker(
             children=[
                 *label_texts,
-                TextArea(evidence, textprops={'fontsize': 6.5}),
+                TextArea(evidence, textprops={'fontsize': 7}),
             ],
             align='left',
             pad=0,
@@ -153,7 +153,7 @@ def plot_results(ax, plot_results, target_label_x, title_date):
         color='gray',
         fontsize=9,
     )
-    ax.set_title(f'Abridged Optimization Record History as of {title_date}', pad=11, fontsize=11)
+    ax.set_title(f'Modded-NanoGPT Optimization Benchmark Results', pad=11, fontsize=11)
     ax.set_xlabel('Training steps @ 0.5M bsz', fontsize=11)
     ax.set_ylabel('Validation loss', fontsize=11)
     ax.tick_params(axis='both', which='major', labelsize=10)
@@ -200,23 +200,19 @@ def average_runs(runs):
 
 
 readme_rows = {}
-log_link_pattern = re.compile(r'\[log\]\((results/[^)]+)\)')
+row_pattern = re.compile(
+    r'^\|\s*(\d+)\s*\|\s*(\d+)[^|]*\|\s*([^|]+?)\s*\|[^|]*\|\s*(\d{4}/\d{2}/\d{2})\s*\|\s*\[log\]\((results/[^)]+)\)'
+)
 with open('README.md', 'r') as f:
     for line in f:
-        if not (line.startswith('| ') and len(line) > 2 and line[2].isdigit()):
-            continue
-        cells = [cell.strip() for cell in line.strip().strip('|').split('|')]
-        if len(cells) != 7:
-            raise RuntimeError(f'Expected 7 columns in README results row: {line}')
-        number, steps, evidence, _description, date, log_cell, _authorship = cells
-        m = log_link_pattern.search(log_cell)
-        if not m:
-            raise RuntimeError(f'No log link found in README results row: {line}')
-        steps_m = re.match(r'\d+', steps)
-        if not steps_m:
-            raise RuntimeError(f'No step count found in README results row: {line}')
-        logfile = m.group(1).removeprefix('results/').removesuffix('.txt')
-        readme_rows[int(number)] = (int(steps_m.group()), evidence, date, logfile)
+        m = row_pattern.search(line)
+        if m:
+            number = int(m.group(1))
+            steps_to_target = int(m.group(2))
+            evidence = m.group(3).strip()
+            date = m.group(4)
+            logfile = m.group(5).removeprefix('results/').removesuffix('.txt')
+            readme_rows[number] = (steps_to_target, evidence, date, logfile)
 pattern = re.compile(r'step:(\d+)/(\d+)\s+val_loss:([0-9.]+)')
 
 for suffix in ["wr", "best"]:
@@ -237,12 +233,30 @@ for suffix in ["wr", "best"]:
         }
     elif suffix == "best":
         logfiles = {
-            9: '#9 (2026/04/29) NorMuon w/ UpdateClampMin',
-            11: '#11 (2026/05/01): #9 + ContraMuon modification',
-            16: '#16 (2026/05/05): #11 + SOAPMuon modification',
-            20: '#20 (2026/05/09): #16 + power lr schedule,\nSoftMuon modification',
-            29: '#29 (2026/05/11): #20 + radial growth brake',
-            30: '#30 (2026/05/14): #29 + Aurora on mlp.proj,\nMuon mu warmup+down, extend ContraMuon period,\ndisable SoftMuon & NorMuon',
+            4: 'Adam(g) = ᴇᴍᴀ(g) ⊙ ᴇᴍᴀ(g²)⁻¹ᐟ²',
+            12: 'Muon(G) = Ortho(EMA(G))\n' + ' ' * 15 + '= (ᴇᴍᴀ(G)ᴇᴍᴀ(G)ᵀ)⁻¹ᐟ⁴ ᴇᴍᴀ(G) (ᴇᴍᴀ(G)ᵀᴇᴍᴀ(G))⁻¹ᐟ⁴',
+            21: '\nShampoo (Gupta et al. 2018, Anil et al. 2020):\nShampoo(G) = ᴇᴍᴀ(GGᵀ)⁻¹ᐟ⁴ ᴇᴍᴀ(G) ᴇᴍᴀ(GᵀG)⁻¹ᐟ⁴',
+            22: '\nStochastic Spectral Descent (Carlson et al. 2015):\nOrtho(G) = Shampoo(G, b1=0, b2=0)\n' + ' ' * 15 + '= Muon(G, mu=0)\n' + ' ' * 15 + '= (GGᵀ)⁻¹ᐟ⁴ G (GᵀG)⁻¹ᐟ⁴',
+        }
+        logfiles = {
+            4: 'Adam(g) = ᴇᴍᴀ(g) ⊙ ᴇᴍᴀ(g²)⁻¹ᐟ²',
+            12: 'Muon(G) = Ortho(EMA(G))\n' + ' ' * 15 + '= (ᴇᴍᴀ(G)ᴇᴍᴀ(G)ᵀ)⁻¹ᐟ⁴ ᴇᴍᴀ(G) (ᴇᴍᴀ(G)ᵀᴇᴍᴀ(G))⁻¹ᐟ⁴',
+            35: '\nShampoo (Gupta et al. 2018, Anil et al. 2020):\nShampoo(G) = ᴇᴍᴀ(GGᵀ)⁻¹ᐟ⁴ ᴇᴍᴀ(G) ᴇᴍᴀ(GᵀG)⁻¹ᐟ⁴',
+            22: '\nStochastic Spectral Descent (Carlson et al. 2015):\nOrtho(G) = Shampoo(G, b1=0, b2=0)\n' + ' ' * 15 + '= Muon(G, mu=0)\n' + ' ' * 15 + '= (GGᵀ)⁻¹ᐟ⁴ G (GᵀG)⁻¹ᐟ⁴',
+        }
+        logfiles = {
+            4: 'Adam',
+            21: '\'Buggy Shampoo\' (Jordan 2026):'
+            + '\n1) Start w/ code from DistributedShampoo README'
+            + '\n2) Set precond_freq=5 and tune sensitive hyperparameters',
+            35: '\'Vanilla Shampoo\' (Anil 2026):'
+            + '\n1) Start w/ code from DistributedShampoo README'
+            + '\n2) Switch from default two-sided preconditioning\nwith exponent=-1/4 to one-sided with exponent=-1/2'
+            + '\n3) Set shampoo_epsilon=0 and adam_eps=1e-15'
+            + '\n4) Enable fp32 DDP communication'
+            + '\n5) Observing that the spectrum of the gradient\nmatrices is low-rank, enable PseudoInverseConfig'
+            + '\n6) Set precond_freq=1 and tune sensitive hyperparameters',
+            12: 'Muon',
         }
     else:
         assert False
@@ -252,7 +266,8 @@ for suffix in ["wr", "best"]:
     # Generate figure
     fig, ax = plt.subplots(figsize=(5.5, 4), dpi=300)
     legend = plot_results(ax, results.values(), 0, title_date)
-    ax.set_xlim(2000, 3400)
+    #ax.set_xlim(0, 8500)
+    ax.set_xlim(1500, 5000)
     ax.set_ylim(3.25, 3.5)
     fig.tight_layout()
     shift_legend_left_half_width(ax, legend)
