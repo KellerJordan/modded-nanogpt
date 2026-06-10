@@ -1,4 +1,4 @@
-# Record: Track 3 Optimization -- aux-β2 + SOAP-f1, clean -- 2755 steps (n=8)
+# Record: Track 3 Optimization -- aux-β2 + SOAP-f1, clean -- 2750 steps (n=20)
 
 ## TL;DR
 
@@ -7,10 +7,11 @@ with an **auxiliary-β2 split** (longer 2nd-moment memory for the 1-D params —
 SOAP **extended to all hidden matrices and refreshed every step**, and schedule/momentum tuning, on a
 **cleaned-up** stack (seven redundant geometry modules removed).
 
-Reaches **3.28 val loss in 2755 steps over n=8 seeds (0–7)** — mean 3.278565, significance
-`(3.28 − mean)·√8 = 0.00406 ≥ 0.004` (just clears the bar; 2760 clears comfortably at 0.0051) — while
-**shrinking the stack to 910 lines** (smaller and ~19% faster per step). This is **−20 steps below the
-prior 2775 boundary** at lower loss and far simpler code.
+On **H100 (the benchmark's hardware), n = 20 seeds (0–19)**, it reaches 3.28 in **2750 steps**: mean
+3.278856, significance `(3.28 − mean)·√20 = 0.0051 ≥ 0.004` (2745 fails). An independent **n = 8 A40** run
+agrees within hardware noise (first-pass 2755; see Result). All while **shrinking the stack to 910 lines**
+(smaller and ~19% faster per step), and 2750 is **−25 steps** below the prior 2775 record, at lower loss
+and far simpler code.
 
 Relative to the **2875 base (PR [#311](https://github.com/KellerJordan/modded-nanogpt/pull/311),
 @liyang2019 — Circuit-Muon on EMA-Nesterov + Aurora)** it applies the local accuracy levers (SOAP on all
@@ -28,8 +29,8 @@ all-hidden, every-step SOAP is in.
 
 Every constant that differs from the PR #311 code is listed. The parenthetical is the approximate effect
 on the first-passing boundary where measured; the removals are loss-neutral (verified identity / within
-GPU noise) and their win is **998 → 910 lines (−88) + ~19% faster/step**. Cumulative (n=8):
-**2875 → 2830 → 2800 → 2775 → 2755.**
+GPU noise) and their win is **998 → 910 lines (−88) + ~19% faster/step**. Cumulative first-passing boundary
+(A40 n=8): **2875 → 2830 → 2800 → 2775 → 2755**; on **H100 (n=20) the boundary is 2750**.
 
 **Added / changed — local accuracy levers:**
 
@@ -78,9 +79,19 @@ PowerCool LR `power=1.2`, Muon-μ warmup/cooldown schedule, SOAP core (`β2=0.90
 | Contra / Circuit / Soft-Muon / Aurora | removed (all present in #311) |
 | `FINAL_TRAIN_STEPS` / `FINAL_LR_POWER` | `2900` / `1.2` |
 
-## Result
+**H100 (the benchmark's hardware), n = 20 non-cherry-picked seeds (0–19), run to step 2900:**
 
-n = 8 non-cherry-picked seeds (0–7), run to step 2850. Validation loss around the crossing:
+| step | mean val loss | `(3.28 − mean)·√20` | |
+|---:|---:|---:|:--|
+| 2740 | 3.279706 | 0.00132 | ✗ |
+| 2745 | 3.279254 | 0.00333 | ✗ |
+| **2750** | **3.278856** | **0.00511** | **✓** |
+| 2775 | 3.276930 | 0.01373 | ✓ |
+
+**First-passing step = 2750** (n=20; 2745 fails at sig 0.0033, 2750 clears at 0.0051). Per-seed values are in
+the `H100_*.txt` logs.
+
+**A40, n = 8 (seeds 0–7)**, the original search hardware, shown for cross-hardware consistency:
 
 | seed | step 2750 | step 2755 | step 2760 | step 2775 |
 |---:|---:|---:|---:|---:|
@@ -95,15 +106,19 @@ n = 8 non-cherry-picked seeds (0–7), run to step 2850. Validation loss around 
 | **mean** | **3.278985** | **3.278565** | **3.278199** | **3.277062** |
 | **(3.28 − mean)·√8** | **0.00287 (✗)** | **0.00406 (✓)** | **0.00510 (✓)** | **0.00831 (✓)** |
 
-**First-passing step = 2755** (n=8; sig 0.00406, the first bin clearing the 0.004 bar; 2750 fails at 0.00287).
-2760 clears with more margin (0.0051); the first **25-step** boundary is **2775**.
+A40 first-passing step = **2755**. On the 8 shared seeds, A40 and H100 per-step losses agree to within
+hardware noise (per-seed |Δ| ≲ 0.0015; means within ~0.0001), so the A40 (2755) and H100 (2750) boundaries
+are consistent; A40 just runs a hair higher, nudging its first pass ~5 steps later.
 
 ## Files
 
 - `train_gpt_clean_SOTA.py` — self-contained training script (910 lines; hyperparameters hardcoded, only
-  `--seed` is a command-line argument). Byte-identical to the source embedded at the top of every log below.
-- 8 `*.txt` reproducibility logs (seeds 0–7, each run to step 2850); each embeds the full source then the run.
-- `figure.png`, `zoomed_figure.png` — n=8 loss curves vs prior records.
+  `--seed` is a command-line argument). Byte-identical to the source embedded in the 8 `A40_*.txt` logs.
+- **20 `H100_*.txt`** logs (seeds 0–19, H100, to step 2900) and **8 `A40_*.txt`** logs (seeds 0–7, A40).
+  Each embeds the full source then the run. The H100 logs embed a source whose **executable code is identical**
+  to the script (code-only token md5 matches); it differs only by one extra docstring comment line (it lists
+  Aurora among the removed modules) and a trailing newline.
+- `figure.png`, `zoomed_figure.png` — H100 (n=20) loss curves vs prior records.
 
 ## Setup & credits
 
@@ -112,7 +127,8 @@ This record was produced by an autonomous research agent (**Claude Code**), adap
 written by Claude Code and the experiments were run by **Claude Code and Codex**. The local changes above
 (SOAP all-hidden + freq=1, aux-β2 split, schedule/momentum tuning, the cleanup) were found by the agent.
 
-Runs were on **8×A40**. Kept load-bearing components, with their upstream PRs:
+The search and the n=8 runs were on **8×A40**; the **n=20 H100** confirmation runs were contributed by
+**[@nooraovo](https://github.com/nooraovo)**. Kept load-bearing components, with their upstream PRs:
 
 | component | PR | author |
 |---|---|---|
