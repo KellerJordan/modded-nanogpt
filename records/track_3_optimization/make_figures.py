@@ -153,7 +153,7 @@ def plot_results(ax, plot_results, target_label_x, title_date):
         color='gray',
         fontsize=9,
     )
-    ax.set_title(f'Abridged Optimization Record History as of {title_date}', pad=11, fontsize=11)
+    ax.set_title(f'Modded-NanoGPT Optimization Benchmark as of {title_date}', pad=11, fontsize=11)
     ax.set_xlabel('Training steps @ 0.5M bsz', fontsize=11)
     ax.set_ylabel('Validation loss', fontsize=11)
     ax.tick_params(axis='both', which='major', labelsize=10)
@@ -237,12 +237,17 @@ for suffix in ["wr", "best"]:
         }
     elif suffix == "best":
         logfiles = {
-            9: '#9 (2026/04/29) NorMuon w/ UpdateClampMin',
-            11: '#11 (2026/05/01): #9 + ContraMuon modification',
-            16: '#16 (2026/05/05): #11 + SOAPMuon modification',
-            20: '#20 (2026/05/09): #16 + power lr schedule,\nSoftMuon modification',
-            29: '#29 (2026/05/11): #20 + radial growth brake',
-            30: '#30 (2026/05/14): #29 + Aurora on mlp.proj,\nMuon mu warmup+down, extend ContraMuon period,\ndisable SoftMuon & NorMuon',
+            12: 'Muon-W',
+            4: 'Adam-Hyperball',
+            9: '#9: NorMuon-UpdateClampMin',
+            11: '#11: #9 + ContraMuon',
+            16: '#11 + SOAPMuon',
+            17: '#11 + Aurora',
+            15: 'NewtonMuon-W',
+            19: 'KLSOAP-Hyperball',
+            21: 'Shampoo-W',
+            22: 'Ortho-W',
+            23: 'Muon-RowNormControl',
         }
     else:
         assert False
@@ -252,8 +257,8 @@ for suffix in ["wr", "best"]:
     # Generate figure
     fig, ax = plt.subplots(figsize=(5.5, 4), dpi=300)
     legend = plot_results(ax, results.values(), 0, title_date)
-    ax.set_xlim(2000, 3400)
-    ax.set_ylim(3.25, 3.5)
+    ax.set_xlim(0, 3800)
+    ax.set_ylim(3.2, 3.85)
     fig.tight_layout()
     shift_legend_left_half_width(ax, legend)
     fig.savefig(f'img/figure_{suffix}.png', bbox_inches='tight', bbox_extra_artists=[legend])
