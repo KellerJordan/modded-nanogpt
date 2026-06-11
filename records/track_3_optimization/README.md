@@ -101,11 +101,7 @@ Figure 2. Per-optimizer best.
 
 <br/><br/>
 
-<table>
-  <tr>
-    <td width="50%"><img src="img/muon_shampoo_ssd.png" width="50%"></td>
-  </tr>
-</table>
+<img src="img/muon_shampoo_ssd.png" width="50%">
 Figure 3. Comparison between Shampoo and Muon, which both reduce to Spectral Descent when momentum is removed.
 
 ## Rules
