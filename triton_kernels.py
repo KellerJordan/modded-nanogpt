@@ -443,28 +443,28 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
         acc0, acc1 = tl.split(acc)
 
         c0 = acc0.to(dtype)
-        if not FORWARD:
-            c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
-            c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
-
-        c_desc.store([offs_am_c, offs_bn_c], c0)
-
         if FORWARD:
+            # Store ONLY post = relu(pre)^2 (drop the redundant `pre` materialization).
+            # Backward reconstructs relu(pre) = sqrt(post) in-kernel, so the full
+            # (M, N) pre tensor never round-trips HBM.
             c0_post = tl.maximum(c0, 0)
             c0_post = c0_post * c0_post
-            aux_desc.store([offs_am_c, offs_bn_c], c0_post)
+            c_desc.store([offs_am_c, offs_bn_c], c0_post)
+        else:
+            # aux holds `post`; relu(pre) = sqrt(post). dpre = 2 * (grad @ W2) * relu(pre).
+            c0_post = aux_desc.load([offs_am_c, offs_bn_c])
+            c0 = 2 * c0 * tl.sqrt(c0_post.to(tl.float32))
+            c_desc.store([offs_am_c, offs_bn_c], c0.to(dtype))
 
         c1 = acc1.to(dtype)
-        if not FORWARD:
-            c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
-            c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
-
-        c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
-
         if FORWARD:
             c1_post = tl.maximum(c1, 0)
             c1_post = c1_post * c1_post
-            aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
+            c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
+        else:
+            c1_post = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
+            c1 = 2 * c1 * tl.sqrt(c1_post.to(tl.float32))
+            c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1.to(dtype))
 
 
 def linear_relu_square(a, b, aux=None):
@@ -474,16 +474,21 @@ def linear_relu_square(a, b, aux=None):
 
     c = torch.empty((M, N), device=a.device, dtype=dtype)
 
-    FORWARD = False
-    if aux is None:
-        FORWARD = True
-        aux = torch.empty((M, N), device=a.device, dtype=dtype)
-
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 256
     BLOCK_SIZE_K = 64
+
+    FORWARD = False
+    if aux is None:
+        FORWARD = True
+        # Forward stores only `post` (into `c`); aux_desc is never accessed on the
+        # forward path. Use a SEPARATE minimal [BM, BN//2] dummy (NOT `c`) so the two
+        # TMA descriptors don't alias the same buffer (aliasing can perturb the
+        # forward kernel's memory analysis / pipelining).
+        aux = torch.empty((BLOCK_SIZE_M, BLOCK_SIZE_N // 2), device=a.device, dtype=dtype)
+
     num_stages = 4 if FORWARD else 3
     num_warps = 8
 
@@ -512,23 +517,27 @@ def linear_relu_square(a, b, aux=None):
     )
 
     if FORWARD:
-        return c, aux
+        # `c` now holds `post`; no separate `pre` tensor is produced.
+        return c
     else:
         return c
 
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, W1, W2):
-        pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
+        # Forward stores only `post = relu(x @ W1.T)^2`; `pre` is never materialized.
+        post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
         x3 = post @ W2
-        ctx.save_for_backward(x, W1, W2, pre, post)
+        ctx.save_for_backward(x, W1, W2, post)
         return x3.view(x.shape)
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, W1, W2, pre, post = ctx.saved_tensors
+        x, W1, W2, post = ctx.saved_tensors
         dW2 = post.T @ grad_output
-        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
+        # dpre kernel reconstructs relu(pre) = sqrt(post) from `post` (passed as aux),
+        # avoiding the redundant `pre` HBM read/write entirely.
+        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=post)
         dW1 = dpre.T @ x
         dx = dpre @ W1
         return dx.view(x.shape), dW1, dW2
