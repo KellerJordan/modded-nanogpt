@@ -6,7 +6,7 @@ Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any
 [Longform announcement](https://x.com/kellerjordan0/status/2049193527440187494)
 
 Thank you to everyone who's contributed results so far:
-@kaiyue-wen, @nilin, @alint77, @wilsoncwu, @kumarkrishna, @lliu606, @zhenghaoxu-gatech, @bentherien, @samacqua, @zhehangdu, @SPThole, @liyang2019, @zzp1012, @fhueb, @kcc-lion, @zhiweixx, @chenchenygu, @breskanu, @fangzhou_wu, @eliebak, @wakamex, @varunneal, and @tomoqt.
+@kaiyue-wen, @nilin, @alint77, @wilsoncwu, @kumarkrishna, @lliu606, @zhenghaoxu-gatech, @bentherien, @samacqua, @zhehangdu, @SPThole, @liyang2019, @zzp1012, @fhueb, @kcc-lion, @zhiweixx, @chenchenygu, @breskanu, @fangzhou_wu, @eliebak, @wakamex, @varunneal, @tomoqt, @rohan-anil, and @konstmish.
 
 
 ## Benchmark definition Tl;dr
@@ -71,9 +71,11 @@ Note: [Beware that](https://github.com/KellerJordan/modded-nanogpt/issues/268) o
 | 30 | 2930(!) | 3.2784 (n=16)✓ | Setup from #29, plus Aurora row-balanced polar on wide `mlp.proj` matrices, Soft-Muon/NorMuon-lite disabled, Contra-Muon ramp extended to step 2500, and Muon momentum warmup/cooldown from track 1 | 2026/05/14 | [log](results/20260514_aurora_proj_pruned_extended_contra/d198124d-5e7f-4743-a683-0eb936a40dbe.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/300) by @eliebak |
 | 31 | 2995 | 3.2789 (n=20)✓ | Setup from #23 Muown, plus NorMuon & Contra-Muon | 2026/05/15 | [log](results/20260515_contranormuown/0f117ad6-2342-40f0-9e00-20cec55f6021.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/301) by @fhueb, @kcc-lion |
 | 32 | 3000 | 3.2778 (n=9)✓ | Setup from #20, plus a SODA-style hidden-matrix anchor correction toward initialization, faded out with a cosine schedule from step 2000 to 2750 | 2026/05/18 | [log](results/20260518_soda_fade_3000_n9/README.md) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/303) by @wakamex |
-| 33 | 3400 | 3.2767 (n=5)✓ | PSGD with Kronecker whitening preconditioners, Hyperball, lr=.025 linearly decayed over the full run, precond_lr=1.0, beta=0.95 | 2026/05/28 | [log](results/20260527_psgd/README.md) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/316) by @varunneal |
+| 33 | 3400 | 3.2767 (n=5)✓ | [PSGD](https://arxiv.org/abs/2402.04553) with Kronecker whitening preconditioners, Hyperball, lr=.025 linearly decayed over the full run, precond_lr=1.0, beta=0.95 | 2026/05/28 | [log](results/20260527_psgd/README.md) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/316) by @varunneal |
 | 34 | 2925(!) | 3.2781 (n=8)✓ | Setup from #30, plus late capped RRE vector extrapolation from step 2820 to 2925 with k=4, damping=.875, and max relative update=.001 (note: pairwise p-value vs. #30 is p=0.168) | 2026/05/20 | [log](results/20260520_rre_extrapolation_pr300_2925/README.md) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/305) by @tomoqt |
 | 35 | 3375 | 3.2767 (n=2)✓ | One-Sided Shampoo with pseudoinverse root preconditioner, Adam grafting, precondition_frequency=1, shampoo_epsilon=0, adam_eps=1e-15, lr=.01, wd=.1, beta2=.9 | 2026/06/10 | [log](results/sh-origpinv-s3375-lr1em2-wd010-b9em1-ge15-pf1-near1-record-130563a2-b40b-43c1-8fb4-b7a3bbfa5969.txt) | @rohan-anil |
+| 36 | 3250 | 3.2787 (n=10)✓ | Tuned baseline Muon + aux AdamW hyperparameters: AdamW embed/proj/1D lr=.7/.004/.015 with wd=.001, Muon lr=.025 wd=.05 | 2026/06/11 | [log](results/20260610_tuned_baseline_3250/263ea3c4-2b13-4adf-8a71-0410386b20e1.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/323) by @konstmish |
+| 37 | 3250 | 3.2786 (n=10)✓ | MuonH (#5) with aux AdamW hyperparameters grafted from the tuned baseline in result #36 and re-tuned for MuonH: embed lr=.91, head lr=.0064, scalar lr=.0195, wd=.001, aux cooldown_frac=.85 (matrix cooldown_frac=1.0 and lr=.018 unchanged) | 2026/06/11 | [log](results/20260611_muonh_tuned_aux_3250/f6649181-6de2-4d67-b243-2b18adb9d594.txt) | by @kaiyue-wen |
 
 Notes:
 * To reproduce any of these runs, simply rip their python script out of their logfile (take everything before `===`), and then run it using the quickstart above.
