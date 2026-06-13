@@ -40,6 +40,31 @@ from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction,
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
 
+# FP8 F.linear: forward FP8 for 2x Tensor Core throughput, backward BF16 for precision
+class FP8LinearFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, w):
+        x_f8 = x.to(torch.float8_e4m3fn)
+        w_f8 = w.to(torch.float8_e4m3fn)
+        y = torch._scaled_mm(
+            x_f8, w_f8.T,
+            out_dtype=torch.bfloat16,
+            scale_a=torch.ones(1, dtype=torch.float32, device=x.device),
+            scale_b=torch.ones(1, dtype=torch.float32, device=x.device),
+            use_fast_accum=True,
+        )
+        ctx.save_for_backward(x, w)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, w = ctx.saved_tensors
+        grad_x = grad_output @ w
+        grad_w = grad_output.T @ x
+        return grad_x, grad_w
+
+fp8_linear_fn = FP8LinearFunction.apply
+
 dynamo.config.recompile_limit = 64
 
 # -----------------------------------------------------------------------------
@@ -351,6 +376,7 @@ class ParamConfig:
     adam_betas: tuple[float, float] | None
     lr_mul: float
     wd_mul: float
+    adam_coptim: float
     lr: float
     initial_lr: float
     weight_decay: float
@@ -454,6 +480,10 @@ class NorMuonAndAdam:
         self._eff_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        # annealed exploration-noise scale for NorMuon orthogonalized update (Langevin/SGLD).
+        # 0-D CPU tensor to avoid recompilation when the value changes each step.
+        self._noise_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._normuon_noise_scale = 0.0  # set per-step (annealed) by TrainingManager.step_optimizers
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
@@ -474,6 +504,7 @@ class NorMuonAndAdam:
         adam_betas = table_entry.get("adam_betas")
         lr_mul = table_entry.get("lr_mul", 1.0)
         wd_mul = table_entry.get("wd_mul", 1.0)
+        adam_coptim = table_entry.get("adam_coptim", 0.0)
 
         if optim == "adam":
             chunk_size = param.shape[0] // self.world_size if comms.startswith("sharded") else None
@@ -484,6 +515,7 @@ class NorMuonAndAdam:
                 adam_betas=tuple(adam_betas) if adam_betas else None,
                 lr_mul=lr_mul,
                 wd_mul=wd_mul,
+                adam_coptim=adam_coptim,
                 lr=self.adam_defaults["lr"],
                 initial_lr=self.adam_defaults["lr"],
                 weight_decay=self.adam_defaults["weight_decay"],
@@ -521,6 +553,7 @@ class NorMuonAndAdam:
                 adam_betas=tuple(adam_betas) if adam_betas else None,
                 lr_mul=lr_mul,
                 wd_mul=wd_mul,
+                adam_coptim=0.0,
                 lr=self.normuon_defaults["lr"],
                 initial_lr=self.normuon_defaults["lr"],
                 weight_decay=self.normuon_defaults["weight_decay"],
@@ -714,12 +747,13 @@ class NorMuonAndAdam:
     # Unified optimizer step with explicit ordering
 
     @torch.no_grad()
-    def step(self, do_adam: bool = True):
+    def step(self, do_adam: bool = True, lm_head_embed_grad_idx: Tensor | None = None):
         """
         Combined optimizer step with explicit ordering.
 
         Args:
             do_adam: If True, update Adam params. NorMuon params always updated.
+            lm_head_embed_grad_idx: Optional vocab rows for an exact sparse final embed.grad.T add.
 
         Flow:
         1. Scatter phase: Launch reduces in scatter_order
@@ -748,7 +782,11 @@ class NorMuonAndAdam:
             # lm_head when tied: aggregate embed.grad.T (tiled Triton transpose-add)
             if label == "lm_head" and do_adam and not self.split_embed:
                 if embed_param is not None and embed_param.grad is not None:
-                    transpose_add(embed_param.grad, param.grad)
+                    if lm_head_embed_grad_idx is None:
+                        transpose_add(embed_param.grad, param.grad)
+                    elif lm_head_embed_grad_idx.numel() > 0:
+                        rows = lm_head_embed_grad_idx
+                        param.grad.index_add_(1, rows, embed_param.grad.index_select(0, rows).T.contiguous())
 
             # Skip embed when tied (copied from lm_head after gather)
             if label == "embed" and not self.split_embed:
@@ -837,10 +875,16 @@ class NorMuonAndAdam:
         self._step_size_t.fill_(lr * (bias2 ** 0.5 / bias1))
         self._eff_wd_t.fill_(lr * lr * p_cfg.weight_decay * p_cfg.wd_mul)
 
-        NorMuonAndAdam._adam_update_step(
-            p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"],
-            beta1, beta2, p_cfg.eps, self._step_size_t, self._eff_wd_t
-        )
+        if p_cfg.adam_coptim > 0.0:
+            NorMuonAndAdam._adam_update_step_coptim(
+                p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"],
+                beta1, beta2, p_cfg.eps, self._step_size_t, self._eff_wd_t, p_cfg.adam_coptim
+            )
+        else:
+            NorMuonAndAdam._adam_update_step(
+                p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"],
+                beta1, beta2, p_cfg.eps, self._step_size_t, self._eff_wd_t
+            )
 
         return p_slice
 
@@ -851,6 +895,25 @@ class NorMuonAndAdam:
         exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
         exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
         update = exp_avg.div(exp_avg_sq.sqrt().add_(eps)).mul_(step_size_t)
+        # Cautious weight decay
+        mask = (update * p_slice) > 0
+        update.addcmul_(p_slice, mask, value=eff_wd_t)
+        p_slice.add_(other=update, alpha=-1.0)
+
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _adam_update_step_coptim(p_slice, g_slice, exp_avg, exp_avg_sq, beta1, beta2, eps, step_size_t, eff_wd_t, strength: float):
+        """Adam update with C-Optim sign-agreement masking on the adaptive step."""
+        exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
+        update = exp_avg.div(exp_avg_sq.sqrt().add_(eps)).mul_(step_size_t)
+
+        agree = (update * g_slice) > 0
+        keep = agree.to(update.dtype)
+        keep_mean = keep.float().mean().clamp_min_(1e-3).to(update.dtype)
+        masked_update = update * (keep / keep_mean)
+        update.lerp_(masked_update, strength)
+
         # Cautious weight decay
         mask = (update * p_slice) > 0
         update.addcmul_(p_slice, mask, value=eff_wd_t)
@@ -882,6 +945,13 @@ class NorMuonAndAdam:
         v_chunk = NorMuonAndAdam._apply_normuon_variance_reduction(
             v_chunk, p_state["second_momentum_buffer"], p_cfg.beta2, red_dim
         )
+
+        # annealed Langevin/SGLD exploration noise on the orthogonalized+variance-reduced
+        # update. Zero-mean Gaussian scaled relative to the per-row update RMS, annealed to 0
+        # by the cooldown so the final iterate settles cleanly in the (hopefully flatter) basin.
+        self._noise_t.fill_(self._normuon_noise_scale)
+        if self._normuon_noise_scale > 0.0:
+            v_chunk = NorMuonAndAdam._add_exploration_noise(v_chunk, self._noise_t, red_dim)
 
         # Update parameter, in place, with cautious weight decay
         param_view = param.data.view(p_cfg.reshape)
@@ -938,6 +1008,20 @@ class NorMuonAndAdam:
         v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt_()
         final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
         return v_chunk.mul_(final_scale.type_as(v_chunk))
+
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _add_exploration_noise(v_chunk, noise_t, red_dim):
+        """Add zero-mean Gaussian exploration noise to the NorMuon update.
+
+        Noise std per row = noise_scale * RMS(v_chunk over red_dim), so the perturbation is
+        commensurate with the actual update magnitude per row (scale-invariant across params).
+        noise_t is a 0-D CPU tensor (the annealed scale) to avoid recompilation.
+        """
+        sigma = noise_t.to(v_chunk.dtype)
+        row_rms = v_chunk.float().square().mean(dim=red_dim, keepdim=True).sqrt_().clamp_min_(1e-10)
+        noise = torch.randn_like(v_chunk) * (sigma * row_rms.type_as(v_chunk))
+        return v_chunk.add_(noise)
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -1059,7 +1143,7 @@ class AttnArgs:
     xsa_alpha: torch.Tensor | None
     train_max_seq_len: torch.Tensor
 
-flash_attn_interface = get_kernel('kernels-community/flash-attn3', version=1).flash_attn_interface
+flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
@@ -1082,7 +1166,12 @@ class CausalSelfAttention(nn.Module):
         seqlens, bm_size = attn_args.seqlens, attn_args.bm_size
         train_max_seq_len, yarn = attn_args.train_max_seq_len, attn_args.yarn
 
-        q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        if self.training:
+            qkv_w = (sa_lambdas[0] * qkvo_w[:self.dim * 3]).type_as(x)
+            qkv = fp8_linear_fn(x.view(-1, self.dim), qkv_w)
+            q, k, v = qkv.view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        else:
+            q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         max_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         q, k = norm(q), norm(k) # QK norm @Grad62304977
@@ -1131,7 +1220,11 @@ class CausalSelfAttention(nn.Module):
             y = y - alpha * proj * vn
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
+        if self.training:
+            o_w = (sa_lambdas[1] * qkvo_w[self.dim * 3:]).type_as(y)
+            y = fp8_linear_fn(y.view(-1, self.dim), o_w).view(B, T, self.dim)
+        else:
+            y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
 
 
@@ -1182,7 +1275,7 @@ class GPT(nn.Module):
         self.cache_layers = [3, 7]
 
         # Attention modules (no learned params -- weights come from qk_bank/vo_bank)
-        self.paired_head_layers = [0, 2, 5, 9]
+        self.paired_head_layers = [0, 5]
         self.attn = CausalSelfAttention(model_dim, head_dim, num_heads, paired=False)
         self.attn_paired = CausalSelfAttention(model_dim, head_dim, num_heads, paired=True)
         self.yarn = Yarn(head_dim, max_seq_len)
@@ -1675,8 +1768,8 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1375  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 1387  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 11  # reduce ext steps (pipeline time savings + val_loss headroom)
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
@@ -1716,7 +1809,7 @@ class TrainingSchedule:
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
-                 cooldown_frac: float = 0.5, split_embed_stage: int = 2, ws_post_yarn_ext: int = 20):
+                 cooldown_frac: float = 0.5, split_embed_stage: int | None = 2, ws_post_yarn_ext: int = 20):
         self.stages = stages
         self.scheduled_iterations = scheduled_iterations
         self.cooldown_frac = cooldown_frac
@@ -1730,8 +1823,8 @@ class TrainingSchedule:
         assert self.scheduled_iterations == ends[-2]
         self.boundaries = list(pairwise(ends))
 
-        # Split embed at specified stage (ensure odd step for Adam)
-        self.split_step = self.boundaries[split_embed_stage][0] | 1
+        # Split embed at specified stage (ensure odd step for Adam), or keep tied throughout.
+        self.split_step = (self.total_steps + 1) if split_embed_stage is None else (self.boundaries[split_embed_stage][0] | 1)
 
         # Precompute MTP weights for all steps
         self.mtp_weights = []
@@ -1760,11 +1853,11 @@ class TrainingSchedule:
 
 # window_sizes are in units of `block_size` tokens (defined in TrainingManager)
 TRAINING_STAGES = [
-    TrainingStage(duration=1/3, train_max_seq_len=896, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
+    TrainingStage(duration=0.36, train_max_seq_len=896, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
                   mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0]),
-    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
+    TrainingStage(duration=0.32, train_max_seq_len=2048, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
                   mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0]),
-    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
+    TrainingStage(duration=0.32, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
     # extension stage
     TrainingStage(train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
@@ -1772,7 +1865,7 @@ TRAINING_STAGES = [
 ]
 
 # TODO - Confirm.
-training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.60)
+training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.60, split_embed_stage=None)
 #training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
 
 def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
@@ -1788,6 +1881,28 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
     else:
         momentum = momentum_max
     return momentum
+
+# annealed Langevin/SGLD exploration-noise schedule for the NorMuon matrix-bank update.
+# NORMUON_NOISE_SIGMA0  : peak noise std as a fraction of the per-row update RMS (0 disables).
+# NORMUON_NOISE_END_FRAC: fraction of scheduled_iterations at which noise reaches 0 (anneal end).
+#                         Default ties anneal end to the LR-cooldown start (1 - cooldown_frac)
+#                         so the cooldown + extension run noise-free and the final iterate is clean.
+NORMUON_NOISE_SIGMA0 = 0.10
+NORMUON_NOISE_END_FRAC = 0.25   # = 1 - cooldown_frac(0.60); noise -> 0 by cooldown start (~step 550)
+NORMUON_NOISE_WARMUP = 50        # steps of linear ramp-up from 0 to SIGMA0 at the very start
+
+def get_normuon_noise_scale(step: int) -> float:
+    if NORMUON_NOISE_SIGMA0 <= 0.0:
+        return 0.0
+    end_step = max(1, int(training_schedule.scheduled_iterations * NORMUON_NOISE_END_FRAC))
+    if step >= end_step:
+        return 0.0
+    sigma = NORMUON_NOISE_SIGMA0
+    if NORMUON_NOISE_WARMUP > 0 and step < NORMUON_NOISE_WARMUP:
+        sigma = sigma * (step / NORMUON_NOISE_WARMUP)
+    # linear anneal from full sigma (after warmup) down to 0 at end_step
+    decay = max(0.0, (end_step - step) / end_step)
+    return sigma * decay
 
 class TrainingManager():
     """
@@ -1815,14 +1930,14 @@ class TrainingManager():
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
-            "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
-            "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "lr_mul": 0.95, "wd_mul": 150.},
+            "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0, "adam_coptim": 0.5},
             "post_lambdas":   {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "bigram_lambdas": {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "resid_lambdas":  {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
             "xsa_alphas":     {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0, "adam_coptim": 0.5},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
 
@@ -1870,6 +1985,8 @@ class TrainingManager():
 
         # Split embed from lm_head at 2/3 of training (on an odd step so Adam updates)
         self.split_step = training_schedule.split_step
+        last_step = training_schedule.total_steps - 1
+        self.lazy_final_lm_head_step = last_step if last_step % 2 == 1 else last_step - 1
 
         self.reset()
 
@@ -1914,6 +2031,12 @@ class TrainingManager():
         step_lr = training_schedule.get_lr(step)
         muon_momentum = get_muon_momentum(step)
         do_adam = self._is_adam_step(step)
+        lm_head_embed_grad_idx = None
+        if do_adam and step == self.lazy_final_lm_head_step:
+            lm_head_embed_grad_idx = self.lazy_embed_row_mask.nonzero(as_tuple=True)[0]
+
+        # set annealed exploration-noise scale for this step (read in _normuon_update)
+        self.optimizer._normuon_noise_scale = get_normuon_noise_scale(step)
 
         # Update learning rates and momentum for all params
         for param, p_cfg in self.optimizer.param_cfgs.items():
@@ -1922,7 +2045,9 @@ class TrainingManager():
                 p_cfg.momentum = muon_momentum
 
         # Step optimizer with do_adam flag
-        self.optimizer.step(do_adam=do_adam)
+        self.optimizer.step(do_adam=do_adam, lm_head_embed_grad_idx=lm_head_embed_grad_idx)
+        if lm_head_embed_grad_idx is not None:
+            self.lazy_embed_row_mask.zero_()
 
         # At split step: copy lm_head optimizer state to embed and mark as split
         if step == self.split_step:
@@ -1934,6 +2059,7 @@ class TrainingManager():
 
         # Reset NorMuon momentum buffers and split_embed state
         self.optimizer.reset()
+        self.lazy_embed_row_mask = torch.zeros(50304, device=device, dtype=torch.bool)
 
         stage, _ = training_schedule.lookup(0)
         self.ws_short, self.ws_long = stage.window_sizes
@@ -1946,6 +2072,11 @@ class TrainingManager():
             self.sparse_counts_state = None
             # buffer we use for fast GPU uploads of send indexes
             self.send_idxes_buffer = torch.empty(args.bigram_vocab_size, dtype=torch.int32, pin_memory=True)
+
+
+    def record_lazy_embed_rows(self, step: int, inputs: Tensor):
+        if step == self.lazy_final_lm_head_step:
+            self.lazy_embed_row_mask[inputs.to(torch.long)] = True
 
 
     def get_state(self):
@@ -2129,6 +2260,7 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
+        training_manager.record_lazy_embed_rows(step, inputs)
         training_manager.sparse_index_update(step, bigram_cpu)
         loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
         training_manager.sparse_index_share(step)
