@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Reproduce the exact-2900 Tail Reference Interpolation candidate.
+# By default this replays the submitted seeds 0..8 sequentially on one node.
+# Override SEEDS for a shorter or longer fixed seed list, e.g. SEEDS="0 1".
+
+SEEDS="${SEEDS:-0 1 2 3 4 5 6 7 8}"
+BASE_MASTER_PORT="${BASE_MASTER_PORT:-29600}"
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+LOCAL_ADDR="${LOCAL_ADDR:-127.0.0.1}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+LOG_DIR="${LOG_DIR:-logs/track3_tail_refinterp_2900}"
+SCRIPT="records/track_3_optimization/results/20260520_tail_refinterp_2900/train_gpt_tail_refinterp_2900.py"
+
+mkdir -p "$LOG_DIR"
+
+for seed in $SEEDS; do
+  port=$((BASE_MASTER_PORT + seed))
+  echo "Running seed ${seed} on port ${port}"
+  TRAIN_STEPS="${TRAIN_STEPS:-2900}" \
+  SCHEDULE_STEPS="${SCHEDULE_STEPS:-3020}" \
+  DENSE_EVAL_START="${DENSE_EVAL_START:-2900}" \
+  DENSE_EVAL_END="${DENSE_EVAL_END:-2900}" \
+  DENSE_EVAL_STRIDE="${DENSE_EVAL_STRIDE:-10}" \
+  CONTRA_TO_NORMAL_END_STEP="${CONTRA_TO_NORMAL_END_STEP:-2750}" \
+  TEMPERED_POLAR_RHO="${TEMPERED_POLAR_RHO:-0.05}" \
+  TEMPERED_POLAR_MAX_DELTA="${TEMPERED_POLAR_MAX_DELTA:-0.25}" \
+  TEMPERED_POLAR_RAMP_START_STEP="${TEMPERED_POLAR_RAMP_START_STEP:-2600}" \
+  TEMPERED_POLAR_RAMP_END_STEP="${TEMPERED_POLAR_RAMP_END_STEP:-2800}" \
+  RADIAL_OUTWARD_SCALE="${RADIAL_OUTWARD_SCALE:-0.5}" \
+  RADIAL_OUTWARD_SCALE_LATE="${RADIAL_OUTWARD_SCALE_LATE:-0.4}" \
+  RADIAL_DECAY_START_STEP="${RADIAL_DECAY_START_STEP:-2400}" \
+  RADIAL_DECAY_END_STEP="${RADIAL_DECAY_END_STEP:-2900}" \
+  TAIL_EMA_START_STEP="${TAIL_EMA_START_STEP:-0}" \
+  TAIL_EMA_GAMMA="${TAIL_EMA_GAMMA:-0.0}" \
+  TAIL_VEL_START_STEP="${TAIL_VEL_START_STEP:-2500}" \
+  TAIL_VEL_BETA="${TAIL_VEL_BETA:-0.90}" \
+  TAIL_VEL_GAMMA="${TAIL_VEL_GAMMA:--6.0}" \
+  TAIL_VEL_MAX_DELTA_RATIO="${TAIL_VEL_MAX_DELTA_RATIO:-0.01}" \
+  TARGET_UW_LATE="${TARGET_UW_LATE:-0.400}" \
+  TARGET_UW_RAMP_START_STEP="${TARGET_UW_RAMP_START_STEP:-2400}" \
+  TARGET_UW_RAMP_END_STEP="${TARGET_UW_RAMP_END_STEP:-2800}" \
+  TARGET_UW_FINAL="${TARGET_UW_FINAL:-0.400}" \
+  TARGET_UW_DECAY_START_STEP="${TARGET_UW_DECAY_START_STEP:-0}" \
+  TARGET_UW_DECAY_END_STEP="${TARGET_UW_DECAY_END_STEP:-0}" \
+  TARGET_UW_SCOPE="${TARGET_UW_SCOPE:-all}" \
+  REF_EXTRAP_CAPTURE_STEP="${REF_EXTRAP_CAPTURE_STEP:-2375}" \
+  REF_EXTRAP_GAMMA="${REF_EXTRAP_GAMMA:--0.075}" \
+  REF_EXTRAP_APPLY_START_STEP="${REF_EXTRAP_APPLY_START_STEP:-2900}" \
+  CHECKPOINT_PREFIX="${CHECKPOINT_PREFIX:-tail_refinterp_2900_seed${seed}}" \
+  torchrun \
+    --nnodes=1 \
+    --nproc_per_node="$NPROC_PER_NODE" \
+    --master_addr="$MASTER_ADDR" \
+    --master_port="$port" \
+    --local_addr="$LOCAL_ADDR" \
+    "$SCRIPT" \
+    --seed "$seed" \
+    2>&1 | tee "$LOG_DIR/tail_refinterp_2900_seed${seed}.txt"
+done
