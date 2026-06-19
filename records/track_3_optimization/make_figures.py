@@ -1,6 +1,7 @@
 import re
 import math
 import random
+import argparse
 from collections import defaultdict
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -8,14 +9,25 @@ from matplotlib.lines import Line2D
 from matplotlib.offsetbox import AnchoredOffsetbox, DrawingArea, HPacker, TextArea, VPacker
 
 
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    '--colors',
+    choices=('pyplot', 'extended'),
+    default='pyplot',
+    help='Color cycle to use: pyplot default, or the previous shuffled extended palette.',
+)
+args = parser.parse_args()
+
 plt.style.use('seaborn-v0_8-whitegrid')
 plt.rcParams['font.family'] = 'DejaVu Sans'
-color_cycle = [
+extended_color_cycle = [
     *plt.colormaps['tab20'].colors,
     *plt.colormaps['tab20b'].colors,
     *plt.colormaps['tab20c'].colors,
 ]
-random.Random(46).shuffle(color_cycle)
+random.Random(46).shuffle(extended_color_cycle)
+pyplot_color_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+color_cycle = pyplot_color_cycle if args.colors == 'pyplot' else extended_color_cycle
 
 
 def get_results(logfiles):
@@ -23,7 +35,7 @@ def get_results(logfiles):
     max_date = ''
     results = {}
     for i, (number, label) in enumerate(logfiles.items()):
-        label = f"#{number}: {label}"
+        # label = f"#{number}: {label}"
         color = color_cycle[i % len(color_cycle)]
         if number not in readme_rows:
             raise RuntimeError(f'No results-history row found in README for #{number}')
@@ -69,10 +81,15 @@ def add_legend(ax, legend_entries):
             linewidth=2.2,
             color=color,
         ))
-        label_size = 6.5 if len(label) > 25 else 8
+        label_lines = label.splitlines()
+        title_size = 6.5 if any(len(line) > 25 for line in label_lines) else 8
+        label_texts = [
+            TextArea(line, textprops={'fontsize': title_size})
+            for line in label_lines
+        ]
         text = VPacker(
             children=[
-                TextArea(label, textprops={'fontsize': label_size}),
+                *label_texts,
                 TextArea(evidence, textprops={'fontsize': 6.5}),
             ],
             align='left',
@@ -102,6 +119,17 @@ def add_legend(ax, legend_entries):
     legend.set_in_layout(False)
     ax.add_artist(legend)
     return legend
+
+
+def shift_legend_left_half_width(ax, legend, anchor_x=0.95, anchor_y=1.01, width_fraction=0.9):
+    ax.figure.canvas.draw()
+    renderer = ax.figure.canvas.get_renderer()
+    legend_width = legend.get_window_extent(renderer=renderer).width
+    axes_width = ax.get_window_extent(renderer=renderer).width
+    legend.set_bbox_to_anchor(
+        (anchor_x - width_fraction * legend_width / axes_width, anchor_y),
+        transform=ax.transAxes,
+    )
 
 
 def plot_results(ax, plot_results, target_label_x, title_date):
@@ -172,19 +200,23 @@ def average_runs(runs):
 
 
 readme_rows = {}
-row_pattern = re.compile(
-    r'^\|\s*(\d+)\s*\|\s*(\d+)[^|]*\|\s*([^|]+?)\s*\|[^|]*\|\s*(\d{4}/\d{2}/\d{2})\s*\|\s*\[log\]\((results/[^)]+)\)'
-)
+log_link_pattern = re.compile(r'\[log\]\((results/[^)]+)\)')
 with open('README.md', 'r') as f:
     for line in f:
-        m = row_pattern.search(line)
-        if m:
-            number = int(m.group(1))
-            steps_to_target = int(m.group(2))
-            evidence = m.group(3).strip()
-            date = m.group(4)
-            logfile = m.group(5).removeprefix('results/').removesuffix('.txt')
-            readme_rows[number] = (steps_to_target, evidence, date, logfile)
+        if not (line.startswith('| ') and len(line) > 2 and line[2].isdigit()):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip('|').split('|')]
+        if len(cells) != 7:
+            raise RuntimeError(f'Expected 7 columns in README results row: {line}')
+        number, steps, evidence, _description, date, log_cell, _authorship = cells
+        m = log_link_pattern.search(log_cell)
+        if not m:
+            raise RuntimeError(f'No log link found in README results row: {line}')
+        steps_m = re.match(r'\d+', steps)
+        if not steps_m:
+            raise RuntimeError(f'No step count found in README results row: {line}')
+        logfile = m.group(1).removeprefix('results/').removesuffix('.txt')
+        readme_rows[int(number)] = (int(steps_m.group()), evidence, date, logfile)
 pattern = re.compile(r'step:(\d+)/(\d+)\s+val_loss:([0-9.]+)')
 
 for suffix in ["wr", "best"]:
@@ -195,27 +227,27 @@ for suffix in ["wr", "best"]:
         logfiles = {
             1: 'Muon (bad hparams)',
             3: 'Muon (less bad hparams)',
-            5: 'MuonH',
-            9: 'NorMuon w/ update clamp-min',
-            11: '#9 + Contra-Muon',
+            5: 'Muon-Hyperball',
+            9: 'NorMuon-UpdateClampMin',
+            11: '#9 + ContraMuon',
             13: '#8 + MuLoCo',
-            14: '#11 + SOAP-Muon on MLP',
-            16: '#14 + SOAP-Muon on attn proj w/ trust gate',
-            20: '#16 + tuned lr sched + Soft-Muon',
+            14: '#11 + SOAPMuon on MLP',
+            16: '#14 + SOAPMuon on attn proj w/ trust gate',
+            20: '#16 + power law lr sched + SoftMuon',
         }
     elif suffix == "best":
         logfiles = {
-            12: 'Muon',
-            4: 'AdamH',
-            8: 'NorMuonH',
-            9: 'NorMuon w/ update clamp-min',
-            10: 'NorMuon',
-            16: '#11 + SOAP-Muon',
-            15: 'Newton-Muon',
+            12: 'Muon-W',
+            4: 'Adam-Hyperball',
+            9: '#9: NorMuon-UpdateClampMin',
+            11: '#11: #9 + ContraMuon',
+            16: '#11 + SOAPMuon',
             17: '#11 + Aurora',
-            18: 'PMuon',
-            19: 'KL-SOAP',
-            21: 'Shampoo',
+            15: 'NewtonMuon-W',
+            19: 'KLSOAP-Hyperball',
+            21: 'Shampoo-W',
+            22: 'Ortho-W',
+            23: 'Muon-RowNormControl',
         }
     else:
         assert False
@@ -225,9 +257,10 @@ for suffix in ["wr", "best"]:
     # Generate figure
     fig, ax = plt.subplots(figsize=(5.5, 4), dpi=300)
     legend = plot_results(ax, results.values(), 0, title_date)
-    ax.set_xlim(0, math.ceil(max_step / 1000) * 1000)
+    ax.set_xlim(0, 3800)
     ax.set_ylim(3.2, 3.85)
     fig.tight_layout()
+    shift_legend_left_half_width(ax, legend)
     fig.savefig(f'img/figure_{suffix}.png', bbox_inches='tight', bbox_extra_artists=[legend])
 
     # Generate zoomed-in figure
@@ -250,4 +283,5 @@ for suffix in ["wr", "best"]:
         zoom_margin = 0.01
         ax.set_ylim(min(zoom_losses) - zoom_margin, max(zoom_losses) + zoom_margin)
     fig.tight_layout()
+    shift_legend_left_half_width(ax, legend)
     fig.savefig(f'img/zoomed_figure_{suffix}.png', bbox_inches='tight', bbox_extra_artists=[legend])

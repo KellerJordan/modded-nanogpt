@@ -1065,14 +1065,14 @@ class Yarn(nn.Module):
 
 @dataclass(slots=True)
 class AttnArgs:
-    ve: torch.Tensor
     sa_lambdas: torch.Tensor
     seqlens: torch.Tensor
     bm_size: int
     yarn: Yarn
     key_offset: bool
     attn_gate_w: torch.Tensor
-    ve_gate_w: torch.Tensor
+    aux_v: torch.Tensor | None
+    xsa_alpha: torch.Tensor | None
     train_max_seq_len: torch.Tensor
 
 flash_attn_interface = get_kernel('kernels-community/flash-attn3').flash_attn_interface
@@ -1093,13 +1093,10 @@ class CausalSelfAttention(nn.Module):
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
         # unpack attention args
-        yarn = attn_args.yarn
-        ve, sa_lambdas, key_offset = attn_args.ve, attn_args.sa_lambdas, attn_args.key_offset
+        aux_v, attn_gate_w = attn_args.aux_v, attn_args.attn_gate_w
+        sa_lambdas, key_offset = attn_args.sa_lambdas, attn_args.key_offset
         seqlens, bm_size = attn_args.seqlens, attn_args.bm_size
-        # sparse gated attention to enable context based no-op by @classiclarryd
-        # only include gates on layers with value embeds used on forward pass
-        attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
-        train_max_seq_len = attn_args.train_max_seq_len
+        train_max_seq_len, yarn = attn_args.train_max_seq_len, attn_args.yarn
 
         q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         max_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
@@ -1113,10 +1110,8 @@ class CausalSelfAttention(nn.Module):
                 # shift keys forward for the stationary head dims. Enables 1-layer induction.
                 k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:]
 
-            if ve is not None:
-                # gate pattern g(x[:6] + ve[:6]) by @photomz
-                ve_gate_out = 2 * torch.sigmoid(F.linear(torch.cat([x[..., :6], ve[None, ..., :6]], dim=-1), ve_gate_w)).view(B, T, self.num_heads, 1)
-                v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
+            if aux_v is not None:
+                v = v + aux_v.view_as(v)
 
         else:
             # Paired heads: adjacent heads' queries attend to each other's keys.
@@ -1132,9 +1127,8 @@ class CausalSelfAttention(nn.Module):
             q = q.view(B, T * 2, self.num_heads // 2, self.head_dim)
             k = k.view(B, T * 2, self.num_heads // 2, self.head_dim)
 
-            if ve is not None:
-                ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T * 2, self.num_heads // 2, 1)
-                v = v + ve_gate_out * ve.view_as(v)
+            if aux_v is not None:
+                v = v + aux_v.view_as(v)
 
             seqlens = 2 * seqlens
             max_len = 2 * max_len
@@ -1144,6 +1138,13 @@ class CausalSelfAttention(nn.Module):
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
+        # Gated XSA (arXiv:2603.09078) with learnable strength: subtract per-head fraction tanh(α)
+        # of y aligned with v̂. Non-paired only (v shape doesn't line up for paired layers).
+        if attn_args.xsa_alpha is not None and not self.paired:
+            vn = F.normalize(v, dim=-1, eps=1e-4)
+            proj = (y * vn).sum(-1, keepdim=True)
+            alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(1, 1, self.num_heads, 1)
+            y = y - alpha * proj * vn
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
@@ -1167,13 +1168,41 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
         super().__init__()
         self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        # there are only 50257 unique GPT-2 tokens; extend to nearest multiple of 128 for efficiency.
+        # suggested by @Grad62304977, originates from Karpathy's experiments.
         self.vocab_size = next_multiple_of_n(vocab_size, n=128)
 
-        self.smear_gate = nn.Linear(12, 1, bias=False)
-        nn.init.zeros_(self.smear_gate.weight)
+        # Transposed weight storage for faster gradient accumulation
+        use_fp8 = not os.environ.get("DISABLE_FP8", False)
+        self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
+        nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
 
-        self.skip_gate = nn.Linear(12, 1, bias=False)
-        nn.init.zeros_(self.skip_gate.weight)
+        self.embed = nn.Embedding(self.vocab_size, model_dim)
+        with torch.no_grad():
+            # tie embed and lm_head at init
+            self.embed.weight.copy_(self.lm_head.weight.T)
+
+        self.init_attn(model_dim, head_dim, num_heads, num_layers, max_seq_len)
+        self.init_mlp(model_dim)
+        self.init_misc(model_dim, num_layers)
+        self.init_mudd(num_layers, model_dim)
+
+        # Auto-label parameters
+        for name, param in self.named_parameters():
+            param.label = name.replace('.weight', '')
+
+    def init_attn(self, model_dim, head_dim, num_heads, num_layers, max_seq_len):
+        # Cache layers for skip / backout snapshots taken at end of loop iter.
+        self.cache_layers = [3, 7]
+
+        # Attention modules (no learned params -- weights come from qk_bank/vo_bank)
+        self.paired_head_layers = [0, 2, 5, 9]
+        self.attn = CausalSelfAttention(model_dim, head_dim, num_heads, paired=False)
+        self.attn_paired = CausalSelfAttention(model_dim, head_dim, num_heads, paired=True)
+        self.yarn = Yarn(head_dim, max_seq_len)
+        self.yarn_paired_head = Yarn(head_dim, max_seq_len, paired=True)
 
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
@@ -1185,17 +1214,10 @@ class GPT(nn.Module):
         self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 unique gates
         self.gate_filler_nones = [None] * (num_layers - 6)
 
-        # -----------------------------------
         # Parameter banks for sharded optimization, by @chrisjmccormick
-
-        # Identify which layers have attention/MLP
         # Attention is skipped in layer 6 by @YouJiacheng
         num_attn_layers = num_layers - 1
-        # All layers have MLP (At 11 layers--dropped first layer @EmelyanenkoK)
-        num_mlp_layers = num_layers
-
         hdim = num_heads * head_dim
-        mlp_hdim = 4 * model_dim
 
         # QK bank: per-head-pair Muon groups for Q, K weights
         # Each pair of adjacent heads gets its own independent polar express orthogonalization
@@ -1212,11 +1234,6 @@ class GPT(nn.Module):
         self.vo_bank = nn.Parameter(torch.empty(num_vo_padded, hdim, hdim))
         self.vo_bank.reshape = (num_vo_padded, hdim, hdim)
 
-        # MLP bank: stores c_fc and c_proj for all MLP layers
-        # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
-        self.mlp_bank = nn.Parameter(torch.empty(12, 2, mlp_hdim, model_dim))  # (12, 2, 3072, 768)
-        self.mlp_bank.reshape = (24, mlp_hdim, model_dim)  # Shape for sharding: (24, 3072, 768)
-
         # improved init scale by @YouJiacheng and @srashedll
         std = 0.5 * model_dim ** -0.5
         bound = (3 ** 0.5) * std
@@ -1225,6 +1242,18 @@ class GPT(nn.Module):
             self.qk_bank[num_qk_groups:].zero_()
             self.vo_bank[:num_vo_real].uniform_(-bound, bound)
             self.vo_bank[num_vo_real:].zero_()
+
+    def init_mlp(self, model_dim):
+        # MLP bank: stores c_fc and c_proj for all MLP layers
+        # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
+        mlp_hdim = 4 * model_dim
+        self.mlp_bank = nn.Parameter(torch.empty(12, 2, mlp_hdim, model_dim))  # (12, 2, 3072, 768)
+        self.mlp_bank.reshape = (24, mlp_hdim, model_dim)  # Shape for sharding: (24, 3072, 768)
+
+        # improved init scale by @YouJiacheng and @srashedll
+        std = 0.5 * model_dim ** -0.5
+        bound = (3 ** 0.5) * std
+        with torch.no_grad():
             self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
 
@@ -1245,12 +1274,13 @@ class GPT(nn.Module):
 
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
 
-        self.embed = nn.Embedding(self.vocab_size, model_dim)
-        with torch.no_grad():
-            self.embed.weight.copy_(self.lm_head.weight.T)
+        self.skip_gate = nn.Linear(12, 1, bias=False)
+        nn.init.zeros_(self.skip_gate.weight)
 
-        self.bigram_embed = nn.Embedding(args.bigram_vocab_size, model_dim)
+        self.bigram_embed = nn.Embedding(args.bigram_vocab_size, args.bigram_dim)
         nn.init.zeros_(self.bigram_embed.weight)
+        bigram_sign_table = torch.randn(args.bigram_sign_table_rows, args.bigram_dim).sign().to(torch.bfloat16)
+        self.register_buffer('bigram_sign_table', bigram_sign_table)
 
         self.post_lambdas = nn.Parameter(torch.ones(num_layers, 2))
 
@@ -1262,21 +1292,71 @@ class GPT(nn.Module):
         # sqrt(1.1) per sublayer so cumulative per-layer scaling is 1.1
         self.resid_lambdas = nn.Parameter(torch.full((num_layers, 2), 1.1**0.5))
 
-        pad = (-num_layers * 2 - 3) % dist.get_world_size()
+        # Per-(layer, head) learnable XSA gate; zero-init -> tanh(0)=0 disables XSA at step 0
+        self.xsa_alphas = nn.Parameter(torch.zeros(num_layers, self.num_heads))
+
+        pad = (-num_layers * 2 - 2) % dist.get_world_size()
         self.scalars = nn.Parameter(
             torch.cat(
                 [
                     *[torch.tensor([0.5, 1.0]) for _ in range(num_layers)],  # SA lambdas
                     torch.zeros(1), # smear_lambda
-                    0.5*torch.ones(1), # backout_lambda
                     -1.5 * torch.ones(1),  # skip_lambda -> σ(-1.5) ≈ 0.18
                     torch.ones(pad),
                 ]
             )
         )
-        # Auto-label parameters
-        for name, param in self.named_parameters():
-            param.label = name.replace('.weight', '')
+
+    def init_mudd(self, num_layers: int, model_dim: int):
+        """
+        Multiway Dynamic Dense Connections @lishengping. https://arxiv.org/abs/2502.12170
+        Expressive and efficient mechanism for data dependent skip connections.
+        Given current activation x, return n skip coefficients computed via ~mlp(x).
+        Trimmed for speedrun: invoked at start of last layer and post-loop only.
+
+        Start of last layer produces 14 coefficients:
+          mu[0..2]  = v_mudd source coefs  (cache[0], cache[7], x)   -> added into V
+          mu[3..5]  = residual source coefs (cache[0], cache[7], x)  -> residual recombination
+          mu[6..7]  = per-pair ve_gate (2 channels, tiled to num_heads)
+          mu[8..9]  = resid_attn / post_attn lambdas (dynamic)
+          mu[10..11]= x0 / bigram injection lambdas (dynamic)
+          mu[12..13]= resid_mlp / post_mlp lambdas (dynamic)
+
+        Post-loop produces 5 residual coefs over
+          {cache[0], cache[7], cache[9], ve_bank0, cache[3]}.
+        """
+        num_mudd_layers = 2
+        self._mudd_scale = 0.1
+        mudd_dim = 64
+        max_num_coef = 14
+
+        self.mudd_w1 = nn.Parameter(torch.empty(num_mudd_layers, mudd_dim, model_dim))
+        for j in range(num_mudd_layers):
+            nn.init.kaiming_uniform_(self.mudd_w1.data[j], a=math.sqrt(5))
+
+        self.mudd_w2 = nn.Parameter(torch.zeros(num_mudd_layers, max_num_coef, mudd_dim))
+
+        # Bias init in pre-scaled domain (effective = bias * _mudd_scale).
+        bs_init = torch.zeros(num_mudd_layers, max_num_coef)
+        # Per-pair ve_gate baseline (matches max of `2*sigmoid` used at other layers):
+        bs_init[0, 6]  = 2.0 / self._mudd_scale       # ve_gate lane 0
+        bs_init[0, 7]  = 2.0 / self._mudd_scale       # ve_gate lane 1
+        # Layer-0 layer-10 dynamic lambdas (effective values match per-layer defaults):
+        bs_init[0, 8]  = 1.1**0.5 / self._mudd_scale  # resid_attn[10]
+        bs_init[0, 9]  = 1.0 / self._mudd_scale       # post_attn[10]
+        bs_init[0, 10] = 0.0                          # x0_lambda[10] (init 0)
+        bs_init[0, 11] = 0.05 / self._mudd_scale      # bigram_lambda[10]
+        bs_init[0, 12] = 1.1**0.5 / self._mudd_scale  # resid_mlp[10]
+        bs_init[0, 13] = 1.0 / self._mudd_scale       # post_mlp[10]
+        # Layer-1 (post-loop): -0.5 backout absorbed into residual h7 coef.
+        bs_init[1, 1]  = -0.5 / self._mudd_scale      # post-loop residual h7 coef
+        self.mudd_b2 = nn.Parameter(bs_init)
+
+    def forward_mudd(self, x, id, num_coef):
+        """Returns `num_coef` per-token MUDD coefficients from block `id` (0 or 1)."""
+        x = F.gelu(F.linear(x, self.mudd_w1[id]))
+        x = (F.linear(x, self.mudd_w2[id, :num_coef]) + self.mudd_b2[id, :num_coef]) * self._mudd_scale
+        return x.split(1, dim=-1)
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
@@ -1292,8 +1372,7 @@ class GPT(nn.Module):
         # ---- Unbind parameters (avoid select_backward kernels) ----
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
         smear_lambda = self.scalars[2 * self.num_layers]
-        backout_lambda = self.scalars[2 * self.num_layers + 1]
-        skip_lambda = self.scalars[2 * self.num_layers + 2]
+        skip_lambda = self.scalars[2 * self.num_layers + 1]
         resid_lambdas_attn = self.resid_lambdas[:, 0].bfloat16().unbind(0)
         resid_lambdas_mlp  = self.resid_lambdas[:, 1].bfloat16().unbind(0)
         post_lambdas_attn = self.post_lambdas[:, 0].bfloat16().unbind(0)
@@ -1304,6 +1383,9 @@ class GPT(nn.Module):
         veg = self.ve_gate_bank.unbind(0)
         attn_gates = [*ag[:6], None, *ag[6:]]
         ve_gates = [None, veg[0], veg[1], *self.gate_filler_nones, veg[2], veg[3], veg[4]]
+        # XSA on non-paired attn layers only; paired {0,2,5,9} and MLP-only layer 6 skipped
+        xsa_alpha_per_layer = self.xsa_alphas.unbind(0)
+        xsa_alphas = [xsa_alpha_per_layer[j] if j in {1, 3, 4, 7, 8, 10} else None for j in range(self.num_layers)]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
         qk_all = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])
@@ -1320,7 +1402,12 @@ class GPT(nn.Module):
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
         
-        x0_bigram = self.bigram_embed(bigram_input_seq)[None]
+        # Use sign-trick to better compress multiple bigrams into a shared bigram embedding row
+        # (details in https://github.com/KellerJordan/modded-nanogpt/pull/299 by @trianxy)
+        sign_idx = torch.zeros_like(input_seq)
+        sign_idx[1:] = (input_seq[:-1] ^ input_seq[1:]) % self.bigram_sign_table.shape[0]  # (8192,)
+        bigram_signs = self.bigram_sign_table[sign_idx]                                    # (seq, bigram_dim)
+        x0_bigram = (self.bigram_embed(bigram_input_seq) * bigram_signs)[None]             # (1, seq, bigram_dim)
 
         # Value embeddings - always computed (not precomputed)
         ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
@@ -1334,43 +1421,29 @@ class GPT(nn.Module):
         x = x0 = norm(x[None])
 
         # Initialize residual stream with pre-layer-0 bigram injection
-        x = x + x0_bigram * bigram_lambdas[0]
+        x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + x0_bigram * bigram_lambdas[0]
 
         # Precompute x0/bigram injection (added to attention output each layer)
         # Layer 0: bigram already injected above, so only x0 component
-        x0_inject = (x0 * x0_lambdas[0],) + tuple(x0 * x0_lambdas[i] + x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
+        x0_inject = tuple(x0 * x0_lambdas[i] for i in range(self.num_layers))
+        bg_inject = (None,) + tuple(x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
         skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
-        
-        # ---- Transformer layers ----
-        x_backout = None
-        skip_connection = None
+
+        # cache[k] is the layer-k snapshot used downstream by MUDD.
+        # cache[0] = residual stream after bigram injection (input to layer 0).
+        cache = {0: x}
         for i in range(self.num_layers):
-            yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
-            attn_args = AttnArgs(
-                ve=ve[i],
-                sa_lambdas=sa_lambdas[i],
-                seqlens=seqlens,
-                bm_size=bm_sizes[i],
-                yarn=yarn,
-                key_offset=key_offset[i],
-                attn_gate_w=attn_gates[i],
-                ve_gate_w=ve_gates[i],
-                train_max_seq_len=train_max_seq_len
-            )
-            # Select weights from banks
-            attn_idx = i - (i > 6) if i != 6 else None
-            qkvo_w = attn_weights[attn_idx] if attn_idx is not None else None
+            is_paired = i in self.paired_head_layers
+            yarn = self.yarn_paired_head if is_paired else self.yarn
+            attn = self.attn_paired if is_paired else self.attn
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
             if use_mlp_fp8:
                 up_proj_f8, up_proj_scale = mlp_up_proj_f8[i], mlp_up_proj_scales[i]
 
-            # Select attention variant for this layer
-            attn = self.attn_paired if i in self.paired_head_layers else self.attn
-
-            # Skip attention on layer 6 @YouJiacheng. Instead pull skip connection from prior long window
+            # Skip attention on layer 6 @YouJiacheng
             if i == 6:
-                x = x + skip_gate_out * skip_connection
+                x = x + skip_gate_out * cache[3]
             else:
                 attn_in = x_backout if x_backout is not None else x
                 attn_out = attn(norm(attn_in), attn_args, qkvo_w)
@@ -1602,11 +1675,17 @@ class Hyperparameters:
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
+    # Descriptive run_id for this iteration:
+    #   - explicit sparse connectivity refactor (no generic loop)
+    #   - (1 + m_r9) * x self-reference fuse on layer 9
+    #   - backout_lambda fully removed (slot dropped from self.scalars; absorbed into MUDD bias init)
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
-    bigram_vocab_size: int = 50304 * 5
+    bigram_vocab_size: int = 50304 * 15
+    bigram_dim: int = 192
+    bigram_sign_table_rows: int = 8192  # prefer a power of 2 (values ~500-15000 gave similar results)
 
 args = Hyperparameters()
 
@@ -1738,15 +1817,27 @@ class TrainingManager():
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "bigram_lambdas": {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "resid_lambdas":  {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
+            "xsa_alphas":     {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
 
+        # ---- MUDD parameter overrides ----
+        self.param_table.update({
+            "mudd_w1":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25},
+            "mudd_w2":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25},
+            "mudd_b2":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25, "wd_mul": 0.0},
+        })
+
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "mudd_b2", "xsa_alphas",
+            "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+        ] + [
+            "mudd_w2",
             "value_embeds", "bigram_embed",  # Medium
+            "mudd_w1",
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "qk_bank", "vo_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
         ]
@@ -1934,8 +2025,12 @@ model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.qk_bank.data = model.qk_bank.data.bfloat16()
 model.vo_bank.data = model.vo_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
+model.mudd_w1.data = model.mudd_w1.data.bfloat16()
+model.mudd_w2.data = model.mudd_w2.data.bfloat16()
+model.mudd_b2.data = model.mudd_b2.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
+dist.broadcast(model.bigram_sign_table, 0)  # buffer, not in parameters()
 
 quantize_weights_fp8(model)
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
