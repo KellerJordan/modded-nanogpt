@@ -13,7 +13,8 @@ Thanks to the efforts of many contributors, this repo now contains a training al
 This improvement in training speed has been brought about by the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU²
 * The Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[repo](https://github.com/KellerJordan/Muon)]
-* Use FP8 matmul for head, and asymmetric rescale and softcap logits
+* Use FP8 for head, and asymmetric rescale and softcap logits
+* Use FP8 on MLP up projection forward pass
 * Initialization of projections to zero (muP-like)
 * Skip connections from embedding to every block as well as from block 3 to 6
 * Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
@@ -192,6 +193,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 81 | 1.363 minutes | [MUDD Skip Connections](https://x.com/classiclarryd/status/2058486428255035457) | 04/22/26 | [log](records/track_1_short/2026-04-22_MuddFormer/this_pr_v3),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/259) | @Lisennlp
 82 | 1.353 minutes | [Learnable XSA](https://x.com/classiclarryd/status/2058975556520329302) | 04/29/26 | [log](records/track_1_short/2026-04-29_XSAGatedLayers/this_pr_v1-s1410/06563169-6435-48ba-a1ad-f3e61bfcc573.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/264) | @_djdumpling
 83 | 1.328 minutes | [Sign Trick on Bigram Embed](https://x.com/classiclarryd/status/2063061926092099868) | 05/20/26 | [log](records/track_1_short/2026-05-20_BigramsSignTrick/pr299/0cf91274-eda8-49cd-9a97-9369f730f271.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/299) | @TrianX
+84 | 1.320 minutes | FP8 on MLP up-projection forward pass | 05/21/26 | [log](records/track_1_short/2026-05-19_FP8MLPUpProj/this_record/008bb79d-d5bc-4205-bd4e-5e4ae82e658c.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/306) | @sisovicm
 ## Rules
 
 New records must:
