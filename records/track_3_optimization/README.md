@@ -165,31 +165,9 @@ What it explicitly does **not** use: Contra-Muon, Soft-Muon, Circuit-Muon, Auror
 Notes: Several active details have yet to be proven independently beneficial. We do not yet know whether the attention SOAP trust gate is helping. We also do not know whether the final Muon momentum cooldown matters much, since the cooldown is scheduled over the last 200 steps of a 2900-step run, but the accepted validation is at step 2720. Likewise, it is unclear whether the Rademacher gain init matters, whether the depth-dependent `mlp.fc` init matters beyond a below-stat-sig ablation signal of about `0.00003` val loss, or whether `attn.proj.bias` beta2 `.9965` is meaningfully different from the other auxiliary beta2 value `.997`.
 
 
-Warning: The figures below are out of date. Better figures are WIP.
+<img src="img/figure_wr_vs_base.png" width="50%">
 
-
-<table>
-  <tr>
-    <td width="50%"><img src="img/figure_wr.png" width="100%"></td>
-    <td width="50%"><img src="img/zoomed_figure_wr.png" width="100%"></td>
-  </tr>
-</table>
-Figure 1. World-record progression.
-
-<br/><br/>
-
-<table>
-  <tr>
-    <td width="50%"><img src="img/figure_best.png" width="100%"></td>
-    <td width="50%"><img src="img/zoomed_figure_best.png" width="100%"></td>
-  </tr>
-</table>
-Figure 2. Per-optimizer best.
-
-<br/><br/>
-
-<img src="img/muon_shampoo_ssd.png" width="50%">
-Figure 3. Comparison between Shampoo and Muon, which both reduce to Spectral Descent when momentum is removed.
+The current WR achieves a ~12% optimization speed improvement relative to a well-tuned baseline.
 
 
 
