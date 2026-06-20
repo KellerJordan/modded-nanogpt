@@ -92,6 +92,10 @@ If it fails to reproduce (i.e., there's an error or we get statistical evidence 
 * The number in the leftmost column reflects the order in which these runs were accepted. This does not necessarily line up with the Date column, which is the date at which the PR appeared.
 * The (!) symbol next to the step count indicates a new world record.
 
+
+Warning: The figures below are out of date. Better figures are WIP.
+
+
 <table>
   <tr>
     <td width="50%"><img src="img/figure_wr.png" width="100%"></td>
