@@ -169,7 +169,7 @@ Notes: Several active details have yet to be proven independently beneficial. We
 
 <img src="img/figure_wr_vs_base.png" width="50%">
 
-Figure 1. The current WR achieves a ~12% optimization speed improvement relative to a well-tuned baseline.
+Figure 1. The current WR achieves a ~19.5% optimization speed improvement relative to a well-tuned baseline.
 
 
 
