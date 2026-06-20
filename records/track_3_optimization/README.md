@@ -8,7 +8,7 @@ Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any
 Thank you to everyone who's contributed results so far:
 [@kaiyue-wen](https://github.com/kaiyue-wen), [@nilin](https://github.com/nilin), [@alint77](https://github.com/alint77), [@wilsoncwu](https://github.com/wilsoncwu), [@kumarkrishna](https://github.com/kumarkrishna), [@lliu606](https://github.com/lliu606), [@zhenghaoxu-gatech](https://github.com/zhenghaoxu-gatech), [@bentherien](https://github.com/bentherien), [@Sam_Acqua](https://x.com/Sam_Acqua), [@zhehangdu](https://github.com/zhehangdu), [@SPThole](https://github.com/SPThole), [@liyang2019](https://github.com/liyang2019), [@zzp1012](https://github.com/zzp1012), Yash Pande, [@fhueb](https://github.com/fhueb), [@kcc-lion](https://github.com/kcc-lion), [@zhiweixx](https://github.com/zhiweixx), [@chenchenygu](https://github.com/chenchenygu), [@breskanu](https://github.com/breskanu), [@fangzhou_wu](https://x.com/fangzhou_wu), [@eliebak](https://github.com/eliebak), [@wakamex](https://github.com/wakamex), [@varunneal](https://github.com/varunneal), [@tomoqt](https://github.com/tomoqt), [@rohan-anil](https://github.com/rohan-anil), [@konstmish](https://github.com/konstmish), [@jn2clark](https://github.com/jn2clark), [@OscarYau525](https://github.com/OscarYau525), [@ypwang61](https://github.com/ypwang61), and [@nooraovo](https://github.com/nooraovo).
 
-**Contents**
+**Table of Contents**
 
 - [Benchmark definition Tl;dr](#benchmark-definition-tldr)
 - [Quickstart](#quickstart)
