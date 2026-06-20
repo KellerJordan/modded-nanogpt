@@ -15,7 +15,7 @@ from pathlib import Path
 
 import torch
 from torch import Tensor, nn
-from torch.optim import AdamW
+from torch.optim import Adam
 import torch.nn.functional as F
 import torch.distributed as dist
 
@@ -284,10 +284,10 @@ for _ in range(num_trials):
             raise Exception(f"Uninitialized parameter: {name}")
 
     # create the optimizer(s)
-    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
-                        dict(params=[model.proj.weight], lr=0.004),
-                        dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
-                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
+    optimizer1 = Adam([dict(params=[model.embed.weight], lr=0.7),
+                       dict(params=[model.proj.weight], lr=0.004),
+                       dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
+                      betas=(0.8, 0.95), eps=1e-10, fused=True)
     optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
                       lr=0.025, weight_decay=0.05)
     optimizers = [optimizer1, optimizer2]
