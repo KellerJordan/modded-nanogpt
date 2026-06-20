@@ -519,7 +519,11 @@ def linear_relu_square(a, b, aux=None):
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, W1, W2):
-        pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
+        if is_hopper:
+            pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
+        else:
+            pre = x.view((-1, x.shape[-1])) @ W1.T
+            post = torch.nn.functional.relu(pre).square()
         x3 = post @ W2
         ctx.save_for_backward(x, W1, W2, pre, post)
         return x3.view(x.shape)
@@ -528,7 +532,11 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         x, W1, W2, pre, post = ctx.saved_tensors
         dW2 = post.T @ grad_output
-        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
+        if is_hopper:
+            dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
+        else:
+            tmp = grad_output.view((-1, grad_output.shape[-1])) @ W2.T
+            dpre = 2 * tmp * torch.nn.functional.relu(pre)
         dW1 = dpre.T @ x
         dx = dpre @ W1
         return dx.view(x.shape), dW1, dW2
@@ -894,10 +902,14 @@ __global__ void ce_fwd_bwd_kernel(
 }
 """
 
+major, minor = torch.cuda.get_device_capability(0)
+compute_capability = f"{major}{minor}"
+is_hopper = compute_capability == "90"
+
 ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
     CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
     "ce_fwd_bwd_kernel",
-    compute_capability="90",
+    compute_capability=compute_capability,
     cuda_include_dirs=["/usr/local/cuda/include/"],
     nvcc_options=["-lineinfo", "--use_fast_math"],
 )
