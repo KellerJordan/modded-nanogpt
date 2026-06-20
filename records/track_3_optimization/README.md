@@ -159,8 +159,8 @@ Active techniques:
    (Introduced in result #39; the current `.3` lookahead variant entered the record chain in #40.)
 
 8. **[Adam](https://arxiv.org/abs/1412.6980) and auxiliary Adam split**:
-   The token embedding and output projection use Adam updates with no weight decay. Norm gains and other 1D/bias params use a minimal bias-correction-free Adam, with beta2 split:
-   `gains=.99`, other aux `.997`, `attn.proj.bias=.9965`.
+   The token embedding and output projection use Adam updates with no weight decay. Norm gains and other 1D/bias params use a minimal bias-correction-free Adam, with beta2 tuned per parameter family:
+   gains `.99`, most biases `.997`, except `attn.proj.bias` which uses `.9965`.
    (Aux Adam is part of the result #1 baseline; the current auxiliary beta2 split was introduced in #44.)
 
 9. **Initialization tweaks**:
