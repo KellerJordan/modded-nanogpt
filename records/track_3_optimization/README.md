@@ -124,7 +124,7 @@ Figure 3. Comparison between Shampoo and Muon, which both reduce to Spectral Des
 
 Codex offers the following description of the techniques used in the current record (#45).
 Note that it is not entirely known which of these techniques is most beneficial.
-Several techniques that were believed beneficial in the past have now been abandoned.
+Several techniques that were considered beneficial in the past have now been abandoned.
 
 Record #45 is: **#44’s clean SOAP-Muon stack, plus a final Tail-EMA readout at step 2720**.
 
