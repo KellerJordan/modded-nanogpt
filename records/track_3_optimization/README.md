@@ -168,11 +168,7 @@ Active techniques:
    (Projection zero-init appears by result #29; depth-scaled `mlp.fc` and CGI/Rademacher gains entered the accepted lineage in #30; the current CGI alpha `.125` was introduced in #44.)
 
 10. **Tail-EMA final readout**:
-   Starting at step `2000`, it keeps an EMA of every non-embedding parameter with `tau=150`, related to Polyak-style iterate averaging / [stochastic weight averaging](https://arxiv.org/abs/1803.05407). At step `2720`, right before validation, it does:
-   ```text
-   theta <- 0.4 * theta + 0.6 * EMA(theta)
-   ```
-   Then validates and stops.
+   Starting at step `2000`, it keeps an EMA of every non-embedding parameter with horizon of 150 steps. At step `2720`, right before validation, it does `theta <- 0.4 * theta + 0.6 * EMA(theta)`, then validates and stops.
    (Introduced in result #45, following the earlier fixed final-readout lineage from #38 and #43.)
 
 What it explicitly does **not** use: Contra-Muon, Soft-Muon, Circuit-Muon, Aurora, TrailDelta, fixed-anchor readout, Muon-history forecasting, CenterShrinkAdam, or NorMuon-lite row/column variance preconditioning. Some stale comments mention older machinery, but these paths are off or removed in the #45 submission defaults.
