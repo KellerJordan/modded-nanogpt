@@ -401,6 +401,7 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
 
 @triton.jit
 def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
+                                 dequant_scale_ptr,
                                  M, N, K,
                                  BLOCK_SIZE_M: tl.constexpr,
                                  BLOCK_SIZE_N: tl.constexpr,
@@ -408,6 +409,7 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                                  GROUP_SIZE_M: tl.constexpr,
                                  NUM_SMS: tl.constexpr,
                                  FORWARD: tl.constexpr,
+                                 USE_FP8: tl.constexpr,
                                  ):
     dtype = tl.bfloat16
     start_pid = tl.program_id(axis=0)
@@ -431,6 +433,9 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
             a = a_desc.load([offs_am, offs_k])
             b = b_desc.load([offs_bn, offs_k])
             accumulator = tl.dot(a, b.T, accumulator)
+
+        if USE_FP8:
+            accumulator *= tl.load(dequant_scale_ptr)
 
         tile_id_c += NUM_SMS
         pid_m = tile_id // num_pid_n
@@ -467,10 +472,19 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
 
-def linear_relu_square(a, b, aux=None):
+_dummy_f32 = None  # lazily initialized 1-element tensor for unused pointer args
+
+def _get_dummy_f32(device):
+    global _dummy_f32
+    if _dummy_f32 is None or _dummy_f32.device != device:
+        _dummy_f32 = torch.zeros(1, dtype=torch.float32, device=device)
+    return _dummy_f32
+
+def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=None):
     M, K = a.shape
     N, K = b.shape
     dtype = a.dtype
+    use_fp8 = b_f8 is not None
 
     c = torch.empty((M, N), device=a.device, dtype=dtype)
 
@@ -483,12 +497,14 @@ def linear_relu_square(a, b, aux=None):
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 256
-    BLOCK_SIZE_K = 64
+    BLOCK_SIZE_K = 128 if use_fp8 else 64
     num_stages = 4 if FORWARD else 3
     num_warps = 8
 
-    a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
-    b_desc = TensorDescriptor.from_tensor(b, [BLOCK_SIZE_N, BLOCK_SIZE_K])
+    a_kernel = a_f8 if use_fp8 else a
+    a_desc = TensorDescriptor.from_tensor(a_kernel, [BLOCK_SIZE_M, BLOCK_SIZE_K])
+    b_kernel = b_f8 if use_fp8 else b
+    b_desc = TensorDescriptor.from_tensor(b_kernel, [BLOCK_SIZE_N, BLOCK_SIZE_K])
     c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
     aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
 
@@ -498,8 +514,15 @@ def linear_relu_square(a, b, aux=None):
             triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
         ), )
 
+    if use_fp8:
+        assert dequant_scale_ptr is not None
+    else:
+        # The unified Triton signature requires a pointer, but bf16 kernels never load it.
+        dequant_scale_ptr = _get_dummy_f32(a.device)
+
     linear_relu_square_kernel[grid](
         a_desc, b_desc, c_desc, aux_desc,
+        dequant_scale_ptr,
         M, N, K,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
@@ -507,6 +530,7 @@ def linear_relu_square(a, b, aux=None):
         GROUP_SIZE_M=1,
         NUM_SMS=NUM_SMS,
         FORWARD=FORWARD,
+        USE_FP8=use_fp8,
         num_stages=num_stages,
         num_warps=num_warps
     )
@@ -518,8 +542,14 @@ def linear_relu_square(a, b, aux=None):
 
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, W1, W2):
-        pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
+    def forward(ctx, x, W1, W2, W1_f8=None, dequant_scale=None, x_f8=None):
+        x_flat = x.view((-1, x.shape[-1]))
+        if W1_f8 is not None:
+            assert x_f8 is not None and dequant_scale is not None
+            x_f8 = x_f8.view((-1, x_f8.shape[-1]))
+            pre, post = linear_relu_square(x_flat, W1, a_f8=x_f8, b_f8=W1_f8, dequant_scale_ptr=dequant_scale)
+        else:
+            pre, post = linear_relu_square(x_flat, W1)
         x3 = post @ W2
         ctx.save_for_backward(x, W1, W2, pre, post)
         return x3.view(x.shape)
@@ -531,7 +561,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
         dW1 = dpre.T @ x
         dx = dpre @ W1
-        return dx.view(x.shape), dW1, dW2
+        return dx.view(x.shape), dW1, dW2, None, None, None
 
 
 # -----------------------------------------------------------------------------
@@ -1004,4 +1034,3 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         )
 
         return grad_x, None, None, grad_w, None, None, None
-

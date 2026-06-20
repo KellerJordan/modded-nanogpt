@@ -1061,14 +1061,13 @@ class AttnArgs:
     yarn: Yarn
     key_offset: bool
     attn_gate_w: torch.Tensor | None
-    attn_gate: torch.Tensor | None
     aux_v: torch.Tensor | None
     xsa_alpha: torch.Tensor | None
     train_max_seq_len: torch.Tensor
 
 
 try:
-    _fa3_mod = get_kernel("kernels-community/flash-attn3")
+    _fa3_mod = get_kernel("kernels-community/flash-attn3", version=1)
 except BaseException as exc:
     print(f"[rank{rank}] kernels-community/flash-attn3 load failed: {type(exc).__name__}: {exc}", flush=True)
     _fa3_mod = get_kernel("varunneal/flash-attention-3", trust_remote_code=True)
@@ -1102,7 +1101,6 @@ class CausalSelfAttention(nn.Module):
         assert T % 16 == 0
         # unpack attention args
         aux_v, attn_gate_w = attn_args.aux_v, attn_args.attn_gate_w
-        attn_gate = attn_args.attn_gate
         sa_lambdas, key_offset = attn_args.sa_lambdas, attn_args.key_offset
         seqlens, bm_size = attn_args.seqlens, attn_args.bm_size
         train_max_seq_len, yarn = attn_args.train_max_seq_len, attn_args.yarn
@@ -1160,15 +1158,10 @@ class CausalSelfAttention(nn.Module):
         if attn_args.xsa_alpha is not None and not self.paired:
             vn = F.normalize(v, dim=-1, eps=1e-4)
             proj = (y * vn).sum(-1, keepdim=True)
-            if attn_args.xsa_alpha.ndim == 1:
-                alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(1, 1, self.num_heads, 1)
-            else:
-                alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(B, T, self.num_heads, 1)
+            alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(B, T, self.num_heads, 1)
             y = y - alpha * proj * vn
-        if attn_gate is not None:
-            y = y * attn_gate.type_as(y).view(B, T, self.num_heads, 1)
-        elif attn_gate_w is not None:
-            y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
+        if attn_gate_w is not None:
+            y = y * attn_gate_w.type_as(y).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
@@ -1270,7 +1263,7 @@ class GPT(nn.Module):
             self.vo_bank[:num_vo_real].uniform_(-bound, bound)
             self.vo_bank[num_vo_real:].zero_()
 
-    def init_mlp(self, model_dim):
+    def init_mlp(self, model_dim):        
         # MLP bank: stores c_fc and c_proj for all MLP layers
         # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
         mlp_hdim = 4 * model_dim
@@ -1287,13 +1280,10 @@ class GPT(nn.Module):
     def init_misc(self, model_dim, num_layers):
         self.smear_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.smear_gate.weight)
-
-        # Preserve the RNG stream from the removed skip_gate Linear init.
-        skip_gate_rng_burn = torch.empty(1, 12)
-        nn.init.kaiming_uniform_(skip_gate_rng_burn, a=math.sqrt(5))
-
-        self.bigram_embed = nn.Embedding(args.bigram_vocab_size, model_dim)
+        self.bigram_embed = nn.Embedding(args.bigram_vocab_size, args.bigram_dim)
         nn.init.zeros_(self.bigram_embed.weight)
+        bigram_sign_table = torch.randn(args.bigram_sign_table_rows, args.bigram_dim).sign().to(torch.bfloat16)
+        self.register_buffer('bigram_sign_table', bigram_sign_table)
 
         self.post_lambdas = nn.Parameter(torch.ones(num_layers, 2))
 
@@ -1364,8 +1354,21 @@ class GPT(nn.Module):
         x = (F.linear(x, self.mudd_w2[id, :num_coef]) + self.mudd_b2[id, :num_coef]) * self._mudd_scale
         return x.split(1, dim=-1)
 
+    def quantize_mlp_fp8(self):
+        """Refresh the FP8 copy of the MLP up-projection weights after optimizer steps."""
+        E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+        with torch.no_grad():
+            if not hasattr(self, "_mlp_up_proj_f8"):
+                self._mlp_up_proj_f8 = torch.zeros_like(self.mlp_bank[:, 0], dtype=torch.float8_e4m3fn)
+                self._mlp_up_proj_scales = torch.ones(12, dtype=torch.float32, device=self.mlp_bank.device)
+                self._mlp_dequant_scale_buf = torch.ones(1, dtype=torch.float32, device=self.mlp_bank.device)
+            flat = self.mlp_bank[:, 0].view(12, -1)
+            scales = flat.abs().amax(dim=1).clamp(min=1e-12) / E4M3_MAX
+            self._mlp_up_proj_scales[:] = scales.float()
+            self._mlp_up_proj_f8[:] = (model.mlp_bank[:, 0] / scales.view(12, 1, 1)).to(torch.float8_e4m3fn)
+
     def init_mudd_gate(self, model_dim: int):
-        self._mudd_gate_scale = 0.1
+        self._mudd_gate_scale = nn.Parameter(torch.tensor(0.1))
         mudd_gate_dim = 64
         assert self.num_heads == 6
         # Fixed gate layouts. The post gate is generated at the start of layer 4.
@@ -1380,10 +1383,11 @@ class GPT(nn.Module):
             nn.init.kaiming_uniform_(self.mudd_gate_w1.data[j], a=math.sqrt(5))
 
         bs_init = torch.zeros(2, max_num_coef)
-        attn_gate_bias = 0.25 / self._mudd_gate_scale
-        bigram_gate_bias = 0.025 / self._mudd_gate_scale
-        skip_gate_bias = 0.5 / self._mudd_gate_scale
-        dc_w1_gate_bias = 1.0 / self._mudd_gate_scale
+        _mudd_gate_scale = 0.1
+        attn_gate_bias = 0.25 / _mudd_gate_scale
+        bigram_gate_bias = 0.05 / _mudd_gate_scale
+        skip_gate_bias = 0.5 / _mudd_gate_scale
+        dc_w1_gate_bias = 1.0 / _mudd_gate_scale
         bs_init[0, 12:18].fill_(attn_gate_bias)     # pre attn[3]
         bs_init[0, 19:26:2].fill_(bigram_gate_bias) # pre bigram gates for layers 0..3
         bs_init[1, 12:18].fill_(attn_gate_bias)     # post attn[10]
@@ -1394,7 +1398,7 @@ class GPT(nn.Module):
 
     def forward_mudd_gate(self, x, id, num_coef):
         x = F.gelu(F.linear(x, self.mudd_gate_w1[id]))
-        return (F.linear(x, self.mudd_gate_w2[id, :num_coef]) + self.mudd_gate_b2[id, :num_coef]) * self._mudd_gate_scale
+        return (F.linear(x, self.mudd_gate_w2[id, :num_coef]) + self.mudd_gate_b2[id, :num_coef]) * self._mudd_gate_scale.type_as(x)
 
     def unpack_pre_mudd_gate(self, gate, xsa_alphas, attn_gates, x0_gates, bigram_gates):
         xsa_alphas[1] = gate[..., 0:6] # 6 means 6 heads
@@ -1424,6 +1428,11 @@ class GPT(nn.Module):
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==ws_long for b in bm_sizes] # apply partial key offset to long windows
 
+        use_mlp_fp8 = self.training and not os.environ.get("DISABLE_FP8", False)
+        if use_mlp_fp8:
+            mlp_up_proj_f8 = self._mlp_up_proj_f8.unbind(0)
+            mlp_up_proj_scales = [self._mlp_up_proj_scales[i:i+1] for i in range(12)]
+
         # ---- Unbind parameters (avoid select_backward kernels) ----
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
         smear_lambda = self.scalars[2 * self.num_layers]
@@ -1452,7 +1461,12 @@ class GPT(nn.Module):
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
         
-        x0_bigram = self.bigram_embed(bigram_input_seq)[None]
+        # Use sign-trick to better compress multiple bigrams into a shared bigram embedding row
+        # (details in https://github.com/KellerJordan/modded-nanogpt/pull/299 by @trianxy)
+        sign_idx = torch.zeros_like(input_seq)
+        sign_idx[1:] = (input_seq[:-1] ^ input_seq[1:]) % self.bigram_sign_table.shape[0]  # (8192,)
+        bigram_signs = self.bigram_sign_table[sign_idx]                                    # (seq, bigram_dim)
+        x0_bigram = (self.bigram_embed(bigram_input_seq) * bigram_signs)[None]             # (1, seq, bigram_dim)
 
         # Value embeddings - always computed (not precomputed)
         ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
@@ -1475,7 +1489,8 @@ class GPT(nn.Module):
         )
 
         # Initialize residual stream with pre-layer-0 bigram injection
-        x = x + x0_bigram * bigram_gates[0]
+        x = x0.clone()
+        x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + x0_bigram * bigram_gates[0]
         skip_gate_out = None
         post_skip_gate = None
 
@@ -1488,6 +1503,8 @@ class GPT(nn.Module):
             attn = self.attn_paired if is_paired else self.attn
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
+            if use_mlp_fp8:
+                up_proj_f8, up_proj_scale = mlp_up_proj_f8[i], mlp_up_proj_scales[i]
             mu = None
 
             if i == 4:
@@ -1501,7 +1518,7 @@ class GPT(nn.Module):
                 )
                 dc_weights[10] = (post_gate[..., 29:35], post_gate[..., 35:41])
 
-            # Skip attention on layer 6 @YouJiacheng
+            # process attn. skip on layer 6 @YouJiacheng
             if i == 6:
                 assert post_skip_gate is not None
                 skip_gate_out = torch.sigmoid(skip_lambda) * post_skip_gate
@@ -1522,8 +1539,9 @@ class GPT(nn.Module):
                     ve_view = ve[i].view(B, T, self.num_heads, self.head_dim)
                     aux_v = (ve_gate * ve_view + v_mudd).view(B, T, -1)
                 elif ve[i] is not None:
+                    # gate pattern g(x[:6] + ve[:6]) by @photomz
                     gate_in = torch.cat([attn_in_normed[..., :6], ve[i][None, ..., :6]], dim=-1)
-                    ve_gate_out = 2 * torch.sigmoid(F.linear(gate_in, ve_gates[i].type_as(gate_in))).view(B, T, self.num_heads, 1)
+                    ve_gate_out = 2 * torch.sigmoid(F.linear(gate_in, ve_gates[i])).view(B, T, self.num_heads, 1)
                     ve_view = ve[i].view(B, T, self.num_heads, self.head_dim)
                     aux_v = (ve_gate_out * ve_view).view(B, T, -1)
                 else:
@@ -1535,8 +1553,7 @@ class GPT(nn.Module):
                     bm_size=bm_sizes[i],
                     yarn=yarn,
                     key_offset=key_offset[i],
-                    attn_gate_w=None,
-                    attn_gate=attn_gates[i] if i in self.attn_gate_layers else None,
+                    attn_gate_w=attn_gates[i] if i in self.attn_gate_layers else None,
                     aux_v=aux_v,
                     xsa_alpha=xsa_alphas[i],
                     train_max_seq_len=train_max_seq_len,
@@ -1545,16 +1562,26 @@ class GPT(nn.Module):
                 attn_out = attn(attn_in_normed, attn_args, qkvo_w, dc_w)
 
                 if mu is not None:
-                    x0_inject = cache[0] * mu[10] + x0_bigram * mu[11]
-                    x = mu[8] * x + mu[9] * attn_out + x0_inject
+                    x = mu[8] * x + mu[9] * attn_out + cache[0] * mu[10]
+                    x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + x0_bigram * mu[11]
                 else:
-                    x0_inject = x0 * x0_gates[i] if i == 0 else x0 * x0_gates[i] + x0_bigram * bigram_gates[i]
-                    x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject
+                    x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0 * x0_gates[i]
+                    if i != 0:
+                        x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + x0_bigram * bigram_gates[i]
+            # process mlp
+            normed = norm(x)
+            if use_mlp_fp8:
+                amax = normed.detach().abs().max().clamp(min=1e-12)
+                x_f8 = (normed.detach() * (448.0 / amax)).to(torch.float8_e4m3fn)
+                self._mlp_dequant_scale_buf.copy_(up_proj_scale).mul_(amax).div_(448.0)
+                mlp_args = (c_fc, c_proj, up_proj_f8, self._mlp_dequant_scale_buf, x_f8)
+            else:
+                mlp_args = (c_fc, c_proj)
 
             if mu is not None:
-                x = mu[12] * x + mu[13] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+                x = mu[12] * x + mu[13] * ReLUSqrdMLP(normed, *mlp_args)
             else:
-                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(normed, *mlp_args)
 
             if i in self.cache_layers:
                 cache[i] = x
@@ -1771,8 +1798,8 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1315  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 1275  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 15  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
@@ -1783,7 +1810,9 @@ class Hyperparameters:
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
-    bigram_vocab_size: int = 50304 * 5
+    bigram_vocab_size: int = 50304 * 15 // 2
+    bigram_dim: int = 768
+    bigram_sign_table_rows: int = 8192  # prefer a power of 2 (values ~500-15000 gave similar results)
 
 args = Hyperparameters()
 
@@ -1923,12 +1952,13 @@ class TrainingManager():
             "mudd_gate_w1": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1},
             "mudd_gate_w2": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1},
             "mudd_gate_b2": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
+            "_mudd_gate_scale": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
         })
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "ve_gate_bank", "mudd_b2", "mudd_gate_b2",
+            "scalars", "smear_gate", "ve_gate_bank", "mudd_b2", "mudd_gate_b2", "_mudd_gate_scale",
             "post_lambdas", "resid_lambdas",  # Small, fast
         ] + [
             "mudd_w2", "mudd_gate_w2",
@@ -2081,8 +2111,8 @@ class TrainingManager():
 logfile = None
 if master_process:
     run_id = args.run_id
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{run_id}.txt"
+    os.makedirs("logs0620", exist_ok=True)
+    logfile = f"logs0620/{run_id}.txt"
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -2126,8 +2156,11 @@ model.mudd_b2.data = model.mudd_b2.data.bfloat16()
 model.mudd_gate_w1.data = model.mudd_gate_w1.data.bfloat16()
 model.mudd_gate_w2.data = model.mudd_gate_w2.data.bfloat16()
 model.mudd_gate_b2.data = model.mudd_gate_b2.data.bfloat16()
+
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
+dist.broadcast(model.bigram_sign_table, 0)  # buffer, not in parameters()
+model.quantize_mlp_fp8()
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
@@ -2163,11 +2196,13 @@ for step in warmup_steps:
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
+    model.quantize_mlp_fp8()
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
 del val_loader, train_loader, initial_state
+model.quantize_mlp_fp8()
 model.train()
 
 ########################################
@@ -2228,6 +2263,7 @@ for step in range(train_steps + 1):
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
+    model.quantize_mlp_fp8()
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)

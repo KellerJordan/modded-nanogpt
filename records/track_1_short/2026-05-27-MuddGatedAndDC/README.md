@@ -1,17 +1,19 @@
 # MUDD-gated & Lightweight DC
 
-This record combines two active model changes on top of the `2026-05-07_XSAGatedLayers` short-track baseline:
+This record tracks three iterations of the MUDD-gate and lightweight DC idea. The older `this_pr_v1` and `this_pr_v2` sweeps were built on the `2026-05-07_XSAGatedLayers` short-track baseline; the current submitted version is `this_pr_v3`, which rebases the same idea on top of the latest upstream PR snapshot stored as `train_gpt_offical.py`.
+
+The two active model changes are:
 
 1. **DC on the final attention layer.** Layer 10 gets a lightweight post-only, no-DD dynamic correction after the base FA3 attention output. The implementation lives in `dc_triton_kernels.py` and is logged with the run.
 2. **MUDD gate.** Two small MUDD-style gating MLPs generate per-token coefficients for selected XSA gates, attention gates, x0/bigram injections, and the layer-3 to layer-6 skip.
 
-The forward also removes or bypasses several redundant trick paths from the previous baseline. The main practical result is that the schedule can be cut from `1375 + 10 = 1385` total steps to `1315 + 20 = 1335` total steps while improving the mean validation loss.
+The forward also removes or bypasses several redundant trick paths from the previous baseline. In the initial v1 sweep, the schedule could be cut from `1375 + 10 = 1385` total steps to `1315 + 20 = 1335` total steps while improving the mean validation loss.
 
 ```text
                    Runs  Steps  Time mean  Time sd  Time delta  Loss mean  Loss sd  Loss p
 xsa-baseline-s1385   10   1385    81.2187   0.0681      0.0000     3.2784  0.0013  2.17e-03
 xsa-baseline-1335     9   1335    78.5576   0.0401     -2.6611     3.2848  0.0017  1.00e+00
-this_pr-s1335        11   1335    78.9669   0.0425     -2.2518     3.2771  0.0012  8.15e-06
+this_pr_v1-s1335     11   1335    78.9669   0.0425     -2.2518     3.2771  0.0012  8.15e-06
 ```
 
 `Time delta` is relative to `xsa-baseline-s1385`. `Loss p` is the one-sample t-test against the 3.28 target:
@@ -26,7 +28,7 @@ The new `xsa-baseline-1335` logs are the matched-step comparison for the PR sche
 The DC path is deliberately narrow:
 
 - `dc_layers = [10]`, so only the final non-paired attention layer uses it.
-- `dc_gate(x, dc_w, num_heads)` computes a small gate path (`dc_hidden_dim = 2 * num_heads = 12`) and emits two per-token, per-head post weights.
+- In v1, `dc_gate(x, dc_w, num_heads)` computed a small gate path (`dc_hidden_dim = 2 * num_heads = 12`) and emitted two per-token, per-head post weights. In v2/v3, the two DC tensors are generated directly by the MUDD gate, and `dc_gate` only validates shape, RMS-normalizes `w1`, and returns contiguous tensors.
 - `post_w1` is RMS-normalized across heads before entering the correction kernel.
 - The base attention still comes from `flash_attn_varlen_func`; the Triton DC kernel adds the post-only correction to that base output.
 - The submitted kernel is the trimmed path for `H=6`, `D=128`, window `112`, and no dense-dense term.
@@ -58,11 +60,11 @@ Known isolated experiments outside this folder suggest DC alone is worth about *
 
 In principle, this correction can be fused into FlashAttention by folding the dynamic reweighting into the probability/value accumulation. This submission keeps it separate: FA3 computes the base attention, then the custom Triton kernel recomputes the layer-10 QK softmax over the local window and applies the DC correction. That split is simple and keeps the experiment isolated, but the custom Triton path is much slower than FA3. At matched 1335 steps, the PR step average is `59.15ms` vs `58.84ms` for `xsa-baseline-1335`, about **+0.31ms/step**, and the total matched-step wall-clock cost is **+0.41s**. Against the valid 1385-step baseline, the 50-step schedule cut still wins by **2.25s** overall. This is also good news: DC appears to buy real loss headroom even with nontrivial overhead, so a future FA3-fused implementation should expose more of the quality gain as wall-clock speedup.
 
-## MUDD gate change
+## MUDD gate change (v1 design)
 
 The earlier MUDD connections from `2026-04-22_MuddFormer` remain: layer 9 produces last-layer V/residual/dynamic-lambda coefficients, and a post-loop MUDD block mixes `{cache[0], cache[7], cache[9], ve_bank0, cache[3]}` before the final norm.
 
-This record adds a separate MUDD gate stack:
+The initial sweep added a separate MUDD gate stack:
 
 - `mudd_gate_w1`, `mudd_gate_w2`, `mudd_gate_b2`, with hidden dim `64` and scale `0.1`.
 - A pre-layer gate from `x0` generates XSA gates for layers `1, 3, 4`, attention gate coefficients for layer `3`, and x0/bigram injection gates for layers `0..5`.
@@ -91,14 +93,16 @@ Some old parameter slots are still present in the file because this was an exper
 - `xsa-baseline-1335/`: 9 matched-step XSA baseline logs at `1315 + 20 = 1335` total steps.
 - `this_pr_v1/`: 11 logs matching `xsaexp8_10_dc_muddgate_ag3710_s1315e20_mglr015_`* at `1315 + 20 = 1335` total steps.
 - `this_pr_v2/`: 10 logs matching `xsaexp8_10_dc_muddgatelr01_ag310_s1315e10_`* at `1315 + 10 = 1325` total steps.
+- `this_pr_v3/`: 10 complete logs at `1275 + 15 = 1290` total steps. Four additional files in this folder are incomplete warmup/interrupted logs and are excluded from the statistics.
 - Root `train_gpt.py`: current submitted training code.
+- Root `train_gpt_offical.py`: snapshot of the latest upstream PR code used as the v3 base.
 - Root `dc_triton_kernels.py`: DC correction kernel included in each PR log.
 
 Timing environment from the logs: 8x NVIDIA H100 80GB HBM3, Python 3.12.3, PyTorch `2.10.0+cu128`, Triton `3.6.0`, driver `580.159.03`.
 
 ## v2 update: gate-generated DC and 1325 steps
 
-The latest `train_gpt.py` moves the PR from the older `this_pr_v1` sweep to `this_pr_v2`. The submitted schedule is now `1315 + 10 = 1325` total steps instead of `1315 + 20 = 1335`, and the DC weights are no longer standalone trainable banks. The layer-10 post-only DC path is still the same Triton correction after FA3, but its two per-token, per-head tensors now come directly from the MUDD gate:
+The v2 `train_gpt.py` moved the PR from the older `this_pr_v1` sweep to `this_pr_v2`. The schedule became `1315 + 10 = 1325` total steps instead of `1315 + 20 = 1335`, and the DC weights were no longer standalone trainable banks. The layer-10 post-only DC path stayed as the same Triton correction after FA3, but its two per-token, per-head tensors came directly from the MUDD gate:
 
 ```text
 dc_weights[10] = (post_gate[..., 29:35], post_gate[..., 35:41])
@@ -131,4 +135,27 @@ this_pr_v2-s1325       10   1325    77.7050   0.0297     -3.5137     3.2781  0.0
 
 The stricter quality comparison is against `xsa-baseline-1335`, which already has 10 more steps than v2. Even with fewer steps, v2 is **0.85s faster** and has mean loss lower by about **0.00669** (two-sided Welch `p = 1.45e-07`). Compared with v1, v2 trades about `+0.00094` mean loss for **1.26s** less wall-clock; the v1-v2 loss gap is not significant at 5% in this sample (two-sided Welch `p = 0.066`).
 
-The practical read is that v1 had the best mean loss, while v2 is the better submitted speedrun point: it removes the standalone DC parameter path, cuts 10 extension steps, keeps the target pass, and improves total wall-clock speed.
+The practical read at the v2 stage was that v1 had the best mean loss, while v2 was the better speedrun point: it removed the standalone DC parameter path, cut 10 extension steps, kept the target pass, and improved total wall-clock speed.
+
+## v3 update: rebased on latest commit and 1290 steps
+
+`this_pr_v3` rebases the MUDD-gate + gate-generated DC idea on top of the latest upstream commit with the bigram sign and FP8 MLP  changes. The older v1/v2 runs were not based on that newer PR, so v3 should be treated as the submitted version.
+
+The main v3 issue was that the latest upstream base changed the bigram embedding path: it introduced the sign trick, used `bigram_dim = 192`, and kept `bigram_vocab_size = 50304 * 15`. With that configuration, the MUDD gate did not reach the gain observed in v2. The likely reason is that the new bigram dimension / vocabulary tradeoff did not let the MUDD-generated bigram gates make full use of the bigram embedding path. v3 therefore uses `bigram_dim = 768` and `bigram_vocab_size = 50304 * 15 // 2`, which is a better loss/speed tradeoff for this gated bigram path: enough width for the MUDD gate to help, but a smaller vocabulary than the original `768`-dim bigram embedding would use.
+
+v3 also makes `_mudd_gate_scale` a learnable parameter initialized at `0.1`. This was added because training showed some instability with the MUDD gate; letting the model tune the global gate scale made the gated path easier to stabilize.
+
+The submitted schedule is `1275 + 15 = 1290` total steps.
+
+Updated results:
+
+```text
+                     Runs  Steps  Time mean  Time sd  Loss mean  Loss sd  Loss p
+upstream commit        -    1390    79.2000      -          -        -        -
+this_pr_v2-s1325      10    1325    77.7050   0.0297    3.27808  0.00098  7.76e-05
+this_pr_v3-s1290      10    1290    75.5199   0.0487    3.27851  0.00097  4.53e-04
+```
+
+`this_pr_v3` passes the `p < 0.01` target rule with `p = 4.53e-04`. Compared with the upstream commit baseline timing, v3 is **3.68s faster** on the same 8xH100 setup (`79.2000s -> 75.5199s`). The size of the speedup lines up with the upstream changes: roughly **0.5s** from FP8 MLP plus roughly **1.5s** from the bigram trick, so the v2 -> v3 timing gain should mostly be read as the rebase benefit rather than a new MUDD/DC speed improvement.
+
+The practical read is that v3 is the submitted speedrun point from this record family: it adapts the MUDD-gate/DC idea to the latest upstream base, restores enough bigram embedding width for the MUDD-generated bigram gates to work, keeps the statistical target pass, and cuts the run to **1290** total steps.
