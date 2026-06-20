@@ -163,7 +163,7 @@ Active techniques:
    (Introduced in result #29.)
 
 5. **PowerCool LR schedule**:
-   LR is flat early, then follows a power-law cooldown with power `1.2` and schedule endpoint `2900`. The exact formula is `lr = min(initial_lr, power_c * (2900 - step)**1.2)`. In #45, the Muon LR is flat until about step 514, while the Adam/auxiliary LRs are flat until about step 1487.
+   LR is flat early, then follows a power-law cooldown with power `1.2` and schedule endpoint `2900`: `lr = min(initial_lr, power_c * (2900 - step)**1.2)`. In #45, the Muon LR is flat until about step 514, while the Adam/auxiliary LRs are flat until about step 1487.
    (Introduced in result #20.)
 
 6. **Muon momentum schedule**:
@@ -200,7 +200,7 @@ For a new result to be considered valid, it must satisfy the following constrain
 2. The trainer cannot perform multiple forward-backward passes per step.
 3. (**Target loss and statistical significance**) The submitted run(s) must attain below 3.28 val loss, thereby matching [Andrej Karpathy's GPT-2 replication](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 To ensure statistical significance, the run(s) are required to pass a one-sided z-test assuming σ=0.0013 that achieves p<.001 (hence 3.09σ = 0.004 delta below the target). E.g., for a single non-cherry-picked run, any val loss below 3.276 suffices, and for n=4 runs, any average below 3.278 suffices. **The precision condition we require is `(3.28 - mu) * n**0.5 >= 0.004`**, where `mu` is the average result over `n` non-cherry-picked runs. (Note: My first three results failed to follow this rule)
-4. (**Reproducibility**) To ensure full reprodubility, all code needed to reproduce the run must be included in the logfile. In particular, third-party optimizer libraries must not be imported; instead, the necessary code must be copied in its entirety into the train script. It's okay if this leads to thousands of extra lines, in the case of complex third-party libraries.
+4. (**Reproducibility**) To ensure full reproducibility, all code needed to reproduce the run must be included in the logfile. In particular, third-party optimizer libraries must not be imported; instead, the necessary code must be copied in its entirety into the train script. It's okay if this leads to thousands of extra lines, in the case of complex third-party libraries.
 5. (**No p-hacking using val spam**) Per-run early-stopping based on val loss (or any other form of per-run decision based on val loss) is not allowed. On the other hand, it *is* permitted to print the val loss every 25 steps near the end of training, and then select the earliest step that has stat sig for reaching the target. In other words, 
 early stopping is permitted as long as the stopping point is selected the same across all trials.
 
@@ -247,14 +247,14 @@ Reducing the step count of result #12 by 200 increases the mean loss from 3.2790
 For example, result #11 is not pairwise statsig vs the prior record, because it lowers step count by 25 while increasing estimated mean val loss by 3.2785 - 3.2771 = 0.0014.
 According to the above information, 0.0014 val loss is worth about 100 * 0.0014/0.0045 = 31 steps, which is greater than the step saving.
 To clarify, this does not constitute evidence that the *algorithm* provided by result #11 is not really better; it only indicates that the *logfiles* provided by
-result #11 do not contain insufficient evidence for that conclusion.
+result #11 do not contain sufficient evidence for that conclusion.
 
 Another calculation: For result #13 --  a perfectly valid new <3.28 record -- we have the following two calculations.
 Against result #11, we have a difference of 15 steps, with final loss being the same. These steps are worth approximately
 15/100 * 0.0045 = 0.000675 units of val loss. The two seed counts are n=16 and n=10.
 **The general requirement is `(final_loss_diff + exp_stepbased_loss_diff) / (1/n1 + 1/n2)**0.5 >= 0.004`.**
-For this case, the LHS is 0.00167, which does not reach up to statsig.
-If we intead compare to result #8, the LHS is instead `((3.2778 - 3.2785) + (40/100 * 0.0045)) / (1/10 + 1/16)**0.5 = 0.0027`, which again does not reach statsig.
+For this case, the LHS is 0.00167, which does not reach statsig.
+If we instead compare to result #8, the LHS is `((3.2778 - 3.2785) + (40/100 * 0.0045)) / (1/10 + 1/16)**0.5 = 0.0027`, which again does not reach statsig.
 
 A third calculation: For the Muon hparams in result #12 vs #6, we have `final_loss_diff = -0.0002`, `exp_stepbased_loss_diff = 50/100*0.0045 = 0.00225`, and `n1 = n2 = 20`. Therefore, the LHS of our general formula is `0.00648`, which is above `0.004`, so we have evidence that the muon hyperparameters of result #12 really are statsig better than those of result #6.
 
@@ -275,7 +275,7 @@ The reality is that as a community, we simply don't know. Why not?
 Because typically, these papers each use their own unique experimental setups, making it challenging to verify whether their baselines are well-tuned or to make comparisons between papers.
 
 For researchers interested in neural network optimization, this is daunting - a sea of methods, many of them claiming to be SOTA, and no shared infrastructure to sort signal from noise. As it stands, the burden is on the individual researcher to make sense of this madness. Calculating the outcome: If N different researchers publish N optimizer papers claiming SOTA, all of them unverifiable and mutually incomparable, then there are only two possibilities: Either (a) research grinds to a halt due to the Θ(N) growth in experiments that each researcher needs to conduct to get a private sense of the real SOTA, or (b) researchers start simply ignoring each other's papers.
-Neither of these are desireable outcomes, and today we are in some mix of the two.
+Neither of these are desirable outcomes, and today we are in some mix of the two.
 
 This benchmark aims to provide a simple, easily-accessible communally-shared way to filter signal from noise, aiming to surface ignored papers/ideas and reduce the number of experiments that each researcher must do in order to get an accurate picture of the SOTA.
 It is a collaborative|competitive benchmark, meaning that, for example, if anyone can find hyperparameters that enable Adam
@@ -313,7 +313,7 @@ Finally, we have replaced the sophisticated local-global pattern of attention by
 
 General
 * Changes to the code should be concentrated to the `Optimization` and `Init & Optim Hyperparams` sections.
-* Results should be submitted in the form of logfiles, like the ones linked in the [results history](#results-history) section above. Logfiles must include the full code used by the run, such that if we replace `train_gpt_simple.py` by the code, then running the quickstart will reproduce the run (up to random seed variance). In particular, hardcoded hyperparameters are to be preferred as compared to command line arguments.
+* Results should be submitted in the form of logfiles, like the ones linked in the [results history](#notable-results-history) section above. Logfiles must include the full code used by the run, such that if we replace `train_gpt_simple.py` by the code, then running the quickstart will reproduce the run (up to random seed variance). In particular, hardcoded hyperparameters are to be preferred as compared to command line arguments.
 
 On tuning hyperparameters:
 * Typically, the most sensitive hyperparameter is the weight decay, followed by the learning rate, and then everything else.
