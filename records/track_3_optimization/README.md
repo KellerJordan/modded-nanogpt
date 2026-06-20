@@ -189,7 +189,7 @@ Active techniques:
 
 What it explicitly does **not** use: Contra-Muon, Soft-Muon, Circuit-Muon, Aurora, TrailDelta, fixed-anchor readout, Muon-history forecasting, CenterShrinkAdam, or NorMuon-lite row/column variance preconditioning. Some stale comments mention older machinery, but these paths are off or removed in the #45 submission defaults.
 
-Notes: Several active-looking details are still unproven. We do not yet know whether the attention SOAP trust gate is helping. We also do not know whether the final Muon momentum cooldown matters much, since the cooldown is scheduled over the last 200 steps of a 2900-step run, but the accepted validation is at step 2720. Likewise, it is unclear whether the Rademacher gain init matters, whether the depth-dependent `mlp.fc` init matters beyond a below-stat-sig ablation signal of about `0.00003` val loss, or whether `attn.proj.bias` beta2 `.9965` is meaningfully different from the other auxiliary beta2 value `.997`.
+Notes: Several active techniques are still unproven. We do not yet know whether the attention SOAP trust gate is helping. We also do not know whether the final Muon momentum cooldown matters much, since the cooldown is scheduled over the last 200 steps of a 2900-step run, but the accepted validation is at step 2720. Likewise, it is unclear whether the Rademacher gain init matters, whether the depth-dependent `mlp.fc` init matters beyond a below-stat-sig ablation signal of about `0.00003` val loss, or whether `attn.proj.bias` beta2 `.9965` is meaningfully different from the other auxiliary beta2 value `.997`.
 
 
 
