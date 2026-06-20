@@ -119,6 +119,59 @@ Figure 2. Per-optimizer best.
 <img src="img/muon_shampoo_ssd.png" width="50%">
 Figure 3. Comparison between Shampoo and Muon, which both reduce to Spectral Descent when momentum is removed.
 
+
+## Techniques used in current record
+
+Codex offers the following description of the techniques used in the current record (#45).
+Note that it is not entirely known which of these techniques is most beneficial.
+Several techniques that were believed beneficial in the past have now been abandoned.
+
+Record #45 is: **#44’s clean SOAP-Muon stack, plus a final Tail-EMA readout at step 2720**.
+
+Active techniques:
+
+1. **Standard Muon core on hidden matrices**
+   Hidden 2D block weights are optimized with Muon: momentum update, Newton-Schulz orthogonalization, then aspect-ratio scaling.
+
+2. **SOAP-Muon on all hidden matrices**
+   Before Muon orthogonalization, the momentum update is SOAP-preconditioned. It uses `precondition_frequency=1` and `beta2=.90`.
+
+3. **Attention SOAP trust gate**
+   For attention SOAP, especially `attn.proj`, the SOAP direction is gated by agreement with raw momentum / gradient alignment. The blend preserves the raw update norm.
+
+4. **u/w floor**
+   After Muon orthogonalization, if `||update|| / ||weight||` is below `0.3825`, the update is scaled up to that floor. This replaces ordinary Muon weight decay.
+
+5. **Radial brake + radius rescale**
+   The update is decomposed into radial and tangential parts. Outward radial movement is damped by `0.5`; inward radial movement is left alone. After the update, the weight is rescaled to the intended radius.
+
+6. **PowerCool LR schedule**
+   LR is flat early, then follows a power-law cooldown with power `1.2` and schedule endpoint `2900`. The exact formula is `lr = min(initial_lr, power_c * (2900 - step)**1.2)`.
+
+7. **Muon momentum schedule**
+   Muon momentum warms from `0.85 -> 0.95` over 300 steps, then cools from `0.95 -> 0.85` over the final 200 steps of the 2900-step schedule.
+
+8. **EMA-Nesterov wrapper**
+   The whole optimizer stack is wrapped in EMA-Nesterov: lookahead scale `.3 * lr/max_lr`, lookahead EMA `.99`, active after a 300-step prefill and before the late rest window.
+
+9. **Auxiliary Adam split**
+   Embedding/head use AdamW. Norm gains and other 1D/bias params use a minimal bias-correction-free Adam, with beta2 split:
+   `gains=.99`, other aux `.997`, `attn.proj.bias=.9965`.
+
+10. **Initialization tweaks**
+   Projection params are zero-initialized. `mlp.fc` weights get depth-scaled down by a factor of `1.0 - 0.30 * (layer_idx / (num_layers - 1))`. RMSNorm gains use CGI/Rademacher paired gain init with alpha `.125`.
+
+11. **Tail-EMA final readout**
+   Starting at step `2000`, it keeps an EMA of every non-embedding parameter with 150-step EMA horizon. At step `2720`, right before validation, it does:
+   ```text
+   theta <- 0.4 * theta + 0.6 * EMA(theta)
+   ```
+   Then validates and stops.
+
+What it explicitly does **not** use: Contra-Muon, Soft-Muon, Circuit-Muon, Aurora, TrailDelta, fixed-anchor readout, or Muon-history forecasting. Despite one stale comment, I also don’t see NorMuon-lite row/column variance preconditioning active in the #45 Muon step.
+
+
+
 ## Rules
 
 For a new result to be considered valid, it must satisfy the following constraints:
