@@ -10,7 +10,7 @@ Thank you to everyone who's contributed results so far:
 
 **Table of Contents**
 
-- [Benchmark definition Tl;dr](#benchmark-definition-tldr)
+- [Benchmark definition tl;dr](#benchmark-definition-tldr)
 - [Quickstart](#quickstart)
 - [Notable results history](#notable-results-history)
 - [Active techniques in current record](#active-techniques-in-current-record)
@@ -25,7 +25,7 @@ Thank you to everyone who's contributed results so far:
 - [Citation](#citation)
 
 
-## Benchmark definition Tl;dr
+## Benchmark definition tl;dr
 
 Runs submitted to this benchmark are considered valid if they meet the following conditions:
 * They must not modify the dataset, batch size, or architecture used by the baseline. It also must not perform more than one forward-backward pass per step.
