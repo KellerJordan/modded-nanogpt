@@ -158,7 +158,7 @@ Active techniques:
    The whole optimizer stack is wrapped in EMA-Nesterov: lookahead scale `.3 * lr/max_lr`, lookahead EMA `.99`, active after a 300-step prefill and until roughly step 1950. It is not the same as the final Tail-EMA readout.
    (Introduced in result #39; the current `.3` lookahead variant entered the record chain in #40.)
 
-8. **[Adam](https://arxiv.org/abs/1412.6980) and auxiliary Adam split**:
+8. **[Adam](https://arxiv.org/abs/1412.6980) tuning**:
    The token embedding and output projection use Adam updates with no weight decay. Norm gains and other 1D/bias params use a minimal bias-correction-free Adam, with beta2 tuned per parameter family:
    gains `.99`, most biases `.997`, except `attn.proj.bias` which uses `.9965`.
    (Aux Adam is part of the result #1 baseline; the current auxiliary beta2 split was introduced in #44.)
