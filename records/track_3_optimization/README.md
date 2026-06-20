@@ -8,6 +8,22 @@ Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any
 Thank you to everyone who's contributed results so far:
 [@kaiyue-wen](https://github.com/kaiyue-wen), [@nilin](https://github.com/nilin), [@alint77](https://github.com/alint77), [@wilsoncwu](https://github.com/wilsoncwu), [@kumarkrishna](https://github.com/kumarkrishna), [@lliu606](https://github.com/lliu606), [@zhenghaoxu-gatech](https://github.com/zhenghaoxu-gatech), [@bentherien](https://github.com/bentherien), [@Sam_Acqua](https://x.com/Sam_Acqua), [@zhehangdu](https://github.com/zhehangdu), [@SPThole](https://github.com/SPThole), [@liyang2019](https://github.com/liyang2019), [@zzp1012](https://github.com/zzp1012), Yash Pande, [@fhueb](https://github.com/fhueb), [@kcc-lion](https://github.com/kcc-lion), [@zhiweixx](https://github.com/zhiweixx), [@chenchenygu](https://github.com/chenchenygu), [@breskanu](https://github.com/breskanu), [@fangzhou_wu](https://x.com/fangzhou_wu), [@eliebak](https://github.com/eliebak), [@wakamex](https://github.com/wakamex), [@varunneal](https://github.com/varunneal), [@tomoqt](https://github.com/tomoqt), [@rohan-anil](https://github.com/rohan-anil), [@konstmish](https://github.com/konstmish), [@jn2clark](https://github.com/jn2clark), [@OscarYau525](https://github.com/OscarYau525), [@ypwang61](https://github.com/ypwang61), and [@nooraovo](https://github.com/nooraovo).
 
+**Contents**
+
+- [Benchmark definition Tl;dr](#benchmark-definition-tldr)
+- [Quickstart](#quickstart)
+- [Notable results history](#notable-results-history)
+- [Techniques used in current record](#techniques-used-in-current-record)
+- [Rules](#rules)
+  - [Freedoms](#freedoms)
+  - [Skeptical results](#skeptical-results)
+  - [Pairwise statistical significance](#pairwise-statistical-significance)
+- [Motivation](#motivation)
+- [Addressing a potential critique](#addressing-a-potential-critique)
+- [Details on relation to the main speedrun](#details-on-relation-to-the-main-speedrun)
+- [Guidelines](#guidelines)
+- [Citation](#citation)
+
 
 ## Benchmark definition Tl;dr
 
@@ -165,7 +181,7 @@ Active techniques:
 
 9. **Initialization tweaks**:
    Projection params are zero-initialized. `mlp.fc` weights get depth-scaled down by a factor of `1.0 - 0.30 * (layer_idx / (num_layers - 1))`. RMSNorm gains use CGI/Rademacher paired gain init with alpha `.125`.
-   (Projection zero-init appears by result #29; depth-scaled `mlp.fc` and CGI/Rademacher gains entered the accepted lineage in #30; the current CGI alpha `.125` was introduced in #44.)
+   (Projection zero-init is present from result #1; depth-scaled `mlp.fc` and CGI/Rademacher gains entered the accepted lineage in #30; the current CGI alpha `.125` was introduced in #44.)
 
 10. **Tail-EMA final readout**:
    Starting at step `2000`, it keeps an EMA of every non-embedding parameter with horizon of 150 steps. At step `2720`, right before validation, it does `theta <- 0.4 * theta + 0.6 * EMA(theta)`, then validates and stops.
@@ -173,7 +189,7 @@ Active techniques:
 
 What it explicitly does **not** use: Contra-Muon, Soft-Muon, Circuit-Muon, Aurora, TrailDelta, fixed-anchor readout, Muon-history forecasting, CenterShrinkAdam, or NorMuon-lite row/column variance preconditioning. Some stale comments mention older machinery, but these paths are off or removed in the #45 submission defaults.
 
-Notes: Several active-looking details are still unproven. We do not yet know whether the attention SOAP trust gate is helping. We also do not know whether the final Muon momentum cooldown matters much, since the cooldown is scheduled over the last 200 steps of a 2900-step run, but the accepted validation is at step 2720. Likewise, it is unclear whether the Rademacher gain init matters, or whether `attn.proj.bias` beta2 `.9965` is meaningfully different from the other auxiliary beta2 value `.997`.
+Notes: Several active-looking details are still unproven. We do not yet know whether the attention SOAP trust gate is helping. We also do not know whether the final Muon momentum cooldown matters much, since the cooldown is scheduled over the last 200 steps of a 2900-step run, but the accepted validation is at step 2720. Likewise, it is unclear whether the Rademacher gain init matters, whether the depth-dependent `mlp.fc` init matters beyond a below-stat-sig ablation signal of about `0.00003` val loss, or whether `attn.proj.bias` beta2 `.9965` is meaningfully different from the other auxiliary beta2 value `.997`.
 
 
 
