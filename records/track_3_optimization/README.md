@@ -134,44 +134,40 @@ Active techniques:
    Hidden 2D block weights are optimized with Muon: momentum update, Newton-Schulz orthogonalization, then aspect-ratio scaling.
    (Introduced in result #1.)
 
-2. **[SOAP-Muon](https://nikhilvyas.github.io/SOAP_Muon.pdf) on all hidden matrices**:
-   Before Muon orthogonalization, the momentum update is preconditioned using SOAP-style row/column gradient covariance statistics. It uses `precondition_frequency=1` and `beta2=.90`.
-   (MLP SOAP-Muon was introduced in result #14; attention SOAP was added in #16; the current all-hidden, frequency-1 version was introduced in #44.)
+2. **[SOAP-Muon](https://nikhilvyas.github.io/SOAP_Muon.pdf) on all hidden matrices, with attention trust gate**:
+   Before Muon orthogonalization, the momentum update is preconditioned using SOAP-style row/column gradient covariance statistics. It uses `precondition_frequency=1` and `beta2=.90`. For `attn.proj`, the SOAP direction is gated by agreement with raw momentum / gradient alignment. The blend preserves the raw update norm.
+   (MLP SOAP-Muon was introduced in result #14; attention SOAP and the trust gate were added in #16; the current all-hidden, frequency-1 version was introduced in #44.)
 
-3. **Attention SOAP trust gate**:
-   For attention SOAP, especially `attn.proj`, the SOAP direction is gated by agreement with raw momentum / gradient alignment. The blend preserves the raw update norm.
-   (Introduced in result #16.)
-
-4. **u/w floor**:
+3. **u/w floor**:
    After Muon orthogonalization, if `||update|| / ||weight||` is below `0.3825`, the update is scaled up to that floor. This replaces ordinary Muon weight decay.
    (Introduced in result #9; the current `0.3825` target comes from the later #29/#30 lineage.)
 
-5. **Radial brake + radius rescale**:
+4. **Radial brake + radius rescale**:
    The update is decomposed into radial and tangential parts. Outward radial movement is damped by `0.5`; inward radial movement is left alone. The code then computes the intended post-step weight norm using only the radial component's first-order effect, applies the full update, and rescales the resulting weight tensor to exactly that norm. This removes the accidental norm change caused by the tangential component's finite step size, while preserving the direction reached by the update.
    (Introduced in result #29.)
 
-6. **PowerCool LR schedule**:
+5. **PowerCool LR schedule**:
    LR is flat early, then follows a power-law cooldown with power `1.2` and schedule endpoint `2900`. The exact formula is `lr = min(initial_lr, power_c * (2900 - step)**1.2)`. In #45, the Muon LR is flat until about step 514, while the Adam/auxiliary LRs are flat until about step 1487.
    (Introduced in result #20.)
 
-7. **Muon momentum schedule**:
+6. **Muon momentum schedule**:
    Muon momentum warms from `0.85 -> 0.95` over 300 steps, then cools from `0.95 -> 0.85` over the final 200 steps of the 2900-step schedule.
    (Introduced into the accepted Track 3 lineage in result #30; the current 200-step cooldown was introduced in #44.)
 
-8. **[EMA-Nesterov](https://arxiv.org/abs/2605.25395) wrapper**:
+7. **[EMA-Nesterov](https://arxiv.org/abs/2605.25395) wrapper**:
    The whole optimizer stack is wrapped in EMA-Nesterov: lookahead scale `.3 * lr/max_lr`, lookahead EMA `.99`, active after a 300-step prefill and until roughly step 1950. It is not the same as the final Tail-EMA readout.
    (Introduced in result #39; the current `.3` lookahead variant entered the record chain in #40.)
 
-9. **[Adam](https://arxiv.org/abs/1412.6980) and auxiliary Adam split**:
+8. **[Adam](https://arxiv.org/abs/1412.6980) and auxiliary Adam split**:
    The token embedding and output projection use Adam updates with no weight decay. Norm gains and other 1D/bias params use a minimal bias-correction-free Adam, with beta2 split:
    `gains=.99`, other aux `.997`, `attn.proj.bias=.9965`.
    (Aux Adam is part of the result #1 baseline; the current auxiliary beta2 split was introduced in #44.)
 
-10. **Initialization tweaks**:
+9. **Initialization tweaks**:
    Projection params are zero-initialized. `mlp.fc` weights get depth-scaled down by a factor of `1.0 - 0.30 * (layer_idx / (num_layers - 1))`. RMSNorm gains use CGI/Rademacher paired gain init with alpha `.125`.
    (Projection zero-init appears by result #29; depth-scaled `mlp.fc` and CGI/Rademacher gains entered the accepted lineage in #30; the current CGI alpha `.125` was introduced in #44.)
 
-11. **Tail-EMA final readout**:
+10. **Tail-EMA final readout**:
    Starting at step `2000`, it keeps an EMA of every non-embedding parameter with `tau=150`, related to Polyak-style iterate averaging / [stochastic weight averaging](https://arxiv.org/abs/1803.05407). At step `2720`, right before validation, it does:
    ```text
    theta <- 0.4 * theta + 0.6 * EMA(theta)
@@ -180,6 +176,8 @@ Active techniques:
    (Introduced in result #45, following the earlier fixed final-readout lineage from #38 and #43.)
 
 What it explicitly does **not** use: Contra-Muon, Soft-Muon, Circuit-Muon, Aurora, TrailDelta, fixed-anchor readout, Muon-history forecasting, CenterShrinkAdam, or NorMuon-lite row/column variance preconditioning. Some stale comments mention older machinery, but these paths are off or removed in the #45 submission defaults.
+
+Notes: Several active-looking details are still unproven. We do not yet know whether the attention SOAP trust gate is helping. We also do not know whether the final Muon momentum cooldown matters much, since the cooldown is scheduled over the last 200 steps of a 2900-step run, but the accepted validation is at step 2720. Likewise, it is unclear whether the Rademacher gain init matters, or whether `attn.proj.bias` beta2 `.9965` is meaningfully different from the other auxiliary beta2 value `.997`.
 
 
 
