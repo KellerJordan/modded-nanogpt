@@ -10,19 +10,20 @@ Thank you to everyone who's contributed results so far:
 
 **Table of Contents**
 
-- [Benchmark definition tl;dr](#benchmark-definition-tldr)
-- [Quickstart](#quickstart)
-- [Notable results history](#notable-results-history)
-- [Active techniques in current record](#active-techniques-in-current-record)
-- [Rules](#rules)
-  - [Freedoms](#freedoms)
-  - [Skeptical results](#skeptical-results)
-  - [Pairwise statistical significance](#pairwise-statistical-significance)
-- [Motivation](#motivation)
-- [Addressing a potential critique](#addressing-a-potential-critique)
-- [Details on relation to the main speedrun](#details-on-relation-to-the-main-speedrun)
-- [Guidelines](#guidelines)
-- [Citation](#citation)
+- [Modded-NanoGPT Optimization Benchmark](#modded-nanogpt-optimization-benchmark)
+  - [Benchmark definition tl;dr](#benchmark-definition-tldr)
+  - [Quickstart](#quickstart)
+  - [Notable results history](#notable-results-history)
+  - [Active techniques in current record](#active-techniques-in-current-record)
+  - [Rules](#rules)
+    - [Freedoms](#freedoms)
+    - [Skeptical results](#skeptical-results)
+    - [Pairwise statistical significance](#pairwise-statistical-significance)
+  - [Motivation](#motivation)
+  - [Addressing a potential critique](#addressing-a-potential-critique)
+  - [Details on relation to the main speedrun](#details-on-relation-to-the-main-speedrun)
+  - [Guidelines](#guidelines)
+  - [Citation](#citation)
 
 
 ## Benchmark definition tl;dr
@@ -100,6 +101,7 @@ Note: [Beware that](https://github.com/KellerJordan/modded-nanogpt/issues/268) o
 | 43 | 2850(!) | 3.2786 (n=13)✓ | Setup from #41, plus fixed late trajectory transforms: BroadDelta on `muon_other`, TrailDelta endpoint pulses, normalized orthogonal phase readout on `muon_other`, and an 8% final readout toward the step-2400 non-embedding anchor | 2026/05/29 | [log](results/20260529_tail_phase_readout_2850/README.md) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/318) by [@jn2clark](https://github.com/jn2clark) |
 | 44 | 2750(!) | 3.2789 (n=20)✓ | Setup from #41, plus SOAP-Muon on all hidden matrices w/ precondition_frequency=1 (prev. had SOAP on MLP + attn.proj w/ precond_freq=1), tune auxiliary β2's, double mu cooldown, set rademacher init CGI α=.125, and remove neutral geometry modules including Circuit/Contra/Soft-Muon and Aurora | 2026/06/10 | [log](results/20260609_soap_f1_auxb2_clean/README.md) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/321) by [@ypwang61](https://github.com/ypwang61) and [@nooraovo](https://github.com/nooraovo) |
 | 45 | 2720(!) | 3.2786 (n=10)✓ | Setup from #44, plus at the final step blend the weights towards EMA(horizon = 150 steps) | 2026/06/12 | [log](results/20260611_tailema_2720_submission/README.md) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/325) by [@jn2clark](https://github.com/jn2clark) |
+| 46 | 3025 | 3.2783 (n=7)✓ | Setup from #27, plus tuned aux Adam hyperparameters from #37 and attention V-matrix SOAPH lr lowered from 0.018 to 0.013, lr schedule endpoint changed to 3100 | 2026/06/21 | [log](results/20260621_soaph_lower_v/SOAPH_lower_v_seed1.txt) | [PR](TBD) by [@breskanu](https://github.com/Fullfix) |
 
 
 Notes:
