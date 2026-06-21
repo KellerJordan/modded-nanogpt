@@ -132,9 +132,9 @@ Active techniques:
    After Muon orthogonalization, if the update is too small relative to the weight, it is scaled up to the `0.3825` floor. In #46 this is applied per output row: each row whose update norm is below `0.3825 * ||row||` is lifted to that target, then the usual radius pin removes the global Frobenius-size change while preserving the row-shape change.
    (The scalar u/w floor was introduced in result #9; the current `0.3825` target comes from the later #29/#30 lineage; RowFloor was introduced in result #46.)
 
-4. **Radial brake + radius rescale**:
-   The update is decomposed into radial and tangential parts. Outward radial movement is damped by `0.5`; inward radial movement is left alone. The code then computes the intended post-step weight norm using only the radial component's first-order effect, applies the full update, and rescales the resulting weight tensor to exactly that norm. This removes the accidental norm change caused by the tangential component's finite step size, while preserving the direction reached by the update.
-   (Introduced in result #29.)
+4. **Radial brake + radius rescale + post-pin CWD**:
+   The update is decomposed into radial and tangential parts. Outward radial movement is damped by `0.5`; inward radial movement is left alone. The code then computes the intended post-step weight norm using only the radial component's first-order effect, applies the full update, and rescales the resulting weight tensor to exactly that norm. This removes the accidental norm change caused by the tangential component's finite step size, while preserving the direction reached by the update. After this radius pin, 2D Muon parameters get sign-gated coordinatewise Cautious Weight Decay with `CWD=0.025`: only coordinates where the optimizer update is already shrinking the weight are decayed. This makes the decay a shape change rather than a global norm change, so it survives the radius rescale.
+   (The radial brake and radius rescale were introduced in result #29. Cautious Weight Decay was used earlier in Track-3 PR #265; the current post-pin version on the #44/#46 stack was introduced in result #46.)
 
 5. **PowerCool LR schedule**:
    LR is flat early, then follows a power-law cooldown with power `1.2` and schedule endpoint `2900`: `lr = min(initial_lr, power_c * (2900 - step)**1.2)`. In #46, the Muon LR is flat until about step 514, while the Adam/auxiliary LRs are flat until about step 1487.
@@ -161,13 +161,9 @@ Active techniques:
    Starting at step `2400`, it keeps an EMA of every non-embedding parameter with horizon of 150 steps. At validation time, it evaluates `theta_eval = 0.4 * theta + 0.6 * EMA(theta)`.
    (Introduced in result #45, following the earlier fixed final-readout lineage from #38 and #43; the current #46 variant starts at step `2400` and excludes the token embedding.)
 
-11. **Cautious Weight Decay**:
-   After the radius pin, 2D Muon parameters get sign-gated coordinatewise decay with `CWD=0.025`: only coordinates where the optimizer update is already shrinking the weight are decayed. This makes the decay a shape change rather than a global norm change, so it survives the radius rescale.
-   (Cautious Weight Decay was used earlier in Track-3 PR #265; the current post-pin version on the #44/#46 stack was introduced in result #46.)
-
 What it explicitly does **not** use: Contra-Muon, Soft-Muon, Circuit-Muon, Aurora, TrailDelta, fixed-anchor readout, Muon-history forecasting, CenterShrinkAdam, or NorMuon-lite row/column variance preconditioning. Some stale comments mention older machinery, but these paths are off or removed in the #46 submission defaults.
 
-Notes: Several active details have yet to be proven independently beneficial. We do not yet know whether the attention SOAP trust gate is helping. The final Muon momentum cooldown is probably irrelevant to the accepted #46 step, since the cooldown is scheduled over steps `2700..2900`, but the accepted validation is at step `2690`. Likewise, it is unclear whether the Rademacher gain init matters, whether the depth-dependent `mlp.fc` init matters beyond a below-stat-sig ablation signal of about `0.00003` val loss, or whether `attn.proj.bias` beta2 `.9965` is meaningfully different from the other auxiliary beta2 value `.997`.
+Notes: Several active details have yet to be proven independently beneficial. We do not yet know whether the attention SOAP trust gate is helping. The final Muon momentum cooldown is probably irrelevant to the accepted #46 step, since the cooldown is scheduled over steps `2700..2900`, but the accepted validation is at step `2690`. PowerCool may also be doing little in this record, since the run ends before the schedule becomes much different from a WSD-style cooldown. Likewise, it is unclear whether the Rademacher gain init matters, whether the depth-dependent `mlp.fc` init matters beyond a below-stat-sig ablation signal of about `0.00003` val loss, or whether `attn.proj.bias` beta2 `.9965` is meaningfully different from the other auxiliary beta2 value `.997`.
 
 
 <br><br>
