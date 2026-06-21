@@ -144,7 +144,7 @@ Active techniques:
    (Introduced into the accepted Track 3 lineage in result #30; the current 200-step cooldown was introduced in #44.)
 
 7. **[EMA-Nesterov](https://arxiv.org/abs/2605.25395) wrapper**:
-   The whole optimizer stack is wrapped in EMA-Nesterov. It keeps an EMA of recent parameter displacement, temporarily moves the model forward along that smoothed direction before the forward/backward pass, computes gradients at that lookahead point, then lets the inner optimizer stack take its normal step. The lookahead scale is `.3 * lr/max_lr`, the displacement EMA is `.99`, and it is active after a 300-step prefill until roughly step 1950.
+   The whole optimizer stack is wrapped in EMA-Nesterov. It keeps an EMA of recent parameter displacement, temporarily moves the model forward along that smoothed direction before the forward/backward pass, computes gradients at that lookahead point, then lets the inner optimizer stack take its normal step. The lookahead scale is `.3 * lr/max_lr`, the displacement EMA is `.99`, and it is active after a 300-step prefill until step `1950`.
    (Introduced in result #39; the current `.3` lookahead variant entered the record chain in #40.)
 
 8. **[Adam](https://arxiv.org/abs/1412.6980) tuning**:
