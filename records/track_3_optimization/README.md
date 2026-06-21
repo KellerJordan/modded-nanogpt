@@ -123,7 +123,7 @@ Active techniques:
    Hidden 2D block weights are optimized with Muon: momentum update, Newton-Schulz orthogonalization, then aspect-ratio scaling.
    (Introduced in result #1.)
 
-2. **[SOAP-Muon](https://nikhilvyas.github.io/SOAP_Muon.pdf) on all hidden matrices, with attention trust gate**:
+2. **[SOAP-Muon](https://nikhilvyas.github.io/SOAP_Muon.pdf) on all hidden matrices**:
    Before Muon orthogonalization, the momentum update is preconditioned using SOAP-style row/column gradient covariance statistics. It uses `precondition_frequency=1` and `beta2=.90`. For `attn.proj`, the SOAP direction is gated by agreement with raw momentum / gradient alignment. The blend preserves the raw update norm.
    (MLP SOAP-Muon was introduced in result #14; attention SOAP and the trust gate were added in #16; the current all-hidden, frequency-1 version was introduced in #44.)
 
@@ -144,7 +144,7 @@ Active techniques:
    (Introduced into the accepted Track 3 lineage in result #30; the current 200-step cooldown was introduced in #44.)
 
 7. **[EMA-Nesterov](https://arxiv.org/abs/2605.25395) wrapper**:
-   The whole optimizer stack is wrapped in EMA-Nesterov: lookahead scale `.3 * lr/max_lr`, lookahead EMA `.99`, active after a 300-step prefill and until roughly step 1950. It is not the same as the final Tail-EMA readout.
+   The whole optimizer stack is wrapped in EMA-Nesterov. It keeps an EMA of recent parameter displacement, temporarily moves the model forward along that smoothed direction before the forward/backward pass, computes gradients at that lookahead point, then lets the inner optimizer stack take its normal step. The lookahead scale is `.3 * lr/max_lr`, the displacement EMA is `.99`, and it is active after a 300-step prefill until roughly step 1950.
    (Introduced in result #39; the current `.3` lookahead variant entered the record chain in #40.)
 
 8. **[Adam](https://arxiv.org/abs/1412.6980) tuning**:
