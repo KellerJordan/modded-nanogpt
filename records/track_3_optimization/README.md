@@ -170,7 +170,7 @@ Notes: Several active details have yet to be proven independently beneficial. We
 
 <img src="img/figure_wr_vs_base.png" width="50%">
 
-Figure 1. The current WR is a ~19.5% speedup compared to a well-tuned baseline.
+Figure 1. The current WR is a 20.8% speedup compared to a well-tuned baseline.
 
 
 
