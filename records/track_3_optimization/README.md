@@ -100,6 +100,7 @@ Note: [Beware that](https://github.com/KellerJordan/modded-nanogpt/issues/268) o
 | 43 | 2850(!) | 3.2786 (n=13)✓ | Setup from #41, plus fixed late trajectory transforms: BroadDelta on `muon_other`, TrailDelta endpoint pulses, normalized orthogonal phase readout on `muon_other`, and an 8% final readout toward the step-2400 non-embedding anchor | 2026/05/29 | [log](results/20260529_tail_phase_readout_2850/tail_phase_readout_2850_seed0.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/318) by [@jn2clark](https://github.com/jn2clark) |
 | 44 | 2750(!) | 3.2789 (n=20)✓ | Setup from #41, plus SOAP-Muon on all hidden matrices w/ precondition_frequency=1 (prev. had SOAP on MLP + attn.proj w/ precond_freq=1), tune auxiliary β2's, double mu cooldown, set rademacher init CGI α=.125, and remove neutral geometry modules including (Circuit,Contra)Muon and Aurora | 2026/06/10 | [log](results/20260609_soap_f1_auxb2_clean/H100_ff29b392-e7b7-453e-b9d5-a7dfe0605dd0.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/321) by [@ypwang61](https://github.com/ypwang61) and [@nooraovo](https://github.com/nooraovo) |
 | 45 | 2720(!) | 3.2786 (n=10)✓ | Setup from #44, plus at the final step blend the weights towards EMA(horizon = 150 steps) | 2026/06/12 | [log](results/20260611_tailema_2720_submission/8878c81f-5f73-461f-a41e-c0887e15c1ca.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/325) by [@jn2clark](https://github.com/jn2clark) |
+| 46 | 2690(!) | 3.2783 (n=8)✓ | Setup from #44, plus Tail-EMA eval readout, RowFloor per-output-row u/w-floor, and post-pin Cautious Weight Decay (`CWD=0.025`) | 2026/06/19 | [log](results/20260619_cwd_rowfloor_tailema/A40_seed0_5c87fa44-7ca7-4d54-971d-d952f9b15792.txt) | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/328) by [@ypwang61](https://github.com/ypwang61) |
 
 
 Notes:
@@ -111,11 +112,11 @@ If it fails to reproduce (i.e., there's an error or we get statistical evidence 
 
 ## Active techniques in current record
 
-Codex offers the following description of the techniques used in the current record (#45).
+Codex offers the following description of the techniques used in the current record (#46).
 Note that it is not entirely known which of these techniques is most beneficial.
 Several techniques that were considered beneficial in the past have now been abandoned.
 
-Record #45 is: **#44’s clean SOAP-Muon stack, plus a final Tail-EMA readout at step 2720**.
+Record #46 is: **#44’s clean SOAP-Muon stack, plus Tail-EMA eval readout, RowFloor, and post-pin Cautious Weight Decay**.
 
 Active techniques:
 
@@ -127,16 +128,16 @@ Active techniques:
    Before Muon orthogonalization, the momentum update is preconditioned using SOAP-style row/column gradient covariance statistics. It uses `precondition_frequency=1` and `beta2=.90`. For `attn.proj`, the SOAP direction is gated by agreement with raw momentum / gradient alignment. The blend preserves the raw update norm.
    (MLP SOAP-Muon was introduced in result #14; attention SOAP and the trust gate were added in #16; the current all-hidden, frequency-1 version was introduced in #44.)
 
-3. **u/w floor**:
-   After Muon orthogonalization, if `||update|| / ||weight||` is below `0.3825`, the update is scaled up to that floor. This replaces ordinary Muon weight decay.
-   (Introduced in result #9; the current `0.3825` target comes from the later #29/#30 lineage.)
+3. **u/w floor / RowUpdateFloor**:
+   After Muon orthogonalization, if the update is too small relative to the weight, it is scaled up to the `0.3825` floor. In #46 this is applied per output row: each row whose update norm is below `0.3825 * ||row||` is lifted to that target, then the usual radius pin removes the global Frobenius-size change while preserving the row-shape change.
+   (The scalar u/w floor was introduced in result #9; the current `0.3825` target comes from the later #29/#30 lineage; RowFloor was introduced in result #46.)
 
 4. **Radial brake + radius rescale**:
    The update is decomposed into radial and tangential parts. Outward radial movement is damped by `0.5`; inward radial movement is left alone. The code then computes the intended post-step weight norm using only the radial component's first-order effect, applies the full update, and rescales the resulting weight tensor to exactly that norm. This removes the accidental norm change caused by the tangential component's finite step size, while preserving the direction reached by the update.
    (Introduced in result #29.)
 
 5. **PowerCool LR schedule**:
-   LR is flat early, then follows a power-law cooldown with power `1.2` and schedule endpoint `2900`: `lr = min(initial_lr, power_c * (2900 - step)**1.2)`. In #45, the Muon LR is flat until about step 514, while the Adam/auxiliary LRs are flat until about step 1487.
+   LR is flat early, then follows a power-law cooldown with power `1.2` and schedule endpoint `2900`: `lr = min(initial_lr, power_c * (2900 - step)**1.2)`. In #46, the Muon LR is flat until about step 514, while the Adam/auxiliary LRs are flat until about step 1487.
    (Introduced in result #20.)
 
 6. **Muon momentum schedule**:
@@ -157,12 +158,16 @@ Active techniques:
    (Projection zero-init is present from result #1; depth-scaled `mlp.fc` and CGI/Rademacher gains entered the accepted lineage in #30; the current CGI alpha `.125` was introduced in #44.)
 
 10. **Tail-EMA final readout**:
-   Starting at step `2000`, it keeps an EMA of every non-embedding parameter with horizon of 150 steps. At step `2720`, right before validation, it does `theta <- 0.4 * theta + 0.6 * EMA(theta)`, then validates and stops.
-   (Introduced in result #45, following the earlier fixed final-readout lineage from #38 and #43.)
+   Starting at step `2400`, it keeps an EMA of every non-embedding parameter with horizon of 150 steps. At validation time, it evaluates `theta_eval = 0.4 * theta + 0.6 * EMA(theta)`.
+   (Introduced in result #45, following the earlier fixed final-readout lineage from #38 and #43; the current #46 variant starts at step `2400` and excludes the token embedding.)
 
-What it explicitly does **not** use: Contra-Muon, Soft-Muon, Circuit-Muon, Aurora, TrailDelta, fixed-anchor readout, Muon-history forecasting, CenterShrinkAdam, or NorMuon-lite row/column variance preconditioning. Some stale comments mention older machinery, but these paths are off or removed in the #45 submission defaults.
+11. **Cautious Weight Decay**:
+   After the radius pin, 2D Muon parameters get sign-gated coordinatewise decay with `CWD=0.025`: only coordinates where the optimizer update is already shrinking the weight are decayed. This makes the decay a shape change rather than a global norm change, so it survives the radius rescale.
+   (Cautious Weight Decay was used earlier in Track-3 PR #265; the current post-pin version on the #44/#46 stack was introduced in result #46.)
 
-Notes: Several active details have yet to be proven independently beneficial. We do not yet know whether the attention SOAP trust gate is helping. We also do not know whether the final Muon momentum cooldown matters much, since the cooldown is scheduled over the last 200 steps of a 2900-step run, but the accepted validation is at step 2720. Likewise, it is unclear whether the Rademacher gain init matters, whether the depth-dependent `mlp.fc` init matters beyond a below-stat-sig ablation signal of about `0.00003` val loss, or whether `attn.proj.bias` beta2 `.9965` is meaningfully different from the other auxiliary beta2 value `.997`.
+What it explicitly does **not** use: Contra-Muon, Soft-Muon, Circuit-Muon, Aurora, TrailDelta, fixed-anchor readout, Muon-history forecasting, CenterShrinkAdam, or NorMuon-lite row/column variance preconditioning. Some stale comments mention older machinery, but these paths are off or removed in the #46 submission defaults.
+
+Notes: Several active details have yet to be proven independently beneficial. We do not yet know whether the attention SOAP trust gate is helping. The final Muon momentum cooldown is probably irrelevant to the accepted #46 step, since the cooldown is scheduled over steps `2700..2900`, but the accepted validation is at step `2690`. Likewise, it is unclear whether the Rademacher gain init matters, whether the depth-dependent `mlp.fc` init matters beyond a below-stat-sig ablation signal of about `0.00003` val loss, or whether `attn.proj.bias` beta2 `.9965` is meaningfully different from the other auxiliary beta2 value `.997`.
 
 
 <br><br>
