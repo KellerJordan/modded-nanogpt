@@ -10,20 +10,19 @@ Thank you to everyone who's contributed results so far:
 
 **Table of Contents**
 
-- [Modded-NanoGPT Optimization Benchmark](#modded-nanogpt-optimization-benchmark)
-  - [Benchmark definition tl;dr](#benchmark-definition-tldr)
-  - [Quickstart](#quickstart)
-  - [Notable results history](#notable-results-history)
-  - [Active techniques in current record](#active-techniques-in-current-record)
-  - [Rules](#rules)
-    - [Freedoms](#freedoms)
-    - [Skeptical results](#skeptical-results)
-    - [Pairwise statistical significance](#pairwise-statistical-significance)
-  - [Motivation](#motivation)
-  - [Addressing a potential critique](#addressing-a-potential-critique)
-  - [Details on relation to the main speedrun](#details-on-relation-to-the-main-speedrun)
-  - [Guidelines](#guidelines)
-  - [Citation](#citation)
+- [Benchmark definition tl;dr](#benchmark-definition-tldr)
+- [Quickstart](#quickstart)
+- [Notable results history](#notable-results-history)
+- [Active techniques in current record](#active-techniques-in-current-record)
+- [Rules](#rules)
+  - [Freedoms](#freedoms)
+  - [Skeptical results](#skeptical-results)
+  - [Pairwise statistical significance](#pairwise-statistical-significance)
+- [Motivation](#motivation)
+- [Addressing a potential critique](#addressing-a-potential-critique)
+- [Details on relation to the main speedrun](#details-on-relation-to-the-main-speedrun)
+- [Guidelines](#guidelines)
+- [Citation](#citation)
 
 
 ## Benchmark definition tl;dr
