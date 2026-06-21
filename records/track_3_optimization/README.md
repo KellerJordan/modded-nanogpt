@@ -41,7 +41,7 @@ The precise rules around statistical significance etc. can be found [below](#rul
 
 ## Quickstart
 
-The baseline setup (tuned Muon with aux AdamW = result #37) can be run using the following command on any {1,2,4,8}x-{A,H}100 machine:
+The baseline setup (tuned Muon with aux AdamW = result #37) can be run using the following command on any {1,2,4,8}x-{A100,H100} machine:
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install torch==2.11 huggingface_hub
