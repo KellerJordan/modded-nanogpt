@@ -102,3 +102,5 @@ Track 3 SOAP-Muon lineage.
 
 Key inherited components include Tail-EMA eval readout, RowFloor, Cautious Weight Decay, SOAP-Muon,
 radial dampening + radius pin, EMA-Nesterov lookahead, and PowerCool LR cooldown.
+
+Generated with CodeX.
