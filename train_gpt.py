@@ -1091,8 +1091,11 @@ class CausalSelfAttention(nn.Module):
             q, k = yarn.rotary(q), yarn.rotary(k)
 
             if key_offset:
-                # shift keys forward for the stationary head dims. Enables 1-layer induction.
-                k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:]
+                # If the next token has a weak V, its KV pair is likely not used much.
+                # For hub tokens and other overloaded channels, shifting K brings the next channel into the computation.
+                norm_sq = (v * v).sum(dim=-1)
+                shift = (norm_sq[:, :-1] >= norm_sq[:, 1:] * 4.0)
+                k = torch.cat((k[:, :1], torch.where(shift[..., None], k[:, :-1], k[:, 1:],)), dim=1)
 
             if aux_v is not None:
                 v = v + aux_v.view_as(v)
@@ -1133,7 +1136,6 @@ class CausalSelfAttention(nn.Module):
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
-
 
 # -----------------------------------------------------------------------------
 # The main model
@@ -1705,7 +1707,7 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1380  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1360  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
