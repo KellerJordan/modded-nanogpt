@@ -1092,7 +1092,7 @@ class CausalSelfAttention(nn.Module):
 
             if key_offset:
                 # shift keys forward for the stationary head dims. Enables 1-layer induction.
-                k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:]
+                k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:].clone()
 
             if aux_v is not None:
                 v = v + aux_v.view_as(v)
