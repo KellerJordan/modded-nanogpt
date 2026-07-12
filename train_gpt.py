@@ -23,6 +23,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import triton
 import numpy as np
+import tiktoken
 
 torch.empty(
     1, device=f"cuda:{os.environ['LOCAL_RANK']}", requires_grad=True
@@ -1141,9 +1142,29 @@ class CausalSelfAttention(nn.Module):
 def next_multiple_of_n(v: float | int, *, n: int):
     return math.ceil(v / n) * n
 
+def build_prefix_table(vocab_size: int) -> Tensor:
+    """Constant lookup table mapping each token to its "prefix token".
+
+    For prefix token prediction: T' is the token whose byte string is the longest
+    proper prefix of token T's byte string that is itself a token in the vocabulary.
+    Tokens without a valid prefix map to -1 for "ignore this term".
+    """
+    enc = tiktoken.get_encoding("gpt2")
+    byte_to_id = enc._mergeable_ranks
+    table = torch.full((vocab_size,), -1, dtype=torch.int64)
+    for b, tid in byte_to_id.items():
+        # longest proper prefix (bytes) that is itself a token
+        for k in range(len(b) - 1, 0, -1):
+            pid = byte_to_id.get(b[:k])
+            if pid is not None:
+                table[tid] = pid
+                break
+    return table
+
 @dataclass(slots=True)
 class ForwardScheduleConfig:
     mtp_weights: torch.Tensor
+    prefix_weight: torch.Tensor
     ws_short: int
     ws_long: int
     train_max_seq_len: int
@@ -1157,6 +1178,9 @@ class GPT(nn.Module):
         # there are only 50257 unique GPT-2 tokens; extend to nearest multiple of 128 for efficiency.
         # suggested by @Grad62304977, originates from Karpathy's experiments.
         self.vocab_size = next_multiple_of_n(vocab_size, n=128)
+
+        # Constant prefix-token lookup table for prefix token prediction
+        self.register_buffer("prefix_table", build_prefix_table(self.vocab_size), persistent=False)
 
         # Transposed weight storage for faster gradient accumulation
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
@@ -1227,7 +1251,7 @@ class GPT(nn.Module):
             self.vo_bank[:num_vo_real].uniform_(-bound, bound)
             self.vo_bank[num_vo_real:].zero_()
 
-    def init_mlp(self, model_dim):        
+    def init_mlp(self, model_dim):
         # MLP bank: stores c_fc and c_proj for all MLP layers
         # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
         mlp_hdim = 4 * model_dim
@@ -1347,6 +1371,7 @@ class GPT(nn.Module):
 
         # ---- Schedule and layer topology ----
         mtp_weights, train_max_seq_len = schedule_cfg.mtp_weights, schedule_cfg.train_max_seq_len
+        prefix_weight = schedule_cfg.prefix_weight
         ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
         # set block masks and key shift
         bm_sizes = [ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, None, ws_short, ws_short, ws_short, ws_long]
@@ -1386,7 +1411,7 @@ class GPT(nn.Module):
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
-        
+
         # Use sign-trick to better compress multiple bigrams into a shared bigram embedding row
         # (details in https://github.com/KellerJordan/modded-nanogpt/pull/299 by @trianxy)
         sign_idx = torch.zeros_like(input_seq)
@@ -1468,7 +1493,7 @@ class GPT(nn.Module):
                 attn_out = attn(attn_in_normed, attn_args, qkvo_w)
 
                 if mu is not None:
-                    x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0] 
+                    x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0]
                     x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + mu[11] * x0_bigram
                 else:
                     x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
@@ -1502,7 +1527,8 @@ class GPT(nn.Module):
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
-            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
+            prefix_target_seq = self.prefix_table[target_seq]
+            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
         else:
             logits = self.lm_head(x)
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
@@ -1705,7 +1731,7 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1380  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1365  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1731,6 +1757,8 @@ class TrainingStage:
     mtp_weights_start: list[float]
     mtp_weights_end: list[float]
     train_max_seq_len: int
+    prefix_weight_start: float = 0.0
+    prefix_weight_end: float = 0.0
     duration: float = None
 
 class TrainingSchedule:
@@ -1763,12 +1791,15 @@ class TrainingSchedule:
         # Split embed at specified stage (ensure odd step for Adam)
         self.split_step = self.boundaries[split_embed_stage][0] | 1
 
-        # Precompute MTP weights for all steps
+        # Precompute MTP weights and prefix-prediction weights for all steps
         self.mtp_weights = []
+        self.prefix_weights = []
         for step in range(self.total_steps + 1):
             stage, t = self.lookup(step)
             w = [a + (b - a) * t for a, b in zip(stage.mtp_weights_start, stage.mtp_weights_end)]
             self.mtp_weights.append(torch.tensor(w, device=device))
+            pw = stage.prefix_weight_start + (stage.prefix_weight_end - stage.prefix_weight_start) * t
+            self.prefix_weights.append(torch.tensor([pw], device=device))
 
     def lookup(self, step: int) -> tuple[TrainingStage, float]:
         # Returns stage and % of the way through that stage
@@ -1791,14 +1822,14 @@ class TrainingSchedule:
 # window_sizes are in units of `block_size` tokens (defined in TrainingManager)
 TRAINING_STAGES = [
     TrainingStage(duration=1/3, train_max_seq_len=896, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
-                  mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0]),
+                  mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0], prefix_weight_start=0.25, prefix_weight_end=0.25),
     TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
-                  mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0]),
+                  mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0], prefix_weight_start=0.25, prefix_weight_end=0.0),
     TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
-                  mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
+                  mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weight_start=0.0, prefix_weight_end=0.0),
     # extension stage
     TrainingStage(train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
-                  mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
+                  mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weight_start=0.0, prefix_weight_end=0.0),
 ]
 
 # TODO - Confirm.
@@ -1909,6 +1940,7 @@ class TrainingManager():
     def get_forward_args(self):
         return ForwardScheduleConfig(
             mtp_weights = self.mtp_weights,
+            prefix_weight = self.prefix_weight,
             ws_short = self.ws_short * self.block_size,
             ws_long = self.ws_long * self.block_size,
             train_max_seq_len = self.train_max_seq_len
@@ -1939,6 +1971,7 @@ class TrainingManager():
 
         self.ws_long = new_ws_long
         self.mtp_weights = training_schedule.mtp_weights[step]
+        self.prefix_weight = training_schedule.prefix_weights[step]
 
     def step_optimizers(self, step: int):
         step_lr = training_schedule.get_lr(step)
@@ -2010,7 +2043,7 @@ class TrainingManager():
         self.row_update_mask.fill(0)
 
 
-        
+
 
 # -----------------------------------------------------------------------------
 # int main
@@ -2177,10 +2210,10 @@ for step in range(train_steps + 1):
 if args.run_evals:
     model.eval()
     from evals import hellaswag
-    hellaswag.evaluate(model=model, 
-                       schedule_cfg=training_manager.get_forward_args(), 
+    hellaswag.evaluate(model=model,
+                       schedule_cfg=training_manager.get_forward_args(),
                        seq_len=args.val_batch_size // (grad_accum_steps * world_size),
-                       get_bigram_hash=get_bigram_hash, 
+                       get_bigram_hash=get_bigram_hash,
                        print0=print0)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
