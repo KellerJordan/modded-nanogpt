@@ -92,6 +92,10 @@ for every seed).
 
 **First-passing step = 2635** under the same formal n=8 statistic convention as #44-#46.
 
+This result is also **pairwise statistically significantly stronger than #46** (per the
+README's pairwise criterion): at step 2635 the mean gap vs the #46 logs is 0.00357,
+giving `0.00357 / sqrt(1/8 + 1/8) = 0.00713 >= 0.004`.
+
 ## Files
 
 - `train_gpt_bimaxwell_st1000.py` — self-contained solution artifact (#46 script + the
