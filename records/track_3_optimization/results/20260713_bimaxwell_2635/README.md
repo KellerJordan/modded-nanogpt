@@ -100,7 +100,9 @@ giving `0.00357 / sqrt(1/8 + 1/8) = 0.00713 >= 0.004`.
 
 - `train_gpt_bimaxwell_st1000.py` — self-contained solution artifact (#46 script + the
   23-line component; nothing else changed). All logfiles embed this exact script.
-- `A800_seed{0..7}.txt` — full seed logs with embedded source.
+- `A800_seed{0..7}.txt` — full seed logs with embedded source (primary n=8 claim).
+- `H100_seed{0..7}.txt` — independent same-recipe fleet on H100 (first formal pass 2645,
+  margin 0.00466; pooled with the A800 fleet, n=16 passes 2635 with margin 0.00487).
 - `summary.tsv` — n=8 formal result table.
 - `figure.png`, `zoomed_figure.png`.
 
