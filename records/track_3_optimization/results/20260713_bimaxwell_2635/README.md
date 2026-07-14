@@ -26,8 +26,10 @@ step 2630 fails: 0.00309
 ```
 
 Per-seed first crossings: [2620, 2620, 2640, 2600, 2630, 2585, 2630, 2610] (mean 2617).
-An independent H100 n=8 of the same recipe is in flight; an earlier variant of the recipe
-(enable at 700) already passed an independent H100 n=8 at 2635.
+An **independent H100 n=8** of the same recipe passes at **2645** (margin 0.00466; crossings
+[2615, 2615, 2635, 2640, 2645, 2595, 2630, 2615]), and **pooling all 16 runs** (nothing held
+back) passes at **2635** with margin 0.00487 — the same step as the A800 claim, with a wider
+margin.
 
 Per-step wall-clock is unchanged (two extra `lerp_`s per hidden matrix, within rerun noise);
 memory adds two momentum-sized buffers per hidden matrix.
