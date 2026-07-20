@@ -464,6 +464,17 @@ class NorMuonAndAdam:
         self._lm_head_param = self._param_by_label.get("lm_head")
         self._embed_param = self._param_by_label.get("embed")
 
+        # Side communicator for Ember's tiny stats all_reduce: on the main communicator
+        # it would queue (in issue order) behind the large grad reduce_scatters and
+        # all_gathers, stalling downstream compute on a ~3KB message. A dummy all_reduce
+        # absorbs lazy NCCL init before the timed region.
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            self._stats_pg = dist.new_group(list(range(dist.get_world_size())))
+            dev = next(iter(self.param_cfgs)).device
+            dist.all_reduce(torch.zeros(1, device=dev), group=self._stats_pg)
+        else:
+            self._stats_pg = None
+
     def _build_param_cfg(self, param: nn.Parameter, label: str):
         """Build config for a single parameter from param_table."""
         table_entry = self.param_table[label]
@@ -544,8 +555,25 @@ class NorMuonAndAdam:
                     chunk = param[:p_cfg.chunk_size]
                 else:
                     chunk = param
-                exp_avg = torch.zeros_like(chunk, dtype=torch.float32, device=param.device)
-                self.param_states[param] = dict(step=0, exp_avg=exp_avg, exp_avg_sq=torch.zeros_like(exp_avg))
+                if p_cfg.label in ("value_embeds", "embed"):
+                    # Ember: no first moment (beta1=0) and a factored second moment in
+                    # place of Adam's dense buffers. r = per-row EMA of mean(g^2),
+                    # c = per-column EMA pooled over the FULL table across all ranks,
+                    # s = matching EMA of the grand mean of g^2; the dense equivalent is
+                    # reconstructed per step as outer(r, c) / s. Optimizer state is
+                    # rows + cols + 1 floats total. embed runs it too (post-untie; stats
+                    # start cold there, see copy_lm_state_to_embed); lm_head keeps dense
+                    # Adam (fp8/transposed storage).
+                    self.param_states[param] = dict(
+                        step=0,
+                        r=torch.zeros(chunk.shape[0], dtype=torch.float32, device=param.device),
+                        c=torch.zeros(chunk.shape[1], dtype=torch.float32, device=param.device),
+                        s=torch.zeros((), dtype=torch.float32, device=param.device),
+                        n_rows=float(param.shape[0]),
+                    )
+                else:
+                    exp_avg = torch.zeros_like(chunk, dtype=torch.float32, device=param.device)
+                    self.param_states[param] = dict(step=0, exp_avg=exp_avg, exp_avg_sq=torch.zeros_like(exp_avg))
 
             elif p_cfg.optim == "normuon":
                 chunk_shape = (p_cfg.chunk_size, *p_cfg.reshape[1:])
@@ -664,24 +692,10 @@ class NorMuonAndAdam:
         lm_cfg = self.param_cfgs[lm_head]
         embed_cfg = self.param_cfgs[embed]
 
-        embed_state['step'] = lm_state['step'] # Preserve step count for bias correction
-
-        # Copy optimizer state with all-gather + transpose + reshard
-        if self.world_size > 1:
-            rank = dist.get_rank()
-            lm_chunk_size = lm_cfg.chunk_size  # 96
-            embed_chunk_size = embed_cfg.chunk_size  # 6288
-
-            # All-gather lm_head momentum to get full (768, 50304) tensor
-            for key in ["exp_avg", "exp_avg_sq"]:
-                lm_chunk = lm_state[key]  # (96, 50304)
-                full_lm = torch.empty(lm_head.shape[0], lm_head.shape[1], dtype=lm_chunk.dtype, device=lm_chunk.device)
-                dist.all_gather_into_tensor(full_lm, lm_chunk.contiguous())
-                embed_state[key].copy_(full_lm.T[rank * embed_chunk_size:(rank + 1) * embed_chunk_size])
-        else:
-            # Single GPU: simple transpose
-            for key in ["exp_avg", "exp_avg_sq"]:
-                embed_state[key].copy_(lm_state[key].T)
+        # embed runs Ember with beta1=0: there is no optimizer state to inherit.
+        # Its r/c/s stats start COLD here (bias correction re-warms them), so the
+        # step counter simply restarts. lm_head's own dense Adam state is untouched.
+        embed_state['step'] = 0
 
         # Mark as split
         self.split_embed = True
@@ -833,14 +847,22 @@ class NorMuonAndAdam:
         p_state["step"] += 1
         t = p_state["step"]
 
+        if p_cfg.label == "value_embeds":
+            lr = lr * get_ember_lr_mult(t)
+        elif p_cfg.label == "embed":
+            lr = lr * 0.5  # Ember embed: flat 0.5x, no ramp (swept optimum)
+
         bias1, bias2 = 1 - beta1 ** t, 1 - beta2 ** t
         self._step_size_t.fill_(lr * (bias2 ** 0.5 / bias1))
         self._eff_wd_t.fill_(lr * lr * p_cfg.weight_decay * p_cfg.wd_mul)
 
-        NorMuonAndAdam._adam_update_step(
-            p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"],
-            beta1, beta2, p_cfg.eps, self._step_size_t, self._eff_wd_t
-        )
+        if p_cfg.label in ("value_embeds", "embed"):
+            self._ember_update(p_slice, grad_chunk, p_state, beta1, beta2, p_cfg.eps)
+        else:
+            NorMuonAndAdam._adam_update_step(
+                p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"],
+                beta1, beta2, p_cfg.eps, self._step_size_t, self._eff_wd_t
+            )
 
         return p_slice
 
@@ -851,6 +873,44 @@ class NorMuonAndAdam:
         exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
         exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
         update = exp_avg.div(exp_avg_sq.sqrt().add_(eps)).mul_(step_size_t)
+        # Cautious weight decay
+        mask = (update * p_slice) > 0
+        update.addcmul_(p_slice, mask, value=eff_wd_t)
+        p_slice.add_(other=update, alpha=-1.0)
+
+    # -----------------------------------
+    # Ember update (value_embeds): https://github.com/katop1234/ember
+
+    def _ember_update(self, p_slice: Tensor, grad_chunk: Tensor, p_state: dict, beta1: float, beta2: float, eps: float):
+        """Ember step for value_embeds. The eager half updates the pooled column/global
+        second-moment stats; its only collective is one all_reduce of ~cols floats per
+        step. Stats use contiguous tree-reduction sums only (never index_add_ /
+        scatter_add_), so updates are bitwise reproducible at any world size."""
+        g32 = grad_chunk.float()
+        col_sum = (g32 * g32).sum(dim=0)  # this rank's column sums of g^2
+        if self._stats_pg is not None:
+            dist.all_reduce(col_sum, group=self._stats_pg)  # -> full-table column sums
+        n_rows = p_state["n_rows"]
+        c_new = col_sum / n_rows                            # column means over the full table
+        s_new = col_sum.sum() / (n_rows * col_sum.numel())  # grand mean of g^2
+        # warm-from-0 EMAs, exactly like exp_avg_sq -> stock bias correction applies unchanged
+        p_state["c"].mul_(beta2).add_(c_new, alpha=1 - beta2)
+        p_state["s"].mul_(beta2).add_(s_new, alpha=1 - beta2)
+        NorMuonAndAdam._ember_update_step(
+            p_slice, grad_chunk, p_state["r"], p_state["c"], p_state["s"],
+            beta2, eps, self._step_size_t, self._eff_wd_t
+        )
+
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _ember_update_step(p_slice, g_slice, r, c, s, beta2, eps, step_size_t, eff_wd_t):
+        """_adam_update_step with beta1=0 (the first moment IS the gradient) and the
+        dense second moment replaced by its factored reconstruction v = outer(r, c) / s.
+        No collectives in here."""
+        g2 = g_slice * g_slice
+        r.mul_(beta2).add_(g2.mean(dim=1), alpha=1 - beta2)  # per-row (token) second moment
+        v = (r / s).unsqueeze(1) * c.unsqueeze(0)            # == outer(r, c) / s
+        update = g_slice.float().div(v.sqrt().add_(eps)).mul_(step_size_t)
         # Cautious weight decay
         mask = (update * p_slice) > 0
         update.addcmul_(p_slice, mask, value=eff_wd_t)
@@ -1706,13 +1766,14 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
     num_scheduled_iterations: int = 1380  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
+    num_extension_iterations: int = 4  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
-    #   - explicit sparse connectivity refactor (no generic loop)
-    #   - (1 + m_r9) * x self-reference fuse on layer 9
-    #   - backout_lambda fully removed (slot dropped from self.scalars; absorbed into MUDD bias init)
+    #   - attention windows step to (8,20) at step 1300 instead of 1380 (earlier YaRN extension)
+    #   - value_embeds optimizer: Ember (factored second moment, r[rows] x c[dim] / s) with
+    #     beta1=0, beta2=0.99 and a 0.64x->1.0x lr ramp over updates 500-690
+    #   - extension steps 10 -> 4 (total 1384)
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
@@ -1737,11 +1798,12 @@ class TrainingSchedule:
     """
     Training schedule initialized via TRAINING_STAGES
         1. Multi Token Prediction schedule of [1, 0.5, 0.25->0] -> [1, 0.5->0] -> [1] @varunneal
-        2. Sliding Attention window schedule of [1,3] -> [3,7] -> [5,11] -> [6,13]
+        2. Sliding Attention window schedule of [1,3] -> [3,7] -> [5,11] -> [8,20] (at step 1300)
         3. YaRN updates to RoPE on window changes
         4. Split embed and lm head at 2/3 of training
         5. Batch size schedule of 8 -> 16 -> 24
-        6. Post training extension of long windows from 13 to 20
+        6. Windows step to (8,20) at step 1300 (YaRN fires there; the extension-stage
+           transition and final-validation ws=20 extension become no-ops)
         7. Seq len updates from 896 to 2048 at 1/3 of training
     """
 
@@ -1794,10 +1856,13 @@ TRAINING_STAGES = [
                   mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0]),
     TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
                   mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0]),
-    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
+    TrainingStage(duration=380/1380, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
+                  mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
+    # windows step to (8,20) at step 1300; batch/seq/lr_mul unchanged so loader and lr stay continuous
+    TrainingStage(duration=80/1380, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(8, 20), lr_mul=1.73,
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
     # extension stage
-    TrainingStage(train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
+    TrainingStage(train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(8, 20), lr_mul=1.0,  # lr_mul is not used
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
 
@@ -1805,10 +1870,19 @@ TRAINING_STAGES = [
 training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.60)
 #training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
 
+def get_ember_lr_mult(t: int, t0=500.0, t1=690.0, start=0.64, target=1.0) -> float:
+    # Ember lr ramp for value_embeds, in UPDATE counts (Adam-side params update on odd
+    # steps only, so update 500 ~ step 1000): hold at 0.64x through update 500, ramp
+    # linearly to 1.0x by update 690 (~step 1380), then hold.
+    frac = min(1.0, max(0.0, (t - t0) / (t1 - t0)))
+    return start + (target - start) * frac
+
 def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
     # warmup phase: linearly increase momentum from min to max
     # cooldown phase: linearly decrease momentum from max to min
-    momentum_cd_start = training_schedule.total_steps - muon_cooldown_steps
+    # cooldown clock stays anchored at the previous record's 1390-step run (1340 -> 1390);
+    # this run stops at 1384, partway down the same ramp, rather than compressing the ramp
+    momentum_cd_start = 1390 - muon_cooldown_steps
     if step < muon_warmup_steps:
         frac = step / muon_warmup_steps
         momentum = momentum_min + frac * (momentum_max - momentum_min)
@@ -1852,8 +1926,12 @@ class TrainingManager():
             "bigram_lambdas": {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "resid_lambdas":  {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
             "xsa_alphas":     {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            # value_embeds runs Ember: no first moment (beta1=0), factored second moment
+            # (see _ember_update); lr additionally follows get_ember_lr_mult
+            "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.0, 0.99],  "lr_mul": 75.,  "wd_mul": 5.0},
+            # embed runs Ember too (post-untie): no first moment, factored second moment,
+            # flat 0.5x lr (see _adam_update); cold stats at the untie
+            "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.0, 0.99],  "wd_mul": 150.},
         }
 
         # ---- MUDD parameter overrides ----
