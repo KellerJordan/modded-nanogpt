@@ -39,7 +39,20 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, quantize_transpose_mlp_down_weights, reduce_mlp_activation_scales, transpose_add, transpose_copy
+from triton_kernels import (
+    XXT,
+    XTX,
+    FusedLinearReLUSquareFunction,
+    FusedSoftcappedCrossEntropy,
+    PackedFP8QKV,
+    QKNormRoPEPad,
+    ba_plus_cAA,
+    quantize_dual_layout_batched,
+    quantize_transpose_mlp_down_weights,
+    reduce_mlp_activation_scales,
+    transpose_add,
+    transpose_copy,
+)
 from dc_triton_kernels import (
     dc_attention_postonly_nodd_correction_add_base_triton,
 )
@@ -62,6 +75,8 @@ torch.cuda.set_device(device)
 dist.init_process_group(backend="cuda:nccl,cpu:gloo", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
+if train_seed := os.environ.get("TRAIN_SEED"):
+    torch.manual_seed(int(train_seed))
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -986,27 +1001,24 @@ class CastedLinearT(nn.Module):
 # PyTorch nn.Module definitions for the model
 
 class Yarn(nn.Module):
-    def __init__(self, head_dim, max_seq_len, paired=False):
+    def __init__(self, head_dim, max_seq_len, paired=False, attn_scale=0.1):
         super().__init__()
         self.head_dim = head_dim
+        self.rotary_dim = head_dim // 2
         self.max_seq_len = max_seq_len
         self.paired = paired
+        self.base_attn_scale = attn_scale
         self.reset()
 
-    def rotary(self, x_BTHD):
-        assert self.factor1.size(0) >= x_BTHD.size(-3)
-        factor1, factor2 = (
-            self.factor1[None, : x_BTHD.size(-3), None, :],
-            self.factor2[None, : x_BTHD.size(-3), None, :],
-        )
-        x_flip = x_BTHD.view(*x_BTHD.shape[:-1], x_BTHD.shape[-1] // 2, 2).flip(-1).view(x_BTHD.shape)
-        return factor1 * x_BTHD + factor2 * x_flip
-
     def reset(self):
-        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=self.head_dim//4, dtype=torch.float32, device=device)
+        angular_freq = (1 / 1024) ** torch.linspace(
+            0, 1, steps=self.rotary_dim // 2, dtype=torch.float32, device=device
+        )
         angular_freq = angular_freq.repeat_interleave(2)
         # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(self.head_dim//2)])
+        angular_freq = torch.cat([
+            angular_freq, angular_freq.new_zeros(self.head_dim - self.rotary_dim)
+        ])
         t = torch.arange(2*self.max_seq_len, dtype=torch.float32, device=device)
         if not self.paired:
             theta = torch.outer(t, angular_freq)
@@ -1032,7 +1044,7 @@ class Yarn(nn.Module):
         self.factor2[..., 1::2] *= -1
         self.angular_freq = angular_freq
         # start with 0.1, inspired by 0.12 from @leloykun and learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-        self.attn_scale = 0.1
+        self.attn_scale = self.base_attn_scale
 
     def apply(self, old_window: int, new_window: int, alpha: int=1, beta: int=32):
         rotations = old_window * self.angular_freq / (2 * torch.pi)
@@ -1080,17 +1092,27 @@ def dc_gate(
     return post_w1.contiguous(), dc_w2.type_as(x).contiguous()
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
+    def __init__(
+        self, dim: int, head_dim: int, qk_dim: int,
+        num_heads: int, paired: bool = False,
+    ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.dim = dim
+        self.qk_dim = qk_dim
+        self.qk_proj_dim = 2 * num_heads * qk_dim
         self.hdim = num_heads * head_dim
         self.paired = paired
-        assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
+        assert self.hdim == dim, "num_heads * head_dim must equal model_dim"
+        # FA3 supports mixed QK/V widths natively at QK <= 64. Widths in
+        # (64, 128) still need padding to the 128-wide V representation.
+        self.attn_qk_dim = qk_dim if qk_dim <= 64 else head_dim
         # Weights are stored in parameter banks and passed via forward()
 
-    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor, dc_w: tuple[Tensor, Tensor] | None = None):
+    def forward(
+        self, x: Tensor, attn_args: AttnArgs, qk_w: Tensor, vo_w: Tensor,
+        qkv_fp8=None, dc_w: tuple[Tensor, Tensor] | None = None,
+    ):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
@@ -1100,38 +1122,37 @@ class CausalSelfAttention(nn.Module):
         seqlens, bm_size = attn_args.seqlens, attn_args.bm_size
         train_max_seq_len, yarn = attn_args.train_max_seq_len, attn_args.yarn
 
-        q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        if qkv_fp8 is not None:
+            weight_f8, weight_f8_t, weight_scale, x_scale, grad_scale = qkv_fp8
+            q, k, v = PackedFP8QKV(
+                x, qk_w.type_as(x), vo_w[0].type_as(x),
+                weight_f8, weight_f8_t, weight_scale, sa_lambdas[0],
+                x_scale, grad_scale,
+                yarn.factor1[:T], yarn.factor2[:T], self.num_heads,
+                self.paired, key_offset,
+            )
+            q, k, v = q[None], k[None], v[None]
+        else:
+            qkv_weight = sa_lambdas[0] * torch.cat((qk_w, vo_w[0])).type_as(x)
+            qkv = F.linear(x, qkv_weight)
+            qk, v = qkv.split((self.qk_proj_dim, self.hdim), dim=-1)
+            qk = qk.view(B, T, 2 * self.num_heads, self.qk_dim)
+            v = v.view(B, T, self.num_heads, self.head_dim)
+            qk = QKNormRoPEPad(
+                qk[0], yarn.factor1[:T], yarn.factor2[:T], self.num_heads,
+                self.attn_qk_dim, self.paired, key_offset,
+            )
+            q, k = qk.chunk(2, dim=-2)
+            q, k = q[None], k[None]
         max_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
-
         if not self.paired:
-            q, k = yarn.rotary(q), yarn.rotary(k)
-
-            if key_offset:
-                # shift keys forward for the stationary head dims. Enables 1-layer induction.
-                k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:]
-
             if aux_v is not None:
                 v = v + aux_v.view_as(v)
-
         else:
-            # Paired heads: adjacent heads' queries attend to each other's keys.
-            # Two copies of the input stream are interleaved to achieve this, which:
-            # - doubles the length of each sequence
-            # - halves the effective window size
-            q = q.view(B, T, self.num_heads // 2, self.head_dim * 2)
-            k = k.view(B, T, self.num_heads // 2, self.head_dim * 2)
             v = v.reshape(B, T * 2, self.num_heads // 2, self.head_dim)
-
-            q, k = yarn.rotary(q), yarn.rotary(k)
-
-            q = q.view(B, T * 2, self.num_heads // 2, self.head_dim)
-            k = k.view(B, T * 2, self.num_heads // 2, self.head_dim)
-
             if aux_v is not None:
                 v = v + aux_v.view_as(v)
-
             seqlens = 2 * seqlens
             max_len = 2 * max_len
 
@@ -1157,8 +1178,10 @@ class CausalSelfAttention(nn.Module):
             y = y - alpha * (dot / denom) * v
         if attn_gate_w is not None:
             y = y * attn_gate_w.type_as(y).view(B, T, self.num_heads, 1)
-        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
+        y = y.contiguous().view(B, T, self.hdim) # re-assemble all head outputs side by side
+        # O is stored transposed so rectangular V/O matrices share one bank shape.
+        out_weight_t = sa_lambdas[1] * vo_w[1].type_as(y)
+        y = y @ out_weight_t
         return y
 
 
@@ -1221,8 +1244,8 @@ class GPT(nn.Module):
         self.register_buffer("prefix_table", torch.full((self.vocab_size,), -1, dtype=torch.int64), persistent=False)
 
         # Transposed weight storage for faster gradient accumulation
-        use_fp8 = not os.environ.get("DISABLE_FP8", False)
-        self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
+        self.use_fp8 = not os.environ.get("DISABLE_FP8", False)
+        self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=self.use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
 
         self.embed = nn.Embedding(self.vocab_size, model_dim)
@@ -1249,11 +1272,22 @@ class GPT(nn.Module):
         self.cache_layers = [3, 7]
 
         # Attention modules (no learned params -- weights come from qk_bank/vo_bank)
-        self.paired_head_layers = [0, 2, 5, 9]
-        self.attn = CausalSelfAttention(model_dim, head_dim, num_heads, paired=False)
-        self.attn_paired = CausalSelfAttention(model_dim, head_dim, num_heads, paired=True)
-        self.yarn = Yarn(head_dim, max_seq_len)
-        self.yarn_paired_head = Yarn(head_dim, max_seq_len, paired=True)
+        self.paired_head_layers = (0, 2, 5, 9)
+        qk_dim = int(os.environ.get("QK_HEAD_DIM", "96"))
+        assert qk_dim % 16 == 0 and 0 < qk_dim < head_dim
+        self.qk_dim = qk_dim
+        self.attn = CausalSelfAttention(
+            model_dim, head_dim, qk_dim, num_heads, paired=False,
+        )
+        self.attn_paired = CausalSelfAttention(
+            model_dim, head_dim, qk_dim, num_heads, paired=True,
+        )
+        qk_attn_scale = 0.1 * math.sqrt(head_dim / qk_dim)
+        self.yarn = Yarn(qk_dim, max_seq_len, attn_scale=qk_attn_scale)
+        self.yarn_paired_head = Yarn(
+            qk_dim, max_seq_len, paired=True, attn_scale=qk_attn_scale,
+        )
+        self._all_yarns = (self.yarn, self.yarn_paired_head)
 
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
@@ -1272,17 +1306,18 @@ class GPT(nn.Module):
         # QK bank: per-head-pair Muon groups for Q, K weights
         # Each pair of adjacent heads gets its own independent polar express orthogonalization
         self._num_attn_layers = num_attn_layers
-        num_qk_groups = num_attn_layers * 2 * (num_heads // 2)  # 10 * 2 * 3 = 60
+        qk_groups_per_layer = 2 * (num_heads // 2)
+        num_qk_groups = num_attn_layers * qk_groups_per_layer
         self._num_qk_groups = num_qk_groups
-        num_qk_padded = next_multiple_of_n(num_qk_groups, n=world_size)  # 64
-        self.qk_bank = nn.Parameter(torch.empty(num_qk_padded, head_dim * 2, model_dim))
-        self.qk_bank.reshape = (num_qk_padded, head_dim * 2, model_dim)
+        num_qk_padded = next_multiple_of_n(num_qk_groups, n=world_size)
+        self.qk_bank = nn.Parameter(torch.empty(num_qk_padded, qk_dim * 2, model_dim))
+        self.qk_bank.reshape = (num_qk_padded, qk_dim * 2, model_dim)
 
         # VO bank: per-layer Muon groups for V and O weights
         num_vo_real = num_attn_layers * 2  # 20
         num_vo_padded = next_multiple_of_n(num_vo_real, n=world_size)  # 24
-        self.vo_bank = nn.Parameter(torch.empty(num_vo_padded, hdim, hdim))
-        self.vo_bank.reshape = (num_vo_padded, hdim, hdim)
+        self.vo_bank = nn.Parameter(torch.empty(num_vo_padded, hdim, model_dim))
+        self.vo_bank.reshape = (num_vo_padded, hdim, model_dim)
 
         # improved init scale by @YouJiacheng and @srashedll
         std = 0.5 * model_dim ** -0.5
@@ -1292,6 +1327,16 @@ class GPT(nn.Module):
             self.qk_bank[num_qk_groups:].zero_()
             self.vo_bank[:num_vo_real].uniform_(-bound, bound)
             self.vo_bank[num_vo_real:].zero_()
+
+        self.register_buffer("_attn_qkv_scales", torch.ones(num_attn_layers))
+        self.register_buffer(
+            "_attn_x_scales",
+            torch.full((num_attn_layers,), 8.0 / 448.0),
+        )
+        self.register_buffer(
+            "_attn_grad_scales",
+            torch.full((num_attn_layers,), 1.0 / 448.0),
+        )
 
     def init_mlp(self, model_dim):        
         # MLP bank: stores c_fc and c_proj for all MLP layers
@@ -1400,6 +1445,36 @@ class GPT(nn.Module):
         x = (F.linear(x, self.mudd_w2[id, :num_coef]) + self.mudd_b2[id, :num_coef]) * self._mudd_scale
         return x.split(1, dim=-1)
 
+    def quantize_attn_fp8(self):
+        """Refresh cached FP8 QKV weights after the optimizer update."""
+        if not self.use_fp8:
+            return
+        E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+        with torch.no_grad():
+            qk = self.qk_bank[:self._num_qk_groups].view(
+                self._num_attn_layers, -1, self.qk_bank.shape[-1]
+            )
+            vo = self.vo_bank[:self._num_attn_layers * 2].view(
+                self._num_attn_layers, 2, *self.vo_bank.shape[1:]
+            )
+            qkv = torch.cat((qk, vo[:, 0]), dim=1)
+            if not hasattr(self, "_attn_qkv_f8"):
+                self._attn_qkv_f8 = torch.empty_like(
+                    qkv, dtype=torch.float8_e4m3fn,
+                )
+                self._attn_qkv_f8_t = torch.empty(
+                    self._num_attn_layers, qkv.shape[-1], qkv.shape[-2],
+                    dtype=torch.float8_e4m3fn, device=qkv.device,
+                )
+            self._attn_qkv_scales.copy_(
+                qkv.view(self._num_attn_layers, -1).abs().amax(dim=1).float()
+                .clamp_min_(1e-12).div_(E4M3_MAX)
+            )
+            quantize_dual_layout_batched(
+                qkv, self._attn_qkv_scales,
+                self._attn_qkv_f8, self._attn_qkv_f8_t,
+            )
+
     def quantize_mlp_fp8(self, bootstrap_down=False):
         """Refresh FP8 copies of both MLP projections after optimizer steps."""
         E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -1495,7 +1570,14 @@ class GPT(nn.Module):
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==ws_long for b in bm_sizes] # apply partial key offset to long windows
 
-        use_mlp_fp8 = self.training and not os.environ.get("DISABLE_FP8", False)
+        use_mlp_fp8 = self.training and self.use_fp8
+        use_attn_fp8 = self.training and self.use_fp8
+        if use_attn_fp8:
+            attn_qkv_f8 = self._attn_qkv_f8.unbind(0)
+            attn_qkv_f8_t = self._attn_qkv_f8_t.unbind(0)
+            attn_qkv_scales = [self._attn_qkv_scales[i:i+1] for i in range(self._num_attn_layers)]
+            attn_x_scales = [self._attn_x_scales[i:i+1] for i in range(self._num_attn_layers)]
+            attn_grad_scales = [self._attn_grad_scales[i:i+1] for i in range(self._num_attn_layers)]
         if use_mlp_fp8:
             mlp_up_proj_f8 = self._mlp_up_proj_f8.unbind(0)
             mlp_up_proj_scales = [self._mlp_up_proj_scales[i:i+1] for i in range(12)]
@@ -1520,9 +1602,12 @@ class GPT(nn.Module):
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
         assert len(dc_weights) == self.num_layers
-        qk_all = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])
-        vo_flat = self.vo_bank[:self._num_attn_layers * 2].view(self._num_attn_layers, 2, *self.vo_bank.shape[1:]).flatten(1, 2)
-        attn_weights = torch.cat([qk_all, vo_flat], dim=1).unbind(0)
+        qk_per_layer = self.qk_bank[:self._num_qk_groups].view(
+            self._num_attn_layers, -1, self.qk_bank.shape[-1]
+        ).unbind(0)
+        vo_per_layer = self.vo_bank[:self._num_attn_layers * 2].view(
+            self._num_attn_layers, 2, *self.vo_bank.shape[1:]
+        ).unbind(0)
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
@@ -1594,14 +1679,24 @@ class GPT(nn.Module):
                 skip_gate_out = torch.sigmoid(skip_lambda) * post_skip_gate
                 x = x + skip_gate_out * cache[3]
             else:
-                qkvo_w = attn_weights[i - (i > 6)]
+                attn_idx = i - (i > 6)
+                qk_w = qk_per_layer[attn_idx]
+                vo_w = vo_per_layer[attn_idx]
+                qkv_fp8 = None
+                if use_attn_fp8:
+                    qkv_fp8 = (
+                        attn_qkv_f8[attn_idx], attn_qkv_f8_t[attn_idx],
+                        attn_qkv_scales[attn_idx], attn_x_scales[attn_idx],
+                        attn_grad_scales[attn_idx],
+                    )
                 attn_in_normed = norm(cache.get(7, x))
                 B, T = attn_in_normed.size(0), attn_in_normed.size(1)
 
                 if i == self.num_layers - 1:
                     cache[9] = x
                     mu = self.forward_mudd(x, id=0, num_coef=14)
-                    v_mudd = (mu[0] * cache[0] + mu[1] * cache[7] + mu[2] * x).view(B, T, self.num_heads, self.head_dim)
+                    v_mudd = mu[0] * cache[0] + mu[1] * cache[7] + mu[2] * x
+                    v_mudd = v_mudd.view(B, T, self.num_heads, self.head_dim)
                     x = (1 + mu[5]) * x + mu[3] * cache[0] + mu[4] * cache[7]
                     ve_gate = torch.cat([mu[6], mu[7]], dim=-1).repeat_interleave(
                         self.num_heads // 2, dim=-1
@@ -1629,7 +1724,7 @@ class GPT(nn.Module):
                     train_max_seq_len=train_max_seq_len,
                 )
                 dc_w = dc_weights[i] if i in self.dc_layers and not is_paired else None
-                attn_out = attn(attn_in_normed, attn_args, qkvo_w, dc_w)
+                attn_out = attn(attn_in_normed, attn_args, qk_w, vo_w, qkv_fp8, dc_w)
 
                 if mu is not None:
                     x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0] 
@@ -1888,7 +1983,7 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
     num_scheduled_iterations: int = 1270  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 15  # number of steps to continue training at final lr and ws
+    num_extension_iterations: int = int(os.environ.get("NUM_EXTENSION_ITERATIONS", "15"))  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
@@ -1988,9 +2083,10 @@ TRAINING_STAGES = [
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weight_start=0.0, prefix_weight_end=0.0),
 ]
 
-# TODO - Confirm.
-training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.60)
-#training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
+training_schedule = TrainingSchedule(
+    TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations,
+    cooldown_frac=0.60,
+)
 
 def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
     # warmup phase: linearly increase momentum from min to max
@@ -2112,8 +2208,8 @@ class TrainingManager():
         stage, _ = training_schedule.lookup(step)
         self.ws_short, new_ws_long = stage.window_sizes
         if new_ws_long != self.ws_long:
-            self.model.yarn.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
-            self.model.yarn_paired_head.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
+            for yarn in self.model._all_yarns:
+                yarn.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
 
         new_batch_size = stage.batch_size
         new_train_max_seq_len = stage.train_max_seq_len
@@ -2157,8 +2253,8 @@ class TrainingManager():
         self.ws_short, self.ws_long = stage.window_sizes
         self.batch_size = stage.batch_size
         self.train_max_seq_len = stage.train_max_seq_len
-        self.model.yarn.reset()
-        self.model.yarn_paired_head.reset()
+        for yarn in self.model._all_yarns:
+            yarn.reset()
         if _sparse_comms_active():
             self.row_update_mask = np.zeros(args.bigram_vocab_size, dtype=np.uint8)
             self.sparse_counts_state = None
@@ -2239,6 +2335,11 @@ model: nn.Module = GPT(
     model_dim=768,
     max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
 ).cuda()
+print0(
+    f"attention heads={model.num_heads} value_dim={model.head_dim} qk_dim={model.qk_dim} "
+    f"seed={os.environ.get('TRAIN_SEED', 'random')} "
+    f"steps={training_schedule.total_steps}"
+)
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
         m.weight.data = m.weight.data.bfloat16()
@@ -2255,6 +2356,7 @@ model.mudd_gate_b2.data = model.mudd_gate_b2.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 dist.broadcast(model.bigram_sign_table, 0)  # buffer, not in parameters()
+model.quantize_attn_fp8()
 model.quantize_mlp_fp8(bootstrap_down=True)
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
@@ -2291,12 +2393,14 @@ for step in warmup_steps:
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
+    model.quantize_attn_fp8()
     model.quantize_mlp_fp8(bootstrap_down=True)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
 del val_loader, train_loader, initial_state
+model.quantize_attn_fp8()
 model.quantize_mlp_fp8(bootstrap_down=True)
 model.train()
 
@@ -2362,6 +2466,7 @@ for step in range(train_steps + 1):
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
+    model.quantize_attn_fp8()
     model.quantize_mlp_fp8(bootstrap_down=(step < 16))
 
     # logging
