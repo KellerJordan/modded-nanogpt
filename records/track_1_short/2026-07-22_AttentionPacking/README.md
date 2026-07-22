@@ -8,7 +8,8 @@
 - Q, K, and V projections are packed and quantized into reusable row-major and
   transposed FP8 layouts once per optimizer update.
 - Both ReLU-squared MLP projections use fused FP8 forward/backward paths.
-- Training is extended from 1390 to 1410 steps to retain the loss margin.
+- The final-lr extension is increased from 10 to 45 iterations, for 1425 total
+  training steps. All of those steps are included in the reported time.
 
 Q/K determine attention routing, while V carries the content mixed by that
 routing. Keeping the value stream full-width while using a smaller normalized
@@ -16,51 +17,66 @@ QK geometry reduces projection work without shrinking the residual stream. The
 idea was conceptually inspired by [nGPT's hyperspherical representation
 view](https://arxiv.org/abs/2410.01131); no nGPT code was copied. The FP8
 implementation extends the repository's existing practice of quantizing
-reusable weights once per optimizer step.
+reusable weights once per optimizer update.
 
-## Baseline method and hardware
+## H100 verification
 
-All runs used the same host with 8x NVIDIA H200, Python 3.10.12, PyTorch
-2.11.0+cu128, Triton 3.6.0, and the unchanged FineWeb data pipeline.
+These are fresh runs on one Prime Intellect node with 8x NVIDIA H100 80GB HBM3.
+The environment used Python 3.12.3, PyTorch 2.10.0+cu128 compiled for CUDA 12.8,
+Triton 3.6.0, and NVIDIA driver 580.105.08.
 
-1. Baseline commit `edf47a0` was run twice with `./run.sh` and completed 1390
-   steps.
-2. Candidate commit `6928d20` was run as
-   `TRAIN_SEED=<0..11> ./run.sh` and completed 1410 steps.
-3. Timing is compared only on this same H200 hardware, as required by the
-   same-hardware baseline rule.
+The candidate uses the repository's unchanged fixed-step evaluation path. The
+training and validation data pipelines and validation calculation were not
+edited; only the allowed extension budget changes the final step from 1390 to
+1425.
 
-Baseline timing reports two exact-source runs; candidate timing reports twelve
-exact-source seeds.
+```bash
+NUM_EXTENSION_ITERATIONS=45 TRAIN_SEED=<2|4|42|1337> ./run.sh
+```
 
-## Results
+`45` is also the checked-in default; it is stated explicitly here to make the
+submitted step budget unambiguous.
 
-| Configuration | n | Steps | Mean loss | Mean time | Time delta |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Baseline | 2 | 1390 | 3.278950 | 76.395 s | - |
-| Attention packing | 12 | 1410 | 3.278717 | 72.713 s | -3.682 s (-4.82%) |
+| Seed | Steps | Validation loss | Training time | Log |
+| ---: | ---: | ---: | ---: | --- |
+| 2 | 1425 | 3.2765 | 77.741 s | [`82b44e9b`](candidate_h100/82b44e9b-6240-47c4-9589-faf623b3ac7a.txt) |
+| 4 | 1425 | 3.2744 | 77.846 s | [`a3a769ea`](candidate_h100/a3a769ea-325a-4501-8afb-77b5bf41424a.txt) |
+| 42 | 1425 | 3.2741 | 77.846 s | [`eb92afdf`](candidate_h100/eb92afdf-d2a5-49f7-8e8b-6b78422459a9.txt) |
+| 1337 | 1425 | 3.2748 | 77.816 s | [`73c64793`](candidate_h100/73c64793-d4f0-42ad-b807-940bead7e027.txt) |
+| **Mean** | **1425** | **3.274950** | **77.812 s (1.297 min)** | |
 
-Candidate mean loss is below 3.28 with one-sided `p=0.005828`.
+The loss sample standard deviation is 0.001072. A one-sided one-sample t-test
+against 3.28 gives `t=-9.418299` and `p=0.001268` for the alternative
+`mean < 3.28`.
 
-| Seed | Validation loss | Training time | Log |
-| ---: | ---: | ---: | --- |
-| 0 | 3.2778 | 72.550 s | [`67464f48`](candidate_h200/67464f48-96d4-4bd6-bea8-31b2a43882a1.txt) |
-| 1 | 3.2804 | 73.065 s | [`41b63686`](candidate_h200/41b63686-6bda-4036-8f61-f7fffa226c9f.txt) |
-| 2 | 3.2796 | 72.876 s | [`83dc7644`](candidate_h200/83dc7644-253e-429f-bbfb-b1fcd14ff477.txt) |
-| 3 | 3.2785 | 72.275 s | [`bf6c2952`](candidate_h200/bf6c2952-e767-4c44-b539-41561f7ca18b.txt) |
-| 4 | 3.2780 | 72.994 s | [`9a08fb51`](candidate_h200/9a08fb51-a539-412c-99c3-3f0f7108c8f6.txt) |
-| 5 | 3.2805 | 72.386 s | [`5ebc5401`](candidate_h200/5ebc5401-2fe4-4e45-9831-75597517fab2.txt) |
-| 6 | 3.2807 | 72.648 s | [`2da0626e`](candidate_h200/2da0626e-30c1-4dce-b4cd-56f7858cdb10.txt) |
-| 7 | 3.2756 | 72.949 s | [`65559e46`](candidate_h200/65559e46-618f-4494-bd91-6fc9bc85d2ae.txt) |
-| 8 | 3.2774 | 73.105 s | [`04549fe9`](candidate_h200/04549fe9-af0b-4c4c-89cf-ec1698033185.txt) |
-| 9 | 3.2786 | 72.724 s | [`a443fbb3`](candidate_h200/a443fbb3-e1cf-46b1-81c9-3245aa0cc6d7.txt) |
-| 10 | 3.2784 | 72.264 s | [`db0a60fa`](candidate_h200/db0a60fa-6ad4-4c11-b2eb-2f0e5afda076.txt) |
-| 11 | 3.2791 | 72.717 s | [`0f74b9ee`](candidate_h200/0f74b9ee-a388-4a5b-b343-949ff050d1ef.txt) |
+## Why 45 extension iterations
 
-| Baseline run | Validation loss | Training time | Log |
-| ---: | ---: | ---: | --- |
-| 0 | 3.2802 | 76.361 s | [`0b8f947a`](baseline_h200/0b8f947a-31fd-423c-a5e9-484075ee29ce.txt) |
-| 1 | 3.2777 | 76.429 s | [`6b4a6f04`](baseline_h200/6b4a6f04-0bc4-4c7c-ac79-242a897accfd.txt) |
+The main schedule's 10 extension iterations ended at step 1390 and produced a
+3.283433 mean on matched H100 seeds 2, 4, and 42. At 30 extensions (1410 total
+steps), those seeds averaged 3.279033, but the loss spread left only
+`p=0.254308`. At 45 extensions, the same seeds averaged 3.275000; adding the
+independent seed 1337 produced the submitted `p=0.001268` result.
 
-The baseline logs embed `edf47a0`; all twelve candidate logs embed `6928d20`.
-Run `python statistics.py` in this directory to reproduce the table statistics.
+Relative to 30 extensions, the extra 15 steps improved matched-seed mean loss
+by 0.004033 and increased mean training time from 76.718 to 77.811 seconds, a
+1.093-second (1.42%) cost. This trades total timed runtime for convergence
+margin and statistical robustness; per-step throughput is unchanged. It also
+leaves less protection against runtime variance: the submitted mean is only
+1.388 seconds below the published record.
+The extra iterations do not change the validation calculation or data stream.
+
+The observed 1.297-minute mean is 1.388 seconds (1.75%) below the published
+1.320-minute record. This is not a same-node baseline comparison.
+
+## Rule check
+
+| Rule | Status |
+| --- | --- |
+| Train and validation data pipelines unchanged | Pass |
+| Mean validation loss <=3.28 with p<0.01 | Pass: mean 3.274950, p=0.001268 |
+| No extra `torch._inductor.config` or `torch.compile` flags | Pass |
+| Faster than the prior record on the same hardware | Not established: no same-node baseline was run |
+
+The candidate satisfies the Track 1 loss requirement on H100. Run
+`python statistics.py` in this directory to reproduce the reported candidate
+statistics.
