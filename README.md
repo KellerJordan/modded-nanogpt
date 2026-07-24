@@ -194,6 +194,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 82 | 1.353 minutes | [Learnable XSA](https://x.com/classiclarryd/status/2058975556520329302) | 04/29/26 | [log](records/track_1_short/2026-04-29_XSAGatedLayers/this_pr_v1-s1410/06563169-6435-48ba-a1ad-f3e61bfcc573.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/264) | @_djdumpling
 83 | 1.328 minutes | [Sign Trick on Bigram Embed](https://x.com/classiclarryd/status/2063061926092099868) | 05/20/26 | [log](records/track_1_short/2026-05-20_BigramsSignTrick/pr299/0cf91274-eda8-49cd-9a97-9369f730f271.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/299) | @TrianX
 84 | 1.320 minutes | FP8 on MLP up-projection forward pass | 05/21/26 | [log](records/track_1_short/2026-05-19_FP8MLPUpProj/this_record/008bb79d-d5bc-4205-bd4e-5e4ae82e658c.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/306) | @sisovicm
+85 | 1.312 minutes | Ember optimizer | 07/20/26 | [logs](records/track_1_short/2026-07-20_EmberWindows) | @katop1234
 ## Rules
 
 New records must:
