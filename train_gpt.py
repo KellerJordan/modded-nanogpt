@@ -1094,7 +1094,7 @@ class CausalSelfAttention(nn.Module):
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
         # unpack attention args
-        aux_v = attn_args.aux_v
+        aux_v, attn_gate_w = attn_args.aux_v, attn_args.attn_gate_w
         sa_lambdas, key_offset = attn_args.sa_lambdas, attn_args.key_offset
         seqlens, bm_size = attn_args.seqlens, attn_args.bm_size
         train_max_seq_len, yarn = attn_args.train_max_seq_len, attn_args.yarn
@@ -1150,10 +1150,10 @@ class CausalSelfAttention(nn.Module):
         # Gated XSA (arXiv:2603.09078) with learnable strength: subtract per-head fraction tanh(α)
         # of y aligned with v̂. Non-paired only (v shape doesn't line up for paired layers).
         if attn_args.xsa_alpha is not None and not self.paired:
-            vn = F.normalize(v, dim=-1, eps=1e-4)
-            proj = (y * vn).sum(-1, keepdim=True)
+            dot = (y * v).sum(-1, keepdim=True)
+            denom = v.square().sum(-1, keepdim=True).clamp_min(1e-8)
             alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(B, T, self.num_heads, 1)
-            y = y - alpha * proj * vn
+            y = y - alpha * (dot / denom) * v
         if attn_gate_w is not None:
             y = y * attn_gate_w.type_as(y).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
