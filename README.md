@@ -196,7 +196,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 83 | 1.328 minutes | [Sign Trick on Bigram Embed](https://x.com/classiclarryd/status/2063061926092099868) | 05/20/26 | [log](records/track_1_short/2026-05-20_BigramsSignTrick/pr299/0cf91274-eda8-49cd-9a97-9369f730f271.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/299) | @TrianX
 84 | 1.320 minutes | FP8 on MLP up-projection forward pass | 05/21/26 | [log](records/track_1_short/2026-05-19_FP8MLPUpProj/this_record/008bb79d-d5bc-4205-bd4e-5e4ae82e658c.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/306) | @sisovicm
 85 | 1.271 minutes | MUDD gates and Lightweight Dynamically Composable MHA | 05/27/26 | [log](records/track_1_short/2026-05-27-MuddGatedAndDC),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/315) | @Lisennlp
-https://github.com/KellerJordan/modded-nanogpt/pull/315
+
 ## Rules
 
 New records must:
