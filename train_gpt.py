@@ -1065,24 +1065,7 @@ class AttnArgs:
     xsa_alpha: torch.Tensor | None
     train_max_seq_len: torch.Tensor
 
-
-try:
-    _fa3_mod = get_kernel("kernels-community/flash-attn3", version=1)
-except BaseException as exc:
-    print(f"[rank{rank}] kernels-community/flash-attn3 load failed: {type(exc).__name__}: {exc}", flush=True)
-    _fa3_mod = get_kernel("varunneal/flash-attention-3", trust_remote_code=True)
-flash_attn_interface = getattr(_fa3_mod, "flash_attn_interface", _fa3_mod)
-
-
-def dc_gate(
-    x: Tensor,
-    dc_w: tuple[Tensor, Tensor],
-    num_heads: int,
-) -> tuple[Tensor, Tensor]:
-    dc_w1, dc_w2 = dc_w
-    assert dc_w1.shape == dc_w2.shape == (x.size(0), x.size(1), num_heads)
-    post_w1 = F.rms_norm(dc_w1.float(), (num_heads,), eps=1.0e-6).type_as(x)
-    return post_w1.contiguous(), dc_w2.type_as(x).contiguous()
+flash_attn_interface = get_kernel('kernels-community/flash-attn3', version=1).flash_attn_interface
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
@@ -1280,6 +1263,10 @@ class GPT(nn.Module):
     def init_misc(self, model_dim, num_layers):
         self.smear_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.smear_gate.weight)
+
+        self.skip_gate = nn.Linear(12, 1, bias=False)
+        nn.init.zeros_(self.skip_gate.weight)
+
         self.bigram_embed = nn.Embedding(args.bigram_vocab_size, args.bigram_dim)
         nn.init.zeros_(self.bigram_embed.weight)
         bigram_sign_table = torch.randn(args.bigram_sign_table_rows, args.bigram_dim).sign().to(torch.bfloat16)
@@ -1367,56 +1354,6 @@ class GPT(nn.Module):
             self._mlp_up_proj_scales[:] = scales.float()
             self._mlp_up_proj_f8[:] = (model.mlp_bank[:, 0] / scales.view(12, 1, 1)).to(torch.float8_e4m3fn)
 
-    def init_mudd_gate(self, model_dim: int):
-        self._mudd_gate_scale = nn.Parameter(torch.tensor(0.1))
-        mudd_gate_dim = 64
-        assert self.num_heads == 6
-        # Fixed gate layouts. The post gate is generated at the start of layer 4.
-        # pre:  xsa[1,3] 12 + attn[3] 6 + inject[0..3] 8 = 26
-        # post: xsa[4,7] 12 + attn[10] 6 + inject[4,5,7,8,9] 10 + skip 1 + dc[10] 12 = 41
-        self._mudd_gate_pre_num_coef = 26
-        self._mudd_gate_post_num_coef = 41
-        max_num_coef = 41
-        self.mudd_gate_w1 = nn.Parameter(torch.empty(2, mudd_gate_dim, model_dim))
-        self.mudd_gate_w2 = nn.Parameter(torch.zeros(2, max_num_coef, mudd_gate_dim))
-        for j in range(2):
-            nn.init.kaiming_uniform_(self.mudd_gate_w1.data[j], a=math.sqrt(5))
-
-        bs_init = torch.zeros(2, max_num_coef)
-        _mudd_gate_scale = 0.1
-        attn_gate_bias = 0.25 / _mudd_gate_scale
-        bigram_gate_bias = 0.05 / _mudd_gate_scale
-        skip_gate_bias = 0.5 / _mudd_gate_scale
-        dc_w1_gate_bias = 1.0 / _mudd_gate_scale
-        bs_init[0, 12:18].fill_(attn_gate_bias)     # pre attn[3]
-        bs_init[0, 19:26:2].fill_(bigram_gate_bias) # pre bigram gates for layers 0..3
-        bs_init[1, 12:18].fill_(attn_gate_bias)     # post attn[10]
-        bs_init[1, 19:28:2].fill_(bigram_gate_bias) # post bigram gates for layers 4,5,7,8,9
-        bs_init[1, 28].fill_(skip_gate_bias)
-        bs_init[1, 29:35].fill_(dc_w1_gate_bias)    # post dc[10] w1, output starts at 1.0
-        self.mudd_gate_b2 = nn.Parameter(bs_init)
-
-    def forward_mudd_gate(self, x, id, num_coef):
-        x = F.gelu(F.linear(x, self.mudd_gate_w1[id]))
-        return (F.linear(x, self.mudd_gate_w2[id, :num_coef]) + self.mudd_gate_b2[id, :num_coef]) * self._mudd_gate_scale.type_as(x)
-
-    def unpack_pre_mudd_gate(self, gate, xsa_alphas, attn_gates, x0_gates, bigram_gates):
-        xsa_alphas[1] = gate[..., 0:6] # 6 means 6 heads
-        xsa_alphas[3] = gate[..., 6:12]
-        attn_gates[3] = gate[..., 12:18]
-        for layer, offset in zip((0, 1, 2, 3), range(18, 26, 2)):
-            x0_gates[layer] = gate[..., offset:offset + 1]
-            bigram_gates[layer] = gate[..., offset + 1:offset + 2]
-
-    def unpack_post_mudd_gate(self, gate, xsa_alphas, attn_gates, x0_gates, bigram_gates):
-        xsa_alphas[4] = gate[..., 0:6]
-        xsa_alphas[7] = gate[..., 6:12]
-        attn_gates[10] = gate[..., 12:18]
-        for layer, offset in zip((4, 5, 7, 8, 9), range(18, 28, 2)):
-            x0_gates[layer] = gate[..., offset:offset + 1]
-            bigram_gates[layer] = gate[..., offset + 1:offset + 2]
-        return gate[..., 28:29]
-
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
@@ -1479,20 +1416,14 @@ class GPT(nn.Module):
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
-        pre_gate = self.forward_mudd_gate(x0, id=0, num_coef=self._mudd_gate_pre_num_coef)
-        self.unpack_pre_mudd_gate(
-            pre_gate,
-            xsa_alphas,
-            attn_gates,
-            x0_gates,
-            bigram_gates,
-        )
-
         # Initialize residual stream with pre-layer-0 bigram injection
-        x = x0.clone()
-        x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + x0_bigram * bigram_gates[0]
-        skip_gate_out = None
-        post_skip_gate = None
+        x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + x0_bigram * bigram_lambdas[0]
+
+        # Precompute x0/bigram injection (added to attention output each layer)
+        # Layer 0: bigram already injected above, so only x0 component
+        x0_inject = tuple(x0 * x0_lambdas[i] for i in range(self.num_layers))
+        bg_inject = (None,) + tuple(x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
+        skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
 
         # cache[k] is the layer-k snapshot used downstream by MUDD.
         # cache[0] = residual stream after bigram injection (input to layer 0).
@@ -1506,17 +1437,6 @@ class GPT(nn.Module):
             if use_mlp_fp8:
                 up_proj_f8, up_proj_scale = mlp_up_proj_f8[i], mlp_up_proj_scales[i]
             mu = None
-
-            if i == 4:
-                post_gate = self.forward_mudd_gate(x, id=1, num_coef=self._mudd_gate_post_num_coef)
-                post_skip_gate = self.unpack_post_mudd_gate(
-                    post_gate,
-                    xsa_alphas,
-                    attn_gates,
-                    x0_gates,
-                    bigram_gates,
-                )
-                dc_weights[10] = (post_gate[..., 29:35], post_gate[..., 35:41])
 
             # process attn. skip on layer 6 @YouJiacheng
             if i == 6:
@@ -1562,12 +1482,13 @@ class GPT(nn.Module):
                 attn_out = attn(attn_in_normed, attn_args, qkvo_w, dc_w)
 
                 if mu is not None:
-                    x = mu[8] * x + mu[9] * attn_out + cache[0] * mu[10]
-                    x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + x0_bigram * mu[11]
+                    x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0] 
+                    x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + mu[11] * x0_bigram
                 else:
-                    x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0 * x0_gates[i]
-                    if i != 0:
-                        x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + x0_bigram * bigram_gates[i]
+                    x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
+                    if bg_inject[i] is not None:
+                        x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + bg_inject[i]
+
             # process mlp
             normed = norm(x)
             if use_mlp_fp8:
@@ -1798,8 +1719,8 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1275  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 15  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 1380  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
@@ -1810,8 +1731,8 @@ class Hyperparameters:
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
-    bigram_vocab_size: int = 50304 * 15 // 2
-    bigram_dim: int = 768
+    bigram_vocab_size: int = 50304 * 15
+    bigram_dim: int = 192
     bigram_sign_table_rows: int = 8192  # prefer a power of 2 (values ~500-15000 gave similar results)
 
 args = Hyperparameters()
