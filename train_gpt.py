@@ -48,6 +48,17 @@ ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
 
 dynamo.config.recompile_limit = 64
 
+# TailEMA is accumulated inside the sharded Adam update. On the terminal Adam
+# step, each local readout shard is blended before its ordinary all-gather.
+EMA_DECAY = float(os.environ.get("EMA_DECAY", "0.9933"))
+EMA_START = int(os.environ.get("EMA_START", "848"))
+EMA_EVERY = max(1, int(os.environ.get("EMA_EVERY", "1")))
+EMA_BLEND = float(os.environ.get("EMA_BLEND", "0.65"))
+EMA_SCOPE = os.environ.get("EMA_SCOPE", "readout")
+EMA_DTYPE = os.environ.get("EMA_DTYPE", "fp32")
+assert EMA_SCOPE in {"readout", "head"}, "fused TailEMA supports readout or head scope"
+assert EMA_DTYPE == "fp32", "fused TailEMA currently requires fp32 shadows"
+
 # -----------------------------------------------------------------------------
 # Distributed training setup
 rank = int(os.environ["RANK"])
@@ -460,6 +471,8 @@ class NorMuonAndAdam:
         self._eff_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._ema_decay_old_t = torch.tensor(1.0, dtype=torch.float32, device="cpu")
+        self._ema_decay_new_t = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
@@ -551,7 +564,13 @@ class NorMuonAndAdam:
                 else:
                     chunk = param
                 exp_avg = torch.zeros_like(chunk, dtype=torch.float32, device=param.device)
-                self.param_states[param] = dict(step=0, exp_avg=exp_avg, exp_avg_sq=torch.zeros_like(exp_avg))
+                state = dict(step=0, exp_avg=exp_avg, exp_avg_sq=torch.zeros_like(exp_avg))
+                ema_labels = {"lm_head", "embed"} if EMA_SCOPE == "readout" else {"lm_head"}
+                if EMA_DECAY > 0.0 and p_cfg.label in ema_labels:
+                    state["ema"] = torch.zeros_like(exp_avg)
+                    state["ema_initialized"] = False
+                    state["ema_terminal_blended"] = False
+                self.param_states[param] = state
 
             elif p_cfg.optim == "normuon":
                 chunk_shape = (p_cfg.chunk_size, *p_cfg.reshape[1:])
@@ -684,10 +703,23 @@ class NorMuonAndAdam:
                 full_lm = torch.empty(lm_head.shape[0], lm_head.shape[1], dtype=lm_chunk.dtype, device=lm_chunk.device)
                 dist.all_gather_into_tensor(full_lm, lm_chunk.contiguous())
                 embed_state[key].copy_(full_lm.T[rank * embed_chunk_size:(rank + 1) * embed_chunk_size])
+            if "ema" in lm_state and "ema" in embed_state and lm_state["ema_initialized"]:
+                full_lm = torch.empty(
+                    lm_head.shape[0], lm_head.shape[1],
+                    dtype=lm_state["ema"].dtype, device=lm_state["ema"].device,
+                )
+                dist.all_gather_into_tensor(full_lm, lm_state["ema"].contiguous())
+                embed_state["ema"].copy_(
+                    full_lm.T[rank * embed_chunk_size:(rank + 1) * embed_chunk_size]
+                )
+                embed_state["ema_initialized"] = True
         else:
             # Single GPU: simple transpose
             for key in ["exp_avg", "exp_avg_sq"]:
                 embed_state[key].copy_(lm_state[key].T)
+            if "ema" in lm_state and "ema" in embed_state and lm_state["ema_initialized"]:
+                embed_state["ema"].copy_(lm_state["ema"].T)
+                embed_state["ema_initialized"] = True
 
         # Mark as split
         self.split_embed = True
@@ -720,12 +752,14 @@ class NorMuonAndAdam:
     # Unified optimizer step with explicit ordering
 
     @torch.no_grad()
-    def step(self, do_adam: bool = True):
+    def step(self, do_adam: bool = True, outer_step: int = 0, terminal_ema: bool = False):
         """
         Combined optimizer step with explicit ordering.
 
         Args:
             do_adam: If True, update Adam params. NorMuon params always updated.
+            terminal_ema: Blend local TailEMA readout shards into the terminal
+                Adam result before the optimizer's ordinary all-gathers.
 
         Flow:
         1. Scatter phase: Launch reduces in scatter_order
@@ -788,7 +822,9 @@ class NorMuonAndAdam:
 
             # Apply update based on optim type
             if p_cfg.optim == "adam":
-                p_slice = self._adam_update(param, grad_chunk, p_cfg, rank)
+                p_slice = self._adam_update(
+                    param, grad_chunk, p_cfg, rank, outer_step, terminal_ema
+                )
             else:
                 p_slice = self._normuon_update(param, grad_chunk, p_cfg, rank)
             # Launch gather for sharded params
@@ -824,7 +860,15 @@ class NorMuonAndAdam:
     # -----------------------------------
     # Adam update
 
-    def _adam_update(self, param: nn.Parameter, grad_chunk: Tensor, p_cfg: ParamConfig, rank: int) -> Tensor:
+    def _adam_update(
+        self,
+        param: nn.Parameter,
+        grad_chunk: Tensor,
+        p_cfg: ParamConfig,
+        rank: int,
+        outer_step: int,
+        terminal_ema: bool,
+    ) -> Tensor:
         """Apply Adam update to a parameter. Returns the updated p_slice."""
         beta1, beta2 = p_cfg.adam_betas
         lr = p_cfg.lr * p_cfg.lr_mul
@@ -843,10 +887,44 @@ class NorMuonAndAdam:
         self._step_size_t.fill_(lr * (bias2 ** 0.5 / bias1))
         self._eff_wd_t.fill_(lr * lr * p_cfg.weight_decay * p_cfg.wd_mul)
 
-        NorMuonAndAdam._adam_update_step(
-            p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"],
-            beta1, beta2, p_cfg.eps, self._step_size_t, self._eff_wd_t
-        )
+        # Adam runs only on odd outer steps. Observe both the unchanged pre-update
+        # tick and the post-update tick so this matches a per-step TailEMA exactly.
+        old_tick, new_tick = outer_step, outer_step + 1
+        old_selected = old_tick >= EMA_START and (old_tick - EMA_START) % EMA_EVERY == 0
+        new_selected = new_tick >= EMA_START and (new_tick - EMA_START) % EMA_EVERY == 0
+        if "ema" in p_state and (old_selected or new_selected or terminal_ema):
+            assert p_slice.dtype == torch.bfloat16, "EMA old-parameter snapshot assumes bf16 readout"
+
+            def observation_decay(selected: bool) -> float:
+                if not selected:
+                    return 1.0
+                if not p_state["ema_initialized"]:
+                    p_state["ema_initialized"] = True
+                    return 0.0
+                return EMA_DECAY
+
+            self._ema_decay_old_t.fill_(observation_decay(old_selected))
+            self._ema_decay_new_t.fill_(observation_decay(new_selected))
+            if terminal_ema:
+                if not p_state["ema_initialized"]:
+                    raise RuntimeError("TailEMA was not initialized before its terminal blend")
+                NorMuonAndAdam._adam_update_step_ema_terminal(
+                    p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"], p_state["ema"],
+                    beta1, beta2, p_cfg.eps, self._step_size_t, self._eff_wd_t,
+                    self._ema_decay_old_t, self._ema_decay_new_t, EMA_BLEND,
+                )
+                p_state["ema_terminal_blended"] = True
+            else:
+                NorMuonAndAdam._adam_update_step_ema(
+                    p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"], p_state["ema"],
+                    beta1, beta2, p_cfg.eps, self._step_size_t, self._eff_wd_t,
+                    self._ema_decay_old_t, self._ema_decay_new_t,
+                )
+        else:
+            NorMuonAndAdam._adam_update_step(
+                p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"],
+                beta1, beta2, p_cfg.eps, self._step_size_t, self._eff_wd_t
+            )
 
         return p_slice
 
@@ -861,6 +939,78 @@ class NorMuonAndAdam:
         mask = (update * p_slice) > 0
         update.addcmul_(p_slice, mask, value=eff_wd_t)
         p_slice.add_(other=update, alpha=-1.0)
+
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _adam_update_step_ema(
+        p_slice,
+        g_slice,
+        exp_avg,
+        exp_avg_sq,
+        ema,
+        beta1,
+        beta2,
+        eps,
+        step_size_t,
+        eff_wd_t,
+        decay_old_t,
+        decay_new_t,
+    ):
+        """Adam plus two logical TailEMA observations in one pointwise graph."""
+        old_param = p_slice.float()
+        exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
+        update = exp_avg.div(exp_avg_sq.sqrt().add_(eps)).mul_(step_size_t)
+        mask = (update * p_slice) > 0
+        update.addcmul_(p_slice, mask, value=eff_wd_t)
+        p_slice.add_(other=update, alpha=-1.0)
+        ema.copy_(ema * decay_old_t + old_param * (1.0 - decay_old_t))
+        ema.copy_(ema * decay_new_t + p_slice.float() * (1.0 - decay_new_t))
+
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _adam_update_step_ema_terminal(
+        p_slice,
+        g_slice,
+        exp_avg,
+        exp_avg_sq,
+        ema,
+        beta1,
+        beta2,
+        eps,
+        step_size_t,
+        eff_wd_t,
+        decay_old_t,
+        decay_new_t,
+        blend,
+    ):
+        """Adam + two EMA observations + BF16 terminal blend in one graph."""
+        old_param = p_slice.float()
+        exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
+        update = exp_avg.div(exp_avg_sq.sqrt().add_(eps)).mul_(step_size_t)
+        mask = (update * p_slice) > 0
+        update.addcmul_(p_slice, mask, value=eff_wd_t)
+        p_slice.add_(other=update, alpha=-1.0)
+        ema.copy_(ema * decay_old_t + old_param * (1.0 - decay_old_t))
+        ema.copy_(ema * decay_new_t + p_slice.float() * (1.0 - decay_new_t))
+        blended = torch.lerp(p_slice.float(), ema, blend).to(p_slice.dtype).contiguous()
+        p_slice.copy_(blended)
+
+    def tail_ema_terminal_applied(self) -> bool:
+        """Confirm every configured readout shard took the terminal blend path."""
+        labels = ["lm_head", "embed"] if EMA_SCOPE == "readout" else ["lm_head"]
+        if EMA_DECAY <= 0.0:
+            return False
+        applied = [
+            self.param_states[self._param_by_label[label]].get("ema_terminal_blended", False)
+            for label in labels
+        ]
+        if not any(applied):
+            return False
+        if not all(applied):
+            raise RuntimeError("TailEMA terminal blend diverged across readout parameters")
+        return True
 
     # -----------------------------------
     # NorMuon update
@@ -1269,7 +1419,11 @@ class GPT(nn.Module):
         bound = (3 ** 0.5) * std
         with torch.no_grad():
             self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
-            self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
+            cproj_mult = float(os.environ.get("MLP_CPROJ_INIT_STD_MULT", "0.5"))
+            if cproj_mult == 0.0:
+                self.mlp_bank[:, 1, :, :].zero_()
+            else:
+                self.mlp_bank[:, 1, :, :].normal_(0, cproj_mult * model_dim ** -0.5)
 
     def init_misc(self, model_dim, num_layers):
         self.smear_gate = nn.Linear(12, 1, bias=False)
@@ -1794,8 +1948,8 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1285  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 15  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "1273"))
+    num_extension_iterations: int = int(os.environ.get("NUM_EXTENSION_ITERATIONS", "15"))
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
@@ -1893,6 +2047,8 @@ TRAINING_STAGES = [
 # TODO - Confirm.
 training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.60)
 #training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
+if EMA_DECAY > 0.0:
+    assert training_schedule.total_steps % 2 == 0, "fused TailEMA requires an even final step"
 
 def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
     # warmup phase: linearly increase momentum from min to max
@@ -2039,8 +2195,14 @@ class TrainingManager():
             if p_cfg.optim == "normuon":
                 p_cfg.momentum = muon_momentum
 
-        # Step optimizer with do_adam flag
-        self.optimizer.step(do_adam=do_adam)
+        # The final training iteration is an odd Adam step whose post-update
+        # tick is total_steps. Blend each local readout shard before that
+        # step's normal all-gather, so no separate terminal communication is
+        # needed.
+        terminal_ema = EMA_DECAY > 0.0 and step + 1 == training_schedule.total_steps
+        self.optimizer.step(
+            do_adam=do_adam, outer_step=step, terminal_ema=terminal_ema
+        )
 
         # At split step: copy lm_head optimizer state to embed and mark as split
         if step == self.split_step:
@@ -2173,7 +2335,28 @@ val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1,
 
 transition_steps = training_manager.get_transition_steps()
 # first and last pair of steps in each transition
-warmup_steps = sorted({0, 1} | {s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 2})
+ema_warmup = set()
+if EMA_DECAY > 0.0:
+    first_post_split_tick = next(
+        (tick for tick in range(EMA_START, training_schedule.total_steps + 1, EMA_EVERY)
+         if tick > training_manager.split_step),
+        None,
+    )
+    if first_post_split_tick is not None:
+        ema_compile_step = (
+            first_post_split_tick if first_post_split_tick % 2 == 1 else first_post_split_tick - 1
+        )
+        if 2 <= ema_compile_step < training_schedule.total_steps:
+            ema_warmup.add(ema_compile_step)
+    # Compile the terminal Adam/EMA/blend graph (for both post-split readout
+    # shard shapes) before timing. The model and optimizer are reset below.
+    ema_warmup.add(training_schedule.total_steps - 1)
+warmup_steps = sorted(
+    {0, 1}
+    | {s + offset for s in transition_steps for offset in [-2, -1, 0, 1]
+       if 2 <= s + offset <= training_schedule.total_steps}
+    | ema_warmup
+)
 print0(f"Sampling steps {warmup_steps} for warmup", console=True)
 for step in warmup_steps:
     training_manager.advance_schedule(step)
@@ -2200,6 +2383,12 @@ del val_loader, train_loader, initial_state
 model.quantize_mlp_fp8()
 model.train()
 
+print0(
+    f"Terminal-blended sharded TailEMA scope={EMA_SCOPE} start={EMA_START} every={EMA_EVERY} "
+    f"decay={EMA_DECAY} blend={EMA_BLEND}",
+    console=True,
+)
+
 ########################################
 #        Training and validation       #
 ########################################
@@ -2223,6 +2412,9 @@ for step in range(train_steps + 1):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
+        if last_step and EMA_DECAY > 0.0:
+            assert training_manager.optimizer.tail_ema_terminal_applied(), \
+                "TailEMA terminal blend did not run before final validation"
         model.eval()
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
