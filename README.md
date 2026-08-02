@@ -213,6 +213,8 @@ New records must:
 3. Not use any extra `torch._inductor.config` or `torch.compile` flags. (These can save a few seconds, but they can also make compilation take >30min. This rule was introduced after the 21st record.)
 4. Run faster than the prior record when baselined on the same hardware.
 
+Incorporating open PRs into a new record is strongly encouraged. This speeds up merges through peer validation and prevents new PRs from going stale due to conflicts with earlier, still-open PRs.
+
 Discretionary reasons why a PR may not be accepted:
 1. Disproportionately degrades the readability of the codebase. A 200 line kernel to drop 300ms is considered worthwhile. 500 lines that convolute the optimizer layout for a 50ms gain will likely be rejected.
 2. The current record is intentionally kept roughly 0.001-0.002 loss below 3.28 to make validation simpler. If a PR substantially consumes this buffer, it should do so in a way that outperforms a simple step count decrease, when measured at equivalent loss.
