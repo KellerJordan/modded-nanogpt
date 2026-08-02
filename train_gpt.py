@@ -40,6 +40,9 @@ from kernels import get_kernel
 from torch import Tensor, nn
 
 from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, quantize_transpose_mlp_down_weights, reduce_mlp_activation_scales, transpose_add, transpose_copy
+from dc_triton_kernels import (
+    dc_attention_postonly_nodd_correction_add_base_triton,
+)
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
