@@ -39,10 +39,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
-from dc_triton_kernels import (
-    dc_attention_postonly_nodd_correction_add_base_triton,
-)
+from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, quantize_transpose_mlp_down_weights, reduce_mlp_activation_scales, transpose_add, transpose_copy
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
@@ -1307,6 +1304,21 @@ class GPT(nn.Module):
             self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
 
+        num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        self.register_buffer("_mlp_down_act_scales", torch.ones(12, dtype=torch.float32))
+        self.register_buffer("_mlp_down_proj_scales", torch.ones(12, dtype=torch.float32))
+        self.register_buffer("_mlp_down_proj_next_scales", torch.ones(12, dtype=torch.float32))
+        self.register_buffer(
+            "_mlp_down_partial_amax",
+            torch.empty(11, num_sms, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_mlp_down_weight_partial_amax",
+            torch.empty(12, 576, dtype=torch.float32),
+            persistent=False,
+        )
+
     def init_misc(self, model_dim, num_layers):
         self.smear_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.smear_gate.weight)
@@ -1385,18 +1397,38 @@ class GPT(nn.Module):
         x = (F.linear(x, self.mudd_w2[id, :num_coef]) + self.mudd_b2[id, :num_coef]) * self._mudd_scale
         return x.split(1, dim=-1)
 
-    def quantize_mlp_fp8(self):
-        """Refresh the FP8 copy of the MLP up-projection weights after optimizer steps."""
+    def quantize_mlp_fp8(self, bootstrap_down=False):
+        """Refresh FP8 copies of both MLP projections after optimizer steps."""
         E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
         with torch.no_grad():
             if not hasattr(self, "_mlp_up_proj_f8"):
                 self._mlp_up_proj_f8 = torch.zeros_like(self.mlp_bank[:, 0], dtype=torch.float8_e4m3fn)
                 self._mlp_up_proj_scales = torch.ones(12, dtype=torch.float32, device=self.mlp_bank.device)
                 self._mlp_dequant_scale_buf = torch.ones(1, dtype=torch.float32, device=self.mlp_bank.device)
-            flat = self.mlp_bank[:, 0].view(12, -1)
-            scales = flat.abs().amax(dim=1).clamp(min=1e-12) / E4M3_MAX
-            self._mlp_up_proj_scales[:] = scales.float()
-            self._mlp_up_proj_f8[:] = (model.mlp_bank[:, 0] / scales.view(12, 1, 1)).to(torch.float8_e4m3fn)
+                hidden_dim, model_dim = self.mlp_bank.shape[-2:]
+                self._mlp_down_proj_f8_storage = torch.empty(
+                    12, model_dim, hidden_dim,
+                    dtype=torch.float8_e4m3fn,
+                    device=self.mlp_bank.device,
+                )
+                self._mlp_down_proj_f8 = self._mlp_down_proj_f8_storage.transpose(1, 2)
+
+            up_weights = self.mlp_bank[:, 0]
+            up_scales = up_weights.view(12, -1).abs().amax(dim=1).clamp(min=1e-12) / E4M3_MAX
+            self._mlp_up_proj_scales[:] = up_scales.float()
+            self._mlp_up_proj_f8[:] = (up_weights / up_scales.view(12, 1, 1)).to(torch.float8_e4m3fn)
+
+            down_weights = self.mlp_bank[:, 1]
+            if bootstrap_down:
+                down_scales = down_weights.view(12, -1).abs().amax(dim=1).clamp(min=1e-12) / E4M3_MAX
+                self._mlp_down_proj_next_scales.copy_(down_scales.float())
+            quantize_transpose_mlp_down_weights(
+                down_weights,
+                self._mlp_down_proj_f8_storage,
+                self._mlp_down_proj_next_scales,
+                self._mlp_down_proj_scales,
+                self._mlp_down_weight_partial_amax,
+            )
 
     def init_mudd_gate(self, model_dim: int):
         self._mudd_gate_scale = nn.Parameter(torch.tensor(0.1))
@@ -1464,6 +1496,8 @@ class GPT(nn.Module):
         if use_mlp_fp8:
             mlp_up_proj_f8 = self._mlp_up_proj_f8.unbind(0)
             mlp_up_proj_scales = [self._mlp_up_proj_scales[i:i+1] for i in range(12)]
+            mlp_down_proj_f8 = self._mlp_down_proj_f8.unbind(0)
+            mlp_down_proj_scales = [self._mlp_down_proj_scales[i:i+1] for i in range(12)]
 
         # ---- Unbind parameters (avoid select_backward kernels) ----
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
@@ -1537,6 +1571,7 @@ class GPT(nn.Module):
             c_proj = mlp_projs[i]
             if use_mlp_fp8:
                 up_proj_f8, up_proj_scale = mlp_up_proj_f8[i], mlp_up_proj_scales[i]
+                down_proj_f8, down_proj_scale = mlp_down_proj_f8[i], mlp_down_proj_scales[i]
             mu = None
 
             if i == 4:
@@ -1607,7 +1642,17 @@ class GPT(nn.Module):
                 amax = normed.detach().abs().max().clamp(min=1e-12)
                 x_f8 = (normed.detach() * (448.0 / amax)).to(torch.float8_e4m3fn)
                 self._mlp_dequant_scale_buf.copy_(up_proj_scale).mul_(amax).div_(448.0)
-                mlp_args = (c_fc, c_proj, up_proj_f8, self._mlp_dequant_scale_buf, x_f8)
+                mlp_args = (
+                    c_fc,
+                    c_proj,
+                    up_proj_f8,
+                    self._mlp_dequant_scale_buf,
+                    x_f8,
+                    down_proj_f8,
+                    down_proj_scale,
+                    self._mlp_down_act_scales[i:i+1],
+                    self._mlp_down_partial_amax[i],
+                )
             else:
                 mlp_args = (c_fc, c_proj)
 
@@ -1618,6 +1663,13 @@ class GPT(nn.Module):
 
             if i in self.cache_layers:
                 cache[i] = x
+
+        if use_mlp_fp8:
+            reduce_mlp_activation_scales(
+                self._mlp_down_partial_amax,
+                self._mlp_down_act_scales[:self.num_layers],
+                headroom=1.80,
+            )
 
         # Post-loop MUDD: 5 residual coefs over {cache[0], cache[7], cache[9], ve_bank0, cache[3]}.
         mu = self.forward_mudd(x, id=1, num_coef=5)
@@ -2200,7 +2252,7 @@ model.mudd_gate_b2.data = model.mudd_gate_b2.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 dist.broadcast(model.bigram_sign_table, 0)  # buffer, not in parameters()
-model.quantize_mlp_fp8()
+model.quantize_mlp_fp8(bootstrap_down=True)
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
@@ -2236,13 +2288,13 @@ for step in warmup_steps:
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
-    model.quantize_mlp_fp8()
+    model.quantize_mlp_fp8(bootstrap_down=True)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
 del val_loader, train_loader, initial_state
-model.quantize_mlp_fp8()
+model.quantize_mlp_fp8(bootstrap_down=True)
 model.train()
 
 ########################################
@@ -2307,7 +2359,7 @@ for step in range(train_steps + 1):
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
-    model.quantize_mlp_fp8()
+    model.quantize_mlp_fp8(bootstrap_down=(step < 16))
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)

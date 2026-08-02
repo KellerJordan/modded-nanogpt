@@ -401,7 +401,8 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
 
 @triton.jit
 def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
-                                 dequant_scale_ptr,
+                                 post_fp8_desc, partial_amax_ptr,
+                                 dequant_scale_ptr, activation_scale_ptr,
                                  M, N, K,
                                  BLOCK_SIZE_M: tl.constexpr,
                                  BLOCK_SIZE_N: tl.constexpr,
@@ -410,6 +411,7 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                                  NUM_SMS: tl.constexpr,
                                  FORWARD: tl.constexpr,
                                  USE_FP8: tl.constexpr,
+                                 EMIT_FP8: tl.constexpr,
                                  ):
     dtype = tl.bfloat16
     start_pid = tl.program_id(axis=0)
@@ -417,6 +419,9 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     num_tiles = num_pid_m * num_pid_n
+    partial_amax = 0.0
+    if EMIT_FP8:
+        inverse_activation_scale = 1.0 / tl.load(activation_scale_ptr)
 
     tile_id_c = start_pid - NUM_SMS
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
@@ -454,22 +459,101 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
             # (M, N) pre tensor never round-trips HBM.
             c0_post = tl.maximum(c0, 0)
             c0_post = c0_post * c0_post
-            c_desc.store([offs_am_c, offs_bn_c], c0_post)
-        else:
-            # aux holds `post`; relu(pre) = sqrt(post). dpre = 2 * (grad @ W2) * relu(pre).
-            c0_post = aux_desc.load([offs_am_c, offs_bn_c])
-            c0 = 2 * c0 * tl.sqrt(c0_post.to(tl.float32))
-            c_desc.store([offs_am_c, offs_bn_c], c0.to(dtype))
+            aux_desc.store([offs_am_c, offs_bn_c], c0_post)
+            if EMIT_FP8:
+                c0_fp8 = tl.minimum(c0_post * inverse_activation_scale, 448.0)
+                post_fp8_desc.store(
+                    [offs_am_c, offs_bn_c], c0_fp8.to(tl.float8e4nv)
+                )
+                partial_amax = tl.maximum(
+                    partial_amax,
+                    tl.max(tl.max(c0_post.to(tl.float32), axis=1), axis=0),
+                )
 
         c1 = acc1.to(dtype)
         if FORWARD:
             c1_post = tl.maximum(c1, 0)
             c1_post = c1_post * c1_post
-            c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
-        else:
-            c1_post = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
-            c1 = 2 * c1 * tl.sqrt(c1_post.to(tl.float32))
-            c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1.to(dtype))
+            aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
+            if EMIT_FP8:
+                c1_fp8 = tl.minimum(c1_post * inverse_activation_scale, 448.0)
+                post_fp8_desc.store(
+                    [offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2],
+                    c1_fp8.to(tl.float8e4nv),
+                )
+                partial_amax = tl.maximum(
+                    partial_amax,
+                    tl.max(tl.max(c1_post.to(tl.float32), axis=1), axis=0),
+                )
+
+    if EMIT_FP8:
+        tl.store(partial_amax_ptr + start_pid, partial_amax)
+
+
+@triton.jit
+def reduce_mlp_activation_scales_kernel(
+    partial_amax_ptr,
+    scale_ptr,
+    partial_stride,
+    partial_count: tl.constexpr,
+    HEADROOM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    layer = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    values = tl.load(
+        partial_amax_ptr + layer * partial_stride + offsets,
+        mask=offsets < partial_count,
+        other=0.0,
+    )
+    amax = tl.max(values, axis=0)
+    tl.store(scale_ptr + layer, tl.maximum(amax, 1.0e-12) * (HEADROOM / 448.0))
+
+
+@triton.jit
+def quantize_transpose_mlp_down_weights_kernel(
+    weight_ptr,
+    output_ptr,
+    next_scale_ptr,
+    used_scale_ptr,
+    partial_amax_ptr,
+    weight_layer_stride,
+    hidden_dim: tl.constexpr,
+    model_dim: tl.constexpr,
+    num_tiles_d: tl.constexpr,
+    num_tiles: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    layer = tl.program_id(0)
+    tile = tl.program_id(1)
+    tile_h = tile // num_tiles_d
+    tile_d = tile % num_tiles_d
+    offsets_h = tile_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    offsets_d = tile_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = (offsets_h[:, None] < hidden_dim) & (offsets_d[None, :] < model_dim)
+    input_offsets = (
+        layer * weight_layer_stride
+        + offsets_h[:, None] * model_dim
+        + offsets_d[None, :]
+    )
+    values = tl.load(weight_ptr + input_offsets, mask=mask, other=0.0).to(tl.float32)
+    scale = tl.load(next_scale_ptr + layer)
+    quantized = tl.maximum(tl.minimum(values / scale, 448.0), -448.0)
+    output_offsets = (
+        layer * model_dim * hidden_dim
+        + offsets_d[:, None] * hidden_dim
+        + offsets_h[None, :]
+    )
+    tl.store(
+        output_ptr + output_offsets,
+        tl.trans(quantized).to(tl.float8e4nv),
+        mask=tl.trans(mask),
+    )
+    tile_amax = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
+    tl.store(partial_amax_ptr + layer * num_tiles + tile, tile_amax)
+    if tile == 0:
+        tl.store(used_scale_ptr + layer, scale)
 
 
 _dummy_f32 = None  # lazily initialized 1-element tensor for unused pointer args
@@ -480,11 +564,21 @@ def _get_dummy_f32(device):
         _dummy_f32 = torch.zeros(1, dtype=torch.float32, device=device)
     return _dummy_f32
 
-def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=None):
+def linear_relu_square(
+    a,
+    b,
+    aux=None,
+    a_f8=None,
+    b_f8=None,
+    dequant_scale_ptr=None,
+    activation_scale=None,
+    partial_amax=None,
+):
     M, K = a.shape
     N, K = b.shape
     dtype = a.dtype
     use_fp8 = b_f8 is not None
+    emit_fp8 = activation_scale is not None
 
     c = torch.empty((M, N), device=a.device, dtype=dtype)
 
@@ -513,6 +607,20 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=N
     c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
     aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
 
+    if emit_fp8:
+        assert FORWARD and use_fp8 and partial_amax is not None
+        assert partial_amax.numel() >= NUM_SMS
+        post_fp8 = torch.empty((M, N), device=a.device, dtype=torch.float8_e4m3fn)
+        post_fp8_desc = TensorDescriptor.from_tensor(
+            post_fp8, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2]
+        )
+        num_stages = 3
+    else:
+        post_fp8 = None
+        post_fp8_desc = aux_desc
+        activation_scale = _get_dummy_f32(a.device)
+        partial_amax = _get_dummy_f32(a.device)
+
     def grid(META):
         return (min(
             NUM_SMS,
@@ -527,7 +635,8 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=N
 
     linear_relu_square_kernel[grid](
         a_desc, b_desc, c_desc, aux_desc,
-        dequant_scale_ptr,
+        post_fp8_desc, partial_amax,
+        dequant_scale_ptr, activation_scale,
         M, N, K,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
@@ -536,26 +645,65 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=N
         NUM_SMS=NUM_SMS,
         FORWARD=FORWARD,
         USE_FP8=use_fp8,
+        EMIT_FP8=emit_fp8,
         num_stages=num_stages,
         num_warps=num_warps
     )
 
-    # On the forward path `c` now holds `post`; no separate `pre` tensor is produced.
-    return c
+    if emit_fp8:
+        return c, aux, post_fp8
+    elif FORWARD:
+        return c, aux
+    else:
+        return c
 
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, W1, W2, W1_f8=None, dequant_scale=None, x_f8=None):
-        # Forward stores only `post = relu(x @ W1.T)^2`; `pre` is never materialized.
+    def forward(
+        ctx,
+        x,
+        W1,
+        W2,
+        W1_f8=None,
+        dequant_scale=None,
+        x_f8=None,
+        W2_f8=None,
+        W2_scale=None,
+        activation_scale=None,
+        partial_amax=None,
+    ):
         x_flat = x.view((-1, x.shape[-1]))
         if W1_f8 is not None:
             assert x_f8 is not None and dequant_scale is not None
             x_f8 = x_f8.view((-1, x_f8.shape[-1]))
-            post = linear_relu_square(x_flat, W1, a_f8=x_f8, b_f8=W1_f8, dequant_scale_ptr=dequant_scale)
+            if W2_f8 is not None:
+                assert W2_scale is not None and activation_scale is not None
+                assert partial_amax is not None
+                pre, post, post_f8 = linear_relu_square(
+                    x_flat,
+                    W1,
+                    a_f8=x_f8,
+                    b_f8=W1_f8,
+                    dequant_scale_ptr=dequant_scale,
+                    activation_scale=activation_scale,
+                    partial_amax=partial_amax,
+                )
+            else:
+                pre, post = linear_relu_square(x_flat, W1, a_f8=x_f8, b_f8=W1_f8, dequant_scale_ptr=dequant_scale)
         else:
-            post = linear_relu_square(x_flat, W1)
-        x3 = post @ W2
-        ctx.save_for_backward(x, W1, W2, post)
+            pre, post = linear_relu_square(x_flat, W1)
+        if W2_f8 is not None:
+            x3 = torch._scaled_mm(
+                post_f8,
+                W2_f8,
+                out_dtype=torch.bfloat16,
+                scale_a=activation_scale,
+                scale_b=W2_scale,
+                use_fast_accum=True,
+            )
+        else:
+            x3 = post @ W2
+        ctx.save_for_backward(x, W1, W2, pre, post)
         return x3.view(x.shape)
 
     @staticmethod
@@ -567,7 +715,57 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=post)
         dW1 = dpre.T @ x
         dx = dpre @ W1
-        return dx.view(x.shape), dW1, dW2, None, None, None
+        return dx.view(x.shape), dW1, dW2, None, None, None, None, None, None, None, None
+
+
+def reduce_mlp_activation_scales(partial_amax, scales, headroom=1.25):
+    num_layers, partial_count = partial_amax.shape
+    assert scales.numel() >= num_layers
+    block_size = triton.next_power_of_2(partial_count)
+    reduce_mlp_activation_scales_kernel[(num_layers,)](
+        partial_amax,
+        scales,
+        partial_amax.stride(0),
+        partial_count=partial_count,
+        HEADROOM=headroom,
+        BLOCK_SIZE=block_size,
+        num_stages=1,
+        num_warps=4,
+    )
+
+
+def quantize_transpose_mlp_down_weights(
+    weights,
+    output_storage,
+    next_scales,
+    used_scales,
+    partial_amax,
+    headroom=1.12,
+):
+    num_layers, hidden_dim, model_dim = weights.shape
+    assert output_storage.shape == (num_layers, model_dim, hidden_dim)
+    block_h = 64
+    block_d = 64
+    num_tiles_d = triton.cdiv(model_dim, block_d)
+    num_tiles = triton.cdiv(hidden_dim, block_h) * num_tiles_d
+    assert partial_amax.shape == (num_layers, num_tiles)
+    quantize_transpose_mlp_down_weights_kernel[(num_layers, num_tiles)](
+        weights,
+        output_storage,
+        next_scales,
+        used_scales,
+        partial_amax,
+        weights.stride(0),
+        hidden_dim=hidden_dim,
+        model_dim=model_dim,
+        num_tiles_d=num_tiles_d,
+        num_tiles=num_tiles,
+        BLOCK_H=block_h,
+        BLOCK_D=block_d,
+        num_stages=1,
+        num_warps=4,
+    )
+    reduce_mlp_activation_scales(partial_amax, next_scales, headroom=headroom)
 
 
 # -----------------------------------------------------------------------------
