@@ -58,7 +58,8 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@soren_dunn_](https://x.com/soren_dunn_), [@photon_mz](https://x.com/photon_mz), [@srashedll](https://x.com/srashedll), [@dhrvji](https://x.com/dhrvji),
 [@EmmettBicker](https://github.com/EmmettBicker), [@dualverse-ai](https://github.com/dualverse-ai), [@sisovicm](https://x.com/sisovicm),
 [@moof2x](https://github.com/moof2x), [@samacqua](https://github.com/samacqua), [@Lisennlp](https://github.com/Lisennlp),
-[@_djdumpling](https://x.com/_djdumpling), [@TrianX](https://x.com/TrianX), [@aryavohra](https://github.com/aryavohra)
+[@_djdumpling](https://x.com/_djdumpling), [@TrianX](https://x.com/TrianX), [@aryavohra](https://github.com/aryavohra),
+[@cong_ml](https://x.com/cong_ml)
 
 
 ---
@@ -197,7 +198,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 84 | 1.320 minutes | FP8 on MLP up-projection forward pass | 05/21/26 | [log](records/track_1_short/2026-05-19_FP8MLPUpProj/this_record/008bb79d-d5bc-4205-bd4e-5e4ae82e658c.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/306) | @sisovicm
 85 | 1.271 minutes | MUDD gates and Lightweight Dynamically Composable MHA | 05/27/26 | [log](records/track_1_short/2026-05-27-MuddGatedAndDC),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/315) | @Lisennlp
 86 | 1.266 minutes | Algebraic rewrite of XSA, same math faster execution | 05/27/26 | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/317) | @aryavohra
-
+87 | 1.256 minutes | Faster Implementation of Relu^2 Kernel | 06/11/26 | [log](records/track_1_short/2026-06-11_RecursiveFromBest/this_pr/00088a48-30a3-4ebd-9768-6061011337f4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/322) | @cong_ml and AI System [Recursive](https://www.recursive.com/)
 ## Rules
 
 New records must:
