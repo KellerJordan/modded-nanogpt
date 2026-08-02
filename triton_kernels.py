@@ -492,7 +492,7 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=N
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 256
-    BLOCK_SIZE_K = 64
+    BLOCK_SIZE_K = 128 if use_fp8 else 64
 
     FORWARD = False
     if aux is None:
@@ -540,17 +540,20 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=N
         num_warps=num_warps
     )
 
-    if FORWARD:
-        # `c` now holds `post`; no separate `pre` tensor is produced.
-        return c
-    else:
-        return c
+    # On the forward path `c` now holds `post`; no separate `pre` tensor is produced.
+    return c
 
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, W1, W2):
+    def forward(ctx, x, W1, W2, W1_f8=None, dequant_scale=None, x_f8=None):
         # Forward stores only `post = relu(x @ W1.T)^2`; `pre` is never materialized.
-        post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
+        x_flat = x.view((-1, x.shape[-1]))
+        if W1_f8 is not None:
+            assert x_f8 is not None and dequant_scale is not None
+            x_f8 = x_f8.view((-1, x_f8.shape[-1]))
+            post = linear_relu_square(x_flat, W1, a_f8=x_f8, b_f8=W1_f8, dequant_scale_ptr=dequant_scale)
+        else:
+            post = linear_relu_square(x_flat, W1)
         x3 = post @ W2
         ctx.save_for_backward(x, W1, W2, post)
         return x3.view(x.shape)
