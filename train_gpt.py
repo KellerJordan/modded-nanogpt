@@ -1168,24 +1168,34 @@ class CausalSelfAttention(nn.Module):
 def next_multiple_of_n(v: float | int, *, n: int):
     return math.ceil(v / n) * n
 
+# Preload (download + parse) the GPT-2 tokenizer at import, outside the timed region.
+# build_prefix_table then only pays the table construction itself.
+tiktoken.get_encoding("gpt2")
+
 def build_prefix_table(vocab_size: int) -> Tensor:
     """Constant lookup table mapping each token to its "prefix token".
 
     For prefix token prediction: T' is the token whose byte string is the longest
     proper prefix of token T's byte string that is itself a token in the vocabulary.
     Tokens without a valid prefix map to -1 for "ignore this term".
+
+    Derived only from the static GPT-2 vocabulary -- never from the training corpus.
+    Sorting byte strings puts every proper prefix before its extensions, so a stack of
+    live ancestors yields the longest one in O(V log V) instead of probing every length.
     """
-    enc = tiktoken.get_encoding("gpt2")
-    byte_to_id = enc._mergeable_ranks
-    table = torch.full((vocab_size,), -1, dtype=torch.int64)
-    for b, tid in byte_to_id.items():
-        # longest proper prefix (bytes) that is itself a token
-        for k in range(len(b) - 1, 0, -1):
-            pid = byte_to_id.get(b[:k])
-            if pid is not None:
-                table[tid] = pid
-                break
-    return table
+    byte_to_id = tiktoken.get_encoding("gpt2")._mergeable_ranks
+    table = [-1] * vocab_size
+    stack: list[bytes] = []  # ancestors of the current token, shortest first
+    stack_ids: list[int] = []
+    for b, tid in sorted(byte_to_id.items()):
+        while stack and not b.startswith(stack[-1]):
+            stack.pop()
+            stack_ids.pop()
+        if stack_ids:
+            table[tid] = stack_ids[-1]
+        stack.append(b)
+        stack_ids.append(tid)
+    return torch.tensor(table, dtype=torch.int64)
 
 @dataclass(slots=True)
 class ForwardScheduleConfig:
@@ -1205,8 +1215,10 @@ class GPT(nn.Module):
         # suggested by @Grad62304977, originates from Karpathy's experiments.
         self.vocab_size = next_multiple_of_n(vocab_size, n=128)
 
-        # Constant prefix-token lookup table for prefix token prediction
-        self.register_buffer("prefix_table", build_prefix_table(self.vocab_size), persistent=False)
+        # Prefix-token lookup table for prefix token prediction. Allocated here, but filled
+        # after the clock starts (see "start the clock") so the build is charged to training
+        # time. -1 means "no valid prefix" == term disabled, which is what warmup runs with.
+        self.register_buffer("prefix_table", torch.full((self.vocab_size,), -1, dtype=torch.int64), persistent=False)
 
         # Transposed weight storage for faster gradient accumulation
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
@@ -1281,7 +1293,7 @@ class GPT(nn.Module):
             self.vo_bank[:num_vo_real].uniform_(-bound, bound)
             self.vo_bank[num_vo_real:].zero_()
 
-    def init_mlp(self, model_dim):
+    def init_mlp(self, model_dim):        
         # MLP bank: stores c_fc and c_proj for all MLP layers
         # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
         mlp_hdim = 4 * model_dim
@@ -1480,7 +1492,7 @@ class GPT(nn.Module):
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
-
+        
         # Use sign-trick to better compress multiple bigrams into a shared bigram embedding row
         # (details in https://github.com/KellerJordan/modded-nanogpt/pull/299 by @trianxy)
         sign_idx = torch.zeros_like(input_seq)
@@ -1582,7 +1594,7 @@ class GPT(nn.Module):
                 attn_out = attn(attn_in_normed, attn_args, qkvo_w, dc_w)
 
                 if mu is not None:
-                    x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0]
+                    x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0] 
                     x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + mu[11] * x0_bigram
                 else:
                     x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0 * x0_gates[i]
@@ -2131,7 +2143,7 @@ class TrainingManager():
         self.row_update_mask.fill(0)
 
 
-
+        
 
 # -----------------------------------------------------------------------------
 # int main
@@ -2244,6 +2256,10 @@ training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
+# Prefix-token table build, inside the timed region. The tokenizer was loaded at import
+# (get_encoding is cached in tiktoken's registry), so this pays only the table construction.
+# In-place copy keeps the buffer's tensor identity, which the compiled graph holds.
+model.prefix_table.copy_(build_prefix_table(model.vocab_size))
 # begin training
 train_steps = training_schedule.total_steps
 for step in range(train_steps + 1):
@@ -2300,10 +2316,10 @@ for step in range(train_steps + 1):
 if args.run_evals:
     model.eval()
     from evals import hellaswag
-    hellaswag.evaluate(model=model,
-                       schedule_cfg=training_manager.get_forward_args(),
+    hellaswag.evaluate(model=model, 
+                       schedule_cfg=training_manager.get_forward_args(), 
                        seq_len=args.val_batch_size // (grad_accum_steps * world_size),
-                       get_bigram_hash=get_bigram_hash,
+                       get_bigram_hash=get_bigram_hash, 
                        print0=print0)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
