@@ -453,13 +453,10 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
         acc0, acc1 = tl.split(acc)
 
         c0 = acc0.to(dtype)
-        if not FORWARD:
-            c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
-            c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
-
-        c_desc.store([offs_am_c, offs_bn_c], c0)
-
         if FORWARD:
+            # Store ONLY post = relu(pre)^2 (drop the redundant `pre` materialization).
+            # Backward reconstructs relu(pre) = sqrt(post) in-kernel, so the full
+            # (M, N) pre tensor never round-trips HBM.
             c0_post = tl.maximum(c0, 0)
             c0_post = c0_post * c0_post
             aux_desc.store([offs_am_c, offs_bn_c], c0_post)
@@ -474,12 +471,6 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                 )
 
         c1 = acc1.to(dtype)
-        if not FORWARD:
-            c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
-            c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
-
-        c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
-
         if FORWARD:
             c1_post = tl.maximum(c1, 0)
             c1_post = c1_post * c1_post
@@ -591,16 +582,21 @@ def linear_relu_square(
 
     c = torch.empty((M, N), device=a.device, dtype=dtype)
 
-    FORWARD = False
-    if aux is None:
-        FORWARD = True
-        aux = torch.empty((M, N), device=a.device, dtype=dtype)
-
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 256
     BLOCK_SIZE_K = 128 if use_fp8 else 64
+
+    FORWARD = False
+    if aux is None:
+        FORWARD = True
+        # Forward stores only `post` (into `c`); aux_desc is never accessed on the
+        # forward path. Use a SEPARATE minimal [BM, BN//2] dummy (NOT `c`) so the two
+        # TMA descriptors don't alias the same buffer (aliasing can perturb the
+        # forward kernel's memory analysis / pipelining).
+        aux = torch.empty((BLOCK_SIZE_M, BLOCK_SIZE_N // 2), device=a.device, dtype=dtype)
+
     num_stages = 4 if FORWARD else 3
     num_warps = 8
 
@@ -712,9 +708,11 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, W1, W2, pre, post = ctx.saved_tensors
+        x, W1, W2, post = ctx.saved_tensors
         dW2 = post.T @ grad_output
-        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
+        # dpre kernel reconstructs relu(pre) = sqrt(post) from `post` (passed as aux),
+        # avoiding the redundant `pre` HBM read/write entirely.
+        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=post)
         dW1 = dpre.T @ x
         dx = dpre @ W1
         return dx.view(x.shape), dW1, dW2, None, None, None, None, None, None, None, None
@@ -950,6 +948,8 @@ __global__ void ce_fwd_bwd_kernel(
     const __nv_bfloat16* __restrict__ logits,
     const int64_t* __restrict__ targets,
     const float* __restrict__ mtp_weights,
+    const int64_t* __restrict__ prefix_targets,
+    const float* __restrict__ prefix_weight_ptr,
     float* __restrict__ losses,
     __nv_fp8_e5m2* grad_input,
     int batch_size,
@@ -969,6 +969,7 @@ __global__ void ce_fwd_bwd_kernel(
   float C = (float)C_param;
   float grad_s = (float)grad_s_param;
   float grad_scale = (float)grad_scale_param;
+  float prefix_weight = prefix_weight_ptr[0];
 
   extern __shared__ __nv_bfloat16 smem[];
 
@@ -1051,6 +1052,11 @@ __global__ void ce_fwd_bwd_kernel(
 
   float lse = block_max + __logf(block_sum);
 
+  // Prefix token prediction target for this position (T' = longest-prefix token of
+  // the immediate next-token target T). prefix_targets[i] < 0 => no valid prefix, ignored.
+  int64_t prefix_target = prefix_targets[blockIdx.x];
+  bool prefix_valid = (prefix_target >= 0 && prefix_target < VOCAB_SIZE);
+
   if (threadIdx.x == 0) {
     float total_loss = 0.0f;
     for (int k = 0; k < n_predict; k++) {
@@ -1064,10 +1070,17 @@ __global__ void ce_fwd_bwd_kernel(
         }
       }
     }
+    // Same CE logic as MTP, but the target is the prefix token T' at this position.
+    if (prefix_valid) {
+      float z_target = A * __bfloat162float(smem[prefix_target]);
+      total_loss += prefix_weight * (lse - z_target);
+    }
     losses[blockIdx.x] = total_loss;
   }
 
-  float S_w = 0.0f;
+  // Total weight over active predictions at this position (used in the softmax-normalizer
+  // gradient term). Include the prefix prediction only when it has a valid target.
+  float S_w = prefix_valid ? prefix_weight : 0.0f;
 
   for (int i = 0; i < n_predict; i++) {
     S_w += mtp_weights[i];
@@ -1100,32 +1113,48 @@ __global__ void ce_fwd_bwd_kernel(
 
   __syncthreads();
 
-  if (threadIdx.x < n_predict && blockIdx.x + threadIdx.x < batch_size) {
+  // Sparse correction for target columns. Threads [0, n_predict) handle the future MTP
+  // targets; thread n_predict handles the prefix target. term2 for a column sums the
+  // weights of every prediction (MTP + prefix) whose target lands on that column, so
+  // duplicate columns across threads write identical values (idempotent, race-free).
+  if (threadIdx.x <= n_predict) {
     int i = threadIdx.x;
-    int64_t target = targets[blockIdx.x + i];
+    int64_t target;
+    bool valid;
+    if (i < n_predict) {
+      int64_t target_idx = blockIdx.x + i;
+      valid = (target_idx < batch_size);
+      target = valid ? targets[target_idx] : -1;
+      valid = valid && (target >= 0 && target < VOCAB_SIZE);
+    } else {
+      target = prefix_target;
+      valid = prefix_valid;
+    }
 
-    float sigmoid_u = __bfloat162float(smem[target]);
-    float z = A * sigmoid_u;
-    float p = __expf(z - lse);
+    if (valid) {
+      float sigmoid_u = __bfloat162float(smem[target]);
+      float z = A * sigmoid_u;
+      float p = __expf(z - lse);
 
-    float term1 = S_w * p;
-    float term2 = 0.0f;
+      float term1 = S_w * p;
+      float term2 = 0.0f;
 
-    #pragma unroll
-    for (int k = 0; k < 3; k++) {
-      int64_t target_idx = blockIdx.x + k;
-      if (target_idx < batch_size && k < n_predict) {
-        if (targets[target_idx] == target) {
+      for (int k = 0; k < n_predict; k++) {
+        int64_t target_idx = blockIdx.x + k;
+        if (target_idx < batch_size && targets[target_idx] == target) {
           term2 += mtp_weights[k];
         }
       }
-    }
+      if (prefix_valid && prefix_target == target) {
+        term2 += prefix_weight;
+      }
 
-    float grad_z = term1 - term2;
-    float grad_x = grad_scale * (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
-    auto result_tmp = f32_to_fp8_e5m2(grad_x);
-    auto result = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
-    grad_input[blockIdx.x * VOCAB_SIZE + target] = result;
+      float grad_z = term1 - term2;
+      float grad_x = grad_scale * (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
+      auto result_tmp = f32_to_fp8_e5m2(grad_x);
+      auto result = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
+      grad_input[blockIdx.x * VOCAB_SIZE + target] = result;
+    }
   }
 }
 """
@@ -1144,6 +1173,8 @@ def ce_fwd_bwd(
     logits: torch.Tensor,
     targets: torch.Tensor,
     mtp_weights: torch.Tensor,
+    prefix_targets: torch.Tensor,
+    prefix_weight: torch.Tensor,
     losses: torch.Tensor,
     grad_input: torch.Tensor,
     n_rows: int,
@@ -1158,14 +1189,14 @@ def ce_fwd_bwd(
     ce_fwd_bwd_kernel(
         grid,
         (CE_KERNEL_BLOCK_SIZE, 1, 1),
-        (logits, targets, mtp_weights, losses, grad_input,
+        (logits, targets, mtp_weights, prefix_targets, prefix_weight, losses, grad_input,
          n_rows, n_predict, A, B, C, grad_s, grad_scale),
         shared_mem=CE_KERNEL_VOCAB_SIZE * 2,
     )
 
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, grad_scale, A=23.0, B=5.0, C=7.5):
+    def forward(ctx, x, targets, mtp_weights, prefix_targets, prefix_weight, lm_head_weight, x_s, w_s, grad_s, grad_scale, A=23.0, B=5.0, C=7.5):
 
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
         w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
@@ -1193,9 +1224,17 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         targets = targets.contiguous()
         mtp_weights = mtp_weights.contiguous()
 
+        if prefix_targets is None:
+            prefix_targets = torch.full((n_rows,), -1, dtype=torch.int64, device=logits.device)
+        prefix_targets = prefix_targets.contiguous()
+
+        if prefix_weight is None:
+            prefix_weight = torch.zeros(1, dtype=torch.float32, device=logits.device)
+        prefix_weight = prefix_weight.reshape(1).to(torch.float32).contiguous()
+
         grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
 
-        ce_fwd_bwd(logits, targets, mtp_weights, losses, grad_input,
+        ce_fwd_bwd(logits, targets, mtp_weights, prefix_targets, prefix_weight, losses, grad_input,
              n_rows, n_predict, A, B, C, grad_s, grad_scale)
 
         ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, grad_input)
@@ -1239,4 +1278,4 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             use_fast_accum=False,
         )
 
-        return grad_x, None, None, grad_w, None, None, None
+        return grad_x, None, None, None, None, grad_w, None, None, None
