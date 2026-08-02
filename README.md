@@ -14,7 +14,7 @@ This improvement in training speed has been brought about by the following techn
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU²
 * The Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[repo](https://github.com/KellerJordan/Muon)]
 * Use FP8 for head, and asymmetric rescale and softcap logits
-* Use FP8 on MLP up projection forward pass
+* Use FP8 on MLP forward pass
 * Initialization of projections to zero (muP-like)
 * Skip connections from embedding to every block as well as from block 3 to 6
 * Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
@@ -60,7 +60,7 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@EmmettBicker](https://github.com/EmmettBicker), [@dualverse-ai](https://github.com/dualverse-ai), [@sisovicm](https://x.com/sisovicm),
 [@moof2x](https://github.com/moof2x), [@samacqua](https://github.com/samacqua), [@Lisennlp](https://github.com/Lisennlp),
 [@_djdumpling](https://x.com/_djdumpling), [@TrianX](https://x.com/TrianX), [@aryavohra](https://github.com/aryavohra),
-[@cong_ml](https://x.com/cong_ml), [@jvarho](https://github.com/jvarho)
+[@cong_ml](https://x.com/cong_ml), [@jvarho](https://github.com/jvarho), [@Mister-dev-oss](https://github.com/Mister-dev-oss), [@CerovazS](https://github.com/CerovazS), [@MarioPaerle](https://github.com/MarioPaerle), [@GabrieleCirillo](https://github.com/GabrieleCirillo), [@crisostomi](https://github.com/crisostomi)
 
 
 ---
@@ -201,6 +201,9 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 86 | 1.266 minutes | Algebraic rewrite of XSA, same math faster execution | 05/27/26 | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/317) | @aryavohra
 87 | 1.256 minutes | Faster Implementation of Relu^2 Kernel | 06/11/26 | [log](records/track_1_short/2026-06-11_RecursiveFromBest/this_pr/00088a48-30a3-4ebd-9768-6061011337f4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/322) | @cong_ml and AI System [Recursive](https://www.recursive.com/)
 88 | 1.243 minutes | Prefix token prediction auxiliary loss | 07/13/26 | [log](records/track_1_short/2026-07-13_PrefixTokenPrediction/prefix-1375/1b20ccf2-cb2f-4b6b-bc8a-2d9cd146f549.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/337) | @jvarho
+89 | 1.23 minutes | MLP down projection in FP8 with efficient delayed scaling metric | 07/17/26 | [log](records/track_1_short/2026-07-17_FP8DownProjection/this_pr/11cb620c-daaf-4e85-83fc-258a5eb7ba09.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/342)  | @Mister-dev-oss, @CerovazS, @MarioPaerle, @GabrieleCirillo, @crisostomi
+
+
 ## Rules
 
 New records must:
