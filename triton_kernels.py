@@ -459,7 +459,7 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
             # (M, N) pre tensor never round-trips HBM.
             c0_post = tl.maximum(c0, 0)
             c0_post = c0_post * c0_post
-            aux_desc.store([offs_am_c, offs_bn_c], c0_post)
+            c_desc.store([offs_am_c, offs_bn_c], c0_post)
             if EMIT_FP8:
                 c0_fp8 = tl.minimum(c0_post * inverse_activation_scale, 448.0)
                 post_fp8_desc.store(
@@ -469,12 +469,17 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                     partial_amax,
                     tl.max(tl.max(c0_post.to(tl.float32), axis=1), axis=0),
                 )
+        else:
+            # aux holds `post`; relu(pre) = sqrt(post). dpre = 2 * (grad @ W2) * relu(pre).
+            c0_post = aux_desc.load([offs_am_c, offs_bn_c])
+            c0 = 2 * c0 * tl.sqrt(c0_post.to(tl.float32))
+            c_desc.store([offs_am_c, offs_bn_c], c0.to(dtype))
 
         c1 = acc1.to(dtype)
         if FORWARD:
             c1_post = tl.maximum(c1, 0)
             c1_post = c1_post * c1_post
-            aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
+            c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
             if EMIT_FP8:
                 c1_fp8 = tl.minimum(c1_post * inverse_activation_scale, 448.0)
                 post_fp8_desc.store(
@@ -485,6 +490,10 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                     partial_amax,
                     tl.max(tl.max(c1_post.to(tl.float32), axis=1), axis=0),
                 )
+        else:
+            c1_post = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
+            c1 = 2 * c1 * tl.sqrt(c1_post.to(tl.float32))
+            c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1.to(dtype))
 
     if EMIT_FP8:
         tl.store(partial_amax_ptr + start_pid, partial_amax)
@@ -650,12 +659,10 @@ def linear_relu_square(
         num_warps=num_warps
     )
 
+    # On the forward path `c` now holds `post`; no separate `pre` tensor is produced.
     if emit_fp8:
-        return c, aux, post_fp8
-    elif FORWARD:
-        return c, aux
-    else:
-        return c
+        return c, post_fp8
+    return c
 
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
@@ -672,14 +679,17 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         activation_scale=None,
         partial_amax=None,
     ):
+        # Forward stores only `post = relu(x @ W1.T)^2`; `pre` is never materialized.
         x_flat = x.view((-1, x.shape[-1]))
         if W1_f8 is not None:
             assert x_f8 is not None and dequant_scale is not None
             x_f8 = x_f8.view((-1, x_f8.shape[-1]))
             if W2_f8 is not None:
+                # Also emit an FP8 copy of `post` (plus per-SM partial amax) so the down
+                # projection can run through _scaled_mm.
                 assert W2_scale is not None and activation_scale is not None
                 assert partial_amax is not None
-                pre, post, post_f8 = linear_relu_square(
+                post, post_f8 = linear_relu_square(
                     x_flat,
                     W1,
                     a_f8=x_f8,
@@ -689,9 +699,9 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
                     partial_amax=partial_amax,
                 )
             else:
-                pre, post = linear_relu_square(x_flat, W1, a_f8=x_f8, b_f8=W1_f8, dequant_scale_ptr=dequant_scale)
+                post = linear_relu_square(x_flat, W1, a_f8=x_f8, b_f8=W1_f8, dequant_scale_ptr=dequant_scale)
         else:
-            pre, post = linear_relu_square(x_flat, W1)
+            post = linear_relu_square(x_flat, W1)
         if W2_f8 is not None:
             x3 = torch._scaled_mm(
                 post_f8,
@@ -703,7 +713,8 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             )
         else:
             x3 = post @ W2
-        ctx.save_for_backward(x, W1, W2, pre, post)
+        # Backward stays BF16: it consumes `post` (and W2), not their FP8 copies.
+        ctx.save_for_backward(x, W1, W2, post)
         return x3.view(x.shape)
 
     @staticmethod
@@ -715,7 +726,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=post)
         dW1 = dpre.T @ x
         dx = dpre @ W1
-        return dx.view(x.shape), dW1, dW2, None, None, None, None, None, None, None, None
+        return dx.view(x.shape), dW1, dW2, None, None, None, None, None, None, None
 
 
 def reduce_mlp_activation_scales(partial_amax, scales, headroom=1.25):
