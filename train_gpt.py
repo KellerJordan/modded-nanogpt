@@ -14,6 +14,7 @@ with open(os.path.join(os.path.dirname(sys.argv[0]), 'dc_triton_kernels.py'), 'r
 import copy
 import glob
 import math
+import random
 import threading
 import time
 import uuid
@@ -1167,12 +1168,31 @@ class CausalSelfAttention(nn.Module):
 def next_multiple_of_n(v: float | int, *, n: int):
     return math.ceil(v / n) * n
 
+# Topological whole-block dropout adapted from Don't Drop Dropout:
+# https://openreview.net/forum?id=AEHn9ya4Re
+LAYER_DROPOUT_LAYERS = (1, 3, 5, 7, 9)
+
+def decreasing_layer_dropout_probability(
+    pmax: float,
+    step: int,
+    plateau_iterations: int,
+    decay_iterations: int,
+) -> float:
+    if step < plateau_iterations:
+        return pmax
+    decay_step = step - plateau_iterations
+    if decay_step >= decay_iterations:
+        return 0.0
+    return pmax * (1 - decay_step / max(decay_iterations - 1, 1))
+
 @dataclass(slots=True)
 class ForwardScheduleConfig:
     mtp_weights: torch.Tensor
     ws_short: int
     ws_long: int
     train_max_seq_len: int
+    dropped_layer: int
+    layer_dropout_scale: torch.Tensor
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
@@ -1493,6 +1513,19 @@ class GPT(nn.Module):
         # cache[0] = residual stream after bigram injection (input to layer 0).
         cache = {0: x}
         for i in range(self.num_layers):
+            # Only odd blocks are forward-equivalent here: the even blocks have
+            # special skip, gate, or MUDD roles. A skipped cache block snapshots
+            # its unchanged input so downstream references remain well-defined.
+            if self.training and i == schedule_cfg.dropped_layer:
+                if i in self.cache_layers:
+                    cache[i] = x
+                continue
+
+            layer_dropout_scale = (
+                schedule_cfg.layer_dropout_scale.type_as(x)
+                if self.training and args.layer_dropout_pmax > 0 and i % 2 == 1
+                else None
+            )
             is_paired = i in self.paired_head_layers
             yarn = self.yarn_paired_head if is_paired else self.yarn
             attn = self.attn_paired if is_paired else self.attn
@@ -1559,10 +1592,20 @@ class GPT(nn.Module):
                 if mu is not None:
                     x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0] 
                     x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + mu[11] * x0_bigram
-                else:
+                elif layer_dropout_scale is None:
                     x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0 * x0_gates[i]
                     if i != 0:
                         x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + x0_bigram * bigram_gates[i]
+                else:
+                    # One shared block mask and the paper's inverse-density
+                    # scale are applied to both attention and MLP residuals.
+                    resid_scale = 1 + layer_dropout_scale * (resid_lambdas_attn[i] - 1)
+                    x = resid_scale * x + layer_dropout_scale * (
+                        post_lambdas_attn[i] * attn_out + x0 * x0_gates[i]
+                    )
+                    x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + (
+                        layer_dropout_scale * x0_bigram * bigram_gates[i]
+                    )
 
             # process mlp
             normed = norm(x)
@@ -1576,8 +1619,13 @@ class GPT(nn.Module):
 
             if mu is not None:
                 x = mu[12] * x + mu[13] * ReLUSqrdMLP(normed, *mlp_args)
-            else:
+            elif layer_dropout_scale is None:
                 x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(normed, *mlp_args)
+            else:
+                resid_scale = 1 + layer_dropout_scale * (resid_lambdas_mlp[i] - 1)
+                x = resid_scale * x + (
+                    layer_dropout_scale * post_lambdas_mlp[i] * ReLUSqrdMLP(normed, *mlp_args)
+                )
 
             if i in self.cache_layers:
                 cache[i] = x
@@ -1796,6 +1844,7 @@ class Hyperparameters:
     # schedule
     num_scheduled_iterations: int = 1285  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 15  # number of steps to continue training at final lr and ws
+    layer_dropout_recovery_iterations: int = int(os.environ.get("LAYER_DROPOUT_RECOVERY_ITERATIONS", 8))
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
@@ -1805,12 +1854,23 @@ class Hyperparameters:
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
+    # Topological whole-block dropout is the submitted default. Set pmax and
+    # recovery iterations to zero to reproduce the 1,300-step baseline.
+    layer_dropout_pmax: float = float(os.environ.get("LAYER_DROPOUT_PMAX", 0.20))
+    layer_dropout_seed: int = int(os.environ.get("LAYER_DROPOUT_SEED", 1337))
+    layer_dropout_plateau_iterations: int = int(os.environ.get("LAYER_DROPOUT_PLATEAU_ITERATIONS", 400))
+    layer_dropout_decay_iterations: int = int(os.environ.get("LAYER_DROPOUT_DECAY_ITERATIONS", 100))
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 15 // 2
     bigram_dim: int = 768
     bigram_sign_table_rows: int = 8192  # prefer a power of 2 (values ~500-15000 gave similar results)
 
 args = Hyperparameters()
+assert 0 <= args.layer_dropout_pmax < 1
+assert args.layer_dropout_pmax * len(LAYER_DROPOUT_LAYERS) <= 1
+assert args.layer_dropout_recovery_iterations >= 0
+assert args.layer_dropout_plateau_iterations >= 0
+assert args.layer_dropout_decay_iterations >= 1
 
 @dataclass(slots=True)
 class TrainingStage:
@@ -1891,18 +1951,23 @@ TRAINING_STAGES = [
 ]
 
 # TODO - Confirm.
-training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.60)
+training_schedule = TrainingSchedule(
+    TRAINING_STAGES, args.num_scheduled_iterations,
+    args.num_extension_iterations + args.layer_dropout_recovery_iterations,
+    cooldown_frac=0.60,
+)
 #training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
 
 def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
     # warmup phase: linearly increase momentum from min to max
     # cooldown phase: linearly decrease momentum from max to min
-    momentum_cd_start = training_schedule.total_steps - muon_cooldown_steps
+    # Recovery extends the already-cooled state without shifting the baseline.
+    momentum_cd_start = args.num_scheduled_iterations + args.num_extension_iterations - muon_cooldown_steps
     if step < muon_warmup_steps:
         frac = step / muon_warmup_steps
         momentum = momentum_min + frac * (momentum_max - momentum_min)
     elif step > momentum_cd_start:
-        frac = (step - momentum_cd_start) / muon_cooldown_steps
+        frac = min(1.0, (step - momentum_cd_start) / muon_cooldown_steps)
         momentum = momentum_max - frac * (momentum_max - momentum_min)
     else:
         momentum = momentum_max
@@ -1989,17 +2054,36 @@ class TrainingManager():
         # Split embed from lm_head at 2/3 of training (on an odd step so Adam updates)
         self.split_step = training_schedule.split_step
 
+        # Restrict dropout to alternating ordinary blocks. The topological
+        # variant won the equal-budget H100 ablation: it samples uniformly over
+        # safe blocks, so all retained blocks share one scale.
+        self.layer_dropout_scale = torch.ones((), dtype=torch.float32, device=device)
+        self._layer_dropout_event_rng = random.Random(args.layer_dropout_seed)
+        self._layer_dropout_cursor = 0
+        self.layer_dropout_probability = 0.0
+
         self.reset()
 
     def apply_final_ws_ext(self):
         self.ws_long = training_schedule.ws_post_yarn_ext
 
-    def get_forward_args(self):
+    def get_forward_args(self, dropped_layer: int | None = None):
+        if dropped_layer is None:
+            dropped_layer = -1
+            if self.model.training:
+                event_probability = len(LAYER_DROPOUT_LAYERS) * self.layer_dropout_probability
+                if event_probability > 0 and self._layer_dropout_event_rng.random() < event_probability:
+                    dropped_layer = LAYER_DROPOUT_LAYERS[
+                        (self._layer_dropout_cursor + rank) % len(LAYER_DROPOUT_LAYERS)
+                    ]
+                    self._layer_dropout_cursor += 1
         return ForwardScheduleConfig(
             mtp_weights = self.mtp_weights,
             ws_short = self.ws_short * self.block_size,
             ws_long = self.ws_long * self.block_size,
-            train_max_seq_len = self.train_max_seq_len
+            train_max_seq_len = self.train_max_seq_len,
+            dropped_layer = dropped_layer,
+            layer_dropout_scale = self.layer_dropout_scale,
         )
 
     def _is_adam_step(self, step: int):
@@ -2027,6 +2111,14 @@ class TrainingManager():
 
         self.ws_long = new_ws_long
         self.mtp_weights = training_schedule.mtp_weights[step]
+
+        self.layer_dropout_probability = decreasing_layer_dropout_probability(
+            args.layer_dropout_pmax,
+            step,
+            args.layer_dropout_plateau_iterations,
+            args.layer_dropout_decay_iterations,
+        )
+        self.layer_dropout_scale.fill_(1 / (1 - self.layer_dropout_probability))
 
     def step_optimizers(self, step: int):
         step_lr = training_schedule.get_lr(step)
@@ -2057,6 +2149,10 @@ class TrainingManager():
         self.ws_short, self.ws_long = stage.window_sizes
         self.batch_size = stage.batch_size
         self.train_max_seq_len = stage.train_max_seq_len
+        self.layer_dropout_probability = args.layer_dropout_pmax
+        self.layer_dropout_scale.fill_(1 / (1 - self.layer_dropout_probability))
+        self._layer_dropout_event_rng.seed(args.layer_dropout_seed)
+        self._layer_dropout_cursor = 0
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
         if _sparse_comms_active():
@@ -2182,6 +2278,25 @@ for step in warmup_steps:
         inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
         model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
     model.train()
+    # Compile the baseline plus all five sparse graphs up front. Otherwise different
+    # ranks can first encounter different graphs and stall at collectives.
+    if (
+        step in {warmup_steps[0], *transition_steps}
+        and training_manager.layer_dropout_probability > 0
+    ):
+        send_args = training_manager.train_loader_send_args
+        inputs, targets, cum_seqlens, bigram_inputs, _ = train_loader.send(send_args)
+        for dropped_layer in (-1, *LAYER_DROPOUT_LAYERS):
+            loss = model(
+                inputs,
+                targets,
+                cum_seqlens,
+                bigram_inputs,
+                training_manager.get_forward_args(dropped_layer=dropped_layer),
+            ).sum() * grad_scale
+            loss.backward()
+            model.zero_grad(set_to_none=True)
+            del loss
     for idx in range(grad_accum_steps):
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
