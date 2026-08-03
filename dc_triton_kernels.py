@@ -292,7 +292,9 @@ def _dc_postonly_corr_fwd_wsmall_cached_kernel(
     CU_SEARCH_ITERS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    DQK: tl.constexpr,
+    BLOCK_DQK: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
     STORE_AUX: tl.constexpr,
     STORE_A_BUF: tl.constexpr,
     ADD_BASE: tl.constexpr,
@@ -304,9 +306,11 @@ def _dc_postonly_corr_fwd_wsmall_cached_kernel(
     if k_start < 0:
         k_start = 0
     k_offs = k_start + tl.arange(0, BLOCK_K)
-    d_offs = tl.arange(0, BLOCK_D)
+    dqk_offs = tl.arange(0, BLOCK_DQK)
+    dv_offs = tl.arange(0, BLOCK_DV)
     q_mask = q_offs < T
-    d_mask = d_offs < BLOCK_D
+    dqk_mask = dqk_offs < DQK
+    dv_mask = dv_offs < BLOCK_DV
     doc_start = tl.load(DOC_START_TABLE + q_offs, mask=q_mask, other=0).to(tl.int64)
     doc_end = tl.load(DOC_END_TABLE + q_offs, mask=q_mask, other=0).to(tl.int64)
     rel = q_offs[:, None] - k_offs[None, :]
@@ -321,63 +325,63 @@ def _dc_postonly_corr_fwd_wsmall_cached_kernel(
 
     if STORE_AUX:
         p0, w10, lse0 = _dc_postonly_probs_wsmall_head(
-            Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid,
+            Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid,
             stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
             stride_w1t, stride_w1h, scaling, T=T, H=0,
         )
         p1, w11, lse1 = _dc_postonly_probs_wsmall_head(
-            Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid,
+            Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid,
             stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
             stride_w1t, stride_w1h, scaling, T=T, H=1,
         )
         p2, w12, lse2 = _dc_postonly_probs_wsmall_head(
-            Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid,
+            Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid,
             stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
             stride_w1t, stride_w1h, scaling, T=T, H=2,
         )
         p3, w13, lse3 = _dc_postonly_probs_wsmall_head(
-            Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid,
+            Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid,
             stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
             stride_w1t, stride_w1h, scaling, T=T, H=3,
         )
         p4, w14, lse4 = _dc_postonly_probs_wsmall_head(
-            Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid,
+            Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid,
             stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
             stride_w1t, stride_w1h, scaling, T=T, H=4,
         )
         p5, w15, lse5 = _dc_postonly_probs_wsmall_head(
-            Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid,
+            Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid,
             stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
             stride_w1t, stride_w1h, scaling, T=T, H=5,
         )
     else:
         p0, w10 = _dc_postonly_probs_wsmall_head_no_lse(
-            Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid,
+            Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid,
             stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
             stride_w1t, stride_w1h, scaling, T=T, H=0,
         )
         p1, w11 = _dc_postonly_probs_wsmall_head_no_lse(
-            Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid,
+            Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid,
             stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
             stride_w1t, stride_w1h, scaling, T=T, H=1,
         )
         p2, w12 = _dc_postonly_probs_wsmall_head_no_lse(
-            Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid,
+            Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid,
             stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
             stride_w1t, stride_w1h, scaling, T=T, H=2,
         )
         p3, w13 = _dc_postonly_probs_wsmall_head_no_lse(
-            Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid,
+            Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid,
             stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
             stride_w1t, stride_w1h, scaling, T=T, H=3,
         )
         p4, w14 = _dc_postonly_probs_wsmall_head_no_lse(
-            Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid,
+            Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid,
             stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
             stride_w1t, stride_w1h, scaling, T=T, H=4,
         )
         p5, w15 = _dc_postonly_probs_wsmall_head_no_lse(
-            Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid,
+            Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid,
             stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
             stride_w1t, stride_w1h, scaling, T=T, H=5,
         )
@@ -403,37 +407,37 @@ def _dc_postonly_corr_fwd_wsmall_cached_kernel(
         tl.store(LSE + q_offs.to(tl.int64) * stride_lt + 4 * stride_lh, lse4, mask=q_mask)
         tl.store(LSE + q_offs.to(tl.int64) * stride_lt + 5 * stride_lh, lse5, mask=q_mask)
     _dc_postonly_store_corr_wsmall_head(
-        V, POST_W2, BASE, OUT, a_acc, q_offs, k_offs, d_offs, q_mask, d_mask,
+        V, POST_W2, BASE, OUT, a_acc, q_offs, k_offs, dv_offs, q_mask, dv_mask,
         stride_vt, stride_vh, stride_vd, stride_w2t, stride_w2h,
         stride_bh, stride_bt, stride_bd, stride_oh, stride_ot, stride_od,
         T=T, H=0, ADD_BASE=ADD_BASE,
     )
     _dc_postonly_store_corr_wsmall_head(
-        V, POST_W2, BASE, OUT, a_acc, q_offs, k_offs, d_offs, q_mask, d_mask,
+        V, POST_W2, BASE, OUT, a_acc, q_offs, k_offs, dv_offs, q_mask, dv_mask,
         stride_vt, stride_vh, stride_vd, stride_w2t, stride_w2h,
         stride_bh, stride_bt, stride_bd, stride_oh, stride_ot, stride_od,
         T=T, H=1, ADD_BASE=ADD_BASE,
     )
     _dc_postonly_store_corr_wsmall_head(
-        V, POST_W2, BASE, OUT, a_acc, q_offs, k_offs, d_offs, q_mask, d_mask,
+        V, POST_W2, BASE, OUT, a_acc, q_offs, k_offs, dv_offs, q_mask, dv_mask,
         stride_vt, stride_vh, stride_vd, stride_w2t, stride_w2h,
         stride_bh, stride_bt, stride_bd, stride_oh, stride_ot, stride_od,
         T=T, H=2, ADD_BASE=ADD_BASE,
     )
     _dc_postonly_store_corr_wsmall_head(
-        V, POST_W2, BASE, OUT, a_acc, q_offs, k_offs, d_offs, q_mask, d_mask,
+        V, POST_W2, BASE, OUT, a_acc, q_offs, k_offs, dv_offs, q_mask, dv_mask,
         stride_vt, stride_vh, stride_vd, stride_w2t, stride_w2h,
         stride_bh, stride_bt, stride_bd, stride_oh, stride_ot, stride_od,
         T=T, H=3, ADD_BASE=ADD_BASE,
     )
     _dc_postonly_store_corr_wsmall_head(
-        V, POST_W2, BASE, OUT, a_acc, q_offs, k_offs, d_offs, q_mask, d_mask,
+        V, POST_W2, BASE, OUT, a_acc, q_offs, k_offs, dv_offs, q_mask, dv_mask,
         stride_vt, stride_vh, stride_vd, stride_w2t, stride_w2h,
         stride_bh, stride_bt, stride_bd, stride_oh, stride_ot, stride_od,
         T=T, H=4, ADD_BASE=ADD_BASE,
     )
     _dc_postonly_store_corr_wsmall_head(
-        V, POST_W2, BASE, OUT, a_acc, q_offs, k_offs, d_offs, q_mask, d_mask,
+        V, POST_W2, BASE, OUT, a_acc, q_offs, k_offs, dv_offs, q_mask, dv_mask,
         stride_vt, stride_vh, stride_vd, stride_w2t, stride_w2h,
         stride_bh, stride_bt, stride_bd, stride_oh, stride_ot, stride_od,
         T=T, H=5, ADD_BASE=ADD_BASE,
@@ -641,7 +645,9 @@ def _dc_postonly_corr_bwd_pre_wsmall_kernel(
     CU_SEARCH_ITERS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    DQK: tl.constexpr,
+    BLOCK_DQK: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     q_start = pid_m * BLOCK_M
@@ -650,9 +656,11 @@ def _dc_postonly_corr_bwd_pre_wsmall_kernel(
     if k_start < 0:
         k_start = 0
     k_offs = k_start + tl.arange(0, BLOCK_K)
-    d_offs = tl.arange(0, BLOCK_D)
+    dqk_offs = tl.arange(0, BLOCK_DQK)
+    dv_offs = tl.arange(0, BLOCK_DV)
     q_mask = q_offs < T
-    d_mask = d_offs < BLOCK_D
+    dqk_mask = dqk_offs < DQK
+    dv_mask = dv_offs < BLOCK_DV
     doc_start = tl.load(DOC_START_TABLE + q_offs, mask=q_mask, other=0).to(tl.int64)
     doc_end = tl.load(DOC_END_TABLE + q_offs, mask=q_mask, other=0).to(tl.int64)
     rel = q_offs[:, None] - k_offs[None, :]
@@ -672,32 +680,32 @@ def _dc_postonly_corr_bwd_pre_wsmall_kernel(
     lse4 = tl.load(LSE + q_offs.to(tl.int64) * stride_lt + 4 * stride_lh, mask=q_mask, other=0.0).to(tl.float32)
     lse5 = tl.load(LSE + q_offs.to(tl.int64) * stride_lt + 5 * stride_lh, mask=q_mask, other=0.0).to(tl.float32)
     p0, _w10 = _dc_postonly_probs_loop_head(
-        Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid, lse0,
+        Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid, lse0,
         stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
         stride_w1t, stride_w1h, scaling, T=T, H=0,
     )
     p1, _w11 = _dc_postonly_probs_loop_head(
-        Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid, lse1,
+        Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid, lse1,
         stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
         stride_w1t, stride_w1h, scaling, T=T, H=1,
     )
     p2, _w12 = _dc_postonly_probs_loop_head(
-        Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid, lse2,
+        Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid, lse2,
         stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
         stride_w1t, stride_w1h, scaling, T=T, H=2,
     )
     p3, _w13 = _dc_postonly_probs_loop_head(
-        Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid, lse3,
+        Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid, lse3,
         stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
         stride_w1t, stride_w1h, scaling, T=T, H=3,
     )
     p4, _w14 = _dc_postonly_probs_loop_head(
-        Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid, lse4,
+        Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid, lse4,
         stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
         stride_w1t, stride_w1h, scaling, T=T, H=4,
     )
     p5, _w15 = _dc_postonly_probs_loop_head(
-        Q, K, POST_W1, q_offs, k_offs, d_offs, q_mask, d_mask, valid, lse5,
+        Q, K, POST_W1, q_offs, k_offs, dqk_offs, q_mask, dqk_mask, valid, lse5,
         stride_qt, stride_qh, stride_qd, stride_kt, stride_kh, stride_kd,
         stride_w1t, stride_w1h, scaling, T=T, H=5,
     )
@@ -712,37 +720,37 @@ def _dc_postonly_corr_bwd_pre_wsmall_kernel(
     )
     da_acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
     da_acc = _dc_postonly_corr_bwd_pre_wsmall_dm_head(
-        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, d_offs, d_mask,
+        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, dv_offs, dv_mask,
         stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
         stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d,
         stride_gwt, stride_gwh, T=T, H=0,
     )
     da_acc = _dc_postonly_corr_bwd_pre_wsmall_dm_head(
-        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, d_offs, d_mask,
+        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, dv_offs, dv_mask,
         stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
         stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d,
         stride_gwt, stride_gwh, T=T, H=1,
     )
     da_acc = _dc_postonly_corr_bwd_pre_wsmall_dm_head(
-        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, d_offs, d_mask,
+        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, dv_offs, dv_mask,
         stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
         stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d,
         stride_gwt, stride_gwh, T=T, H=2,
     )
     da_acc = _dc_postonly_corr_bwd_pre_wsmall_dm_head(
-        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, d_offs, d_mask,
+        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, dv_offs, dv_mask,
         stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
         stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d,
         stride_gwt, stride_gwh, T=T, H=3,
     )
     da_acc = _dc_postonly_corr_bwd_pre_wsmall_dm_head(
-        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, d_offs, d_mask,
+        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, dv_offs, dv_mask,
         stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
         stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d,
         stride_gwt, stride_gwh, T=T, H=4,
     )
     da_acc = _dc_postonly_corr_bwd_pre_wsmall_dm_head(
-        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, d_offs, d_mask,
+        V, DO, POST_W2, DV, GPOST_W2, da_acc, a_hidden, q_offs, k_offs, rel, valid, q_mask, dv_offs, dv_mask,
         stride_vt, stride_vh, stride_vd, stride_dot, stride_doh, stride_dod,
         stride_w2t, stride_w2h, stride_dv_t, stride_dv_h, stride_dv_d,
         stride_gwt, stride_gwh, T=T, H=5,
@@ -817,7 +825,8 @@ def _dc_postonly_corr_bwd_qk_wsmall_kernel(
     CU_SEARCH_ITERS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    DQK: tl.constexpr,
+    BLOCK_DQK: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     h = tl.program_id(1)
@@ -827,9 +836,9 @@ def _dc_postonly_corr_bwd_qk_wsmall_kernel(
     if k_start < 0:
         k_start = 0
     k_offs = k_start + tl.arange(0, BLOCK_K)
-    d_offs = tl.arange(0, BLOCK_D)
+    dqk_offs = tl.arange(0, BLOCK_DQK)
     q_mask = q_offs < T
-    d_mask = d_offs < BLOCK_D
+    dqk_mask = dqk_offs < DQK
     doc_start = tl.load(DOC_START_TABLE + q_offs, mask=q_mask, other=0).to(tl.int64)
     doc_end = tl.load(DOC_END_TABLE + q_offs, mask=q_mask, other=0).to(tl.int64)
     rel = q_offs[:, None] - k_offs[None, :]
@@ -843,15 +852,15 @@ def _dc_postonly_corr_bwd_qk_wsmall_kernel(
     )
     q = tl.load(
         Q + q_offs[:, None].to(tl.int64) * stride_qt + h * stride_qh
-        + d_offs[None, :].to(tl.int64) * stride_qd,
-        mask=q_mask[:, None] & d_mask[None, :],
+        + dqk_offs[None, :].to(tl.int64) * stride_qd,
+        mask=q_mask[:, None] & dqk_mask[None, :],
         other=0.0,
     )
     k_load_offs = tl.minimum(k_offs, T - 1)
     k = tl.load(
         K + k_load_offs[:, None].to(tl.int64) * stride_kt + h * stride_kh
-        + d_offs[None, :].to(tl.int64) * stride_kd,
-        mask=d_mask[None, :],
+        + dqk_offs[None, :].to(tl.int64) * stride_kd,
+        mask=dqk_mask[None, :],
         other=0.0,
     )
     lse = tl.load(
@@ -883,16 +892,16 @@ def _dc_postonly_corr_bwd_qk_wsmall_kernel(
     dk_blk = tl.dot(tl.trans(ds.to(q.dtype)), q, input_precision="tf32") * scaling
     tl.store(
         DQ + q_offs[:, None].to(tl.int64) * stride_dq_t + h * stride_dq_h
-        + d_offs[None, :].to(tl.int64) * stride_dq_d,
+        + dqk_offs[None, :].to(tl.int64) * stride_dq_d,
         dq_blk,
-        mask=q_mask[:, None] & d_mask[None, :],
+        mask=q_mask[:, None] & dqk_mask[None, :],
     )
     tl.atomic_add(
         DK + k_offs[:, None].to(tl.int64) * stride_dk_t + h * stride_dk_h
-        + d_offs[None, :].to(tl.int64) * stride_dk_d,
+        + dqk_offs[None, :].to(tl.int64) * stride_dk_d,
         dk_blk,
         sem="relaxed",
-        mask=(k_offs[:, None] < T) & d_mask[None, :],
+        mask=(k_offs[:, None] < T) & dqk_mask[None, :],
     )
 
 def _is_supported_postonly_triton(
@@ -912,7 +921,7 @@ def _is_supported_postonly_triton(
         and seq_lens.is_cuda
         and q.ndim == 4
         and k.shape == q.shape
-        and v.shape == q.shape
+        and v.shape[:3] == q.shape[:3]
         and post_w1.shape == q.shape[:3]
         and post_w2.shape == q.shape[:3]
         and q.shape[0] == 1
@@ -944,12 +953,14 @@ def _dc_attention_postonly_correction_add_base_forward_impl(
     return_aux: bool = False,
     base_out: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    q = q.contiguous()
-    k = k.contiguous()
+    # Q/K may be an unpadded view of the 128-wide FA3 tensors.  Every kernel
+    # below uses the explicit strides, so materializing those views only adds
+    # two full read/write copies.
     v = v.contiguous()
     cu_seqlens = cu_seqlens.contiguous()
 
-    B, T, H, D = q.shape
+    B, T, H, DQK = q.shape
+    D = v.shape[-1]
     assert B == 1 and H == 6 and D == 128
     assert int(window) > 0 and int(window) <= 128
     assert base_out is not None
@@ -960,7 +971,8 @@ def _dc_attention_postonly_correction_add_base_forward_impl(
         cu_seqlens, T, n_docs, cu_search_iters
     )
     block_m = _normalize_block_m(block_m)
-    block_d = triton.next_power_of_2(D)
+    block_dqk = triton.next_power_of_2(DQK)
+    block_dv = triton.next_power_of_2(D)
 
     if base_out.ndim == 3:
         assert base_out.shape == (T, H, D)
@@ -1028,7 +1040,9 @@ def _dc_attention_postonly_correction_add_base_forward_impl(
         CU_SEARCH_ITERS=cu_search_iters,
         BLOCK_M=block_m,
         BLOCK_K=block_k,
-        BLOCK_D=block_d,
+        DQK=DQK,
+        BLOCK_DQK=block_dqk,
+        BLOCK_DV=block_dv,
         STORE_AUX=return_aux,
         STORE_A_BUF=False,
         ADD_BASE=True,
@@ -1055,15 +1069,16 @@ def _dc_attention_postonly_correction_add_base_backward_impl(
     window: int,
     skip_qk_grad_requested: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
-    q = q.contiguous()
-    k = k.contiguous()
+    # Preserve strided, reduced-width Q/K views; the kernels consume their
+    # explicit strides and do not require dense token/head packing.
     v = v.contiguous()
     cu_seqlens = cu_seqlens.contiguous()
     doc_start_table = doc_start_table.contiguous()
     doc_end_table = doc_end_table.contiguous()
     softmax_lse = softmax_lse.contiguous()
 
-    B, T, H, D = q.shape
+    B, T, H, DQK = q.shape
+    D = v.shape[-1]
     assert B == 1 and H == 6 and D == 128
     assert int(window) > 0 and int(window) <= 128
     if grad_out.ndim == 3:
@@ -1137,7 +1152,9 @@ def _dc_attention_postonly_correction_add_base_backward_impl(
         CU_SEARCH_ITERS=cu_search_iters,
         BLOCK_M=small_block_m,
         BLOCK_K=small_block_k,
-        BLOCK_D=128,
+        DQK=DQK,
+        BLOCK_DQK=triton.next_power_of_2(DQK),
+        BLOCK_DV=128,
         num_warps=int(DC_POSTONLY_CORR_BWD_WSMALL_PRE_WARPS),
         num_stages=int(DC_POSTONLY_CORR_BWD_WSMALL_PRE_STAGES),
     )
@@ -1186,7 +1203,8 @@ def _dc_attention_postonly_correction_add_base_backward_impl(
         CU_SEARCH_ITERS=cu_search_iters,
         BLOCK_M=small_block_m,
         BLOCK_K=small_block_k,
-        BLOCK_D=128,
+        DQK=DQK,
+        BLOCK_DQK=triton.next_power_of_2(DQK),
         num_warps=int(DC_POSTONLY_CORR_BWD_WSMALL_QK_WARPS),
         num_stages=int(DC_POSTONLY_CORR_BWD_WSMALL_QK_STAGES),
     )
@@ -1277,7 +1295,10 @@ def dc_attention_postonly_nodd_correction_add_base_triton(
     block_n: int = 32,
 ) -> torch.Tensor:
     post_w1, post_w2 = dc_weights
-    B, T, H, D = q.shape
+    # Q/K may be narrower than V (reduced-width QK projections); the correction
+    # output and base_out carry the V width.
+    B, T, H, DQK = q.shape
+    D = v.shape[-1]
     if window is None:
         window = 112
     if seq_lens is None:
@@ -1292,6 +1313,8 @@ def dc_attention_postonly_nodd_correction_add_base_triton(
         or not _is_supported_postonly_triton(q, k, v, post_w1, post_w2, seq_lens)
         or H != 6
         or D != 128
+        or DQK <= 0
+        or DQK > D
         or int(window) <= 0
         or int(window) > 128
         or (softmax_lse is not None and softmax_lse.numel() != 0)
