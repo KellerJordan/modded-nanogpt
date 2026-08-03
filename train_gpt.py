@@ -42,16 +42,20 @@ from torch import Tensor, nn
 from triton_kernels import (
     XXT,
     XTX,
+    FusedFP8MLPFunction,
     FusedLinearReLUSquareFunction,
     FusedSoftcappedCrossEntropy,
     PackedFP8QKV,
     QKNormRoPEPad,
     ba_plus_cAA,
+    quantize_dual_layout,
     quantize_dual_layout_batched,
+    quantize_dual_layout_packed_batched,
     quantize_transpose_mlp_down_weights,
     reduce_mlp_activation_scales,
     transpose_add,
     transpose_copy,
+    update_mlp_weight_scales,
 )
 from dc_triton_kernels import (
     dc_attention_postonly_nodd_correction_add_base_triton,
@@ -59,6 +63,8 @@ from dc_triton_kernels import (
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
+# FP8 variant: both projections and all four backward GEMMs run in FP8.
+FP8MLP = FusedFP8MLPFunction.apply
 
 dynamo.config.recompile_limit = 64
 
@@ -1110,7 +1116,7 @@ class CausalSelfAttention(nn.Module):
         # Weights are stored in parameter banks and passed via forward()
 
     def forward(
-        self, x: Tensor, attn_args: AttnArgs, qk_w: Tensor, vo_w: Tensor,
+        self, x: Tensor, attn_args: AttnArgs, qk_w: Tensor, v_w: Tensor, o_w: Tensor,
         qkv_fp8=None, dc_w: tuple[Tensor, Tensor] | None = None,
     ):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -1125,7 +1131,7 @@ class CausalSelfAttention(nn.Module):
         if qkv_fp8 is not None:
             weight_f8, weight_f8_t, weight_scale, x_scale, grad_scale = qkv_fp8
             q, k, v = PackedFP8QKV(
-                x, qk_w.type_as(x), vo_w[0].type_as(x),
+                x, qk_w.type_as(x), v_w.type_as(x),
                 weight_f8, weight_f8_t, weight_scale, sa_lambdas[0],
                 x_scale, grad_scale,
                 yarn.factor1[:T], yarn.factor2[:T], self.num_heads,
@@ -1133,16 +1139,15 @@ class CausalSelfAttention(nn.Module):
             )
             q, k, v = q[None], k[None], v[None]
         else:
-            qkv_weight = sa_lambdas[0] * torch.cat((qk_w, vo_w[0])).type_as(x)
+            qkv_weight = sa_lambdas[0] * torch.cat((qk_w, v_w)).type_as(x)
             qkv = F.linear(x, qkv_weight)
             qk, v = qkv.split((self.qk_proj_dim, self.hdim), dim=-1)
             qk = qk.view(B, T, 2 * self.num_heads, self.qk_dim)
             v = v.view(B, T, self.num_heads, self.head_dim)
-            qk = QKNormRoPEPad(
+            q, k = QKNormRoPEPad(
                 qk[0], yarn.factor1[:T], yarn.factor2[:T], self.num_heads,
                 self.attn_qk_dim, self.paired, key_offset,
             )
-            q, k = qk.chunk(2, dim=-2)
             q, k = q[None], k[None]
         max_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
@@ -1162,8 +1167,11 @@ class CausalSelfAttention(nn.Module):
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         if dc_w is not None:
             dc_weights = dc_gate(x, dc_w, self.num_heads)
+            # DC kernels accept explicit strides, so use the 96-wide views
+            # directly instead of copying them or recomputing over FA3 padding.
+            q_dc, k_dc = q[..., :self.qk_dim], k[..., :self.qk_dim]
             y = dc_attention_postonly_nodd_correction_add_base_triton(
-                y, q, k, v, dc_weights, None,
+                y, q_dc, k_dc, v, dc_weights, None,
                 scaling=yarn.attn_scale,
                 window=112,
                 seq_lens=seqlens,
@@ -1180,7 +1188,7 @@ class CausalSelfAttention(nn.Module):
             y = y * attn_gate_w.type_as(y).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.hdim) # re-assemble all head outputs side by side
         # O is stored transposed so rectangular V/O matrices share one bank shape.
-        out_weight_t = sa_lambdas[1] * vo_w[1].type_as(y)
+        out_weight_t = sa_lambdas[1] * o_w.type_as(y)
         y = y @ out_weight_t
         return y
 
@@ -1330,6 +1338,11 @@ class GPT(nn.Module):
 
         self.register_buffer("_attn_qkv_scales", torch.ones(num_attn_layers))
         self.register_buffer(
+            "_attn_weight_partial_amax",
+            torch.empty(num_attn_layers, 32, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
             "_attn_x_scales",
             torch.full((num_attn_layers,), 8.0 / 448.0),
         )
@@ -1341,9 +1354,9 @@ class GPT(nn.Module):
     def init_mlp(self, model_dim):        
         # MLP bank: stores c_fc and c_proj for all MLP layers
         # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
-        mlp_hdim = 4 * model_dim
-        self.mlp_bank = nn.Parameter(torch.empty(12, 2, mlp_hdim, model_dim))  # (12, 2, 3072, 768)
-        self.mlp_bank.reshape = (24, mlp_hdim, model_dim)  # Shape for sharding: (24, 3072, 768)
+        self.mlp_hdim = 4 * model_dim
+        self.mlp_bank = nn.Parameter(torch.empty(12, 2, self.mlp_hdim, model_dim))  # (12, 2, 3072, 768)
+        self.mlp_bank.reshape = (24, self.mlp_hdim, model_dim)  # Shape for sharding: (24, 3072, 768)
 
         # improved init scale by @YouJiacheng and @srashedll
         std = 0.5 * model_dim ** -0.5
@@ -1352,18 +1365,48 @@ class GPT(nn.Module):
             self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
 
+        # Lagged activation scales for the FP8 MLP. `post` is the forward activation
+        # relu(pre)^2; `dpre` is its gradient. Both are scaled from the previous step's
+        # per-SM partial amax so no device sync is needed mid-step.
         num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-        self.register_buffer("_mlp_down_act_scales", torch.ones(12, dtype=torch.float32))
-        self.register_buffer("_mlp_down_proj_scales", torch.ones(12, dtype=torch.float32))
-        self.register_buffer("_mlp_down_proj_next_scales", torch.ones(12, dtype=torch.float32))
+        self.register_buffer("_mlp_post_scales", torch.full((12,), 16.0 / 448.0))
+        self.register_buffer("_mlp_dpre_scales", torch.full((12,), 1.0 / 448.0))
         self.register_buffer(
-            "_mlp_down_partial_amax",
-            torch.empty(11, num_sms, dtype=torch.float32),
+            "_mlp_post_partial_amax",
+            torch.full((12, num_sms), 16.0 / 1.25),
             persistent=False,
         )
         self.register_buffer(
-            "_mlp_down_weight_partial_amax",
-            torch.empty(12, 576, dtype=torch.float32),
+            "_mlp_dpre_partial_amax",
+            torch.full((12, num_sms), 1.0 / 1.25),
+            persistent=False,
+        )
+        # MLP input scales are delayed by one step. Their quantizers write one
+        # exact amax per existing 64x128 tile, removing the full-tensor reduction
+        # dependency before each FP8 quantization launch.
+        # Training token counts grow monotonically up to 24 * 2048 per rank.
+        max_quant_tiles = triton.cdiv(24 * 2048, 64) * triton.cdiv(model_dim, 128)
+        self.register_buffer("_mlp_x_scales", torch.full((self.num_layers,), 8.0 / 448.0))
+        # These must be independent allocations. Mutating unbind() views of one
+        # backing tensor makes AOT functionalization clone/scatter their shared
+        # base and can route multiple Triton writes through the same pointer.
+        self._mlp_x_partial_names = tuple(
+            f"_mlp_x_partial_amax_{i}" for i in range(self.num_layers)
+        )
+        for name in self._mlp_x_partial_names:
+            # Persistent so the post-warmup state reset clears tail tiles written
+            # by the larger warmup shapes.
+            self.register_buffer(name, torch.zeros(max_quant_tiles, dtype=torch.float32))
+        self.register_buffer(
+            "_mlp_x_partial_staging",
+            torch.empty((self.num_layers, max_quant_tiles), dtype=torch.float32),
+            persistent=False,
+        )
+        # Exact-current down-projection scale used by both forward and backward.
+        self.register_buffer("_mlp_down_proj_scales", torch.ones(12, dtype=torch.float32))
+        self.register_buffer(
+            "_mlp_weight_partial_amax",
+            torch.empty(12, 2, 32, dtype=torch.float32),
             persistent=False,
         )
 
@@ -1449,7 +1492,6 @@ class GPT(nn.Module):
         """Refresh cached FP8 QKV weights after the optimizer update."""
         if not self.use_fp8:
             return
-        E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
         with torch.no_grad():
             qk = self.qk_bank[:self._num_qk_groups].view(
                 self._num_attn_layers, -1, self.qk_bank.shape[-1]
@@ -1457,55 +1499,91 @@ class GPT(nn.Module):
             vo = self.vo_bank[:self._num_attn_layers * 2].view(
                 self._num_attn_layers, 2, *self.vo_bank.shape[1:]
             )
-            qkv = torch.cat((qk, vo[:, 0]), dim=1)
+            v = vo[:, 0]
             if not hasattr(self, "_attn_qkv_f8"):
-                self._attn_qkv_f8 = torch.empty_like(
-                    qkv, dtype=torch.float8_e4m3fn,
+                packed_shape = (qk.shape[0], qk.shape[1] + v.shape[1], qk.shape[2])
+                self._attn_qkv_f8 = torch.empty(
+                    packed_shape, dtype=torch.float8_e4m3fn, device=qk.device,
                 )
                 self._attn_qkv_f8_t = torch.empty(
-                    self._num_attn_layers, qkv.shape[-1], qkv.shape[-2],
-                    dtype=torch.float8_e4m3fn, device=qkv.device,
+                    packed_shape[0], packed_shape[2], packed_shape[1],
+                    dtype=torch.float8_e4m3fn, device=qk.device,
                 )
-            self._attn_qkv_scales.copy_(
-                qkv.view(self._num_attn_layers, -1).abs().amax(dim=1).float()
-                .clamp_min_(1e-12).div_(E4M3_MAX)
-            )
-            quantize_dual_layout_batched(
-                qkv, self._attn_qkv_scales,
+            quantize_dual_layout_packed_batched(
+                qk, v, self._attn_qkv_scales, self._attn_weight_partial_amax,
                 self._attn_qkv_f8, self._attn_qkv_f8_t,
             )
 
-    def quantize_mlp_fp8(self, bootstrap_down=False):
-        """Refresh FP8 copies of both MLP projections after optimizer steps."""
-        E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+    def quantize_mlp_fp8(self, update_activation_scales=True):
+        """Refresh FP8 MLP weights and lagged activation scales.
+
+        Both projections are emitted in row-major and transposed FP8 layouts so all
+        four backward GEMMs can run through _scaled_mm without transposing anything.
+        The down projection uses an exact-current scale; its two layouts still come
+        from a single read of the weights.
+        """
+        if not self.use_fp8:
+            return
         with torch.no_grad():
+            if update_activation_scales:
+                torch.stack(
+                    [getattr(self, name) for name in self._mlp_x_partial_names],
+                    out=self._mlp_x_partial_staging,
+                )
+                reduce_mlp_activation_scales(
+                    self._mlp_x_partial_staging,
+                    self._mlp_x_scales,
+                    headroom=1.25,
+                )
+                reduce_mlp_activation_scales(
+                    self._mlp_post_partial_amax, self._mlp_post_scales, headroom=1.25,
+                )
+                reduce_mlp_activation_scales(
+                    self._mlp_dpre_partial_amax, self._mlp_dpre_scales, headroom=1.25,
+                )
+                # The reduction kernel only floors the amax at 1e-12, which lets the
+                # scale underflow if a layer's activations or gradients collapse; the
+                # next step then divides by ~0 and overflows FP8. Floor the scales.
+                self._mlp_post_scales.clamp_min_(1e-6)
+                self._mlp_dpre_scales.clamp_min_(1e-7)
+                self._mlp_x_scales.clamp_min_(1e-6)
+
             if not hasattr(self, "_mlp_up_proj_f8"):
+                model_dim = self.mlp_bank.shape[-1]
                 self._mlp_up_proj_f8 = torch.zeros_like(self.mlp_bank[:, 0], dtype=torch.float8_e4m3fn)
                 self._mlp_up_proj_scales = torch.ones(12, dtype=torch.float32, device=self.mlp_bank.device)
-                self._mlp_dequant_scale_buf = torch.ones(1, dtype=torch.float32, device=self.mlp_bank.device)
-                hidden_dim, model_dim = self.mlp_bank.shape[-2:]
-                self._mlp_down_proj_f8_storage = torch.empty(
-                    12, model_dim, hidden_dim,
-                    dtype=torch.float8_e4m3fn,
-                    device=self.mlp_bank.device,
+                self._mlp_up_proj_f8_t = torch.empty(
+                    12, model_dim, self.mlp_hdim,
+                    dtype=torch.float8_e4m3fn, device=self.mlp_bank.device,
                 )
-                self._mlp_down_proj_f8 = self._mlp_down_proj_f8_storage.transpose(1, 2)
+                # (hidden, model) row-major for the backward dpre GEMM.
+                self._mlp_down_proj_f8 = torch.zeros_like(
+                    self.mlp_bank[:, 1], dtype=torch.float8_e4m3fn,
+                )
+                # (model, hidden) for the forward down-projection _scaled_mm.
+                self._mlp_down_proj_f8_t = torch.empty(
+                    12, model_dim, self.mlp_hdim,
+                    dtype=torch.float8_e4m3fn, device=self.mlp_bank.device,
+                )
 
             up_weights = self.mlp_bank[:, 0]
-            up_scales = up_weights.view(12, -1).abs().amax(dim=1).clamp(min=1e-12) / E4M3_MAX
-            self._mlp_up_proj_scales[:] = up_scales.float()
-            self._mlp_up_proj_f8[:] = (up_weights / up_scales.view(12, 1, 1)).to(torch.float8_e4m3fn)
-
             down_weights = self.mlp_bank[:, 1]
-            if bootstrap_down:
-                down_scales = down_weights.view(12, -1).abs().amax(dim=1).clamp(min=1e-12) / E4M3_MAX
-                self._mlp_down_proj_next_scales.copy_(down_scales.float())
+            update_mlp_weight_scales(
+                self.mlp_bank, self._mlp_weight_partial_amax,
+                self._mlp_up_proj_scales, self._mlp_down_proj_scales,
+            )
+            quantize_dual_layout_batched(
+                up_weights, self._mlp_up_proj_scales,
+                self._mlp_up_proj_f8, self._mlp_up_proj_f8_t,
+            )
+            # Keep the down projection on the current exact scale. Its FP8 copy is
+            # also consumed by the backward dpre GEMM, where stale-scale clipping
+            # compounds through the remaining MLP gradients.
             quantize_transpose_mlp_down_weights(
                 down_weights,
-                self._mlp_down_proj_f8_storage,
-                self._mlp_down_proj_next_scales,
+                self._mlp_down_proj_f8_t,
                 self._mlp_down_proj_scales,
-                self._mlp_down_weight_partial_amax,
+                row_output=self._mlp_down_proj_f8,
             )
 
     def init_mudd_gate(self, model_dim: int):
@@ -1580,9 +1658,19 @@ class GPT(nn.Module):
             attn_grad_scales = [self._attn_grad_scales[i:i+1] for i in range(self._num_attn_layers)]
         if use_mlp_fp8:
             mlp_up_proj_f8 = self._mlp_up_proj_f8.unbind(0)
+            mlp_up_proj_f8_t = self._mlp_up_proj_f8_t.unbind(0)
             mlp_up_proj_scales = [self._mlp_up_proj_scales[i:i+1] for i in range(12)]
             mlp_down_proj_f8 = self._mlp_down_proj_f8.unbind(0)
+            mlp_down_proj_f8_t = self._mlp_down_proj_f8_t.unbind(0)
             mlp_down_proj_scales = [self._mlp_down_proj_scales[i:i+1] for i in range(12)]
+            mlp_post_scales = [self._mlp_post_scales[i:i+1] for i in range(12)]
+            mlp_dpre_scales = [self._mlp_dpre_scales[i:i+1] for i in range(12)]
+            mlp_post_partial_amax = self._mlp_post_partial_amax.unbind(0)
+            mlp_dpre_partial_amax = self._mlp_dpre_partial_amax.unbind(0)
+            mlp_x_scales = [self._mlp_x_scales[i:i+1] for i in range(self.num_layers)]
+            mlp_x_partial_amax = [
+                getattr(self, name) for name in self._mlp_x_partial_names
+            ]
 
         # ---- Unbind parameters (avoid select_backward kernels) ----
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
@@ -1605,9 +1693,12 @@ class GPT(nn.Module):
         qk_per_layer = self.qk_bank[:self._num_qk_groups].view(
             self._num_attn_layers, -1, self.qk_bank.shape[-1]
         ).unbind(0)
-        vo_per_layer = self.vo_bank[:self._num_attn_layers * 2].view(
-            self._num_attn_layers, 2, *self.vo_bank.shape[1:]
-        ).unbind(0)
+        # Unbind V and O as separate leaves. Indexing a per-layer (2, ...) view
+        # inside the module makes each access a `select`, which shows up as
+        # select_backward kernels -- the same thing mlp_bank[0::2]/[1::2] avoids.
+        vo_all = self.vo_bank[:self._num_attn_layers * 2].unbind(0)
+        v_per_layer = vo_all[0::2]
+        o_per_layer = vo_all[1::2]
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
@@ -1659,7 +1750,9 @@ class GPT(nn.Module):
             c_proj = mlp_projs[i]
             if use_mlp_fp8:
                 up_proj_f8, up_proj_scale = mlp_up_proj_f8[i], mlp_up_proj_scales[i]
-                down_proj_f8, down_proj_scale = mlp_down_proj_f8[i], mlp_down_proj_scales[i]
+                up_proj_f8_t = mlp_up_proj_f8_t[i]
+                down_proj_f8, down_proj_f8_t = mlp_down_proj_f8[i], mlp_down_proj_f8_t[i]
+                down_proj_scale = mlp_down_proj_scales[i]
             mu = None
 
             if i == 4:
@@ -1681,7 +1774,8 @@ class GPT(nn.Module):
             else:
                 attn_idx = i - (i > 6)
                 qk_w = qk_per_layer[attn_idx]
-                vo_w = vo_per_layer[attn_idx]
+                v_w = v_per_layer[attn_idx]
+                o_w = o_per_layer[attn_idx]
                 qkv_fp8 = None
                 if use_attn_fp8:
                     qkv_fp8 = (
@@ -1724,7 +1818,7 @@ class GPT(nn.Module):
                     train_max_seq_len=train_max_seq_len,
                 )
                 dc_w = dc_weights[i] if i in self.dc_layers and not is_paired else None
-                attn_out = attn(attn_in_normed, attn_args, qk_w, vo_w, qkv_fp8, dc_w)
+                attn_out = attn(attn_in_normed, attn_args, qk_w, v_w, o_w, qkv_fp8, dc_w)
 
                 if mu is not None:
                     x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0] 
@@ -1737,37 +1831,32 @@ class GPT(nn.Module):
             # process mlp
             normed = norm(x)
             if use_mlp_fp8:
-                amax = normed.detach().abs().max().clamp(min=1e-12)
-                x_f8 = (normed.detach() * (448.0 / amax)).to(torch.float8_e4m3fn)
-                self._mlp_dequant_scale_buf.copy_(up_proj_scale).mul_(amax).div_(448.0)
-                mlp_args = (
-                    c_fc,
-                    c_proj,
-                    up_proj_f8,
-                    self._mlp_dequant_scale_buf,
-                    x_f8,
-                    down_proj_f8,
-                    down_proj_scale,
-                    self._mlp_down_act_scales[i:i+1],
-                    self._mlp_down_partial_amax[i],
+                normed_flat = normed.detach().view(-1, normed.shape[-1])
+                x_scale = mlp_x_scales[i]
+                x_f8, x_f8_t = quantize_dual_layout(
+                    normed_flat, x_scale, mlp_x_partial_amax[i],
                 )
+                mlp_args = (
+                    c_fc, c_proj,
+                    up_proj_f8, up_proj_f8_t,
+                    down_proj_f8, down_proj_f8_t,
+                    up_proj_scale, down_proj_scale,
+                    x_scale, mlp_post_scales[i], mlp_dpre_scales[i],
+                    mlp_post_partial_amax[i], mlp_dpre_partial_amax[i],
+                    x_f8, x_f8_t,
+                )
+                mlp_fn = FP8MLP
             else:
                 mlp_args = (c_fc, c_proj)
+                mlp_fn = ReLUSqrdMLP
 
             if mu is not None:
-                x = mu[12] * x + mu[13] * ReLUSqrdMLP(normed, *mlp_args)
+                x = mu[12] * x + mu[13] * mlp_fn(normed, *mlp_args)
             else:
-                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(normed, *mlp_args)
+                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * mlp_fn(normed, *mlp_args)
 
             if i in self.cache_layers:
                 cache[i] = x
-
-        if use_mlp_fp8:
-            reduce_mlp_activation_scales(
-                self._mlp_down_partial_amax,
-                self._mlp_down_act_scales[:self.num_layers],
-                headroom=1.80,
-            )
 
         # Post-loop MUDD: 5 residual coefs over {cache[0], cache[7], cache[9], ve_bank0, cache[3]}.
         mu = self.forward_mudd(x, id=1, num_coef=5)
@@ -2357,7 +2446,7 @@ for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 dist.broadcast(model.bigram_sign_table, 0)  # buffer, not in parameters()
 model.quantize_attn_fp8()
-model.quantize_mlp_fp8(bootstrap_down=True)
+model.quantize_mlp_fp8(update_activation_scales=False)
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
@@ -2394,14 +2483,14 @@ for step in warmup_steps:
         del loss
     training_manager.step_optimizers(step)
     model.quantize_attn_fp8()
-    model.quantize_mlp_fp8(bootstrap_down=True)
+    model.quantize_mlp_fp8()
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
 del val_loader, train_loader, initial_state
 model.quantize_attn_fp8()
-model.quantize_mlp_fp8(bootstrap_down=True)
+model.quantize_mlp_fp8(update_activation_scales=False)
 model.train()
 
 ########################################
@@ -2467,7 +2556,7 @@ for step in range(train_steps + 1):
         del loss
     training_manager.step_optimizers(step)
     model.quantize_attn_fp8()
-    model.quantize_mlp_fp8(bootstrap_down=(step < 16))
+    model.quantize_mlp_fp8()
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)

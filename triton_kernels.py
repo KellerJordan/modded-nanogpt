@@ -523,14 +523,13 @@ def reduce_mlp_activation_scales_kernel(
 def quantize_transpose_mlp_down_weights_kernel(
     weight_ptr,
     output_ptr,
-    next_scale_ptr,
-    used_scale_ptr,
-    partial_amax_ptr,
+    row_output_ptr,
+    scale_ptr,
     weight_layer_stride,
     hidden_dim: tl.constexpr,
     model_dim: tl.constexpr,
     num_tiles_d: tl.constexpr,
-    num_tiles: tl.constexpr,
+    EMIT_ROW: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -547,7 +546,7 @@ def quantize_transpose_mlp_down_weights_kernel(
         + offsets_d[None, :]
     )
     values = tl.load(weight_ptr + input_offsets, mask=mask, other=0.0).to(tl.float32)
-    scale = tl.load(next_scale_ptr + layer)
+    scale = tl.load(scale_ptr + layer)
     quantized = tl.maximum(tl.minimum(values / scale, 448.0), -448.0)
     output_offsets = (
         layer * model_dim * hidden_dim
@@ -559,10 +558,17 @@ def quantize_transpose_mlp_down_weights_kernel(
         tl.trans(quantized).to(tl.float8e4nv),
         mask=tl.trans(mask),
     )
-    tile_amax = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
-    tl.store(partial_amax_ptr + layer * num_tiles + tile, tile_amax)
-    if tile == 0:
-        tl.store(used_scale_ptr + layer, scale)
+    if EMIT_ROW:
+        # Row-major (hidden, model) copy for the FP8 backward's dpre GEMM, which
+        # needs a contiguous last dim. Free here: the tile is already in registers.
+        # NB: must use the output's own contiguous layer stride, NOT input_offsets --
+        # `weights` is a non-contiguous bank slice whose layer stride is 2x this one.
+        row_offsets = (
+            layer * hidden_dim * model_dim
+            + offsets_h[:, None] * model_dim
+            + offsets_d[None, :]
+        )
+        tl.store(row_output_ptr + row_offsets, quantized.to(tl.float8e4nv), mask=mask)
 
 
 _dummy_f32 = None  # lazily initialized 1-element tensor for unused pointer args
@@ -748,35 +754,41 @@ def reduce_mlp_activation_scales(partial_amax, scales, headroom=1.25):
 def quantize_transpose_mlp_down_weights(
     weights,
     output_storage,
-    next_scales,
-    used_scales,
-    partial_amax,
-    headroom=1.12,
+    scales,
+    row_output=None,
 ):
+    """Quantize the MLP down weights with an exact-current scale.
+
+    Always emits the transposed (model, hidden) storage used by the forward
+    _scaled_mm. Pass `row_output` to additionally emit the row-major
+    (hidden, model) copy that the FP8 backward's dpre GEMM requires; both come
+    from a single read of the weights.
+    """
     num_layers, hidden_dim, model_dim = weights.shape
     assert output_storage.shape == (num_layers, model_dim, hidden_dim)
+    emit_row = row_output is not None
+    if emit_row:
+        assert row_output.shape == (num_layers, hidden_dim, model_dim)
+        assert row_output.is_contiguous()
     block_h = 64
     block_d = 64
     num_tiles_d = triton.cdiv(model_dim, block_d)
     num_tiles = triton.cdiv(hidden_dim, block_h) * num_tiles_d
-    assert partial_amax.shape == (num_layers, num_tiles)
     quantize_transpose_mlp_down_weights_kernel[(num_layers, num_tiles)](
         weights,
         output_storage,
-        next_scales,
-        used_scales,
-        partial_amax,
+        row_output if emit_row else weights,  # unused pointer when EMIT_ROW is False
+        scales,
         weights.stride(0),
         hidden_dim=hidden_dim,
         model_dim=model_dim,
         num_tiles_d=num_tiles_d,
-        num_tiles=num_tiles,
+        EMIT_ROW=emit_row,
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         num_stages=1,
         num_warps=4,
     )
-    reduce_mlp_activation_scales(partial_amax, next_scales, headroom=headroom)
 
 
 # -----------------------------------------------------------------------------
@@ -1296,7 +1308,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
 
 @triton.jit
 def _fp8_relu_square_forward_kernel(
-    a_desc, b_desc, pre_desc, post_desc, post_t_desc,
+    a_desc, b_desc, post_desc, post_t_desc,
     dequant_scale_ptr, post_scale_ptr, partial_amax_ptr,
     M, N, K,
     BLOCK_M: tl.constexpr,
@@ -1333,7 +1345,6 @@ def _fp8_relu_square_forward_kernel(
         post0 *= post0
         post0_f32 = post0.to(tl.float32)
         q0 = (post0_f32 / post_scale).to(tl.float8e4nv)
-        pre_desc.store([offs_m, offs_n], pre0)
         post_desc.store([offs_m, offs_n], q0)
         post_t_desc.store([offs_n, offs_m], tl.trans(q0))
         local_amax = tl.maximum(local_amax, tl.max(tl.max(post0_f32, axis=1), axis=0))
@@ -1344,7 +1355,6 @@ def _fp8_relu_square_forward_kernel(
         post1_f32 = post1.to(tl.float32)
         q1 = (post1_f32 / post_scale).to(tl.float8e4nv)
         n1 = offs_n + BLOCK_N // 2
-        pre_desc.store([offs_m, n1], pre1)
         post_desc.store([offs_m, n1], q1)
         post_t_desc.store([n1, offs_m], tl.trans(q1))
         local_amax = tl.maximum(local_amax, tl.max(tl.max(post1_f32, axis=1), axis=0))
@@ -1354,8 +1364,8 @@ def _fp8_relu_square_forward_kernel(
 
 @triton.jit
 def _fp8_relu_square_backward_kernel(
-    a_desc, b_desc, pre_desc, dpre_desc, dpre_t_desc,
-    dequant_scale_ptr, dpre_scale_ptr, partial_amax_ptr,
+    a_desc, b_desc, post_desc, dpre_desc, dpre_t_desc,
+    dequant_scale_ptr, dpre_scale_ptr, post_scale_ptr, partial_amax_ptr,
     M, N, K,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -1386,8 +1396,8 @@ def _fp8_relu_square_backward_kernel(
         acc0, acc1 = tl.split(acc)
         dpre_scale = tl.load(dpre_scale_ptr)
 
-        pre0 = pre_desc.load([offs_m, offs_n])
-        dpre0 = 2.0 * acc0.to(tl.bfloat16) * tl.maximum(pre0, 0.0)
+        post0 = post_desc.load([offs_m, offs_n]).to(tl.float32) * tl.load(post_scale_ptr)
+        dpre0 = 2.0 * acc0.to(tl.bfloat16) * tl.sqrt(post0).to(tl.bfloat16)
         dpre0_f32 = dpre0.to(tl.float32)
         q0 = (dpre0_f32 / dpre_scale).to(tl.float8e4nv)
         dpre_desc.store([offs_m, offs_n], q0)
@@ -1395,8 +1405,8 @@ def _fp8_relu_square_backward_kernel(
         local_amax = tl.maximum(local_amax, tl.max(tl.max(tl.abs(dpre0_f32), axis=1), axis=0))
 
         n1 = offs_n + BLOCK_N // 2
-        pre1 = pre_desc.load([offs_m, n1])
-        dpre1 = 2.0 * acc1.to(tl.bfloat16) * tl.maximum(pre1, 0.0)
+        post1 = post_desc.load([offs_m, n1]).to(tl.float32) * tl.load(post_scale_ptr)
+        dpre1 = 2.0 * acc1.to(tl.bfloat16) * tl.sqrt(post1).to(tl.bfloat16)
         dpre1_f32 = dpre1.to(tl.float32)
         q1 = (dpre1_f32 / dpre_scale).to(tl.float8e4nv)
         dpre_desc.store([offs_m, n1], q1)
@@ -1408,21 +1418,29 @@ def _fp8_relu_square_backward_kernel(
 
 @triton.jit
 def _quantize_dual_layout_kernel(
-    src, row, transposed, scale_ptr,
+    src, row, transposed, scale_ptr, partial_amax_ptr,
     M, N,
     src_stride_m, src_stride_n,
+    NUM_PID_N: tl.constexpr,
+    EMIT_AMAX: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     x = tl.load(
         src + offs_m[:, None] * src_stride_m + offs_n[None, :] * src_stride_n,
         mask=mask,
         other=0.0,
     )
-    q = (x.to(tl.float32) / tl.load(scale_ptr)).to(tl.float8e4nv)
+    scaled = x.to(tl.float32) / tl.load(scale_ptr)
+    # E4M3FN overflow becomes NaN rather than infinity. Delayed scales can miss
+    # a transient range spike, so saturate explicitly instead of poisoning all
+    # downstream GEMMs from a single outlier.
+    q = tl.maximum(tl.minimum(scaled, 448.0), -448.0).to(tl.float8e4nv)
     tl.store(row + offs_m[:, None] * N + offs_n[None, :], q, mask=mask)
     transposed_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)
     tl.store(
@@ -1430,35 +1448,9 @@ def _quantize_dual_layout_kernel(
         tl.trans(q),
         mask=transposed_mask,
     )
-
-
-@triton.jit
-def _quantize_dual_layout_amax_kernel(
-    src_desc, row_desc, transposed_desc,
-    scale_ptr, partial_amax_ptr,
-    M, N,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-):
-    start_pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    num_tiles = num_pid_m * num_pid_n
-    local_amax = 0.0
-
-    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
-        pid_m = tile_id // num_pid_n
-        pid_n = tile_id % num_pid_n
-        offs_m = pid_m * BLOCK_M
-        offs_n = pid_n * BLOCK_N
-        x = src_desc.load([offs_m, offs_n]).to(tl.float32)
-        q = (x / tl.load(scale_ptr)).to(tl.float8e4nv)
-        row_desc.store([offs_m, offs_n], q)
-        transposed_desc.store([offs_n, offs_m], tl.trans(q))
-        local_amax = tl.maximum(local_amax, tl.max(tl.max(tl.abs(x), axis=1), axis=0))
-
-    tl.store(partial_amax_ptr + start_pid, local_amax)
+    if EMIT_AMAX:
+        tile_amax = tl.max(tl.max(tl.abs(x.to(tl.float32)), axis=1), axis=0)
+        tl.store(partial_amax_ptr + pid_m * NUM_PID_N + pid_n, tile_amax)
 
 
 @triton.jit
@@ -1493,6 +1485,150 @@ def _quantize_dual_layout_batched_kernel(
     )
 
 
+@triton.jit
+def _batched_matrix_amax_partial_kernel(
+    src, partial_amax,
+    MATRIX_ELEMENTS: tl.constexpr,
+    SRC_STRIDE_B: tl.constexpr,
+    NUM_PARTS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Read each matrix once and emit a small set of exact amax partials."""
+    batch = tl.program_id(0)
+    part = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    local_amax = tl.zeros((BLOCK_SIZE,), tl.float32)
+    for start in tl.range(
+        part * BLOCK_SIZE, MATRIX_ELEMENTS, NUM_PARTS * BLOCK_SIZE,
+    ):
+        indices = start + offsets
+        values = tl.load(
+            src + batch * SRC_STRIDE_B + indices,
+            mask=indices < MATRIX_ELEMENTS,
+            other=0.0,
+        ).to(tl.float32)
+        local_amax = tl.maximum(local_amax, tl.abs(values))
+    tl.store(
+        partial_amax + batch * NUM_PARTS + part,
+        tl.max(local_amax, axis=0),
+    )
+
+
+@triton.jit
+def _packed_batched_matrix_amax_partial_kernel(
+    first, second, partial_amax,
+    FIRST_ELEMENTS: tl.constexpr,
+    SECOND_ELEMENTS: tl.constexpr,
+    FIRST_STRIDE_B: tl.constexpr,
+    SECOND_STRIDE_B: tl.constexpr,
+    NUM_PARTS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Amax over a logical row-pack without materializing the concatenation."""
+    batch = tl.program_id(0)
+    part = tl.program_id(1)
+    total_elements = FIRST_ELEMENTS + SECOND_ELEMENTS
+    offsets = tl.arange(0, BLOCK_SIZE)
+    local_amax = tl.zeros((BLOCK_SIZE,), tl.float32)
+    for start in tl.range(
+        part * BLOCK_SIZE, total_elements, NUM_PARTS * BLOCK_SIZE,
+    ):
+        indices = start + offsets
+        valid = indices < total_elements
+        in_first = indices < FIRST_ELEMENTS
+        first_values = tl.load(
+            first + batch * FIRST_STRIDE_B + indices,
+            mask=valid & in_first,
+            other=0.0,
+        )
+        second_indices = tl.maximum(indices - FIRST_ELEMENTS, 0)
+        second_values = tl.load(
+            second + batch * SECOND_STRIDE_B + second_indices,
+            mask=valid & ~in_first,
+            other=0.0,
+        )
+        values = first_values.to(tl.float32) + second_values.to(tl.float32)
+        local_amax = tl.maximum(local_amax, tl.abs(values))
+    tl.store(
+        partial_amax + batch * NUM_PARTS + part,
+        tl.max(local_amax, axis=0),
+    )
+
+
+@triton.jit
+def _reduce_mlp_weight_scales_kernel(
+    partial_amax, up_scales, down_scales,
+    NUM_PARTS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    layer = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < NUM_PARTS
+    up = tl.load(
+        partial_amax + (2 * layer) * NUM_PARTS + offsets,
+        mask=mask, other=0.0,
+    )
+    down = tl.load(
+        partial_amax + (2 * layer + 1) * NUM_PARTS + offsets,
+        mask=mask, other=0.0,
+    )
+    tl.store(
+        up_scales + layer,
+        tl.maximum(tl.max(up, axis=0), 1.0e-12) / 448.0,
+    )
+    tl.store(
+        down_scales + layer,
+        tl.maximum(tl.max(down, axis=0), 1.0e-12) / 448.0,
+    )
+
+
+@triton.jit
+def _quantize_dual_layout_packed_batched_kernel(
+    first, second, row, transposed, scale_ptr,
+    M, N,
+    FIRST_ROWS: tl.constexpr,
+    FIRST_STRIDE_B: tl.constexpr,
+    SECOND_STRIDE_B: tl.constexpr,
+    ROW_STRIDE_B: tl.constexpr,
+    TRANSPOSED_STRIDE_B: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Quantize a logical row-pack directly from its two source allocations."""
+    batch = tl.program_id(2)
+    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    valid = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    in_first = offs_m[:, None] < FIRST_ROWS
+    first_offsets = offs_m[:, None] * N + offs_n[None, :]
+    second_rows = tl.maximum(offs_m - FIRST_ROWS, 0)
+    second_offsets = second_rows[:, None] * N + offs_n[None, :]
+    source_ptrs = tl.where(
+        in_first,
+        first + batch * FIRST_STRIDE_B + first_offsets,
+        second + batch * SECOND_STRIDE_B + second_offsets,
+    )
+    values = tl.load(
+        source_ptrs,
+        mask=valid,
+        other=0.0,
+    ).to(tl.float32)
+    scaled = values / tl.load(scale_ptr + batch)
+    quantized = tl.maximum(tl.minimum(scaled, 448.0), -448.0).to(tl.float8e4nv)
+    tl.store(
+        row + batch * ROW_STRIDE_B + offs_m[:, None] * N + offs_n[None, :],
+        quantized,
+        mask=valid,
+    )
+    transposed_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)
+    tl.store(
+        transposed + batch * TRANSPOSED_STRIDE_B
+        + offs_n[:, None] * M + offs_m[None, :],
+        tl.trans(quantized),
+        mask=transposed_mask,
+    )
+
+
 def quantize_dual_layout(
     src: torch.Tensor,
     scale: torch.Tensor,
@@ -1509,26 +1645,17 @@ def quantize_dual_layout(
         assert row.shape == (M, N) and row.dtype == torch.float8_e4m3fn
         assert transposed is not None
         assert transposed.shape == (N, M) and transposed.dtype == torch.float8_e4m3fn
-    if partial_amax is not None:
-        num_sms = torch.cuda.get_device_properties(src.device).multi_processor_count
-        assert src.is_contiguous() and partial_amax.shape == (num_sms,)
-        block_m, block_n = 128, 128
-        grid = (min(num_sms, triton.cdiv(M, block_m) * triton.cdiv(N, block_n)),)
-        _quantize_dual_layout_amax_kernel[grid](
-            TensorDescriptor.from_tensor(src, [block_m, block_n]),
-            TensorDescriptor.from_tensor(row, [block_m, block_n]),
-            TensorDescriptor.from_tensor(transposed, [block_n, block_m]),
-            scale, partial_amax,
-            M, N,
-            BLOCK_M=block_m, BLOCK_N=block_n, NUM_SMS=num_sms,
-            num_stages=3, num_warps=8,
-        )
-        return row, transposed
-
     block_m, block_n = 64, 128
-    _quantize_dual_layout_kernel[(triton.cdiv(M, block_m), triton.cdiv(N, block_n))](
-        src, row, transposed, scale,
+    num_pid_m, num_pid_n = triton.cdiv(M, block_m), triton.cdiv(N, block_n)
+    emit_amax = partial_amax is not None
+    if emit_amax:
+        assert src.is_contiguous() and partial_amax.numel() >= num_pid_m * num_pid_n
+    else:
+        partial_amax = _get_dummy_f32(src.device)
+    _quantize_dual_layout_kernel[(num_pid_m, num_pid_n)](
+        src, row, transposed, scale, partial_amax,
         M, N, src.stride(0), src.stride(1),
+        NUM_PID_N=num_pid_n, EMIT_AMAX=emit_amax,
         BLOCK_M=block_m, BLOCK_N=block_n,
         num_stages=2, num_warps=8,
     )
@@ -1545,8 +1672,14 @@ def quantize_dual_layout_batched(
     assert scales.shape == (B,)
     if row is None:
         row = torch.empty((B, M, N), device=src.device, dtype=torch.float8_e4m3fn)
+    else:
+        assert row.shape == (B, M, N) and row.dtype == torch.float8_e4m3fn
     if transposed is None:
         transposed = torch.empty((B, N, M), device=src.device, dtype=torch.float8_e4m3fn)
+    else:
+        assert transposed.shape == (B, N, M)
+        assert transposed.dtype == torch.float8_e4m3fn
+    assert row.is_contiguous() and transposed.is_contiguous()
     block_m, block_n = 64, 128
     grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n), B)
     _quantize_dual_layout_batched_kernel[grid](
@@ -1556,6 +1689,84 @@ def quantize_dual_layout_batched(
         row.stride(0), transposed.stride(0),
         BLOCK_M=block_m, BLOCK_N=block_n,
         num_stages=2, num_warps=8,
+    )
+    return row, transposed
+
+
+def update_mlp_weight_scales(weights, partial_amax, up_scales, down_scales):
+    """Compute exact per-projection scales without a full-size `abs` temporary."""
+    B, projections, M, N = weights.shape
+    assert projections == 2 and weights.is_contiguous()
+    num_parts = partial_amax.shape[-1]
+    assert partial_amax.shape == (B, projections, num_parts)
+    assert up_scales.shape == down_scales.shape == (B,)
+    flat = weights.view(B * projections, M, N)
+    block_size = 2048
+    _batched_matrix_amax_partial_kernel[(B * projections, num_parts)](
+        flat, partial_amax,
+        MATRIX_ELEMENTS=M * N,
+        SRC_STRIDE_B=flat.stride(0),
+        NUM_PARTS=num_parts,
+        BLOCK_SIZE=block_size,
+        num_stages=1,
+        num_warps=8,
+    )
+    _reduce_mlp_weight_scales_kernel[(B,)](
+        partial_amax, up_scales, down_scales,
+        NUM_PARTS=num_parts,
+        BLOCK_SIZE=triton.next_power_of_2(num_parts),
+        num_stages=1,
+        num_warps=4,
+    )
+
+
+def quantize_dual_layout_packed_batched(
+    first, second, scales, partial_amax, row, transposed,
+):
+    """Exact-scale dual-layout quantization of a logical row concatenation."""
+    B, first_rows, N = first.shape
+    B2, second_rows, N2 = second.shape
+    assert (B2, N2) == (B, N)
+    assert first.device == second.device and first.dtype == second.dtype
+    assert first.stride(1) == second.stride(1) == N
+    assert first.stride(2) == second.stride(2) == 1
+    total_rows = first_rows + second_rows
+    assert scales.shape == (B,)
+    num_parts = partial_amax.shape[-1]
+    assert partial_amax.shape == (B, num_parts)
+    assert row.shape == (B, total_rows, N) and row.dtype == torch.float8_e4m3fn
+    assert transposed.shape == (B, N, total_rows)
+    assert transposed.dtype == torch.float8_e4m3fn
+    assert row.is_contiguous() and transposed.is_contiguous()
+
+    block_size = 2048
+    _packed_batched_matrix_amax_partial_kernel[(B, num_parts)](
+        first, second, partial_amax,
+        FIRST_ELEMENTS=first_rows * N,
+        SECOND_ELEMENTS=second_rows * N,
+        FIRST_STRIDE_B=first.stride(0),
+        SECOND_STRIDE_B=second.stride(0),
+        NUM_PARTS=num_parts,
+        BLOCK_SIZE=block_size,
+        num_stages=1,
+        num_warps=8,
+    )
+    reduce_mlp_activation_scales(partial_amax, scales, headroom=1.0)
+
+    block_m, block_n = 64, 128
+    grid = (triton.cdiv(total_rows, block_m), triton.cdiv(N, block_n), B)
+    _quantize_dual_layout_packed_batched_kernel[grid](
+        first, second, row, transposed, scales,
+        total_rows, N,
+        FIRST_ROWS=first_rows,
+        FIRST_STRIDE_B=first.stride(0),
+        SECOND_STRIDE_B=second.stride(0),
+        ROW_STRIDE_B=row.stride(0),
+        TRANSPOSED_STRIDE_B=transposed.stride(0),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        num_stages=2,
+        num_warps=8,
     )
     return row, transposed
 
@@ -1570,7 +1781,6 @@ def fp8_relu_square_forward(
     M, K = x_f8.shape
     N, Kw = w_f8.shape
     assert K == Kw
-    pre = torch.empty((M, N), device=x_f8.device, dtype=torch.bfloat16)
     post = torch.empty((M, N), device=x_f8.device, dtype=torch.float8_e4m3fn)
     post_t = torch.empty((N, M), device=x_f8.device, dtype=torch.float8_e4m3fn)
     num_sms = torch.cuda.get_device_properties(x_f8.device).multi_processor_count
@@ -1581,7 +1791,6 @@ def fp8_relu_square_forward(
     _fp8_relu_square_forward_kernel[grid](
         TensorDescriptor.from_tensor(x_f8, [block_m, block_k]),
         TensorDescriptor.from_tensor(w_f8, [block_n, block_k]),
-        TensorDescriptor.from_tensor(pre, [block_m, block_n // 2]),
         TensorDescriptor.from_tensor(post, [block_m, block_n // 2]),
         TensorDescriptor.from_tensor(post_t, [block_n // 2, block_m]),
         dequant_scale, post_scale, partial_amax,
@@ -1589,20 +1798,21 @@ def fp8_relu_square_forward(
         BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, NUM_SMS=num_sms,
         num_stages=3, num_warps=8,
     )
-    return pre, post, post_t, partial_amax
+    return post, post_t, partial_amax
 
 
 def fp8_relu_square_backward(
     grad_f8: torch.Tensor,
     w_f8: torch.Tensor,
     dequant_scale: torch.Tensor,
-    pre: torch.Tensor,
+    post: torch.Tensor,
     dpre_scale: torch.Tensor,
+    post_scale: torch.Tensor,
     partial_amax: torch.Tensor | None = None,
 ):
     M, K = grad_f8.shape
     N, Kw = w_f8.shape
-    assert K == Kw and pre.shape == (M, N)
+    assert K == Kw and post.shape == (M, N)
     dpre = torch.empty((M, N), device=grad_f8.device, dtype=torch.float8_e4m3fn)
     dpre_t = torch.empty((N, M), device=grad_f8.device, dtype=torch.float8_e4m3fn)
     num_sms = torch.cuda.get_device_properties(grad_f8.device).multi_processor_count
@@ -1613,10 +1823,10 @@ def fp8_relu_square_backward(
     _fp8_relu_square_backward_kernel[grid](
         TensorDescriptor.from_tensor(grad_f8, [block_m, block_k]),
         TensorDescriptor.from_tensor(w_f8, [block_n, block_k]),
-        TensorDescriptor.from_tensor(pre, [block_m, block_n // 2]),
+        TensorDescriptor.from_tensor(post, [block_m, block_n // 2]),
         TensorDescriptor.from_tensor(dpre, [block_m, block_n // 2]),
         TensorDescriptor.from_tensor(dpre_t, [block_n // 2, block_m]),
-        dequant_scale, dpre_scale, partial_amax,
+        dequant_scale, dpre_scale, post_scale, partial_amax,
         M, N, K,
         BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, NUM_SMS=num_sms,
         num_stages=3, num_warps=8,
@@ -1657,7 +1867,7 @@ class FusedFP8MLPFunction(torch.autograd.Function):
         x_f8_t,
     ):
         x_flat = x.view((-1, x.shape[-1]))
-        pre, post_f8, post_f8_t, _ = fp8_relu_square_forward(
+        post_f8, post_f8_t, _ = fp8_relu_square_forward(
             x_f8.view_as(x_flat),
             W1_f8,
             x_scale * W1_scale,
@@ -1668,7 +1878,7 @@ class FusedFP8MLPFunction(torch.autograd.Function):
         ctx.save_for_backward(
             W1_f8_t,
             W2_f8,
-            pre,
+            post_f8,
             post_f8_t,
             x_f8_t,
             W1_scale,
@@ -1686,7 +1896,7 @@ class FusedFP8MLPFunction(torch.autograd.Function):
         (
             W1_f8_t,
             W2_f8,
-            pre,
+            post_f8,
             post_f8_t,
             x_f8_t,
             W1_scale,
@@ -1697,6 +1907,9 @@ class FusedFP8MLPFunction(torch.autograd.Function):
             dpre_partial_amax,
         ) = ctx.saved_tensors
         grad = grad_output.view((-1, grad_output.shape[-1])).contiguous()
+        # Output gradients are substantially more volatile than RMS-normalized
+        # MLP inputs, so keep their scale exact-current rather than clipping to a
+        # one-step-lagged range.
         grad_scale = (grad.detach().abs().amax().float().clamp_min(1e-12) / 448.0).view(1)
         grad_f8, grad_f8_t = quantize_dual_layout(grad, grad_scale)
         dW2 = _scaled_mm(
@@ -1707,8 +1920,9 @@ class FusedFP8MLPFunction(torch.autograd.Function):
             grad_f8,
             W2_f8,
             grad_scale * W2_scale,
-            pre,
+            post_f8,
             dpre_scale,
+            post_scale,
             dpre_partial_amax,
         )
         dW1 = _scaled_mm(
@@ -1773,7 +1987,15 @@ def _qk_norm_rope_pad_forward_kernel(
     x = tl.load(
         x_ptrs,
         mask=mask, other=0.0,
-    ).to(tl.float32)
+    )
+    # RoPE swaps adjacent lanes.  The full Q/K tile is already resident, so
+    # form the swapped view in registers instead of reading it from HBM again.
+    x_flip = tl.reshape(
+        tl.flip(tl.reshape(x, (BLOCK_M, BLOCK_D // 2, 2)), dim=2),
+        (BLOCK_M, BLOCK_D),
+    )
+    x = x.to(tl.float32)
+    x_flip = x_flip.to(tl.float32)
     rstd = tl.rsqrt(
         tl.sum(x * x, axis=1) / qk_dim + 1.1920928955078125e-7
     )
@@ -1796,11 +2018,6 @@ def _qk_norm_rope_pad_forward_kernel(
     f2 = tl.load(
         factor2 + token[:, None] * factor_stride_t + factor_offset[:, None] + offs_d[None, :]
         if PAIRED else factor2 + token[:, None] * factor_stride_t + offs_d[None, :],
-        mask=mask, other=0.0,
-    ).to(tl.float32)
-    x_flip = tl.load(
-        qk + token[:, None] * stride_qkt + input_head[:, None] * stride_qkh
-        + (offs_d[None, :] ^ 1),
         mask=mask, other=0.0,
     ).to(tl.float32)
     normalized = x * rstd[:, None]
@@ -1891,10 +2108,6 @@ def _qk_norm_rope_pad_backward_kernel(
         output_token[:, None] * stride_grad_t
         + output_head[:, None] * padded_dim + offs_d[None, :]
     )
-    output_flip_ptrs = (
-        output_token[:, None] * stride_grad_t
-        + output_head[:, None] * padded_dim + offs_flip[None, :]
-    )
     is_query = input_head[:, None] < num_heads
 
     x = tl.load(
@@ -1906,12 +2119,13 @@ def _qk_norm_rope_pad_backward_kernel(
         is_query,
         tl.load(grad_q + output_ptrs, mask=mask & is_query, other=0.0),
         tl.load(grad_k + output_ptrs, mask=mask & ~is_query, other=0.0),
-    ).to(tl.float32)
-    grad_flip = tl.where(
-        is_query,
-        tl.load(grad_q + output_flip_ptrs, mask=mask & is_query, other=0.0),
-        tl.load(grad_k + output_flip_ptrs, mask=mask & ~is_query, other=0.0),
-    ).to(tl.float32)
+    )
+    grad_flip = tl.reshape(
+        tl.flip(tl.reshape(grad, (BLOCK_M, BLOCK_D // 2, 2)), dim=2),
+        (BLOCK_M, BLOCK_D),
+    )
+    grad = grad.to(tl.float32)
+    grad_flip = grad_flip.to(tl.float32)
     f1 = tl.load(
         factor1 + token[:, None] * factor_stride_t + factor_offset[:, None] + offs_d[None, :]
         if PAIRED else factor1 + token[:, None] * factor_stride_t + offs_d[None, :],
@@ -1970,10 +2184,12 @@ def qk_norm_rope_pad_forward(
         block_m = 4 if key_offset else 8
     output_tokens = tokens * (2 if paired else 1)
     output_heads = num_heads // 2 if paired else num_heads
-    out = torch.empty(
-        (output_tokens, 2 * output_heads, padded_dim), device=qk.device, dtype=qk.dtype
-    )
-    out_q, out_k = out.chunk(2, dim=1)
+    # Keep Q and K in independent allocations. Returning views into one shared
+    # allocation makes functionalization clone both views before this mutating
+    # Triton call and copy them back afterwards to preserve alias semantics.
+    output_shape = (output_tokens, output_heads, padded_dim)
+    out_q = torch.empty(output_shape, device=qk.device, dtype=qk.dtype)
+    out_k = torch.empty(output_shape, device=qk.device, dtype=qk.dtype)
     rows = tokens * heads2
     block_d = triton.next_power_of_2(qk_dim)
     _qk_norm_rope_pad_forward_kernel[(triton.cdiv(rows, block_m),)](
@@ -1985,16 +2201,15 @@ def qk_norm_rope_pad_forward(
         PAIRED=paired, KEY_OFFSET=key_offset,
         BLOCK_M=block_m, BLOCK_D=block_d, num_warps=num_warps,
     )
-    return out
+    return out_q, out_k
 
 
 def qk_norm_rope_pad_backward(
-    grad_out, qk, factor1, factor2, num_heads, paired=False, key_offset=False,
+    grad_q, grad_k, qk, factor1, factor2, num_heads, paired=False, key_offset=False,
     block_m=8, num_warps=4,
 ):
     tokens, heads2, qk_dim = qk.shape
     rotary_dim = qk_dim // 2
-    grad_q, grad_k = grad_out.chunk(2, dim=1)
     padded_dim = grad_q.shape[-1]
     grad_qk = torch.empty_like(qk)
     rows = tokens * heads2
@@ -2016,20 +2231,20 @@ class QKNormRoPEPadFunction(torch.autograd.Function):
     def forward(
         ctx, qk, factor1, factor2, num_heads, padded_dim, paired, key_offset,
     ):
-        out = qk_norm_rope_pad_forward(
+        out_q, out_k = qk_norm_rope_pad_forward(
             qk, factor1, factor2, num_heads, padded_dim, paired, key_offset,
         )
         ctx.save_for_backward(qk, factor1, factor2)
         ctx.num_heads = num_heads
         ctx.paired = paired
         ctx.key_offset = key_offset
-        return out
+        return out_q, out_k
 
     @staticmethod
-    def backward(ctx, grad_out):
+    def backward(ctx, grad_q, grad_k):
         qk, factor1, factor2 = ctx.saved_tensors
         grad_qk = qk_norm_rope_pad_backward(
-            grad_out, qk, factor1, factor2,
+            grad_q, grad_k, qk, factor1, factor2,
             ctx.num_heads, ctx.paired, ctx.key_offset,
         )
         return grad_qk, None, None, None, None, None, None
@@ -2106,23 +2321,20 @@ def _qkv_norm_rope_pack_fp8_backward_kernel(
                 grad_q + output_token[:, None] * stride_grad_q_t
                 + output_head * stride_grad_q_h + offs_d[None, :]
             )
-            grad_flip_ptr = (
-                grad_q + output_token[:, None] * stride_grad_q_t
-                + output_head * stride_grad_q_h + offs_flip[None, :]
-            )
         else:
             grad_ptr = (
                 grad_k + output_token[:, None] * stride_grad_k_t
                 + output_head * stride_grad_k_h + offs_d[None, :]
             )
-            grad_flip_ptr = (
-                grad_k + output_token[:, None] * stride_grad_k_t
-                + output_head * stride_grad_k_h + offs_flip[None, :]
-            )
-        grad = tl.load(grad_ptr, mask=qk_mask, other=0.0).to(tl.float32)
-        grad_flip = tl.load(
-            grad_flip_ptr, mask=qk_mask, other=0.0
-        ).to(tl.float32)
+        grad = tl.load(grad_ptr, mask=qk_mask, other=0.0)
+        grad_flip = tl.reshape(
+            tl.flip(
+                tl.reshape(grad, (BLOCK_T, BLOCK_QK // 2, 2)), dim=2
+            ),
+            (BLOCK_T, BLOCK_QK),
+        )
+        grad = grad.to(tl.float32)
+        grad_flip = grad_flip.to(tl.float32)
 
         rstd = tl.rsqrt(
             tl.sum(x * x, axis=1) / qk_dim + 1.1920928955078125e-7
@@ -2233,24 +2445,43 @@ class PackedFP8QKVFunction(torch.autograd.Function):
         qk_dim = qk_weight.shape[0] // (2 * num_heads)
         head_dim = v_weight.shape[0] // num_heads
         attn_qk_dim = qk_dim if qk_dim <= 64 else head_dim
+        qk_features = 2 * num_heads * qk_dim
         x_flat = x.reshape(-1, x.shape[-1])
         x_f8, x_f8_t = quantize_dual_layout(x_flat, x_scale)
         scaled_weight_scale = weight_scale * qkv_scale
-        qkv = torch._scaled_mm(
-            x_f8, weight_f8.T,
-            out_dtype=torch.bfloat16,
-            scale_a=x_scale,
-            scale_b=scaled_weight_scale,
-            use_fast_accum=True,
-        )
-        qk_features = 2 * num_heads * qk_dim
-        qk = qkv[:, :qk_features].view(-1, 2 * num_heads, qk_dim)
-        qk_out = qk_norm_rope_pad_forward(
+        if paired:
+            # A packed QKV result leaves V as a strided suffix of every token
+            # row.  Paired attention must then materialize V to merge the token
+            # and head axes.  Two column-sliced GEMMs read X once more but make
+            # V dense at birth, avoiding the larger BF16 read/write repack.
+            qk = torch._scaled_mm(
+                x_f8, weight_f8[:qk_features].T,
+                out_dtype=torch.bfloat16,
+                scale_a=x_scale,
+                scale_b=scaled_weight_scale,
+                use_fast_accum=True,
+            ).view(-1, 2 * num_heads, qk_dim)
+            v = torch._scaled_mm(
+                x_f8, weight_f8[qk_features:].T,
+                out_dtype=torch.bfloat16,
+                scale_a=x_scale,
+                scale_b=scaled_weight_scale,
+                use_fast_accum=True,
+            ).view(-1, num_heads, head_dim)
+        else:
+            qkv = torch._scaled_mm(
+                x_f8, weight_f8.T,
+                out_dtype=torch.bfloat16,
+                scale_a=x_scale,
+                scale_b=scaled_weight_scale,
+                use_fast_accum=True,
+            )
+            qk = qkv[:, :qk_features].view(-1, 2 * num_heads, qk_dim)
+            v = qkv[:, qk_features:].view(-1, num_heads, head_dim)
+        q, k = qk_norm_rope_pad_forward(
             qk, factor1, factor2, num_heads, attn_qk_dim,
             paired, key_offset,
         )
-        q, k = qk_out.chunk(2, dim=1)
-        v = qkv[:, qk_features:].view(-1, num_heads, head_dim)
         ctx.save_for_backward(
             qk_weight, v_weight,
             x_f8_t, weight_f8_t, scaled_weight_scale, qkv_scale,
