@@ -14,10 +14,13 @@ with open(os.path.join(os.path.dirname(sys.argv[0]), 'dc_triton_kernels.py'), 'r
 import copy
 import glob
 import math
+import signal
 import threading
 import time
+import traceback
 import unicodedata
 import uuid
+import warnings
 from dataclasses import dataclass
 from itertools import accumulate, pairwise
 from pathlib import Path
@@ -1261,7 +1264,7 @@ def _ends_contraction(text: str) -> bool:
             return not before or _char_cls(before[-1]) in "LN"
     return False
 
-def build_canonical_mask(vocab_size: int) -> Tensor:
+def build_canonical_mask(vocab_size: int, ranks: dict | None = None) -> np.ndarray:
     """Bit-packed (vocab_size, vocab_size // 8) mask of non-canonical (prev, cur) pairs.
 
     Bit x of row p is set when the GPT-2 tokenizer would never emit token x directly after
@@ -1281,7 +1284,7 @@ def build_canonical_mask(vocab_size: int) -> Tensor:
       inside the continuation can preempt the seam merge at a lower rank -- so the pair
       survives re-encoding after all.
     """
-    ranks = tiktoken.get_encoding("gpt2")._mergeable_ranks
+    ranks = tiktoken.get_encoding("gpt2")._mergeable_ranks if ranks is None else ranks
     tok = {v: k for k, v in ranks.items()}
     never = 1 << 30
 
@@ -1339,7 +1342,75 @@ def build_canonical_mask(vocab_size: int) -> Tensor:
         if len(ps) and len(xs):
             mask[np.ix_(ps, xs)] |= _SEAM_OK[np.ix_(end_cls[ps], start_cls[xs])]
 
-    return torch.from_numpy(np.packbits(mask, axis=1, bitorder="little"))
+    return np.packbits(mask, axis=1, bitorder="little")
+
+class BackgroundCanonicalMask:
+    """Builds the canonical mask concurrently with training, in a forked child process.
+
+    The build is a few seconds of pure-Python work, so running it in a thread would hold the GIL
+    and throttle the training loop's kernel launches. A forked child has its own interpreter and
+    only computes, writing the result into shared memory.
+    """
+
+    def __init__(self, vocab_size: int, owner: bool, print0):
+        self.vocab_size = vocab_size
+        self.print0 = print0
+        self.buf = self.ranks = self.pid = None
+        self.pinned = False
+        if owner:
+            self.buf = torch.empty(vocab_size, vocab_size // 8, dtype=torch.uint8).share_memory_()
+            self.ranks = tiktoken.get_encoding("gpt2")._mergeable_ranks  # cached, but takes a lock
+            # Page-lock the buffer so that collect's H2D is a direct DMA rather than a staged
+            # copy, roughly 10ms instead of 50. Registering is itself slow, which is why it
+            # belongs here, before the clock. The mapping is MAP_SHARED, so the child still
+            # writes to these same pages and the fork stays safe.
+            cudart = torch.cuda.cudart()
+            err = cudart.cudaHostRegister(self.buf.data_ptr(), self.buf.nbytes, 0)
+            self.pinned = err == cudart.cudaError.success
+            if not self.pinned:
+                print0(f"NOTE: could not page-lock the canonical mask buffer ({err}), "
+                       "so its copy to device will be slower", console=True)
+
+    def start(self):
+        if self.buf is None:
+            return
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)  # fork out of a threaded process
+            self.pid = os.fork()
+        if self.pid == 0:
+            code = 1
+            try:
+                np.copyto(self.buf.numpy(), build_canonical_mask(self.vocab_size, self.ranks))
+                code = 0
+            except BaseException:
+                traceback.print_exc()
+            os._exit(code)  # skips atexit/CUDA/NCCL teardown, which is not ours to run
+
+    def wait(self, timeout=60.0):
+        """Block until the mask is ready. Called from the timed region."""
+        if self.pid is None:
+            return
+        deadline = time.perf_counter() + timeout
+        while not (reaped := os.waitpid(self.pid, os.WNOHANG))[0]:
+            if time.perf_counter() > deadline:
+                os.kill(self.pid, signal.SIGKILL)
+                reaped = os.waitpid(self.pid, 0)
+                break
+            time.sleep(0.05)
+        self.pid = None
+        if reaped[1]:
+            self.print0(f"WARNING: background canonical mask build failed ({reaped[1]}), building it inline", console=True)
+            np.copyto(self.buf.numpy(), build_canonical_mask(self.vocab_size, self.ranks))
+
+    def collect(self, out: Tensor):
+        """Fill `out` on every rank, then release the shared buffer."""
+        assert self.pid is None, "collect before wait"
+        if self.buf is not None:
+            out.copy_(self.buf)  # kept blocking: the source is released just below
+            if self.pinned:
+                torch.cuda.cudart().cudaHostUnregister(self.buf.data_ptr())
+        dist.broadcast(out, 0)
+        self.buf = self.ranks = None
 
 @dataclass(slots=True)
 class ForwardScheduleConfig:
@@ -2620,10 +2691,11 @@ model.train()
 ########################################
 train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
 
-# Validation-only table, so it is built before the clock starts. Rank 0 builds and broadcasts.
-if master_process:
-    model.canon_mask.copy_(build_canonical_mask(model.vocab_size))
-dist.broadcast(model.canon_mask, 0)
+# The canonical mask is only needed by the final validation, so rank 0 builds it in a child
+# process while we train, and model.canon_mask stays all-zero == no masking until then, which
+# is what the intermediate validations run with. Only the buffer is allocated here; the build
+# is started below the clock, so its whole cost -- not just its use -- lands in the timed region.
+canon_mask_builder = BackgroundCanonicalMask(model.vocab_size, owner=master_process, print0=print0)
 
 gc.collect()
 
@@ -2631,6 +2703,7 @@ training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
+canon_mask_builder.start()
 # Prefix-token table build, inside the timed region. The tokenizer was loaded at import
 # (get_encoding is cached in tiktoken's registry), so this pays only the table construction.
 # In-place copy keeps the buffer's tensor identity, which the compiled graph holds.
@@ -2644,6 +2717,10 @@ for step in range(train_steps + 1):
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         if last_step:
             training_manager.apply_final_ws_ext()
+            # Both on the clock: the wait in case the build is somehow not done, and the copy
+            # and broadcast of the result because they are part of the mask's cost.
+            canon_mask_builder.wait()
+            canon_mask_builder.collect(model.canon_mask)
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
