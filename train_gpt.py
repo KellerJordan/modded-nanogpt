@@ -16,6 +16,7 @@ import glob
 import math
 import threading
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from itertools import accumulate, pairwise
@@ -1197,6 +1198,118 @@ def build_prefix_table(vocab_size: int) -> Tensor:
         stack_ids.append(tid)
     return torch.tensor(table, dtype=torch.int64)
 
+# Whether a merge may span the seam between a prev-token end and a cur-token start, by the
+# pretokenizer class of the character on either side of it.
+_CLS = "SNLO?"  # whitespace, number, letter, other, inside a character
+_SEAM_OK = np.ones((len(_CLS), len(_CLS)), dtype=bool)
+_SEAM_OK[:, _CLS.index("?")] = False  # cur's pretoken keeps going past cur's end
+_SEAM_OK[_CLS.index("S"), _CLS.index("S")] = False  # a whitespace run is one pretoken
+_SEAM_OK[_CLS.index("O"), _CLS.index("L")] = False  # contractions, see build_canonical_mask
+
+_CONTRACTIONS = ("'s", "'t", "'re", "'ve", "'m", "'ll", "'d")
+
+def _char_cls(ch: str) -> str:
+    if ch.isspace() and not "\x1c" <= ch <= "\x1f":
+        return "S"
+    cat = unicodedata.category(ch)[0]
+    return cat if cat in "LN" else "O"
+
+def _edge_cls(b: bytes, first: bool) -> int:
+    for n in range(1, 5):
+        try:
+            s = (b[:n] if first else b[-n:]).decode()
+        except UnicodeDecodeError:
+            continue
+        return _CLS.index(_char_cls(s[0] if first else s[-1]))
+    return _CLS.index("?")
+
+def _ends_contraction(text: str) -> bool:
+    for c in _CONTRACTIONS:
+        if text.endswith(c):
+            before = text[:-len(c)]
+            return not before or _char_cls(before[-1]) in "LN"
+    return False
+
+def build_canonical_mask(vocab_size: int) -> Tensor:
+    """Bit-packed (vocab_size, vocab_size // 8) mask of non-canonical (prev, cur) pairs.
+
+    Bit x of row p is set when the GPT-2 tokenizer would never emit token x directly after
+    token p, i.e. encode(decode([..., p, x])) != [..., p, x], so softmax can drop it.
+
+    Since GPT-2 is not pure BPE we need to consider the pretokenization rules.
+
+    Set bits have to hold for the pair *in context*, which is stricter than proving
+    encode(decode([p, x])) != [p, x]: the mask is applied mid-document, so text on either
+    side of the pair gets a vote. Pairs whose answer depends on it are left unset.
+
+    * Left. The seven contraction rules ('s, 't, ...) are dropped and tokens ending in a
+      contraction pretoken mask nothing at all, because whether a "'" opens a pretoken
+      depends on what precedes the previous token.
+    * Right. x's first-piece trajectory ends in an unbounded interval, which assumes the
+      pretoken stops at x. When x ends mid-character it demonstrably does not, and a merge
+      inside the continuation can preempt the seam merge at a lower rank -- so the pair
+      survives re-encoding after all.
+    """
+    ranks = tiktoken.get_encoding("gpt2")._mergeable_ranks
+    tok = {v: k for k, v in ranks.items()}
+    never = 1 << 30
+
+    # Trajectory of each token's first and last BPE piece as (start_rank, piece) intervals,
+    # plus the merge rule that finally forms the token. Keyed by token id, which is also the
+    # rank of that final merge -- tiktoken numbers a merged token by its own rank.
+    firsts, lasts, rules = {}, {}, {}
+    for tid, b in tok.items():
+        pieces = [bytes([c]) for c in b]
+        first_traj, last_traj = [(0, pieces[0])], [(0, pieces[-1])]
+        while len(pieces) > 1:
+            best = best_i = None
+            for i in range(len(pieces) - 1):
+                r = ranks.get(pieces[i] + pieces[i + 1])
+                if r is not None and (best is None or r < best):
+                    best, best_i = r, i
+            if best is None:
+                break
+            rules[tid] = (pieces[best_i], pieces[best_i + 1])
+            pieces[best_i:best_i + 2] = [pieces[best_i] + pieces[best_i + 1]]
+            if best_i == 0:
+                first_traj.append((best + 1, pieces[0]))
+            if best_i == len(pieces) - 1:
+                last_traj.append((best, pieces[-1]))
+        firsts[tid], lasts[tid] = first_traj, last_traj
+
+    def by_piece(trajs):
+        idx = {}
+        for tid, traj in trajs.items():
+            for i, (start, piece) in enumerate(traj):
+                end = traj[i + 1][0] if i + 1 < len(traj) else never
+                if start < end:
+                    idx.setdefault(piece, []).append((start, end, tid))
+        return idx
+
+    by_last, by_first = by_piece(lasts), by_piece(firsts)
+
+    # Pretokenizer class of each token end, and whether a token ends in a contraction
+    # pretoken -- nothing can extend one of those, so it may not mask anything.
+    end_cls = np.full(vocab_size, _CLS.index("?"), dtype=np.intp)
+    start_cls = np.full(vocab_size, _CLS.index("?"), dtype=np.intp)
+    closed = np.zeros(vocab_size, dtype=bool)
+    for tid, b in tok.items():
+        end_cls[tid], start_cls[tid] = _edge_cls(b, first=False), _edge_cls(b, first=True)
+        try:
+            closed[tid] = _ends_contraction(b.decode())
+        except UnicodeDecodeError:
+            pass  # ends mid-character, so it cannot end in a contraction
+
+    mask = np.zeros((vocab_size, vocab_size), dtype=bool)
+    for rank, (a, b) in rules.items():
+        ps = np.array([p for s, e, p in by_last.get(a, ()) if s <= rank < e], dtype=np.intp)
+        ps = ps[~closed[ps]]
+        xs = np.array([x for s, e, x in by_first.get(b, ()) if s <= rank < e], dtype=np.intp)
+        if len(ps) and len(xs):
+            mask[np.ix_(ps, xs)] |= _SEAM_OK[np.ix_(end_cls[ps], start_cls[xs])]
+
+    return torch.from_numpy(np.packbits(mask, axis=1, bitorder="little"))
+
 @dataclass(slots=True)
 class ForwardScheduleConfig:
     mtp_weights: torch.Tensor
@@ -1219,6 +1332,10 @@ class GPT(nn.Module):
         # after the clock starts (see "start the clock") so the build is charged to training
         # time. -1 means "no valid prefix" == term disabled, which is what warmup runs with.
         self.register_buffer("prefix_table", torch.full((self.vocab_size,), -1, dtype=torch.int64), persistent=False)
+
+        # Canonical token mask for the validation softmax, one bit per (prev, cur) pair.
+        # Allocated all-zero == no masking.
+        self.register_buffer("canon_mask", torch.zeros(self.vocab_size, self.vocab_size // 8, dtype=torch.uint8), persistent=False)
 
         # Transposed weight storage for faster gradient accumulation
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
@@ -1293,7 +1410,7 @@ class GPT(nn.Module):
             self.vo_bank[:num_vo_real].uniform_(-bound, bound)
             self.vo_bank[num_vo_real:].zero_()
 
-    def init_mlp(self, model_dim):        
+    def init_mlp(self, model_dim):
         # MLP bank: stores c_fc and c_proj for all MLP layers
         # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
         mlp_hdim = 4 * model_dim
@@ -1529,7 +1646,7 @@ class GPT(nn.Module):
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
-        
+
         # Use sign-trick to better compress multiple bigrams into a shared bigram embedding row
         # (details in https://github.com/KellerJordan/modded-nanogpt/pull/299 by @trianxy)
         sign_idx = torch.zeros_like(input_seq)
@@ -1632,7 +1749,7 @@ class GPT(nn.Module):
                 attn_out = attn(attn_in_normed, attn_args, qkvo_w, dc_w)
 
                 if mu is not None:
-                    x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0] 
+                    x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0]
                     x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + mu[11] * x0_bigram
                 else:
                     x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0 * x0_gates[i]
@@ -1687,9 +1804,14 @@ class GPT(nn.Module):
             loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
         else:
             logits = self.lm_head(x)
-            logits = 23 * torch.sigmoid((logits + 5) / 7.5)
-            logits_for_loss = logits.float()
-            loss_per_token = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="none")
+            logits = 23 * torch.sigmoid((logits.float() + 5) / 7.5)
+            logits = logits.view(-1, logits.size(-1))
+            # Drop the tokens the tokenizer would never emit after input_seq. -60 is well below
+            # the 0..23 the softcap leaves, so a dropped token contributes nothing to the softmax.
+            shifts = torch.arange(8, dtype=torch.uint8, device=logits.device)
+            dropped = (self.canon_mask[input_seq, :, None] >> shifts & 1).view(logits.shape).bool()
+            logits = logits.masked_fill(dropped, -60.0)
+            loss_per_token = F.cross_entropy(logits, target_seq, reduction="none")
         return loss_per_token
 # -----------------------------------------------------------------------------
 # Distributed data loader
@@ -2198,7 +2320,7 @@ class TrainingManager():
         self.row_update_mask.fill(0)
 
 
-        
+
 
 # -----------------------------------------------------------------------------
 # int main
@@ -2305,6 +2427,11 @@ model.train()
 ########################################
 train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
 
+# Validation-only table, so it is built before the clock starts. Rank 0 builds and broadcasts.
+if master_process:
+    model.canon_mask.copy_(build_canonical_mask(model.vocab_size))
+dist.broadcast(model.canon_mask, 0)
+
 gc.collect()
 
 training_time_ms = 0
@@ -2371,10 +2498,10 @@ for step in range(train_steps + 1):
 if args.run_evals:
     model.eval()
     from evals import hellaswag
-    hellaswag.evaluate(model=model, 
-                       schedule_cfg=training_manager.get_forward_args(), 
+    hellaswag.evaluate(model=model,
+                       schedule_cfg=training_manager.get_forward_args(),
                        seq_len=args.val_batch_size // (grad_accum_steps * world_size),
-                       get_bigram_hash=get_bigram_hash, 
+                       get_bigram_hash=get_bigram_hash,
                        print0=print0)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
