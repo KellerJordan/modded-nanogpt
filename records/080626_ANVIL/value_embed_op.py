@@ -78,6 +78,43 @@ def selected_load_backward_op(
     return output
 
 
+@torch.library.custom_op(
+    "nanogpt_slg::selected_load_backward_into",
+    mutates_args={"output"},
+)
+def selected_load_backward_into_op(
+    token_ids: torch.Tensor,
+    grad0: torch.Tensor,
+    grad1: torch.Tensor,
+    grad2: torch.Tensor,
+    grad3: torch.Tensor,
+    grad4: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Accumulate directly into a persistent two-step BF16 cycle buffer."""
+    _check_token_ids(token_ids)
+    grads = (grad0, grad1, grad2, grad3, grad4)
+    for grad in grads:
+        _check_grad(grad, token_ids)
+    _check_weight(output, token_ids)
+    launch_candidate(token_ids, grads, output.view(PLANES, VOCAB, WIDTH))
+
+
+@selected_load_backward_into_op.register_fake
+def _selected_load_backward_into_fake(
+    token_ids: torch.Tensor,
+    grad0: torch.Tensor,
+    grad1: torch.Tensor,
+    grad2: torch.Tensor,
+    grad3: torch.Tensor,
+    grad4: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    del grad1, grad2, grad3, grad4
+    assert token_ids.ndim == 1 and grad0.shape == (token_ids.numel(), WIDTH)
+    assert output.shape == (PLANES * VOCAB, WIDTH)
+
+
 @selected_load_backward_op.register_fake
 def _selected_load_backward_fake(
     token_ids: torch.Tensor,
@@ -118,8 +155,37 @@ class _ValueEmbeddingSelectedLoad(torch.autograd.Function):
         return grad_weight, None
 
 
+class _ValueEmbeddingSelectedLoadInto(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, weight: torch.Tensor, token_ids: torch.Tensor, output: torch.Tensor):
+        _check_token_ids(token_ids)
+        _check_weight(weight, token_ids)
+        _check_weight(output, token_ids)
+        ctx.save_for_backward(token_ids, output)
+        gathered = weight.view(PLANES, VOCAB, WIDTH)[:, token_ids]
+        return gathered[0], gathered[1], gathered[2], gathered[3], gathered[4]
+
+    @staticmethod
+    def backward(ctx, grad0, grad1, grad2, grad3, grad4):
+        token_ids, output = ctx.saved_tensors
+        grads = (grad0, grad1, grad2, grad3, grad4)
+        assert all(grad is not None for grad in grads)
+        for grad in grads:
+            _check_grad(grad, token_ids)
+        selected_load_backward_into_op(token_ids, *grads, output)
+        return None, None, None
+
+
 def value_embedding_planes_selected_load(
     weight: torch.Tensor,
     token_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _ValueEmbeddingSelectedLoad.apply(weight, token_ids)
+
+
+def value_embedding_planes_selected_load_into(
+    weight: torch.Tensor,
+    token_ids: torch.Tensor,
+    output: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _ValueEmbeddingSelectedLoadInto.apply(weight, token_ids, output)
