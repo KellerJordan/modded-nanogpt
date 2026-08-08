@@ -1,11 +1,11 @@
 """NanoGPT speedrun record-attempt trainer: GPT-2-scale (124M) on 8xH100, single node.
 
 Target: mean final validation cross-entropy <= 3.28 (all runs count), minimizing the
-wall-clock time of the training section. Timing convention: compilation, kernel
-warmup, CUDA-graph capture, data prescan/prefetch priming and every validation pass
-(including the final one) are untimed; the clock runs from the post-warmup
-torch.cuda.synchronize() to the synchronize at each validation break, so exactly the
-training steps are wall-timed.
+wall-clock time of the training section. Timing convention (standard): compilation,
+kernel warmup, CUDA-graph capture and every validation pass (including the final
+one) are untimed; the clock runs from the post-warmup torch.cuda.synchronize() to
+the synchronize at each validation break. First-batch fetch, shard loading, the
+prefix-table build and the terminal weight ships are all inside the timed section.
 
 Main method departures from the stock baseline:
   * Optimizer: ANVIL — a twin-rail velocity matrix optimizer over sharded
@@ -60,9 +60,7 @@ from itertools import accumulate, pairwise
 from pathlib import Path
 import gc
 
-# Allocator config must be set before the first CUDA allocation; expandable_segments
-# avoids fragmentation-driven OOM across the stage batch-size transitions.
-os.environ["PYTORCH_ALLOC_CONF"] = ('expandable_segments:True')
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import triton
 import numpy as np
@@ -94,7 +92,7 @@ _KX_R2 = True        # off-clock TEMA ship + fp32 TEMA scratch + shard prescan +
 _KX_LMF8T = True      # col-major lm_head fp8 cache for the CE forward GEMM
 _KX_PROF = int('0')    # probe-only: chrome-trace steps [N, N+8) on rank 0 (wall meaningless)
 _R2_YARN_ROWS = 0                                       # set >0 before the timed loop when _KX_R2
-_R2_PRESCAN_MAX = 8                                     # shards fully loaded+scanned in untimed prep
+_R2_PRESCAN_MAX = 0                                     # 0 = stock lazy shard loading (no pre-clock prescan)
 _r2_tema_scratch: dict = {}
 from dc_triton_kernels import (
     dc_attention_postonly_nodd_correction_add_base_triton,
@@ -123,23 +121,40 @@ PREFIX_CE = True          # PR#337 port: auxiliary prefix-token CE through the f
 PREFIX_CE_WEIGHT = float("0.2")
 
 _ptp_tab_cache = None
-def _ptp_table(device):
-    """PREFIX_CE: token -> longest proper byte-prefix token id (-1 = none). Static
-    vocab map (PR#337); built once from the gpt2 encoding — no data-pipeline
-    involvement, requires `pip install tiktoken` (import deferred to first use)."""
+def _ptp_table_alloc(device):
+    """PREFIX_CE: allocate the prefix-token table with every row -1 ("no prefix" =
+    exact no-op in the CE kernel, which is what warmup runs with), and warm the
+    tokenizer download/parse — both untimed. The table CONTENTS are built by
+    _ptp_table_fill() right after the clock starts, so the construction is charged
+    to training time, matching the placement this mechanism's record (#88) was
+    accepted with. Static vocab map (PR#337); no data-pipeline involvement."""
     global _ptp_tab_cache
     if _ptp_tab_cache is None or _ptp_tab_cache.device != device:
         import tiktoken
-        ranks = tiktoken.get_encoding("gpt2")._mergeable_ranks
-        t = torch.full((50304,), -1, dtype=torch.int64)
-        for b, tid in ranks.items():
-            for k in range(len(b) - 1, 0, -1):
-                pid = ranks.get(b[:k])
-                if pid is not None:
-                    t[tid] = pid
-                    break
-        _ptp_tab_cache = t.to(device)
+        tiktoken.get_encoding("gpt2")  # download + parse untimed; fill pays construction only
+        _ptp_tab_cache = torch.full((50304,), -1, dtype=torch.int64, device=device)
     return _ptp_tab_cache
+
+def _ptp_table_fill():
+    """Token -> longest proper byte-prefix token id, copy_'d into the pre-allocated
+    device table IN PLACE (the tensor feeds compiled code; its address must never
+    change). Sorted-stack build: sorting the vocab's byte strings puts every proper
+    prefix before its extensions, so a stack of live ancestors yields the longest
+    one in O(V log V). Runs after the timer starts."""
+    import tiktoken
+    ranks = tiktoken.get_encoding("gpt2")._mergeable_ranks
+    table = [-1] * 50304
+    stack: list = []
+    stack_ids: list = []
+    for b, tid in sorted(ranks.items()):
+        while stack and not b.startswith(stack[-1]):
+            stack.pop()
+            stack_ids.pop()
+        if stack_ids:
+            table[tid] = stack_ids[-1]
+        stack.append(b)
+        stack_ids.append(tid)
+    _ptp_tab_cache.copy_(torch.tensor(table, dtype=torch.int64))
 TAIL_AVG_WINDOW = int('250')          # tail weight-average window (0=off); assemblies compared at final val
 # Tail-average rule: lerp_(p, 0.02) per step, i.e. an EMA with a ~50-step timescale
 # (NOT a uniform mean over the TAIL_AVG_WINDOW window), over the label set returned
@@ -385,7 +400,6 @@ _sov_labels = set(x for x in "".split(",") if x)  # empty = side-stream path dis
 
 # -----------------------------------------------------------------------------
 # Distributed training setup
-
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 assert 8 % world_size == 0, "world_size must be a divisor of 8"
@@ -439,8 +453,6 @@ def _(x: Tensor, w: Tensor, *_):
 
 @torch.library.custom_op("nanogpt::mm_t_backward", mutates_args=())
 def mm_t_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
-    """Backward of nanogpt::mm_t from the saved fp8 activations/weights:
-    grad_x = g @ w.T (bf16), grad_w = x.T @ g (fp32, already in (in, out) layout)."""
     @torch.compile
     def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
         assert grad.is_contiguous()
@@ -482,7 +494,6 @@ def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
     return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
 
 def backward_t(ctx, grad_out: Tensor, *_):
-    """Autograd bridge for nanogpt::mm_t (grads for x and w only)."""
     x_f8, w_f8 = ctx.saved_tensors
     x_s, w_s, grad_s = ctx.scales
     grad_x, grad_w = torch.ops.nanogpt.mm_t_backward(
@@ -491,7 +502,6 @@ def backward_t(ctx, grad_out: Tensor, *_):
     return grad_x, grad_w, None, None, None
 
 def setup_context_t(ctx: torch.autograd.function.FunctionCtx, inputs, output):
-    """Save the fp8 casts (not the bf16 inputs) for mm_t's backward."""
     *_, x_s, w_s, grad_s = inputs
     _, x_f8, w_f8 = output
     ctx.save_for_backward(x_f8, w_f8)
@@ -501,7 +511,7 @@ def setup_context_t(ctx: torch.autograd.function.FunctionCtx, inputs, output):
 mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 
 # -----------------------------------------------------------------------------
-# ANVIL cascade
+# Polar Express
 
 # ANVIL map schedule: six quintic spectral maps t -> a + b*t + c*t^2 acting on
 # the velocity Gram, derived by a CEM + minimax-polish pipeline and
@@ -589,7 +599,7 @@ def anvil_cascade(grad_chunk: torch.Tensor, velocity: torch.Tensor, momentum_t: 
     # A_raw/d^2, so stage 1 reuses the rescaled Gram and only stages 2..5
     # recompute it from the running iterate.
     if is_tall:
-        # Tall: Triton kernels on the small right Gram X^T @ X, right multiplication
+        # Tall: use Triton kernels with X^T @ X (small) and right multiplication
         A = torch.empty((*X.shape[:-2], X.size(-1), X.size(-1)), device=X.device, dtype=X.dtype)
         XTX(X, out=A)  # A = X.T @ X on the raw blend
         tr = A.diagonal(dim1=-2, dim2=-1).float().sum(-1)[..., None, None]
@@ -599,7 +609,7 @@ def anvil_cascade(grad_chunk: torch.Tensor, velocity: torch.Tensor, momentum_t: 
         B = torch.empty_like(A)
         C = torch.empty_like(X)
 
-        # Pick batched vs unbatched
+        # Select batched vs unbatched
         if split_baddbmm:
             XB_matmul = torch.bmm if X.ndim > 2 else torch.mm
         else:
@@ -623,7 +633,7 @@ def anvil_cascade(grad_chunk: torch.Tensor, velocity: torch.Tensor, momentum_t: 
 
             X, C = C, X  # Swap references to avoid unnecessary copies
     else:
-        # Wide: Triton kernels on the small left Gram X @ X^T, left multiplication
+        # Wide: use Triton kernels with X @ X^T (small) and left multiplication
         A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
         XXT(X, out=A)  # A = X @ X.mT on the raw blend
         tr = A.diagonal(dim1=-2, dim2=-1).float().sum(-1)[..., None, None]
@@ -633,7 +643,7 @@ def anvil_cascade(grad_chunk: torch.Tensor, velocity: torch.Tensor, momentum_t: 
         B = torch.empty_like(A)
         C = torch.empty_like(X)
 
-        # Pick batched vs unbatched
+        # Select batched vs unbatched
         if split_baddbmm:
             BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
         else:
@@ -653,13 +663,11 @@ def anvil_cascade(grad_chunk: torch.Tensor, velocity: torch.Tensor, momentum_t: 
 
             X, C = C, X  # Swap references to avoid unnecessary copies
 
-
     return X
 
 # -----------------------------------------------------------------------------
 # Sparse Comms for bigram embedding gradient reduce-scatter
 def _sparse_comms_active():
-    """Sparse bigram-grad comms are only wired (and worthwhile) at full 8-GPU scale."""
     # we count on this in order for sparse communication to be worthwhile
     return world_size == 8 and grad_accum_steps == 1
 
@@ -711,7 +719,6 @@ def sparse_comms_start(idxes_np, N, rank, world, send_idxes_buffer, bgsp_out=Non
 
 @torch.no_grad
 def sparse_comms_share_indexes(send_idxes, send_counts, recv_counts):
-    """Exchange the row-index lists (async all_to_all) once counts are known."""
     # cpu tensors, so these ops are cheap and don't force a host<->device sync
     total_recv_count = recv_counts.sum().item()
     recv_counts = recv_counts.tolist()
@@ -737,8 +744,6 @@ def sparse_comms_share_indexes(send_idxes, send_counts, recv_counts):
 @torch.compile
 @torch.no_grad
 def sparse_comms_share_gradients(grad, idxes, send_counts, recv_counts):
-    """Gather the non-owned touched rows from the dense grad and launch their
-    async value all_to_all."""
     # gather the rows that we want to send
     send_vals = grad[idxes]
 
@@ -761,7 +766,6 @@ def sparse_comms_share_gradients(grad, idxes, send_counts, recv_counts):
 
 @torch.no_grad
 def sparse_comms_merge_gradients(grad, recv_idx, recv_vals, rank, world):
-    """Merge received rows into the dense grad and return this rank's averaged shard."""
     d = grad.shape[1]
     rows_per_rank = grad.shape[0] // world
 
@@ -811,7 +815,7 @@ def bgsp_merge_gradients(shard, compact, full_idx, lo, hi, recv_idx, recv_vals, 
 
 
 # -----------------------------------------------------------------------------
-# Combined ANVIL + Adam Optimizer
+# Combined NorMuon + Adam Optimizer
 
 @dataclass(slots=True)
 class ParamConfig:
@@ -827,7 +831,7 @@ class ParamConfig:
     weight_decay: float
     # Adam-specific
     eps: float | None = None
-    # ANVIL-specific
+    # NorMuon-specific
     reshape: tuple | None = None
     chunk_size: int | None = None
     momentum: float | None = None
@@ -892,12 +896,13 @@ class AnvilAndAdam:
     - 'sharded': Gradients are reduce-scattered, each rank updates its shard,
       and results are all-gathered.
 
-    Adam parameters may be freely sharded. ANVIL operates on full matrices; sharding is
-    supported by grouping matrices into parameter banks. ANVIL parameters must have a
+    Adam parameters may be freely sharded. NorMuon operates on full matrices; sharding is
+    supported by grouping matrices into parameter banks. NorMuon parameters must have a
     `.reshape` attribute that reshapes the bank so that the leading dimension is divisible
     by world_size.
 
-    # Contributors include @YouJiacheng, @KonstantinWilleke, @alexrgilbert, @adricarda, @tuttyfrutyee, @vdlad, @ryanyang0, @vagrawal, @varunneal, @chrisjmccormick
+    # Contributors include @YouJiacheng, @KonstantinWilleke, @alexrgilbert, @adricarda,
+    # @tuttyfrutyee, @vdlad, @ryanyang0, @vagrawal, @varunneal, @chrisjmccormick
     """
     def __init__(self, named_params, param_table: dict, scatter_order: list, work_order: list,
                  adam_defaults: dict, anvil_defaults: dict):
@@ -1093,7 +1098,7 @@ class AnvilAndAdam:
 
             chunk_size = reshape[0] // self.world_size
             chunk_shape = (chunk_size, *reshape[1:])
-            # Shape-based LR multiplier for ANVIL
+            # Shape-based LR multiplier for NorMuon
             shape_mult = max(1.0, chunk_shape[-2] / chunk_shape[-1]) ** 0.5 if len(chunk_shape) >= 2 else 1.0
             lr_mul = shape_mult * lr_mul
             if label == "mlp_bank":
@@ -1161,8 +1166,7 @@ class AnvilAndAdam:
                     (2, *chunk_shape), dtype=torch.float32, device=param.device
                 )
 
-                # Per-lane energy accumulator - update second moments reduced
-                # along the longer matrix dimension (one scalar per lane)
+                # Second momentum buffer - reduced along one dimension
                 if chunk_shape[-2] >= chunk_shape[-1]:
                     lane_shape = (*chunk_shape[:-1], 1)
                 else:
@@ -1171,8 +1175,7 @@ class AnvilAndAdam:
                     lane_shape, dtype=torch.float32, device=param.device
                 )
 
-                # Mantissa sidecar: low 16 bits of the fp32-precise parameter
-                # shadow (see _sign_aligned_decay_update)
+                # Mantissa buffer for precision tracking
                 mantissa = torch.zeros(
                     chunk_shape, dtype=torch.uint16, device=param.device
                 )
@@ -1182,7 +1185,6 @@ class AnvilAndAdam:
                     lane_energy=lane_energy,
                     mantissa=mantissa,
                 )
-
 
     # -----------------------------------
     # Reduce/Gather operations
@@ -1280,7 +1282,7 @@ class AnvilAndAdam:
     # State management
 
     def reset(self):
-        """Reset ANVIL velocity/energy state and split_embed state (called on training reset)."""
+        """Reset NorMuon momentum buffers and split_embed state (called on training reset)."""
         self.split_embed = False
         self._skip_labels = set()
         for param, p_cfg in self.param_cfgs.items():
@@ -1431,7 +1433,7 @@ class AnvilAndAdam:
         Combined optimizer step with explicit ordering.
 
         Args:
-            do_adam: If True, update Adam params. ANVIL params always updated.
+            do_adam: If True, update Adam params. NorMuon params always updated.
 
         Flow:
         1. Scatter phase: Launch reduces in scatter_order
@@ -1595,10 +1597,6 @@ class AnvilAndAdam:
                 else:
                     gather_futures.append(gather_fut)
 
-        # [SOV] side-stream dispatch: dense items above are already queued on the
-        # compute stream; these run concurrently on the side stream. Gather futures
-        # join at Phase 3; the trailing wait_stream re-serializes before grad clear.
-
         # ===== Phase 3: Wait for gathers, sync embed if tied =====
         # Wait for lm_head gather first so we can copy to embed while other gathers complete
         if lm_head_gather_future is not None:
@@ -1705,7 +1703,7 @@ class AnvilAndAdam:
         exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
         exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
         update = exp_avg.div(exp_avg_sq.sqrt().add_(eps)).mul_(step_size_t)
-        # Sign-aligned decay gate
+        # Cautious weight decay
         mask = (update * p_slice) > 0
         update.addcmul_(p_slice, mask, value=eff_wd_t)
         p_slice.add_(other=update, alpha=-1.0)
@@ -1761,7 +1759,7 @@ class AnvilAndAdam:
                 torch._foreach_add_(params, update, alpha=-1.0)
 
     # -----------------------------------
-    # ANVIL update
+    # NorMuon update
 
     def _anvil_update(self, param: nn.Parameter, grad_chunk: Tensor, p_cfg: ParamConfig, rank: int) -> Tensor:
         """Apply the ANVIL update to a parameter. Returns the updated p_slice.
@@ -1826,13 +1824,13 @@ class AnvilAndAdam:
             bimax_w_t=self._bimax_w_t if _DUAL_MOMENTUM is not None else None,
         )
 
-        # Per-lane energy equalization
+        # Variance reduction
         red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
         v_chunk = AnvilAndAdam._rail_equalizer(
             v_chunk, p_state["lane_energy"], p_cfg.beta2, red_dim
         )
 
-        # Update parameter, in place, with sign-aligned decay
+        # Update parameter, in place, with cautious weight decay
         param_view = param.data.view(p_cfg.reshape)
         p_slice = param_view[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size]
 
@@ -1863,25 +1861,16 @@ class AnvilAndAdam:
                 eff_wd_t, eff_lr_t
             )
 
-
         return p_slice
 
     @staticmethod
     @torch.compile(dynamic=False, fullgraph=True)
     def _sign_aligned_decay_update(p, mantissa, grad, wd_tensor, lr_tensor):
         """
-        Sign-aligned decoupled weight decay + mantissa-extended bf16 parameter
-        update. wd_tensor and lr_tensor are 0-D scalar tensors.
-
-        The live bf16 parameter (viewed as uint16) is the HIGH half of an
-        fp32-precise shadow value; the uint16 `mantissa` sidecar carries the LOW
-        half (bf16 is exactly fp32's sign + exponent + top 7 mantissa bits, so
-        high<<16 | low reassembles a full fp32 bit pattern). Updates are applied
-        to the shadow, which is then split back into its two halves - so the
-        parameter accumulates at fp32 precision while staying bf16 in memory.
-
-        Decay is gated per element to where the update direction agrees with the
-        parameter's sign, so decay never fights the descent direction.
+        Cautious weight decay + parameter update. wd_tensor and lr_tensor are 0-D CPU tensors.
+        Mantissa is tracked to enable higher precision updates on bfloat16 parameters.
+        bfloat16 format: 1 sign bit + 8 exponent bits + 7 mantissa bits = 16 bits total
+        float32 format: 1 sign bit + 8 exponent bits + 23 mantissa bits = 32 bits total
         """
         assert p.dtype == mantissa.dtype == torch.uint16
         grad = grad.float()
@@ -1942,7 +1931,6 @@ class AnvilAndAdam:
 # PyTorch nn.Module definitions for the model
 
 def norm(x: Tensor):
-    """RMS norm without learnable scale."""
     return F.rms_norm(x, (x.size(-1),))
 
 
@@ -2005,7 +1993,6 @@ class Yarn(nn.Module):
         self.reset()
 
     def rotary(self, x_BTHD):
-        """Apply the precomputed rotary factors to q or k."""
         assert self.factor1.size(0) >= x_BTHD.size(-3)
         if self.heads:
             # KX_RSTAG/KX_RNOPE: factors are (2*max_seq, H, head_dim) -- the head axis is
@@ -2093,13 +2080,6 @@ class Yarn(nn.Module):
         return angular_freq.contiguous()
 
     def apply(self, old_window: int, new_window: int, alpha: int=1, beta: int=32):
-        """YaRN-rescale angular_freq for a window transition, partially rebuild the
-        factor tables (training-indexable rows only when _R2_YARN_ROWS is set), and
-        retune attn_scale."""
-        # NOTE (KX_RSTAG/KX_RNOPE): every op in the YaRN rescale below is elementwise /
-        # broadcast over angular_freq, so it is shape-agnostic and works unchanged on the
-        # (H, head_dim) per-head ladder. RNOPE rows stay exactly 0 through it: rotations=0
-        # -> interpolation_weight = clamp(-1/31, 0, 1) = 0 -> 0 *= scaling_factor -> 0.
         rotations = old_window * self.angular_freq / (2 * torch.pi)
         scaling_factor = old_window / new_window
         interpolation_weight = torch.clamp((rotations - alpha) / (beta - alpha), 0, 1)
@@ -2152,9 +2132,6 @@ class Yarn(nn.Module):
 
 @dataclass(slots=True)
 class AttnArgs:
-    """Per-forward attention arguments: schedule-dependent geometry (window size,
-    seqlens), the layer's Yarn, MUDD-generated gates, and optional fp8 cache
-    plumbing for the fp8 attention paths."""
     sa_lambdas: torch.Tensor
     seqlens: torch.Tensor
     bm_size: int
@@ -2192,8 +2169,6 @@ def dc_gate(
     dc_w: tuple[Tensor, Tensor],
     num_heads: int,
 ) -> tuple[Tensor, Tensor]:
-    """Prepare the token-conditional DC-attention gate pair (rms-normed w1, raw w2)
-    for the correction kernel."""
     dc_w1, dc_w2 = dc_w
     assert dc_w1.shape == dc_w2.shape == (x.size(0), x.size(1), num_heads)
     post_w1 = F.rms_norm(dc_w1.float(), (num_heads,), eps=1.0e-6).type_as(x)
@@ -2318,13 +2293,10 @@ class CausalSelfAttention(nn.Module):
 # The main model
 
 def next_multiple_of_n(v: float | int, *, n: int):
-    """Round v up to the next multiple of n."""
     return math.ceil(v / n) * n
 
 @dataclass(slots=True)
 class ForwardScheduleConfig:
-    """Schedule-dependent forward arguments (per step): MTP weights, short/long
-    attention windows in tokens, and the max packed sequence length."""
     mtp_weights: torch.Tensor
     ws_short: int
     ws_long: int
@@ -2338,11 +2310,6 @@ class ForwardScheduleConfig:
     ptp_w: float = -1.0   # per-stage prefix-CE weight (piecewise-const ramp); -1 => use PREFIX_CE_WEIGHT constant
 
 class GPT(nn.Module):
-    """The speedrun model: 11 blocks (attention skipped on layer 6), weights held in
-    sharded parameter banks (qk_bank / vo_bank / mlp_bank), tied-then-split
-    embed/lm_head, hashed-bigram and token value-embedding input channels, MUDD
-    dynamic skip/gate coefficients, ReLU^2 MLP with fp8 forward+backward, and a
-    fused softcapped cross-entropy head with multi-token-prediction weights."""
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
         super().__init__()
         self.num_layers = num_layers
@@ -2387,7 +2354,6 @@ class GPT(nn.Module):
             param.label = name.replace('.weight', '')
 
     def init_attn(self, model_dim, head_dim, num_heads, num_layers, max_seq_len):
-        """Attention modules, rotary tables, value embeddings and the qk/vo banks."""
         # Cache layers for skip / backout snapshots taken at end of loop iter.
         self.cache_layers = [3, 7]
 
@@ -2431,8 +2397,8 @@ class GPT(nn.Module):
         num_attn_layers = num_layers - 1
         hdim = num_heads * head_dim
 
-        # QK bank: per-head-pair ANVIL groups for Q, K weights
-        # Each pair of adjacent heads gets its own independent cascade whitening
+        # QK bank: per-head-pair Muon groups for Q, K weights
+        # Each pair of adjacent heads gets its own independent polar express orthogonalization
         self._num_attn_layers = num_attn_layers
         num_qk_groups = num_attn_layers * 2 * (num_heads // 2)  # 10 * 2 * 3 = 60
         self._num_qk_groups = num_qk_groups
@@ -2447,7 +2413,7 @@ class GPT(nn.Module):
         self.qk_bank = nn.Parameter(torch.empty(num_qk_padded, _qk_grp, model_dim))
         self.qk_bank.reshape = (num_qk_padded, _qk_grp, model_dim)
 
-        # VO bank: per-layer ANVIL groups for V and O weights
+        # VO bank: per-layer Muon groups for V and O weights
         num_vo_real = num_attn_layers * 2  # 20
         num_vo_padded = next_multiple_of_n(num_vo_real, n=world_size)  # 24
         self.vo_bank = nn.Parameter(torch.empty(num_vo_padded, hdim, hdim))
@@ -2465,8 +2431,7 @@ class GPT(nn.Module):
             self.vo_bank[:num_vo_real].uniform_(-bound, bound)
             self.vo_bank[num_vo_real:].zero_()
 
-    def init_mlp(self, model_dim):
-        """MLP parameter bank (c_fc / c_proj pairs, padded to 24 matrices)."""
+    def init_mlp(self, model_dim):        
         # MLP bank: stores c_fc and c_proj for all MLP layers
         # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
         mlp_hdim = 4 * model_dim
@@ -2481,7 +2446,6 @@ class GPT(nn.Module):
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
 
     def init_misc(self, model_dim, num_layers):
-        """Smear gate, bigram embedding + sign table, and the residual/SA scalars."""
         self.smear_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.smear_gate.weight)
 
@@ -2682,9 +2646,6 @@ class GPT(nn.Module):
                                        self._lm_f8_cm.T.view(torch.uint8))
 
     def init_mudd_gate(self, model_dim: int):
-        """MUDD gate generators: token-conditional XSA alphas, attn/bigram/x0 gates,
-        the skip gate and the DC-attention gate pair, in two fixed coefficient layouts
-        (pre = start of layer 0, post = start of layer 4)."""
         self._mudd_gate_scale = nn.Parameter(torch.tensor(0.1))
         mudd_gate_dim = 64
         assert self.num_heads == 6
@@ -2723,28 +2684,20 @@ class GPT(nn.Module):
         self.mudd_gate_b2 = nn.Parameter(bs_init)
 
     def forward_mudd_gate(self, x, id, num_coef):
-        """Return `num_coef` per-token gate coefficients from gate block `id` (0=pre, 1=post)."""
         x = F.gelu(F.linear(x, self.mudd_gate_w1[id]))
         return (F.linear(x, self.mudd_gate_w2[id, :num_coef]) + self.mudd_gate_b2[id, :num_coef]) * self._mudd_gate_scale.type_as(x)
 
     def unpack_pre_mudd_gate(self, gate, xsa_alphas, attn_gates, x0_gates, bigram_gates):
-        """Scatter the 26 pre-gate coefficients into the per-layer gate lists."""
         xsa_alphas[1] = gate[..., 0:6] # 6 means 6 heads
         xsa_alphas[3] = gate[..., 6:12]
-        # KX_317=2: freeze the layer-3 gate at its init value (attn_gate_bias 2.5 * scale 0.1
-        # = 0.25) instead of taking the token-conditional coefficients. Index 12:18 is
-        # unchanged either way; full_like keeps shape/dtype/device and carries no grad, so
-        # mudd_gate_w2/b2 rows 12:18 go dead exactly as in mode 1.
         attn_gates[3] = gate[..., 12:18]
         for layer, offset in zip((0, 1, 2, 3), range(18, 26, 2)):
             x0_gates[layer] = gate[..., offset:offset + 1]
             bigram_gates[layer] = gate[..., offset + 1:offset + 2]
 
     def unpack_post_mudd_gate(self, gate, xsa_alphas, attn_gates, x0_gates, bigram_gates):
-        """Scatter the post-gate coefficients; returns the layer-6 skip gate slice."""
         xsa_alphas[4] = gate[..., 0:6]
         xsa_alphas[7] = gate[..., 6:12]
-        # KX_317=2: see unpack_pre_mudd_gate. Same index 12:18, frozen at the init value.
         attn_gates[10] = gate[..., 12:18]
         for layer, offset in zip((4, 5, 7, 8, 9), range(18, 28, 2)):
             x0_gates[layer] = gate[..., offset:offset + 1]
@@ -2774,7 +2727,7 @@ class GPT(nn.Module):
             mlp_up_proj_f8 = self._mlp_up_proj_f8.unbind(0)
             mlp_up_proj_scales = [self._mlp_up_proj_scales[i:i+1] for i in range(12)]
 
-        # ---- Unbind parameters (avoid per-index slicing backward kernels) ----
+        # ---- Unbind parameters (avoid select_backward kernels) ----
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
         smear_lambda = self.scalars[2 * self.num_layers]
         skip_lambda = self.scalars[2 * self.num_layers + 1]
@@ -3058,7 +3011,6 @@ class GPT(nn.Module):
 # Distributed data loader
 
 def _load_data_shard(file: Path):
-    """Read one .bin token shard into a pinned uint16 tensor (zero-copy readinto)."""
     header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
     assert header[0] == 20240520, "magic number mismatch in the data .bin file"
     assert header[1] == 1, "unsupported version"
@@ -3074,8 +3026,6 @@ BOS_ID = 50256
 TRAIN_MAX_NUM_DOCS = {16384: 64, 32768: 96, 49152: 128}
 
 class Shard:
-    """BOS-indexed view over one token shard: serves BOS-aligned packed batches
-    (partial BOS index immediately, full index swapped in from a background scan)."""
     def __init__(self, tokens: Tensor, world_size: int = 1):
         self.tokens = tokens
         self.size = tokens.numel()
@@ -3101,8 +3051,6 @@ class Shard:
             self.bos_idx = self._full_idx
 
     def next_batch(self, num_tokens_local: int, max_seq_len: int):
-        """Pick per-rank BOS-aligned (start, end) document lists packing exactly
-        num_tokens_local+1 tokens per rank; raises StopIteration at the shard tail."""
         self._maybe_switch()
         n = len(self.bos_idx)
         starts = [[] for _ in range(self.world_size)]
@@ -3185,11 +3133,7 @@ def get_bigram_hash(x):
     out[1:] = torch.bitwise_xor(rand_int_1 * out[1:], rand_int_2 * out[:-1]) % mod
     return out
 
-
 def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
-    """Yield per-rank (inputs, targets, cum_lengths, bigram_inputs, bigram_cpu)
-    batches across shards; accepts new (num_tokens, max_seq_len, grad_accum_steps)
-    via .send() at stage transitions. Token streams are byte-identical to stock."""
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -3200,13 +3144,12 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
 
-    # Shard prescan: prescan (load + FULL BOS scan) the shards this run will consume,
-    # in untimed prep (the generator body first runs at the pre-clock prime / warmup).
-    # Stock pays each mid-run shard load+scan in a GIL-contending background thread
-    # while the timed loop's host work runs. Full-index-from-birth is batch-identical:
-    # the async full index is a superset-prefix of the partial one it replaces.
+    # Shard loading follows the stock convention: every shard (including the first)
+    # is loaded by the async loader during the timed run. _R2_PRESCAN_MAX = 0 keeps
+    # the prescan machinery disabled; _r2_shards stays empty so _r2_next_getter
+    # always falls through to the stock async path.
     _r2_shards = None
-    if align_to_bos:
+    if align_to_bos and _R2_PRESCAN_MAX > 0:
         _r2_shards = {}
         for _f in files[:_R2_PRESCAN_MAX]:
             _t = _load_data_shard(_f)
@@ -3214,7 +3157,6 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             _sh._ready.wait()
             _sh._maybe_switch()
             _r2_shards[_f] = _sh
-        print0(f"[r2] {len(_r2_shards)} shards loaded+scanned off-clock", console=True)
 
     def _r2_next_getter(_it):
         """Next-shard getter: prescanned dict hit, else the stock async loader."""
@@ -3222,8 +3164,6 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         if _r2_shards is not None and _nf in _r2_shards:
             _sh = _r2_shards[_nf]
             return lambda: _sh
-        if _r2_shards is not None:
-            print0(f"[r2] prescan miss, stock async load: {_nf.name}", console=True)
         return Shard.load_async(_nf, world_size)
 
     file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
@@ -3311,7 +3251,6 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 
 @dataclass(slots=True)
 class Hyperparameters:
-    """Run-level configuration: data paths, step counts, batch sizes, eval cadence."""
     # data
     data_path = os.environ.get("DATA_PATH", ".")
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin") # input .bin to train on
@@ -3324,6 +3263,10 @@ class Hyperparameters:
     num_extension_iterations: int = int('23')  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
+    # Descriptive run_id for this iteration:
+    #   - explicit sparse connectivity refactor (no generic loop)
+    #   - (1 + m_r9) * x self-reference fuse on layer 9
+    #   - backout_lambda fully removed (slot dropped from self.scalars; absorbed into MUDD bias init)
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
@@ -3337,7 +3280,6 @@ args.val_loss_every = 0
 
 @dataclass(slots=True)
 class TrainingStage:
-    """One stage of the batch/window/seq-len/MTP schedule."""
     lr_mul: float
     batch_size: int
     window_sizes: tuple[int, int]  # (short, long) in block units
@@ -3384,7 +3326,6 @@ class TrainingSchedule:
             self.mtp_weights.append(torch.tensor(w, device=device))
 
     def lookup(self, step: int) -> tuple[TrainingStage, float]:
-        """Return (stage, fraction of the way through that stage) for a step."""
         # Returns stage and % of the way through that stage
         for i, (start, end) in enumerate(self.boundaries):
             if step < end:
@@ -3393,7 +3334,6 @@ class TrainingSchedule:
         return self.stages[-1], 1.0
 
     def get_lr(self, step: int) -> float:
-        """Global lr multiplier: per-stage lr_mul with a terminal cooldown to LR_FLOOR."""
         # learning rate schedule: tied to batch size schedule, with cooldown at the end
         stage, _ = self.lookup(step)
         lr = stage.lr_mul
@@ -3500,9 +3440,10 @@ if EXT_BATCH:
 ptp_init(device)  # default-path CE dummy: must pre-exist any compiled forward (dynamo-safe)
 if PREFIX_CE:
     _fk._PTP_W_RUNTIME = float(PREFIX_CE_WEIGHT)  # baseline before first schedule update; RAMP overwrites per stage
-    # Eager build (dynamo cannot trace tiktoken's registry): table lives on-device
-    # before the first compiled forward; the forward does a plain tensor lookup only.
-    _ptp_table(device)
+    # Eager alloc (dynamo cannot trace tiktoken's registry): the all(-1) table lives
+    # on-device before the first compiled forward; contents are filled on the clock
+    # by _ptp_table_fill() below. The forward does a plain tensor lookup only.
+    _ptp_table_alloc(device)
 
 training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=float("0.80"),
                                      split_embed_stage=int('4'),
@@ -3535,7 +3476,7 @@ class TrainingManager():
         1. Scalars are given higher momentum terms to smooth learning @ChrisJMcCormick
         2. Adam optimizers are only stepped on odd steps @classiclarryd
         3. Explicit scatter_order and work_order for communication scheduling (no backward hooks)
-        4. The ANVIL fast-rail beta has a linear warmup and cooldown schedule
+        4. Muon has a linear momentum warmup and cooldown schedule
         5. Learning rates follow a linear decay schedule
         6. Embed is tied to lm_head until split step (2/3 of training), then untied @classiclarryd
     """
@@ -3571,7 +3512,6 @@ class TrainingManager():
             "mudd_gate_b2": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
             "_mudd_gate_scale": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
         })
-
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
@@ -3671,11 +3611,9 @@ class TrainingManager():
         self.reset()
 
     def apply_final_ws_ext(self):
-        """Widen ws_long for the final validation (post-training YaRN extension)."""
         self.ws_long = training_schedule.ws_post_yarn_ext
 
     def get_forward_args(self):
-        """Build the ForwardScheduleConfig for the current schedule state."""
         return ForwardScheduleConfig(
             mtp_weights = self.mtp_weights,
             ws_short = self.ws_short * self.block_size,
@@ -3690,7 +3628,6 @@ class TrainingManager():
         return step % 2 == 1
 
     def get_transition_steps(self):
-        """Steps at which a new stage begins (recompile/warmup boundaries)."""
         return [start for start, _ in training_schedule.boundaries[1:]]
 
     def advance_schedule(self, step: int):
@@ -3736,8 +3673,6 @@ class TrainingManager():
         _fk._PTP_W_RUNTIME = self._ptp_w_now
 
     def step_optimizers(self, step: int):
-        """Advance per-param lr/momentum from the schedules, stage the dual-momentum
-        scalars, build the bigram grad payload, and run the optimizer step."""
         step_lr = training_schedule.get_lr(step)
         rail_beta = get_rail_beta(step)
         do_adam = self._is_adam_step(step)
@@ -3754,8 +3689,6 @@ class TrainingManager():
 
 
         # Update learning rates and momentum for all params
-        # (_KX_GLR_CONST is hoisted to a module constant -- it is read per param per
-        # step on a heavily saturated host, so no per-step lookup may sit here.)
         for param, p_cfg in self.optimizer.param_cfgs.items():
             p_cfg.lr = p_cfg.initial_lr * step_lr * _KX_GLR_CONST
             if _KX_QKLRMW_N > 0 and p_cfg.label == "qk_bank" and step < _KX_QKLRMW_N:
@@ -3793,11 +3726,10 @@ class TrainingManager():
             self.optimizer.copy_lm_state_to_embed()
 
     def reset(self, state=None):
-        """Restore optimizer/schedule state to step 0 (used for the post-warmup reset)."""
         if state is not None:
             self.optimizer.load_state_dict(state)
 
-        # Reset ANVIL velocity/energy state and split_embed state
+        # Reset NorMuon momentum buffers and split_embed state
         self.optimizer.reset()
 
         stage, _ = training_schedule.lookup(0)
@@ -3848,7 +3780,6 @@ class TrainingManager():
 
 
     def get_state(self):
-        """Deep-copied optimizer state snapshot (for the warmup save/restore)."""
         return copy.deepcopy(self.optimizer.state_dict())
 
     def sparse_index_update(self, step, bigram_indexes, trigram_indexes=None):
@@ -3874,7 +3805,6 @@ class TrainingManager():
                 self.sparse_counts_state = (send_idxes, send_counts, recv_counts, recv_counts_fut)
 
     def sparse_index_share(self, step):
-        """Launch the async row-index all_to_all and hand its futures to the optimizer."""
         if not _sparse_comms_active() or not self._is_adam_step(step):
             return
 
@@ -4263,7 +4193,6 @@ if master_process and True:
     _atexit.register(lambda: (_logf.flush(), _logf.close()))
 
 def print0(s, console=False):
-    """Rank-0 logging to the run logfile (and optionally the console)."""
     if master_process:
         if _logf is not None:
             # byte-identical output to the reopen path (same print(), same file, append order)
@@ -4290,7 +4219,6 @@ if KX_SLG_LOAD:
     )
 
 def nvidia_smi():
-    """Capture `nvidia-smi` output for the run log."""
     import subprocess  # avoid top level import
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
@@ -4445,15 +4373,14 @@ if _KX_R2:
     print0(f"[r2] yarn partial-rebuild rows={_R2_YARN_ROWS}", console=True)
 
 training_time_ms = 0
-    # Pre-clock prime (composes with the prefetch double-buffer): the loader is
-    # created above but generators are lazy — its first .send() pays the full first-shard
-    # read + ~GB pinned alloc + BOS scan. Stock pays this INSIDE the timed region at
-    # step 0; priming here moves it to legal untimed prep (same class as compile warmup).
-    # Batch sequence is bit-identical; step 0 consumes _pref_batch via the existing path.
-_pref_batch = train_loader.send(None)
+# The first .send() on the lazy train_loader generator (first-shard read + pinned
+# alloc + BOS scan) is paid INSIDE the timed region at step 0, matching the stock
+# convention. _pref_batch stays None here so step 0 takes the synchronous-fetch path.
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
+if PREFIX_CE:
+    _ptp_table_fill()  # prefix-table construction charged to training time (record #88 convention)
 # begin training
 train_steps = training_schedule.total_steps
 for step in range(train_steps + 1):
@@ -4463,31 +4390,29 @@ for step in range(train_steps + 1):
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         if last_step:
             training_manager.apply_final_ws_ext()
-        # stop the clock
-        torch.cuda.synchronize()
-
-        training_time_ms += 1000 * (time.perf_counter() - t0)
         if last_step and TAIL_EMA_WINDOW > 0 and _tema_bufs:
-            # TailEMA terminal ship: MUST sit after the timer read above so the blend
-            # is genuinely off-clock. Labels are disjoint
+            # TailEMA terminal ship, ON the clock: the terminal blend is an O(params)
+            # lerp costing single-digit ms; keeping it inside the timed section means
+            # the counted weights are exactly the weights that exist when the clock
+            # stops. Labels are disjoint
             # from the tavg ship below, so relative order is value-irrelevant.
             with torch.no_grad():
                 for _lbl, _bar in _tema_bufs.items():
                     _p = training_manager.optimizer._param_by_label[_lbl]
                     _p.data.copy_(torch.lerp(_p.data.float(), _bar, TAIL_EMA_BLEND).to(_p.dtype))
-            print0(f"[tema] shipped off-clock win={TAIL_EMA_WINDOW} blend={TAIL_EMA_BLEND} labels={sorted(_tema_bufs)}", console=True)
+            print0(f"[tema] shipped win={TAIL_EMA_WINDOW} blend={TAIL_EMA_BLEND} labels={sorted(_tema_bufs)}", console=True)
         if _KX_R2:
             # Restore any partially-rebuilt Yarn factor rows before eval
-            # touches val-length sequences. Untimed (clock stopped above).
+            # touches val-length sequences. On the clock (runs before the timer read).
             for _m in model.modules():
                 if isinstance(_m, Yarn):
                     _m.r2_ensure_full()
         if last_step and TAIL_AVG_WINDOW > 0 and 'full' == "full" and _tavg_bufs:
             # Ship the full tail-average: swap the assembled weights in BEFORE the final
-            # counted validation, and after the clock has stopped, so the assembly is
-            # untimed. (Placement is load-bearing: after the whole validation section
-            # the reported final val would run on the raw weights and the ship would
-            # only ever affect the saved checkpoint.)
+            # counted validation and BEFORE the timer read, so the assembly is paid
+            # on the clock. (Placement before validation is load-bearing: after the
+            # whole validation section the reported final val would run on the raw
+            # weights and the ship would only ever affect the saved checkpoint.)
             # FP8 weight caches (quantize_mlp_fp8: _mlp_up_proj_f8 / _mlp_down_f8 /
             # _mlp_down_f8_row / _lm_f8 / _attn_f8) need no refresh here: every consumer
             # is gated on self.training (GPT.forward `use_mlp_fp8`/`use_attn_f8`,
@@ -4511,14 +4436,17 @@ for step in range(train_steps + 1):
             # state; the counted final val below, the saved checkpoint and all
             # post-loop evals see it. Mantissa staleness is the same class the
             # stock tavg ship already accepts (no optimizer step ever consumes
-            # the sidecar after this point). Off-clock: the training clock was
-            # read for the last time above and is never read again at last_step.
+            # the sidecar after this point). On the clock: the timer read happens
+            # after every ship in this section.
             with torch.no_grad():
                 for _lbl, _bar in _shipblend_bufs.items():
                     _p = training_manager.optimizer._param_by_label[_lbl]
                     _p.data.copy_(torch.lerp(_p.data.float(), _bar, _SHIPBLEND_B).to(_p.dtype))
             print0(f"[shipblend] blended banks k={_SHIPBLEND_K} blend={_SHIPBLEND_B} "
                    f"n={max(_shipblend_n.values()) if _shipblend_n else 0} labels={sorted(_shipblend_bufs)}", console=True)
+        # stop the clock (after every last_step weight ship above)
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
