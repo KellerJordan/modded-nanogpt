@@ -13,8 +13,10 @@ Main method departures from the stock baseline:
     spectral-map cascade on the velocity Gram, per-lane energy equalization,
     sign-aligned decay, exact-fp32 commits on bf16 storage via a mantissa
     sidecar, and a bank tail-blend ship step;
-    replicated-full Adam for lm_head/embed; fused flat all_reduce for the small
-    replicated params and explicitly scheduled communication orders.
+    sharded Adam for lm_head/embed (a replicated-full variant is compiled in
+    behind KX_SHARDED_LM_ADAM=0, off in the record config); fused flat
+    all_reduce for the small replicated params and explicitly scheduled
+    communication orders.
   * fp8 MLP forward AND backward (static clip-free activation scales, delayed
     grad/post-activation scales, dual-layout weight caches); fp8 lm_head cache
     feeding a fused softcapped cross-entropy with an auxiliary prefix-token CE term.
@@ -26,9 +28,27 @@ Main method departures from the stock baseline:
     rebuilds repaired off-clock; tail-EMA / tail-average weight shipping applied
     after the clock stops, before the final validation.
   * Manual CUDA-graph capture of the post-step fp8 quantize segment.
+  * Mixed-width QK attention (KX_QKMW64): every attention layer except the two
+    long-window carrier layers (3, 10) runs 64-dim query/key heads — values and
+    outputs stay 128 — with a fully-rotating 64-dim rotary (32 distinct
+    frequencies, KX_QK64_ROT64) and attention scale 0.12; the carriers keep
+    stock full-width QK on their own module + rotary table.
+  * V-lite value-embedding gradient channel (KX_VELITE): value-embed grads
+    accumulate into one persistent buffer per Adam cycle (no per-step dense
+    grad materialization); value-embed and hashed-bigram Adam run on a
+    period-4 cadence from step 336 (KX_VEPER/KX_BGPER, stock is every odd step).
+  * Stage-3 sequence geometry: document-truncation cap 3072 (_seq3) with a
+    virtual 2048-token attention cap (KX_VIRTUAL_SEQ_CAP) applied to the packed
+    seqlens; token streams stay byte-identical to stock.
+  * +40 scheduled steps inserted into stage 2 (KX_GROW=40): stage boundaries
+    after stage 2 shift by +40 and the LR cooldown re-anchors to the grown
+    scheduled length (KX_STEPS + 40).
 
 Live environment variables: KX_SEED (seeded reproduction runs), KX_STEPS (scheduled
-step count), DATA_PATH (data root). Everything else is baked into constants below.
+step count before growth; the KX_GROW=40 default adds 40 steps in stage 2),
+DATA_PATH (data root). Every other KX_ knob is an env read whose DEFAULT IS the
+record configuration — the record run sets none of them; overrides exist for
+ablation/reproduction only.
 """
 import os
 import sys
@@ -91,6 +111,8 @@ if '1' == "1" or '1' == "1":
 _KX_R2 = True        # off-clock TEMA ship + fp32 TEMA scratch + shard prescan + partial Yarn rebuild
 _KX_LMF8T = True      # col-major lm_head fp8 cache for the CE forward GEMM
 _KX_PROF = int('0')    # probe-only: chrome-trace steps [N, N+8) on rank 0 (wall meaningless)
+KX_VELITE = int(os.environ.get("KX_VELITE", "1"))
+assert KX_VELITE in (0, 1), "KX_VELITE must be 0 or 1"
 _R2_YARN_ROWS = 0                                       # set >0 before the timed loop when _KX_R2
 _R2_PRESCAN_MAX = 0                                     # 0 = stock lazy shard loading (no pre-clock prescan)
 _r2_tema_scratch: dict = {}
@@ -109,12 +131,15 @@ if KX_SLG_LOAD:
     import hashlib as _slg_hashlib
 
     _SLG_OP_PATH = Path(__file__).with_name("value_embed_op.py")
-    _SLG_OP_SHA256 = "27cf093a81516bb3bd6062c45d28a63662826c16c31d4646c435426afbb080be"
+    _SLG_OP_SHA256 = "7fa8e190958ac971009c5f18573435b0962c0085dd8b3453c4a081f467fcbe59"
     _slg_op_sha256 = _slg_hashlib.sha256(_SLG_OP_PATH.read_bytes()).hexdigest()
     assert _slg_op_sha256 == _SLG_OP_SHA256, (
         f"SLG trainer op mismatch: got {_slg_op_sha256}, expected {_SLG_OP_SHA256}"
     )
-    from value_embed_op import value_embedding_planes_selected_load
+    from value_embed_op import (
+        value_embedding_planes_selected_load,
+        value_embedding_planes_selected_load_into,
+    )
 
 FP8_MLP_FWD = True     # FP8 MLP down-projection forward
 PREFIX_CE = True          # PR#337 port: auxiliary prefix-token CE through the fused kernel (train only; val untouched)
@@ -226,7 +251,11 @@ if BIGRAM_BF16_BWD:
 # "replicated_full" (one async AVG all_reduce of the full grad, full-param Adam
 # on every rank, NO gather). NCCL AR is bitwise-identical across ranks -> ranks
 # stay in lockstep. Distinct comms name keeps them OUT of the FLAT_ALLREDUCE flat buffer.
-REPLICATED_FULL_ADAM = int('1')
+# KX_SHARDED_LM_ADAM=1 (record default) keeps the stock sharded Adam path for
+# lm_head/embed; 0 selects the replicated_full variant described above.
+KX_SHARDED_LM_ADAM = int(os.environ.get("KX_SHARDED_LM_ADAM", "1"))
+assert KX_SHARDED_LM_ADAM in (0, 1), "KX_SHARDED_LM_ADAM must be 0 or 1"
+REPLICATED_FULL_ADAM = 0 if KX_SHARDED_LM_ADAM else 1
 VEMB_LR_MUL = float('70')  # value_embeds lr_mul
 BIGRAM_LR_MUL = float('70')  # bigram_embed lr_mul
 KX_C2S = False          # FP8 attention forwards, static scales + cached weights (v2)
@@ -239,6 +268,16 @@ KX_XS8 = float("32.0")       # static amax bound for attn inputs (RMS-normed)
 # mixed q/k=64, v=128 head dims (verified fwd on H100). N=64 is the validated
 # setting.
 KX_QKD = int("0")
+KX_QKMW64 = int(os.environ.get("KX_QKMW64", "1"))
+KX_QK64_ROT64 = int(os.environ.get("KX_QK64_ROT64", "1"))
+KX_QK64_CALDIAG = int(os.environ.get("KX_QK64_CALDIAG", "0"))
+assert KX_QK64_CALDIAG in (0, 1)
+assert KX_QK64_ROT64 in (0, 1)
+assert not KX_QK64_ROT64 or KX_QKMW64
+KX_QKMW64_SCALE = float(os.environ.get("KX_QKMW64_SCALE", "0.12"))
+_KX_QK64_EVALSCALE = [float(x) for x in os.environ.get("KX_QK64_EVALSCALE_LADDER", "").split(",") if x.strip()]
+assert KX_QKMW64 in (0, 1)
+assert not KX_QKMW64 or 0.08 <= KX_QKMW64_SCALE <= 0.16
 # KX_WSL:
 # per-layer attention-window multipliers "layer:mult,...". Applied to per-stage bm_size in
 # tokens, rounded to a 128 multiple, floor 128. Mults <1 on SHORT-window layers only (keeps
@@ -308,8 +347,16 @@ COMM_ORDER = int('1')
 GRAD_FIREWALL = True  # scale-poison + grad firewall (nan/inf scrub on delayed fp8 scales)
 # Per-param Adam period for value_embeds only (0/1/2 = stock every-odd-step).
 # NOT numerics-preserving: it changes how many steps of gradient accumulate into one
-# Adam update -> loss-screen risk class, kept on its own knob, default off.
-KX_VEPER = int("0")
+# Adam update -> loss-screen risk class, kept on its own knob. Record default:
+# period 4, value_embeds from KX_VEPER_START=336, bigram from KX_BGPER_START=336.
+KX_VEPER = int(os.environ.get("KX_VEPER", "4"))
+KX_BGPER = int(os.environ.get("KX_BGPER", "4"))
+KX_BGPER_START = int(os.environ.get("KX_BGPER_START", "336"))
+assert KX_BGPER in (0, 4), "KX_BGPER must be 0 or 4"
+assert KX_BGPER_START % 4 == 0, "KX_BGPER_START must be a cycle boundary"
+KX_VEPER_START = int(os.environ.get("KX_VEPER_START", "336"))
+assert KX_VEPER in (0, 4), "KX_VEPER must be 0 or 4"
+assert KX_VEPER_START % 4 == 0, "KX_VEPER_START must be a cycle boundary"
 # Manual CUDA-graph capture of the optimizer-phase compute segments.
 # Collectives, future.wait()s, transpose_add/copy and the sparse
 # bigram path all stay eager; only the collective-free compute between them is captured:
@@ -1318,6 +1365,21 @@ class AnvilAndAdam:
             # REPLICATED_FULL_ADAM: both states are full-extent -- plain transpose, no reshard.
             for key in ["exp_avg", "exp_avg_sq"]:
                 embed_state[key].copy_(lm_state[key].T)
+        else:
+            # Correct the dormant sharded path promised by this method: gather each
+            # lm state once at the late untie boundary, transpose, then retain only
+            # this rank's embed-row shard. Values are copied without arithmetic.
+            _erank = dist.get_rank()
+            _elo = _erank * embed_cfg.chunk_size
+            _ehi = _elo + embed_cfg.chunk_size
+            for key in ["exp_avg", "exp_avg_sq"]:
+                _lm_full = torch.empty(lm_head.shape, dtype=lm_state[key].dtype,
+                                       device=lm_state[key].device)
+                dist.all_gather_into_tensor(_lm_full, lm_state[key].contiguous())
+                embed_state[key].copy_(_lm_full.T[_elo:_ehi])
+                del _lm_full
+
+            print0("[sharded_lm_adam] untie-state-fired exact-copy=1", console=True)
 
         # Mark as split
         self.split_embed = True
@@ -2193,7 +2255,7 @@ class CausalSelfAttention(nn.Module):
         # every slice/view below is bit-identical to the baseline.
         # KX_QKMW: full_qk=True pins this module at the FULL v/o head dim regardless
         # of KX_QKD, so the two wide (ws_long) layers keep stock 128-wide q/k.
-        self.d_qk = head_dim if full_qk else (head_dim)
+        self.d_qk = head_dim if full_qk else (64 if KX_QKMW64 else head_dim)
         self.qk_rows = num_heads * self.d_qk       # rows of q (= rows of k) in qkvo_w
         self.qkv_rows = 2 * self.qk_rows + self.hdim  # q+k+v rows (o rows follow)
         # Weights are stored in parameter banks and passed via forward()
@@ -2203,7 +2265,12 @@ class CausalSelfAttention(nn.Module):
 
         y: (..., qkv_rows). Off (KX_QKD=0): the original uniform-head-dim
         view+chunk, untouched. On: unequal split — q/k at d_qk, v at head_dim."""
-        return y.view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        if self.d_qk == self.head_dim:
+            return y.view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k, v = y.split((self.qk_rows, self.qk_rows, self.hdim), dim=-1)
+        return (q.view(B, T, self.num_heads, self.d_qk),
+                k.view(B, T, self.num_heads, self.d_qk),
+                v.view(B, T, self.num_heads, self.head_dim))
 
     def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor, dc_w: tuple[Tensor, Tensor] | None = None):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -2216,7 +2283,8 @@ class CausalSelfAttention(nn.Module):
         train_max_seq_len, yarn = attn_args.train_max_seq_len, attn_args.yarn
 
         q, k, v = self._split_qkv(F.linear(x, sa_lambdas[0] * qkvo_w[:self.qkv_rows].type_as(x)), B, T)
-        max_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
+        max_len = ((KX_VIRTUAL_SEQ_CAP if KX_VIRTUAL_SEQ_CAP and train_max_seq_len > KX_VIRTUAL_SEQ_CAP else train_max_seq_len)
+                   if self.training else (args.val_batch_size // (grad_accum_steps * world_size)))
 
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         if attn_args.qk_gain is not None:
@@ -2318,6 +2386,9 @@ class GPT(nn.Module):
         # there are only 50257 unique GPT-2 tokens; extend to nearest multiple of 128 for efficiency.
         # suggested by @Grad62304977, originates from Karpathy's experiments.
         self.vocab_size = next_multiple_of_n(vocab_size, n=128)
+        if KX_QK64_CALDIAG:
+            self.register_buffer("_eval_logit_temp", torch.ones((), dtype=torch.float32),
+                                 persistent=False)
 
         # Transposed weight storage for faster gradient accumulation
         use_fp8 = True
@@ -2362,13 +2433,24 @@ class GPT(nn.Module):
         self.paired_head_layers = [int(x) for x in "0,2,5,9".split(",") if x.strip() != ""]
         self.attn = CausalSelfAttention(model_dim, head_dim, num_heads, paired=False)
         self.attn_paired = CausalSelfAttention(model_dim, head_dim, num_heads, paired=True)
+        if KX_QKMW64:
+            self.attn_wide = CausalSelfAttention(
+                model_dim, head_dim, num_heads, paired=False, full_qk=True)
         # KX_QKD: rotary tables are built for the q/k head dim (d_qk), which the
         # narrowed q/k tensors carry. Off: d_qk == head_dim, identical to stock.
-        _qk_dim = head_dim
+        _qk_dim = 64 if KX_QKMW64 else head_dim
         # KX_RSTAG/KX_RNOPE: only the narrow NON-PAIRED Yarn gets a head axis (heads=0 =>
         # `if self.heads:` is False everywhere => stock construction, bit-identical).
-        self.yarn = Yarn(_qk_dim, max_seq_len, heads=(0))
-        self.yarn_paired_head = Yarn(_qk_dim, max_seq_len, paired=True)
+        _qk64_rot = 64 if KX_QK64_ROT64 else None
+        self.yarn = Yarn(_qk_dim, max_seq_len, rot=_qk64_rot, heads=(0))
+        self.yarn_paired_head = Yarn(_qk_dim, max_seq_len, paired=True, rot=_qk64_rot)
+        if KX_QKMW64:
+            self.yarn.attn_scale = KX_QKMW64_SCALE
+            self.yarn_paired_head.attn_scale = KX_QKMW64_SCALE
+            self.yarn_wide = Yarn(head_dim, max_seq_len)
+            print0(f"[mixed_qk64] ON narrow=64 carriers=3,10 scale={KX_QKMW64_SCALE}", console=True)
+            if KX_QK64_ROT64:
+                print0("[qk64_rot64] ON rotating_dims=64 distinct_freqs=32 stationary_dims=0", console=True)
         # KX_QKMW: the wide (ws_long carrier) layers get their own full-width, non-paired
         # attention module + rotary table (32 freqs, rot band head_dim//2 = 64 -- exactly
         # the stock d=128 rotary). Model-layer indices; the matching attention-bank
@@ -2409,7 +2491,7 @@ class GPT(nn.Module):
         # KX_QKMW: allocate at the STOCK full width (2 * head_dim = 256 rows/group) even
         # though KX_QKD=64 -- the narrow layers occupy rows [:2*KX_QKD] of each group and
         # the remainder is dead zero. Keeps every optimizer/comms geometry at stock.
-        _qk_grp = (_qk_dim) * 2
+        _qk_grp = (head_dim if KX_QKMW64 else _qk_dim) * 2
         self.qk_bank = nn.Parameter(torch.empty(num_qk_padded, _qk_grp, model_dim))
         self.qk_bank.reshape = (num_qk_padded, _qk_grp, model_dim)
 
@@ -2704,10 +2786,11 @@ class GPT(nn.Module):
             bigram_gates[layer] = gate[..., offset + 1:offset + 2]
         return gate[..., 28:29]
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig, bg_sink: Tensor | None = None):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig, bg_sink: Tensor | None = None, ve_sink: Tensor | None = None):
         """Full forward pass over one packed batch; returns per-token loss (training:
         fused softcapped CE with MTP + prefix-CE; eval: plain softcapped CE).
-        bg_sink is the zeros leaf that harvests the bigram-channel gradient."""
+        bg_sink is the zeros leaf that harvests the bigram-channel gradient.
+        ve_sink is the persistent V-lite per-Adam-cycle value-gradient buffer."""
         assert input_seq.ndim == 1
 
         # ---- Schedule and layer topology ----
@@ -2745,9 +2828,22 @@ class GPT(nn.Module):
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
         assert len(dc_weights) == self.num_layers
-        qk_all = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])
-        vo_flat = self.vo_bank[:self._num_attn_layers * 2].view(self._num_attn_layers, 2, *self.vo_bank.shape[1:]).flatten(1, 2)
-        attn_weights = torch.cat([qk_all, vo_flat], dim=1).unbind(0)
+        _qkg = self.qk_bank[:self._num_qk_groups].view(
+            self._num_attn_layers, 2 * (self.num_heads // 2),
+            self.qk_bank.shape[-2], self.qk_bank.shape[-1])
+        qk_full = _qkg.flatten(1, 2).unbind(0)
+        if KX_QKMW64:
+            _qkgn = (_qkg.view(self._num_attn_layers, 2 * (self.num_heads // 2),
+                               2, self.head_dim, self.qk_bank.shape[-1])
+                      [:, :, :, :64, :].reshape(
+                          self._num_attn_layers, 2 * (self.num_heads // 2),
+                          128, self.qk_bank.shape[-1]))
+            qk_narrow = _qkgn.flatten(1, 2).unbind(0)
+        else:
+            qk_narrow = qk_full
+        vo_weights = (self.vo_bank[:self._num_attn_layers * 2]
+                      .view(self._num_attn_layers, 2, *self.vo_bank.shape[1:])
+                      .flatten(1, 2).unbind(0))
         use_attn_f8 = False
         attn_f8 = self._attn_f8.unbind(0) if use_attn_f8 else None
         attn_ws = [self._attn_ws[j] for j in range(self._num_attn_layers)] if use_attn_f8 else None
@@ -2782,9 +2878,14 @@ class GPT(nn.Module):
 
         # Value embeddings - always computed (not precomputed)
         if KX_SLG_LOAD:
-            _ve0, _ve1, _ve2, _ve3, _ve4 = value_embedding_planes_selected_load(
-                self.value_embeds, input_seq
-            )
+            if KX_VELITE and ve_sink is not None:
+                _ve0, _ve1, _ve2, _ve3, _ve4 = value_embedding_planes_selected_load_into(
+                    self.value_embeds, input_seq, ve_sink
+                )
+            else:
+                _ve0, _ve1, _ve2, _ve3, _ve4 = value_embedding_planes_selected_load(
+                    self.value_embeds, input_seq
+                )
             # Shifted .01 ... 234 structure on token value embeddings by @photomz
             ve = [None, _ve0, _ve1, *self.gate_filler_nones, _ve2, _ve3, _ve4]
         assert len(ve) == self.num_layers
@@ -2816,7 +2917,7 @@ class GPT(nn.Module):
             is_paired = i in self.paired_head_layers
             # KX_QKMW: the ws_long carriers run the full-width (d_qk=128) module + rotary.
             # Off: `is_wide` is a compile-time-constant False and this is the stock pick.
-            is_wide = False
+            is_wide = KX_QKMW64 and i in self._qkmw_wide_layers
             # KX_QKSCAF: during the scaffold phase every NON-wide layer also runs at
             # d_qk=128 -- same pairing as always, only the width (and the rotary/attn
             # scale that go with it) change. Off: `is_scaf` is a compile-time-constant
@@ -2853,7 +2954,9 @@ class GPT(nn.Module):
                 skip_gate_out = torch.sigmoid(skip_lambda) * post_skip_gate
                 x = x + skip_gate_out * cache[3]
             else:
-                qkvo_w = attn_weights[i - (i > 6)]
+                _ai = i - (i > 6)
+                _qkw = qk_full[_ai] if is_wide else qk_narrow[_ai]
+                qkvo_w = torch.cat((_qkw, vo_weights[_ai]), dim=0)
                 attn_in_normed = norm(cache.get(7, x))
                 B, T = attn_in_normed.size(0), attn_in_normed.size(1)
                 if use_s3w:
@@ -3004,7 +3107,8 @@ class GPT(nn.Module):
         else:
             logits = self.lm_head(x)
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
-            logits_for_loss = logits.float()
+            logits_for_loss = (logits.float() * self._eval_logit_temp
+                               if KX_QK64_CALDIAG else logits.float())
             loss_per_token = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="none")
         return loss_per_token
 # -----------------------------------------------------------------------------
@@ -3206,6 +3310,24 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             _targets = buf[1:]
             end_idxs[-1] -= 1  # last document was too long to account for _targets offset
             cum_lengths = (end_idxs - start_idxs).cumsum(0)
+            if KX_VIRTUAL_SEQ_CAP and max_seq_len > KX_VIRTUAL_SEQ_CAP:
+                # Split attention segments only. _inputs/_targets and the loader
+                # document selection above remain byte-for-byte stock.
+                _stock_docs = len(cum_lengths)
+                _virtual_ends = [0]
+                for _virtual_end in cum_lengths.tolist():
+                    while _virtual_end - _virtual_ends[-1] > KX_VIRTUAL_SEQ_CAP:
+                        _virtual_ends.append(_virtual_ends[-1] + KX_VIRTUAL_SEQ_CAP)
+                    _virtual_ends.append(_virtual_end)
+                assert _virtual_ends[-1] == num_tokens_local
+                assert max(b - a for a, b in zip(_virtual_ends, _virtual_ends[1:])) <= KX_VIRTUAL_SEQ_CAP
+                assert len(_virtual_ends) <= max_num_docs
+                cum_lengths = torch.tensor(_virtual_ends[1:], dtype=cum_lengths.dtype)
+                if not getattr(distributed_data_generator, "_n3x_virtual_cap_printed", False):
+                    print0(f"[virtual_seq_cap] loader-fired stock_cap={max_seq_len} "
+                           f"attention_cap={KX_VIRTUAL_SEQ_CAP} stock_docs={_stock_docs} "
+                           f"virtual_docs={len(cum_lengths)} stock_tokens=1", console=True)
+                    distributed_data_generator._n3x_virtual_cap_printed = True
 
         else:
             if pos + num_tokens + 1 >= len(tokens):  # should not occur for val data
@@ -3303,7 +3425,10 @@ class TrainingSchedule:
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
                  cooldown_frac: float = 0.5, split_embed_stage: int = 2, ws_post_yarn_ext: int = 20):
         self.stages = stages
-        self.scheduled_iterations = scheduled_iterations
+        _kx_grow = int(os.environ.get("KX_GROW", "40"))
+        _kx_grow_stage = int(os.environ.get("KX_GROW_STAGE", "2"))
+        assert _kx_grow % 2 == 0, "KX_GROW must be even (Adam parity)"
+        self.scheduled_iterations = scheduled_iterations + _kx_grow
         self.cooldown_frac = cooldown_frac
         # increase final validation ws, used for YaRN extension and short window size @classiclarryd
         self.ws_post_yarn_ext = ws_post_yarn_ext
@@ -3311,7 +3436,10 @@ class TrainingSchedule:
         self.total_steps = self.scheduled_iterations + extension_iterations
 
         # Build stage boundaries (last is extension stage)
-        ends = [0, *[round(c * scheduled_iterations) for c in accumulate(s.duration for s in stages[:-1])], self.total_steps]
+        ends = [0, *[round(c * scheduled_iterations) for c in accumulate(s.duration for s in stages[:-1])], scheduled_iterations + extension_iterations]
+        if _kx_grow:
+            ends = [e + _kx_grow if i > _kx_grow_stage else e for i, e in enumerate(ends)]
+            print(f"[kx_grow] fired: +{_kx_grow} steps in stage {_kx_grow_stage}; ends={ends}", flush=True)
         assert self.scheduled_iterations == ends[-2]
         self.boundaries = list(pairwise(ends))
 
@@ -3402,6 +3530,8 @@ _seq1 = int("896")
 # Attention windows are in 128-token blocks and set separately by STAGE_WINDOW_SIZES. Raising it only
 # lowers the sequences-per-batch count, so the TRAIN_MAX_NUM_DOCS[49152]=128 cap stays
 # satisfied; the assert guards the (untested) shrinking direction.
+KX_VIRTUAL_SEQ_CAP = int(os.environ.get("KX_VIRTUAL_SEQ_CAP", "2048"))
+assert KX_VIRTUAL_SEQ_CAP in (0, 2048)
 _seq3 = int('3072')
 assert _seq3 >= 512, "KX_SEQ3 < 512 can exceed TRAIN_MAX_NUM_DOCS[49152]=128 sequences per rank-batch"
 TRAINING_STAGES = [
@@ -3604,6 +3734,10 @@ class TrainingManager():
             adam_defaults=adam_defaults,
             anvil_defaults=anvil_defaults,
         )
+        self._velite_buf = (torch.zeros_like(self.optimizer._param_by_label["value_embeds"])
+                            if KX_VELITE else None)
+        if KX_VELITE:
+            print0(f"[velite] ON persistent cycle buffer shape={tuple(self._velite_buf.shape)}", console=True)
 
         # Split embed from lm_head at 2/3 of training (on an odd step so Adam updates)
         self.split_step = training_schedule.split_step
@@ -3627,6 +3761,12 @@ class TrainingManager():
         """Adam params are only updated on odd steps."""
         return step % 2 == 1
 
+    def _is_bigram_step(self, step: int):
+        """Bigram Adam cadence; stock until the aligned optional switch."""
+        if KX_BGPER == 4 and step >= KX_BGPER_START:
+            return step % 4 == 3
+        return self._is_adam_step(step)
+
     def get_transition_steps(self):
         return [start for start, _ in training_schedule.boundaries[1:]]
 
@@ -3645,9 +3785,16 @@ class TrainingManager():
         if new_ws_long != self.ws_long:
             self.model.yarn.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
             self.model.yarn_paired_head.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
+            if KX_QKMW64:
+                self.model.yarn_wide.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
 
         new_batch_size = stage.batch_size
         new_train_max_seq_len = stage.train_max_seq_len
+        if (KX_VIRTUAL_SEQ_CAP and new_train_max_seq_len > KX_VIRTUAL_SEQ_CAP and
+                not self._virtual_seq_cap_guard):
+            print0(f"[virtual_seq_cap] cadence-fired step={step} stock_cap={new_train_max_seq_len} "
+                   f"attention_cap={KX_VIRTUAL_SEQ_CAP}", console=True)
+            self._virtual_seq_cap_guard = True
         if new_batch_size != self.batch_size or new_train_max_seq_len != self.train_max_seq_len:
             self.train_loader_send_args = (new_batch_size, new_train_max_seq_len, grad_accum_steps)
             self.batch_size = new_batch_size
@@ -3677,6 +3824,18 @@ class TrainingManager():
         rail_beta = get_rail_beta(step)
         do_adam = self._is_adam_step(step)
 
+        if KX_VELITE and do_adam:
+            # The custom VE backward wrote both the preceding even step and this odd
+            # step directly into the persistent cycle buffer, bypassing dense
+            # AccumulateGrad. Hand that payload to the stock RS/Adam path.
+            _ve_param = self.optimizer._param_by_label["value_embeds"]
+            if _ve_param.grad is None:
+                _ve_param.grad = self._velite_buf
+            else:
+                assert (KX_VEPER == 4 and step >= KX_VEPER_START and
+                        _ve_param.grad is self._velite_buf), (
+                    "V-lite guard failed: unexpected VE grad materialized")
+
         if _DUAL_MOMENTUM is not None:
             # DUAL_MOMENTUM engage switch, expressed as scalar-tensor fills so the
             # anvil_cascade graph never recompiles: before engage_step the fast
@@ -3691,6 +3850,14 @@ class TrainingManager():
         # Update learning rates and momentum for all params
         for param, p_cfg in self.optimizer.param_cfgs.items():
             p_cfg.lr = p_cfg.initial_lr * step_lr * _KX_GLR_CONST
+            if KX_VEPER == 4 and p_cfg.label == "value_embeds":
+                _veper_active = step >= KX_VEPER_START
+                p_cfg.adam_betas = ((0.75 ** 2, 0.95 ** 2) if _veper_active else (0.75, 0.95))
+                p_cfg.wd_mul = 10.0 if _veper_active else 5.0
+            if p_cfg.label == "bigram_embed":
+                _bgper_active = KX_BGPER == 4 and step >= KX_BGPER_START
+                p_cfg.adam_betas = ((0.75 ** 2, 0.95 ** 2) if _bgper_active else (0.75, 0.95))
+                p_cfg.wd_mul = 10.0 if _bgper_active else 5.0
             if _KX_QKLRMW_N > 0 and p_cfg.label == "qk_bank" and step < _KX_QKLRMW_N:
                 # qk-early-protect: lower qk_bank lr for step<N (the formation phase
                 # punishes qk aggression). Disabled in this configuration
@@ -3700,11 +3867,28 @@ class TrainingManager():
             if p_cfg.optim == "anvil":
                 p_cfg.momentum = rail_beta
 
-        # KX_VEPER: give value_embeds its own (longer) Adam period. Its gradient keeps
-        # accumulating on the skipped steps exactly like Adam's stock every-other-step
-        # accumulation, so no signal is dropped -- but the *content* of the gradient an
-        # Adam update sees changes (sum over KX_VEPER steps instead of 2), so this is a
-        # loss-affecting change and is deliberately independent of COMM_ORDER.
+        # Late-only period 4. The aligned boundary means the cycle buffer is
+        # freshly zeroed under both the stock and new cadence at the switch.
+        _veper_active = KX_VEPER == 4 and step >= KX_VEPER_START
+        if _veper_active:
+            _ve_update_now = do_adam and (step % KX_VEPER == KX_VEPER - 1)
+            self.optimizer._skip_labels = (set() if (not do_adam or _ve_update_now)
+                                            else {"value_embeds"})
+            if do_adam and not _ve_update_now and not getattr(self, "_veper_late_guard", False):
+                print0(f"[veper4_late] cadence-fired start={KX_VEPER_START} skip=1 cycle=4", console=True)
+                self._veper_late_guard = True
+        else:
+            self.optimizer._skip_labels = set()
+
+        # KX_BGPER: union a bigram-only skip into the independently selected
+        # VE cadence.  Its per-token sink gradients and touched-row mask remain
+        # live until the next period-4 fire; no signal is discarded.
+        _bg_update_now = self._is_bigram_step(step)
+        if do_adam and not _bg_update_now:
+            self.optimizer._skip_labels.add("bigram_embed")
+            if KX_BGPER == 4 and step >= KX_BGPER_START and not self._bgper_guard:
+                print0(f"[bgper4_mid] cadence-fired start={KX_BGPER_START} skip=1 cycle=4", console=True)
+                self._bgper_guard = True
 
         # KX_TRISYNC: K-step FedAvg cadence for local_kavg tables (trigram_embed).
         # Fires on step % K == 0 independent of the Adam parity (the seam inside
@@ -3716,7 +3900,7 @@ class TrainingManager():
         # values into the payload the optimizer consumes (compact rows, or the persistent
         # dense buffer). Must run after the last backward and before Phase 1.
         if _bigram_sink_on:
-            self.bgsp_build(do_adam)
+            self.bgsp_build(_bg_update_now)
 
         # Step optimizer with do_adam flag
         self.optimizer.step(do_adam=do_adam)
@@ -3725,12 +3909,24 @@ class TrainingManager():
         if step == self.split_step:
             self.optimizer.copy_lm_state_to_embed()
 
+    def ve_lite_prepare(self, step: int, force: bool = False):
+        _veper_active = KX_VEPER == 4 and step >= KX_VEPER_START
+        _ve_cycle_start = (step % 4 == 0) if _veper_active else (step % 2 == 0)
+        if KX_VELITE and (force or _ve_cycle_start):
+            self._velite_buf.zero_()
+
+    def ve_lite_sink(self):
+        return self._velite_buf
+
     def reset(self, state=None):
         if state is not None:
             self.optimizer.load_state_dict(state)
 
         # Reset NorMuon momentum buffers and split_embed state
         self.optimizer.reset()
+        self._virtual_seq_cap_guard = False
+        self._veper_late_guard = False
+        self._bgper_guard = False
 
         stage, _ = training_schedule.lookup(0)
         # KX_QKSCAF: first stage boundary == the truncation step (0 when the knob is off,
@@ -3742,6 +3938,10 @@ class TrainingManager():
         self.train_max_seq_len = stage.train_max_seq_len
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
+        if KX_QKMW64:
+            self.model.yarn.attn_scale = KX_QKMW64_SCALE
+            self.model.yarn_paired_head.attn_scale = KX_QKMW64_SCALE
+            self.model.yarn_wide.reset()
         if _sparse_comms_active():
             self.row_update_mask = np.zeros(args.bigram_vocab_size, dtype=np.uint8)
             self.sparse_counts_state = None
@@ -3755,11 +3955,12 @@ class TrainingManager():
                 _bdt = self.model.bigram_embed.weight.dtype
                 self._bgsp_sinks = {}
                 if BIGRAM_SPARSE_GRAD:
-                    # Compact capacity: an Adam cycle is at most 2 steps (odd-step
-                    # Adam), so the unique-row count cannot exceed
-                    # twice the largest per-rank token count. Asserted at build time.
+                    # Compact capacity: a bigram Adam cycle is 4 steps here (KX_BGPER=4
+                    # record default; 2 under stock odd-step Adam), so the unique-row
+                    # count cannot exceed cycle_len x the largest per-rank token count.
                     _cap_tok = max(s.batch_size for s in TRAINING_STAGES) // (world_size * grad_accum_steps)
-                    _cap = min(args.bigram_vocab_size, 2 * _cap_tok + 64)
+                    _bg_cycle = 4 if KX_BGPER == 4 else 2
+                    _cap = min(args.bigram_vocab_size, _bg_cycle * _cap_tok + 64)
                     self._bgsp_buf = torch.zeros(_cap, args.bigram_dim, device=device,
                                                  dtype=(torch.float32 if BIGRAM_SPARSE_GRAD == 2 else _bdt))
                     self._bgsp_shard = torch.zeros(args.bigram_vocab_size // world_size,
@@ -3790,7 +3991,7 @@ class TrainingManager():
 
         self.row_update_mask[bigram_indexes] = 1
 
-        if self._is_adam_step(step):
+        if self._is_bigram_step(step):
             with torch.no_grad():
                 bigram_idx_np = np.flatnonzero(self.row_update_mask).astype(np.int32)
                 # BIGRAM_SPARSE_GRAD: np.flatnonzero over the accumulated row mask IS the sorted,
@@ -3805,7 +4006,8 @@ class TrainingManager():
                 self.sparse_counts_state = (send_idxes, send_counts, recv_counts, recv_counts_fut)
 
     def sparse_index_share(self, step):
-        if not _sparse_comms_active() or not self._is_adam_step(step):
+        """Launch the async row-index all_to_all and hand its futures to the optimizer."""
+        if not _sparse_comms_active() or not self._is_bigram_step(step):
             return
 
         send_idxes, send_counts, recv_counts, recv_counts_fut = self.sparse_counts_state
@@ -4272,6 +4474,10 @@ _kx_census = int("0")
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
+if KX_BGPER == 4:
+    print0(f"[bgper4_mid] ON start={KX_BGPER_START} period=4 dynamic_betas=1", console=True)
+if KX_VEPER == 4:
+    print0(f"[veper4_late] ON start={KX_VEPER_START} period=4 dynamic_betas=1", console=True)
 if COMM_ORDER or 0 > 2:
     print0(f"[cr] COMM_ORDER={COMM_ORDER} KX_VEPER={0}")
     print0(f"[cr] scatter_order={training_manager.scatter_order}")
@@ -4292,10 +4498,11 @@ transition_steps = training_manager.get_transition_steps()
 # first and last pair of steps in each transition
 warmup_steps = sorted({0, 1} | {s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 2}
                       | {training_schedule.split_step + offset for offset in [1, 2, 3]
-                         if 2 <= training_schedule.split_step + offset <= args.num_scheduled_iterations + args.num_extension_iterations - 1})
+                         if 2 <= training_schedule.split_step + offset <= training_schedule.total_steps - 1})
 print0(f"Sampling steps {warmup_steps} for warmup", console=True)
 for step in warmup_steps:
     training_manager.advance_schedule(step)
+    training_manager.ve_lite_prepare(step, force=True)
     model.eval()
     with torch.no_grad():
         inputs, targets, cum_seqlens, bigram_inputs, *_ = next(val_loader)
@@ -4308,7 +4515,13 @@ for step in warmup_steps:
         training_manager.sparse_index_update(step, bigram_cpu, None)
         if _bigram_sink_on:
             _bg_sink = training_manager.bgsp_sink(bigram_inputs.shape[0])
-            loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(), _bg_sink).sum() * grad_scale
+            if KX_VELITE:
+                loss = model(inputs, targets, cum_seqlens, bigram_inputs,
+                             training_manager.get_forward_args(), _bg_sink,
+                             training_manager.ve_lite_sink()).sum() * grad_scale
+            else:
+                loss = model(inputs, targets, cum_seqlens, bigram_inputs,
+                             training_manager.get_forward_args(), _bg_sink).sum() * grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
         if _bigram_sink_on:
@@ -4506,6 +4719,60 @@ for step in range(train_steps + 1):
         training_manager.ws_long = _wl_base
         model.train()
 
+    if last_step and KX_QKMW64 and KX_QK64_ROT64 and KX_QK64_CALDIAG:
+        # All ladders are after the final timer read and restore exact shipped
+        # weights/buffers before moving to the next independent family.
+        model.eval()
+        for _cal_v in (0.97, 0.985, 1.0, 1.015, 1.03):
+            model._eval_logit_temp.fill_(_cal_v)
+            print0(f"[qk64_logittemp] mul={_cal_v:g} val_loss:{_extra_val():.4f}", console=True)
+        model._eval_logit_temp.fill_(1.0)
+
+        _cal_narrow = torch.tensor([0, 1, 2, 4, 5, 7, 8, 9],
+                                   device=model.post_lambdas.device, dtype=torch.long)
+        _cal_post_base = model.post_lambdas.data[:, 0].clone()
+        for _cal_v in (0.90, 0.95, 1.0, 1.05, 1.10):
+            with torch.no_grad():
+                model.post_lambdas.data[:, 0].copy_(_cal_post_base)
+                model.post_lambdas.data[:, 0].index_copy_(
+                    0, _cal_narrow,
+                    (_cal_post_base[_cal_narrow].float() * _cal_v).to(model.post_lambdas.dtype))
+            print0(f"[qk64_postamp] mul={_cal_v:g} val_loss:{_extra_val():.4f}", console=True)
+        with torch.no_grad():
+            model.post_lambdas.data[:, 0].copy_(_cal_post_base)
+
+        _cal_gw = model.mudd_gate_w2.data[:, 12:18].clone()
+        _cal_gb = model.mudd_gate_b2.data[:, 12:18].clone()
+        for _cal_v in (0.80, 0.90, 1.0, 1.10, 1.20):
+            with torch.no_grad():
+                model.mudd_gate_w2.data[:, 12:18].copy_(
+                    (_cal_gw.float() * _cal_v).to(model.mudd_gate_w2.dtype))
+                model.mudd_gate_b2.data[:, 12:18].copy_(
+                    (_cal_gb.float() * _cal_v).to(model.mudd_gate_b2.dtype))
+            print0(f"[qk64_carriergate] mul={_cal_v:g} val_loss:{_extra_val():.4f}", console=True)
+        with torch.no_grad():
+            model.mudd_gate_w2.data[:, 12:18].copy_(_cal_gw)
+            model.mudd_gate_b2.data[:, 12:18].copy_(_cal_gb)
+        model.train()
+
+    if last_step and KX_QKMW64 and _KX_QK64_EVALSCALE:
+        # Diagnostic only: the timer has already been read and is never advanced again.
+        # Multipliers apply to the effective post-YaRN narrow scales, leaving the two
+        # wide carriers untouched. This is a same-trajectory exact final-val sweep.
+        model.eval()
+        _qk_es_base = model.yarn.attn_scale
+        _qk_es_pair_base = model.yarn_paired_head.attn_scale
+        for _qk_es_mul in _KX_QK64_EVALSCALE:
+            model.yarn.attn_scale = _qk_es_base * _qk_es_mul
+            model.yarn_paired_head.attn_scale = _qk_es_pair_base * _qk_es_mul
+            print0(f"[qk64_evalscale] mul={_qk_es_mul:g} "
+                   f"nonpaired={model.yarn.attn_scale:.9f} "
+                   f"paired={model.yarn_paired_head.attn_scale:.9f} "
+                   f"val_loss:{_extra_val():.4f}", console=True)
+        model.yarn.attn_scale = _qk_es_base
+        model.yarn_paired_head.attn_scale = _qk_es_pair_base
+        model.train()
+
     if last_step and _TAIL_EMA2_WINDOWS and _tavg2_bufs:
         # tavg2 ladder: swap each window's Adam-side EMA in, val, swap back. Untimed.
         model.eval()
@@ -4565,6 +4832,7 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    training_manager.ve_lite_prepare(step)
     for idx in range(grad_accum_steps):
         if _pref_batch is not None:
             _batch = _pref_batch
@@ -4575,7 +4843,13 @@ for step in range(train_steps + 1):
         training_manager.sparse_index_update(step, bigram_cpu, None)
         if _bigram_sink_on:
             _bg_sink = training_manager.bgsp_sink(bigram_inputs.shape[0])
-            loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(), _bg_sink).sum() * grad_scale
+            if KX_VELITE:
+                loss = model(inputs, targets, cum_seqlens, bigram_inputs,
+                             training_manager.get_forward_args(), _bg_sink,
+                             training_manager.ve_lite_sink()).sum() * grad_scale
+            else:
+                loss = model(inputs, targets, cum_seqlens, bigram_inputs,
+                             training_manager.get_forward_args(), _bg_sink).sum() * grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
         if _bigram_sink_on:
