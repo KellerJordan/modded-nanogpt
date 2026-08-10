@@ -19,7 +19,7 @@ PLANES = 5
 VOCAB = 50304
 WIDTH = 768
 EXPECTED_KERNEL_SHA256 = (
-    "cdfff4f283c3da3bcfa92df4b07bcc47b22171958a9f10f55b238e56e3085f43"
+    "882d0358ce17ffcd7957624ab6b071a06aa2f8261d31828efbbf7548ea77b360"
 )
 
 _KERNEL_PATH = Path(__file__).with_name("value_embed_kernel.py")

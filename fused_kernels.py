@@ -19,18 +19,6 @@
 #   KX_A2P   plumbing upgrades from PR#342: fused quantize+transpose weight
 #            cache kernel with lagged (one-step-stale) scales, and per-SM
 #            partial-amax slots instead of tl.atomic_max in GEMM epilogues.
-#   KX_S3D   FP8 attention qkv DGRAD (dx = g @ W_qkv, K=2304 — C1D's shape
-#            class): fused aten e5m2 cast of g +
-#            the existing nanogpt::dx_f8 op.
-#   KX_S3W   FP8 attention dW_qkv (g^T @ x, K=T — the splitK family)
-#            via the existing nanogpt::wg1_f8 op. Transposed operands land in
-#            trainer-side PREALLOCATED buffers (never
-#            torch.empty a [2304,T] per step inside an op). 1=primary
-#            (fp8->fp8 transpose_copy of the fused cast, or GE4 quantize),
-#            2=route B (dual-layout quantize of bf16 g; DCE-independent).
-#   KX_S3O   o-site dW (unused; dx_o K=768 is excluded and not implemented).
-#   KX_S3_GE4  e4m3 wgrad g at a delayed per-layer scale (default ON: dW_qkv's
-#            v-rows feed the vo weight bank; halves elementwise noise).
 #
 # Numerical rules respected throughout:
 #   * use_fast_accum=False on EVERY gradient GEMM (NaN otherwise).
@@ -55,41 +43,32 @@ E4M3_MAX_F = 448.0
 # KX_LHBW: emit the lm_head/CE wgrad in bf16 instead of fp32. Halves the 154MB
 # grad_w write AND the fp32 reduce_scatter bytes on Adam steps (the grad buffer takes
 # grad_w's dtype at first backward). Same rounding class as the accepted MLP bf16
-# wgrad path. Default 0 = stock fp32 bit-path.
+# wgrad path (shipped on).
 _LHBW16 = True
 
 # CE backward dead-saves (byte-identical
 # when the knob is off). Backward only reads grad_input/x_f8/w_f8/mtp_weights — the
 # saved logits/lse/x/targets/lm_head_weight are dead across the backward window.
-import os as _r2_os
 _R2CE = True  # CE backward saves only what backward reads (baked)
 
 # Behavior flags. The trainer decides what buffers to pass; these flags decide
-# what the kernels do with them. Read once at import (matching kernel-module's _C1C
-# pattern); tests may override via set_flags() BEFORE any launches.
+# what the kernels do with them. Read once at import (matching the earlier
+# revision's _C1C pattern).
 FLAGS = {
-    "C1C":   False,   # legacy dW2 diagnostic (MEASURED DEAD: +10.7s, kept for provenance)
+    "C1C":   False,   # legacy dW2 diagnostic path, permanently off
     "WG2":   True,   # FP8 dW2 via epilogue dual-layout
     "C1D":   True,   # FP8 dx
     "C1E":   True,   # FP8 dW1
     "PDROP": True, # drop pre; bwd reconstructs sqrt(post_f8)
     "GE4":   False,   # e4m3 grads w/ real scales
     "A2P":   True,   # per-SM amax + lagged weight quantize
-    "S3D":   False,   # FP8 attention qkv dgrad
-    "S3W":   0,     # FP8 attention dW_qkv (2 = route B)
-    "S3O":   False,   # o-site dW (unused)
-    "S3GE4": True,  # e4m3 wgrad g, delayed scale
-    # Diagnostic knob: route the S3D dgrad-g cast through the triton
-    # quantize kernel instead of the fused aten pointwise (removes the
-    # inductor-fusion surface entirely; costs one extra bf16 read of g).
-    "S3CAST_K": False,
 }
 
 
 
 # -----------------------------------------------------------------------------
 # Triton kernel for symmetric matrix multiplication by @byronxu99
-# (unchanged from kernel-module)
+# (unchanged from the earlier revision of this module)
 
 @triton.jit
 def _pid_to_block(
@@ -223,7 +202,7 @@ def XXT(A: torch.Tensor, out: torch.Tensor):
     return out
 
 # -----------------------------------------------------------------------------
-# Triton kernel for X.T @ X (tall matrices) — unchanged from kernel-module
+# Triton kernel for X.T @ X (tall matrices) — unchanged from the earlier revision of this module
 
 @triton.jit
 def XTX_kernel(
@@ -439,7 +418,7 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
 # Extension: dual-layout fp8 epilogue emission on BOTH passes.
 #
 # FORWARD extras (all constexpr-gated, dead-code-eliminated when off):
-#   EMIT_F8      store post/post_scale as e4m3 row-major [M, N]   (C1A, as kernel-module)
+#   EMIT_F8      store post/post_scale as e4m3 row-major [M, N]   (C1A, earlier-revision convention)
 #   EMIT_T       ALSO store the same fp8 tile transposed to [N, M] via a
 #                register-tile tl.trans — PR#344's technique. Write-only cost.
 #   STORE_PRE    store the bf16 pre tensor (off under KX_PDROP)
@@ -527,7 +506,7 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
 
         if FORWARD:
             # ---- half 0 ----
-            c0 = acc0.to(dtype)                      # pre (bf16-rounded, as kernel-module)
+            c0 = acc0.to(dtype)                      # pre (bf16-rounded, earlier-revision convention)
             if STORE_PRE:
                 c_desc.store([offs_am_c, offs_bn_c], c0)
             c0_post = tl.maximum(c0, 0)
@@ -617,7 +596,7 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                     tl.atomic_max(dpre_amax_ptr, tile_max)
 
 
-# COMPILE-SAFETY INVARIANT (fixv3, 2026-07-27): linear_relu_square executes
+# COMPILE-SAFETY INVARIANT: linear_relu_square executes
 # INSIDE torch.compile's autograd-Function HOP subgraphs (fullgraph=True), where
 # dynamo rejects any Python-state mutation from an outer scope with
 # "HigherOrderOperator: Mutating a variable not in the current scope
@@ -633,7 +612,7 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
 # Written ONLY by eager calls (tests, prime_stage_cache); under torch.compile
 # it is a read-only lookup -- call prime_stage_cache() before compiling so
 # every reachable variant is resolved (defaults-variant initial values are the
-# kernel-module-proven ones, so an unprimed cache is still safe with all new flags off).
+# the earlier module revision-proven ones, so an unprimed cache is still safe with all new flags off).
 _lrs_stage_cache = {}
 
 def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=None,
@@ -642,7 +621,7 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=N
                        emit_dpre=False, emit_dpre_t=False, store_c_bf=True,
                        dpre_scale=None, dpre_amax=None, grad_e4m3=False,
                        partial_amax_mode=False):
-    """kernel-module's fused MLP GEMM, extended with dual-layout fp8 epilogue emission.
+    """the earlier module revision's fused MLP GEMM, extended with dual-layout fp8 epilogue emission.
 
     Returns (pre, post, post_f8, post_t) on the forward pass and
     (dpre, dpre_f8, dpre_t) on the backward pass; entries not requested are None.
@@ -790,7 +769,7 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=N
         # work here anyway: the launch is deferred into the compiled artifact,
         # so no exception can reach this try at trace time. The cache must be
         # primed eagerly (prime_stage_cache()) before compiling; unprimed keys
-        # fall back to initial_stages == the kernel-module-proven defaults-variant values.
+        # fall back to initial_stages == the earlier module revision-proven defaults-variant values.
         _launch(num_stages)
     else:
         while True:
@@ -933,7 +912,7 @@ def quantize_dual_layout(src: torch.Tensor, scale: torch.Tensor,
       out_t    PREALLOCATED transposed destination (a [N, M_max][:, :M] slice
                is fine: rows may be strided, last dim must be contiguous).
                Never allocate a [2304,T] temporary per step (+10.7s/run class).
-      emit_row/emit_t  constexpr-gated stores (EMIT_ROW off = quantize_transposed).
+      emit_row/emit_t  constexpr-gated stores.
       amax     optional 0-D fp32 slot: in-kernel atomic amax of the bf16 source
                (rides the read the kernel does anyway — delayed-scale refresh
                reads it post-step; no standalone amax reduction).
@@ -971,14 +950,6 @@ def quantize_dual_layout(src: torch.Tensor, scale: torch.Tensor,
     return row, t
 
 
-def quantize_transposed(src: torch.Tensor, scale: torch.Tensor,
-                        dst_t: torch.Tensor,
-                        fmt: torch.dtype = torch.float8_e4m3fn,
-                        amax: torch.Tensor | None = None):
-    """One bf16 read -> ONE transposed fp8 write into a preallocated dst_t
-    [N, M] (S3 §4.4). Optional in-kernel amax for delayed scales."""
-    return quantize_dual_layout(src, scale, fmt=fmt, out_t=dst_t,
-                                emit_row=False, emit_t=True, amax=amax)[1]
 
 
 # -----------------------------------------------------------------------------
@@ -1037,7 +1008,7 @@ def quantize_mlp_weights_dual(bank: torch.Tensor, scales: torch.Tensor,
 
     row    : [L, H, D] e4m3 contiguous (row-major cache), or None.
     col_t  : [L, D, H] e4m3 contiguous — pass the .transpose(1,2) view of a
-             col-major cache built with the kernel-module idiom
+             col-major cache built with the earlier module revision idiom
              `zeros_like(bank).transpose(1,2).contiguous().transpose(1,2)`.
     scales : [L] fp32. When update_scales, refreshed FIRST from partial_amax
              (which holds LAST call's per-tile amaxes) with `headroom`; weights
@@ -1074,134 +1045,8 @@ def quantize_mlp_weights_dual(bank: torch.Tensor, scales: torch.Tensor,
 
 
 # -----------------------------------------------------------------------------
-# FP8 attention projection ops (unchanged from kernel-module)
-
-@torch.library.custom_op("nanogpt::af8s", mutates_args=())
-def af8s_op(x: torch.Tensor, w_f8: torch.Tensor, w_bf: torch.Tensor,
-            ws_t: torch.Tensor, x_s: float) -> torch.Tensor:
-    """FP8 attention projection fwd, static scales: y = x @ w.T (lambda applied
-    by the caller on the output, keeping its autograd path intact). w_f8 cached
-    per step (no per-forward quantize); ws_t = per-layer weight scale (0-D fp32
-    tensor, refreshed with the cache); x_s static (RMS-normed inputs).
-    Backward bf16 via w_bf."""
-    x_f8 = (x * (1.0 / x_s)).to(torch.float8_e4m3fn)
-    return torch._scaled_mm(
-        x_f8, w_f8.T,
-        out_dtype=torch.bfloat16,
-        scale_a=x.new_tensor(x_s, dtype=torch.float32),
-        scale_b=ws_t,
-        use_fast_accum=True,
-    )
-
-@af8s_op.register_fake
-def _(x, w_f8, w_bf, ws_t, x_s):
-    return x.new_empty((x.shape[0], w_f8.shape[0]), dtype=torch.bfloat16)
-
-def _af8s_backward(ctx, grad_out):
-    x, w_bf = ctx.saved_tensors
-    g = grad_out.contiguous()
-    grad_x = g @ w_bf.type_as(g)
-    grad_w = g.T @ x.type_as(g)
-    return grad_x, None, grad_w, None, None
-
-def _af8s_setup(ctx, inputs, output):
-    x, w_f8, w_bf, ws_t, x_s = inputs
-    ctx.save_for_backward(x, w_bf)
-
-af8s_op.register_autograd(_af8s_backward, setup_context=_af8s_setup)
-
-
-@torch.library.custom_op("nanogpt::af8sd", mutates_args=())
-def af8sd_op(x: torch.Tensor, w_f8: torch.Tensor, w_bf: torch.Tensor,
-             ws_t: torch.Tensor) -> torch.Tensor:
-    """FP8 attention projection fwd, DYNAMIC per-call input scale + static cached
-    weight scale (o-site variant of af8s). The o-proj input y is unbounded (no
-    norm between SDPA and o-proj) and float8_e4m3fn has no inf, so a static input
-    scale turns outlier tokens into NaN; one amax reduction per call bounds it.
-    Backward bf16 via w_bf."""
-    xs = x.abs().amax().clamp_min(1e-6).float() / 448.0
-    x_f8 = (x / xs).to(torch.float8_e4m3fn)
-    return torch._scaled_mm(
-        x_f8, w_f8.T,
-        out_dtype=torch.bfloat16,
-        scale_a=xs,
-        scale_b=ws_t,
-        use_fast_accum=True,
-    )
-
-@af8sd_op.register_fake
-def _(x, w_f8, w_bf, ws_t):
-    return x.new_empty((x.shape[0], w_f8.shape[0]), dtype=torch.bfloat16)
-
-def _af8sd_backward(ctx, grad_out):
-    x, w_bf = ctx.saved_tensors
-    g = grad_out.contiguous()
-    grad_x = g @ w_bf.type_as(g)
-    grad_w = g.T @ x.type_as(g)
-    return grad_x, None, grad_w, None
-
-def _af8sd_setup(ctx, inputs, output):
-    x, w_f8, w_bf, ws_t = inputs
-    ctx.save_for_backward(x, w_bf)
-
-af8sd_op.register_autograd(_af8sd_backward, setup_context=_af8sd_setup)
-
-
-@torch.library.custom_op("nanogpt::af8", mutates_args=())
-def af8_op(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """FP8 forward for attention projections: y = x @ w.T with dynamic per-tensor
-    e4m3 scales (inputs are RMS-normed => stable range). Backward stays bf16."""
-    xs = x.abs().amax().clamp_min(1e-6).float() / 448.0
-    ws = w.abs().amax().clamp_min(1e-6).float() / 448.0
-    x_f8 = (x / xs).to(torch.float8_e4m3fn)
-    w_f8 = (w / ws).to(torch.float8_e4m3fn)
-    return torch._scaled_mm(
-        x_f8, w_f8.T,
-        out_dtype=torch.bfloat16,
-        scale_a=xs, scale_b=ws,
-        use_fast_accum=True,
-    )
-
-@af8_op.register_fake
-def _(x, w):
-    return x.new_empty((x.shape[0], w.shape[0]), dtype=torch.bfloat16)
-
-def _af8_backward(ctx, grad_out):
-    x, w = ctx.saved_tensors
-    g = grad_out.contiguous()
-    grad_x = g @ w.to(g.dtype)
-    grad_w = g.T @ x.to(g.dtype)
-    return grad_x, grad_w
-
-def _af8_setup(ctx, inputs, output):
-    x, w = inputs
-    ctx.save_for_backward(x, w)
-
-af8_op.register_autograd(_af8_backward, setup_context=_af8_setup)
-
-# -----------------------------------------------------------------------------
 # FP8 MLP scaled_mm wrappers (opaque to inductor — house mm_t pattern).
 # fp32 accumulation (use_fast_accum=False) on EVERY gradient GEMM: NaN risk otherwise.
-
-@torch.library.custom_op("nanogpt::wg_f8", mutates_args=())
-def wg_f8_op(post_f8: torch.Tensor, g_f8: torch.Tensor, post_scale: torch.Tensor,
-             grad_s: float) -> torch.Tensor:
-    """LEGACY C1C diagnostic (do NOT ship): dW2 via standalone .contiguous()
-    transposes. The tiled-transpose variant of this measured +10.7s
-    per run — layout must come from a producing kernel's epilogue instead
-    (KX_WG2). Kept for diagnostics only."""
-    return torch._scaled_mm(
-        post_f8.T.contiguous(),
-        g_f8.T.contiguous().T,
-        out_dtype=torch.bfloat16,
-        scale_a=post_scale,
-        scale_b=post_f8.new_tensor(grad_s, dtype=torch.float32),
-        use_fast_accum=False,
-    )
-
-@wg_f8_op.register_fake
-def _(post_f8, g_f8, post_scale, grad_s):
-    return post_f8.new_empty((post_f8.shape[1], g_f8.shape[1]), dtype=torch.bfloat16)
 
 @torch.library.custom_op("nanogpt::dp_f8", mutates_args=())
 def dp_f8_op(post_f8: torch.Tensor, w2_f8: torch.Tensor, post_scale: torch.Tensor,
@@ -1285,123 +1130,11 @@ def _(dpre_f8, w1_f8_col, dpre_scale, w1_scale):
                              dtype=torch.bfloat16)
 
 
-# -----------------------------------------------------------------------------
-# S3: attention projections — bf16 FORWARD, fp8 BACKWARD GEMMs only.
-# ZERO new custom ops: dx_qkv is C1D's
-# nanogpt::dx_f8 verbatim (K=2304, the shape class that shipped; the
-# K=768 FORWARD stays bf16 here on purpose); dW_qkv is C1E's
-# nanogpt::wg1_f8 verbatim (K=T, the splitK family).
-
-class AttnProjBwdFP8(torch.autograd.Function):
-    """bf16 forward y = x @ w_eff.T (identical dispatch to the F.linear it
-    replaces — nothing in the forward graph changes); fp8 backward GEMMs.
-    w_eff is the bf16 lambda*W tensor: returning its grad keeps the existing
-    pointwise chain to sa_lambdas and the banks bit-identical.
-
-    Args (all trailing optional; the trainer passes what its KX_S3* need):
-      x        [T, in] bf16       w_eff [out, in] bf16 (= lambda * bank rows)
-      w_col_f8 [out, in] e4m3 COL-major cache of lambda*W (post-step refresh,
-               lambda folded: sign in values, scale positive)   <- KX_S3D
-      w_cs     0-D f32 per-layer scale of that cache
-      gs_t     0-D f32 static e5m2 scale for the dgrad g row (KX_S3_GS)
-      g_s_inv  python float 1/KX_S3_GS (compile-time constant for the fused
-               cast — never x.new_tensor per call, the C2S H2D defect)
-      x_t_f8   [in, T] fp8 activation operand in wgrad layout, PRE-FILLED by
-               the trainer's forward-side quantize_transposed <- KX_S3W
-      x_s      0-D f32 its scale (static 2^-4 for attn_in_normed — clip-free
-               by the sqrt(768) proof; delayed per-layer amax for o's y)
-      g_scale  0-D f32 wgrad-g scale (== gs_t when e5m2; delayed per-layer
-               buffer element under KX_S3_GE4)
-      g_amax   0-D f32 amax slot for the delayed refresh (GE4 only)
-      gt_buf   [out, T] fp8 PREALLOCATED transposed-g destination (a
-               [out, T_max][:, :T] slice)   <- KX_S3W
-      ge4      bool: wgrad g in e4m3 at the delayed scale (default ON in the
-               trainer: dW_qkv's v-rows feed the vo weight bank)
-      route_b  bool (KX_S3W==2): DCE-independent fallback — one dual-layout
-               quantize of bf16 g feeds BOTH backward GEMMs.
-    """
-
-    @staticmethod
-    def forward(ctx, x, w_eff, w_col_f8=None, w_cs=None, gs_t=None, g_s_inv=1.0,
-                x_t_f8=None, x_s=None, g_scale=None, g_amax=None, gt_buf=None,
-                ge4=False, route_b=False):
-        assert not (route_b and gt_buf is None), "route B is an KX_S3W mode"
-        y = x @ w_eff.T                      # bf16, traced, NOT wrapped
-        ctx.save_for_backward(x, w_eff)
-        # Non-differentiable operands (caches/buffers/scales) are ctx-stashed —
-        # the shipping FusedLinearReLUSquareFunction pattern for graph INPUTS
-        # (the defaults-regression lesson only bans stashing INTERMEDIATES).
-        ctx.w_col_f8 = w_col_f8
-        ctx.w_cs = w_cs
-        ctx.gs_t = gs_t
-        ctx.g_s_inv = g_s_inv
-        ctx.x_t_f8 = x_t_f8
-        ctx.x_s = x_s
-        ctx.g_scale = g_scale
-        ctx.g_amax = g_amax
-        ctx.gt_buf = gt_buf
-        ctx.ge4 = ge4
-        ctx.route_b = route_b
-        return y
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        x, w_eff = ctx.saved_tensors
-        g = grad_out.contiguous()
-        s3d = ctx.w_col_f8 is not None
-        s3w = ctx.gt_buf is not None
-
-        g_f8 = None
-        row_scale = ctx.gs_t
-        if s3d and not ctx.route_b:
-                # (1) row-major e5m2 dgrad operand: PURE ATEN POINTWISE —
-                # inductor fuses it into the kernel producing g (FA3-bwd ->
-                # rotary/qk-norm/cat chain). Explicit clamp before the cast
-                # (aten fp32->fp8 is non-saturating). Deploy check: kernel census
-                # must show NO standalone cast kernel.
-            g_f8 = (g * ctx.g_s_inv).clamp(-57344.0, 57344.0).to(torch.float8_e5m2)
-
-        # ---- dW = g^T @ x  (K=T) -------------------------------------------
-        if s3w:
-            if ctx.route_b:
-                # route B (KX_S3W=2): no DCE dependency, no fused cast — one
-                # dual-layout quantize of bf16 g feeds both GEMMs.
-                fmt = torch.float8_e4m3fn if ctx.ge4 else torch.float8_e5m2
-                g_f8, _ = quantize_dual_layout(g, ctx.g_scale, fmt=fmt,
-                                               out_t=ctx.gt_buf, amax=ctx.g_amax)
-            elif ctx.ge4 or g_f8 is None:
-                # e4m3 wgrad operand at the delayed per-layer scale (or the
-                # o-site / S3W-without-S3D case): quantize-transpose the bf16
-                # g; the amax for next step's scale rides the read in-kernel.
-                fmt = torch.float8_e4m3fn if ctx.ge4 else torch.float8_e5m2
-                quantize_transposed(g, ctx.g_scale, ctx.gt_buf, fmt=fmt,
-                                    amax=ctx.g_amax)
-            else:
-                # e5m2 twin of the dx operand: fp8->fp8 transpose into the
-                # preallocated buffer. With S3D on, this removes the last bf16
-                # reader of g and inductor DCEs the 226 MB/layer bf16 store
-                # (S3 §3.3; verify offline with gate G2 before any cluster run).
-                transpose_copy(g_f8, ctx.gt_buf)
-            dW = torch.ops.nanogpt.wg1_f8(ctx.gt_buf, ctx.x_t_f8,
-                                          ctx.g_scale, ctx.x_s)
-        else:
-            dW = g.T @ x                     # bf16, unchanged (keeps g alive)
-
-        # ---- dx = g @ w_eff  (K=2304) --------------------------------------
-        if s3d:
-            if ctx.route_b:
-                row_scale = ctx.g_scale
-            dx = torch.ops.nanogpt.dx_f8(g_f8, ctx.w_col_f8, row_scale, ctx.w_cs)
-        else:
-            dx = g @ w_eff                   # bf16 (o-site: K=768 fp8 measured slower)
-
-        return (dx, dW) + (None,) * 11
-
 
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
-    """kernel-module's fused MLP autograd function extended to the full-FP8 MLP package.
+    """the earlier module revision's fused MLP autograd function extended to the full-FP8 MLP package.
 
-    Positional arg layout (superset of kernel-module's 13; all trailing args optional —
+    Positional arg layout (superset of the earlier module revision's 13; all trailing args optional —
     the trainer passes exactly what its configuration flags require):
        0 x        [T, 768] bf16 (normed residual)
        1 W1       [3072, 768] bf16      2 W2  [3072, 768] bf16
@@ -1439,17 +1172,14 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
                 dequant_scale_ptr=dequant_scale,
                 emit_f8=emit, post_scale=post_scale, post_amax=post_amax,
                 emit_t=wg2, store_pre=not pdrop, store_post_bf=store_post_bf,
-                # PDROP forces the shipping single-slot atomic amax path
-                # (measured: A2P+PDROP -> mid-run NaN; each alone
-                # clean. The combo was the only fwd kernel variant never
-                # compiled by any gate test: EMIT_F8=1, STORE_PRE=0,
-                # STORE_POST_BF=1, PARTIAL_AMAX=1. Scale algebra audited
-                # clean, so the hazard class is variant-specific codegen;
-                # keep PDROP off the PARTIAL_AMAX variants until root-caused
-                # on GPU. Atomic into slot 0 of the [NUM_SMS] row is fully
-                # compatible with the trainer's .amax(dim=1) refresh — no
-                # trainer change. Costs only P2 (~0.05-0.15 ms) under PDROP;
-                # P1 (the measured 0.9 ms/step weight kernel) is unaffected.)
+                # In the shipped configuration PDROP selects the single-slot
+                # atomic amax path: PARTIAL_AMAX is disabled whenever PDROP is
+                # on, so the fwd kernel never compiles the
+                # EMIT_F8=1/STORE_PRE=0/STORE_POST_BF=1/PARTIAL_AMAX=1 variant.
+                # Atomic into slot 0 of the [NUM_SMS] row is fully compatible
+                # with the trainer's .amax(dim=1) refresh -- no trainer change.
+                # Costs only P2 (~0.05-0.15 ms) under PDROP; P1 (the measured
+                # 0.9 ms/step weight kernel) is unaffected.
                 partial_amax_mode=FLAGS["A2P"] and emit and not pdrop)
         else:
             pre, post, post_f8, post_t = linear_relu_square(
@@ -1460,15 +1190,14 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             x3 = torch.ops.nanogpt.dp_f8(post_f8, W2_f8, post_scale, w2_scale)
         else:
             x3 = post @ W2
-        # Saved-tensor contract: IDENTICAL to kernel-module at defaults —
+        # Saved-tensor contract: IDENTICAL to the earlier module revision at defaults —
         # save_for_backward(x, W1, W2, pre, post) — with pre/post dropped only
         # under the variant flags that delete those tensors. Defaults-regression
         # discipline (measured +3.3mb without it): plain ctx-attr
         # stashing of graph INTERMEDIATES (pre/post) was one of only two
-        # structural deltas from kernel-module inside the compiled autograd-Function HOP;
-        # extras that kernel-module itself ctx-stashes (post_f8, post_scale, ...) stay
-        # ctx-stashed, matching kernel-module's layout exactly. gate_tier0.py asserts
-        # bitwise kernel-module-equivalence eager AND compiled before any full-run screen.
+        # structural deltas from the earlier module revision inside the compiled autograd-Function HOP;
+        # extras that the earlier module revision itself ctx-stashes (post_f8, post_scale, ...) stay
+        # ctx-stashed, matching the earlier revision's layout exactly.
         saved = [x, W1, W2]
         if pre is not None:
             saved.append(pre)
@@ -1495,7 +1224,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        # Dynamo-robust unpack (47c_t0gate crash post-mortem): no star-unpack
+        # Dynamo-robust unpack: no star-unpack
         # of saved_tensors, no bool-as-index — constant-bool branches with
         # literal integer indices only. ctx.saved_layout is trace-time-constant
         # Python metadata (same proven pattern as ctx.pdrop/ctx.wg2).
@@ -1540,7 +1269,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
                 g_f8 = torch.clamp(g_flat.float() / g_scale_t,
                                    -E4M3_MAX_F, E4M3_MAX_F).to(fmt)
             else:
-                # kernel-module's C1B cast, unchanged (static e5m2 scale)
+                # the earlier module revision's C1B cast, unchanged (static e5m2 scale)
                 g_f8 = (g_flat / ctx.grad_s).to(torch.float8_e5m2)
 
         # ---- 2. dW2 --------------------------------------------------------
@@ -1548,7 +1277,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             dW2 = torch.ops.nanogpt.wg2_f8(ctx.post_t, g_f8_t,
                                            ctx.post_scale, g_scale_t)
         else:
-            dW2 = post.T @ grad_output  # kernel-module-exact default expression (unflattened)
+            dW2 = post.T @ grad_output  # the earlier module revision-exact default expression (unflattened)
 
         # ---- 3. dpre (+ fp8 emits from the same kernel's epilogue) ----------
         # Under PDROP the aux the backward reads IS the fp8 post (it has to
@@ -1572,7 +1301,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             dW1 = torch.ops.nanogpt.wg1_f8(dpre_t, ctx.x_f8_t,
                                            ctx.dpre_scale, ctx.x_scale)
         else:
-            dW1 = dpre.T @ x  # kernel-module-exact default expression (unflattened)
+            dW1 = dpre.T @ x  # the earlier module revision-exact default expression (unflattened)
 
         # ---- 5. dx -----------------------------------------------------------
         if c1d:
@@ -1650,7 +1379,7 @@ def transpose_copy(src: torch.Tensor, dst: torch.Tensor):
 
 
 # -----------------------------------------------------------------------------
-# Tiled transpose-add kernel: dst (M, N) += src (N, M).T  (unchanged from kernel-module)
+# Tiled transpose-add kernel: dst (M, N) += src (N, M).T  (unchanged from the earlier revision of this module)
 
 @triton.jit
 def _transpose_add_kernel(
@@ -1702,7 +1431,7 @@ def transpose_add(src: torch.Tensor, dst: torch.Tensor):
 
 
 # -----------------------------------------------------------------------------
-# Fused softcapped cross-entropy (unchanged from kernel-module, incl. C7 lm_head FP8 reuse)
+# Fused softcapped cross-entropy (unchanged from the earlier revision of this module, incl. C7 lm_head FP8 reuse)
 
 CE_KERNEL_BLOCK_SIZE = 256
 CE_KERNEL_VOCAB_SIZE = 50304
