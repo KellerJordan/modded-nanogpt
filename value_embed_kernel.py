@@ -21,7 +21,7 @@ NUM_STAGES = 1
 
 
 @triton.jit
-def _veg_candidate_selected_load_kernel(
+def _veg_selected_load_kernel(
     token_ids,
     grad4,
     grad3,
@@ -52,7 +52,7 @@ def _veg_candidate_selected_load_kernel(
     token = tl.where(token < 0, token + V, token)
     tl.device_assert(
         (0 <= token) & (token < V),
-        "index out of bounds: 0 <= tmp4 < 50304",
+        "index out of bounds: 0 <= token < 50304",
     )
     tl.atomic_add(output + x0 + D * token + V * D * x2, value, sem="relaxed")
 
@@ -97,5 +97,5 @@ def _launch(kernel, token_ids, grads, output) -> None:
     )
 
 
-def launch_candidate(token_ids, grads, output) -> None:
-    _launch(_veg_candidate_selected_load_kernel, token_ids, grads, output)
+def launch_selected_load(token_ids, grads, output) -> None:
+    _launch(_veg_selected_load_kernel, token_ids, grads, output)

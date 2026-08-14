@@ -3,25 +3,37 @@
 GPT-2 (124M-class) on FineWeb10B, 8×H100-80GB single node, targeting the modded-nanogpt gate:
 **final val CE ≤ 3.28, mean over runs, all runs count.**
 
-## Result (2026-08-08, unseeded certification pool)
+## Result
 
 Certified record shape: `KX_STEPS=1178` scheduled steps plus 40 grown mid-schedule
 steps (the trainer's default; 1218 scheduled + 23 extension = 1241 trained steps).
-Sixteen unseeded runs across 4 independent cloud 8xH100-80GB machines (three
-Xeon 8480+ hosts, one Xeon 8468, all driver 580.126), fresh compile caches every
-run, all runs counted:
+
+**Logged pool (2026-08-14, per-run logs in `this_pr/`)** — twelve unseeded runs of
+the shipped source on a fresh 8xH100-80GB machine (Xeon 8480+, driver 580.126.09),
+fresh compile caches every run, all runs counted, bracketed by four same-session
+runs of the current-record `train_gpt.py` on the same machine:
+
+- **wall: mean 64.72 s** (range 64.56-64.87, sd 0.10)
+- **val CE: mean 3.27740** (n=12, sd 0.00138; one-sided t vs 3.2800: t=6.5, p = 0.00003)
+- **same-machine record #89 baseline: 74.02 s mean** (n=4, logs in `baseline/`) —
+  an improvement of **9.30 s / 12.6%** on identical hardware and session
+- a second logged pool (16 runs, machine A, 2026-08-13) and the per-machine
+  breakdowns are in `this_pr/statistics.md`
+
+**Initial certification pool (2026-08-08, unlogged)** — sixteen unseeded runs
+across 4 independent cloud 8xH100-80GB machines (three Xeon 8480+ hosts, one
+Xeon 8468), fresh compile caches every run, all runs counted:
 
 | val CE (all 16 runs; per-machine grouping in this_pr/statistics.md) | |
 |---|---|
 | 3.2765, 3.2764, 3.2757, 3.2769 | 3.2755, 3.2758, 3.2777, 3.2773 |
 | 3.2750, 3.2768, 3.2762, 3.2754 | 3.2764, 3.2749, 3.2751, 3.2750 |
 
-- **val CE: mean 3.27604** (n=16, sd 0.00087; one-sided t vs 3.2800: t=18.2, p < 1e-10)
-- **wall: mean 64.95s** on the fastest machine (Xeon 8480+, driver 580.126; five runs:
-  64.87, 64.91, 64.92, 64.99, 65.05); the other 8480+ hosts measured 65.43-65.78 and
-  65.74-66.13 across their runs, the 8468 host 64.84-65.75; all-16 mean 65.36 s
-- Record #89, measured in the same session on two of these machines: 74.38 (fastest)
-  and 75.05, a 9.4s improvement on identical hardware
+- val CE: mean 3.27604 (n=16, sd 0.00087; one-sided t vs 3.2800: t=18.2, p < 1e-10)
+- wall: mean 64.95 s on that pool's fastest machine (five runs: 64.87-65.05);
+  all-16 mean 65.36 s across the four hosts
+- Record #89, measured in the same session on two of those machines: 74.38
+  (fastest) and 75.05
 - The previous entry of this lineage (65.87s mean, val 3.2783) improves by about 0.9s
   on the same machine class (fastest-machine means compared)
   with a 0.0023 larger validation-loss margin
@@ -34,7 +46,7 @@ run, all runs counted:
   fp8 lm_head cache, prefix-token aux CE), fp8 quantize/matmul machinery, optimizer
   matrix helpers.
 - `value_embed_op.py` + `value_embed_kernel.py` (new) — selected-load value-embedding
-  backward (loads only the active adjoint plane; sha-pinned import).
+  backward (loads only the active adjoint plane).
 - `bigram_kernels.py` (new) — bigram embedding backward.
 - `dc_triton_kernels.py` — dual-chunk attention correction, unchanged from the current
   record. `run.sh` and the data pipeline are untouched; the standard `bash run.sh`
@@ -64,6 +76,10 @@ run, all runs counted:
 - **Schedule**: 3 stages (batch 8/16/24, seq 896/2048/3072) + terminal batch taper + 23
   extension steps at windows (6,13); cooldown fraction 0.80 to LR floor 0.20; windows
   1,3→3,7→5,11 through the stages, final-val long window at the stock 20.
+- **Host-side systems work**: automatic Python garbage collection is frozen and
+  disabled for the timed loop (the single collect runs after the final timer read);
+  the run log is held in one buffered handle with step prints thinned to every 25
+  steps. Both are host-only; neither touches numerics.
 - **Timing note**: validation runs once, at the end. Mid-run validation is disabled
   by default (val_loss_every=0) purely to shorten total machine occupancy; validation
   passes are untimed either way, the validation code path is unchanged from the

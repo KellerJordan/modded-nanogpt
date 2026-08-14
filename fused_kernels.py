@@ -14,8 +14,6 @@
 #            epilogue; transposed x from the forward dual-layout quantize).
 #   KX_PDROP drop the bf16 `pre` store entirely (PR#322): backward reconstructs
 #            relu(pre) = sqrt(post) from the fp8 `post` it reads as aux anyway.
-#   KX_GE4   e4m3 gradients (g: dynamic per-tensor scale; dpre: delayed
-#            per-layer scale) instead of e5m2 at static KX_GS.
 #   KX_A2P   plumbing upgrades from PR#342: fused quantize+transpose weight
 #            cache kernel with lagged (one-step-stale) scales, and per-SM
 #            partial-amax slots instead of tl.atomic_max in GEMM epilogues.
@@ -52,15 +50,12 @@ _LHBW16 = True
 _R2CE = True  # CE backward saves only what backward reads (baked)
 
 # Behavior flags. The trainer decides what buffers to pass; these flags decide
-# what the kernels do with them. Read once at import (matching the earlier
-# revision's _C1C pattern).
+# what the kernels do with them. Read once at import.
 FLAGS = {
-    "C1C":   False,   # legacy dW2 diagnostic path, permanently off
     "WG2":   True,   # FP8 dW2 via epilogue dual-layout
     "C1D":   True,   # FP8 dx
     "C1E":   True,   # FP8 dW1
     "PDROP": True, # drop pre; bwd reconstructs sqrt(post_f8)
-    "GE4":   False,   # e4m3 grads w/ real scales
     "A2P":   True,   # per-SM amax + lagged weight quantize
 }
 
@@ -68,7 +63,6 @@ FLAGS = {
 
 # -----------------------------------------------------------------------------
 # Triton kernel for symmetric matrix multiplication by @byronxu99
-# (unchanged from the earlier revision of this module)
 
 @triton.jit
 def _pid_to_block(
@@ -202,7 +196,7 @@ def XXT(A: torch.Tensor, out: torch.Tensor):
     return out
 
 # -----------------------------------------------------------------------------
-# Triton kernel for X.T @ X (tall matrices) — unchanged from the earlier revision of this module
+# Triton kernel for X.T @ X (tall matrices)
 
 @triton.jit
 def XTX_kernel(
@@ -430,7 +424,7 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
 #   EMIT_DPRE    store dpre/dpre_scale as fp8 row-major [M, N]     (for dx, C1D)
 #   EMIT_DPRE_T  ALSO store it transposed to [N, M]                (for dW1, C1E)
 #   STORE_C_BF   store bf16 dpre (off only when C1D && C1E: nothing reads it)
-#   GRAD_E4M3    dpre fp8 format: e4m3 (GE4) vs e5m2 (default)
+#   GRAD_E4M3    dpre fp8 format: e4m3 vs e5m2 (default)
 # Both passes:
 #   PARTIAL_AMAX amax goes to a per-SM slot (buffer is a [NUM_SMS] row) via an
 #                UNCONTENDED per-slot tl.atomic_max, instead of every tile of a
@@ -611,8 +605,8 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
 # precedent (3) and step down automatically if a variant exceeds H100 smem.
 # Written ONLY by eager calls (tests, prime_stage_cache); under torch.compile
 # it is a read-only lookup -- call prime_stage_cache() before compiling so
-# every reachable variant is resolved (defaults-variant initial values are the
-# the earlier module revision-proven ones, so an unprimed cache is still safe with all new flags off).
+# every reachable variant is resolved (defaults-variant initial values are
+# known-safe on H100, so an unprimed cache is still safe with all new flags off).
 _lrs_stage_cache = {}
 
 def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=None,
@@ -621,7 +615,7 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=N
                        emit_dpre=False, emit_dpre_t=False, store_c_bf=True,
                        dpre_scale=None, dpre_amax=None, grad_e4m3=False,
                        partial_amax_mode=False):
-    """the earlier module revision's fused MLP GEMM, extended with dual-layout fp8 epilogue emission.
+    """Fused MLP GEMM with dual-layout fp8 epilogue emission.
 
     Returns (pre, post, post_f8, post_t) on the forward pass and
     (dpre, dpre_f8, dpre_t) on the backward pass; entries not requested are None.
@@ -765,11 +759,11 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=N
         # Dynamo trace (constant-folded True). Two reasons this branch is a bare
         # cache-read + single launch: (1) writing _lrs_stage_cache here is a
         # module-dict mutation inside the autograd-Function HOP -> hard dynamo
-        # error (SideEffects) -- the v3 crash; (2) the OOR retry could never
+        # error (SideEffects); (2) the OOR retry could never
         # work here anyway: the launch is deferred into the compiled artifact,
         # so no exception can reach this try at trace time. The cache must be
         # primed eagerly (prime_stage_cache()) before compiling; unprimed keys
-        # fall back to initial_stages == the earlier module revision-proven defaults-variant values.
+        # fall back to initial_stages == the known-safe defaults-variant values.
         _launch(num_stages)
     else:
         while True:
@@ -814,8 +808,7 @@ def prime_stage_cache(device=None):
     b = torch.zeros(N, K, device=dev, dtype=torch.bfloat16)
     a_e4 = torch.zeros(M, K, device=dev, dtype=torch.float8_e4m3fn)
     b_e4 = torch.zeros(N, K, device=dev, dtype=torch.float8_e4m3fn)
-    g_fmt = torch.float8_e4m3fn if FLAGS["GE4"] else torch.float8_e5m2
-    g_f8 = torch.zeros(M, K, device=dev, dtype=g_fmt)
+    g_f8 = torch.zeros(M, K, device=dev, dtype=torch.float8_e5m2)
     one = torch.ones(1, dtype=torch.float32, device=dev)
     slots = nsm if FLAGS["A2P"] else 1
     amax_f = torch.zeros(slots, dtype=torch.float32, device=dev)
@@ -823,7 +816,7 @@ def prime_stage_cache(device=None):
 
     wg2, pdrop = FLAGS["WG2"], FLAGS["PDROP"]
     c1d, c1e = FLAGS["C1D"], FLAGS["C1E"]
-    store_post_bf = not (wg2 or FLAGS["C1C"])
+    store_post_bf = not wg2
 
     # fwd, bf16 (eval path / DISABLE_FP8)
     linear_relu_square(a, b)
@@ -846,7 +839,7 @@ def prime_stage_cache(device=None):
     aux_bwd = (torch.zeros(M, N, device=dev, dtype=torch.float8_e4m3fn)
                if pdrop else aux_bf)
     kw = dict(aux=aux_bwd, a_f8=g_f8, b_f8=b_e4, dequant_scale_ptr=one,
-              post_scale=one, grad_e4m3=FLAGS["GE4"],
+              post_scale=one,
               partial_amax_mode=FLAGS["A2P"] and not pdrop)
     if c1d or c1e:
         kw.update(emit_dpre=c1d, emit_dpre_t=c1e,
@@ -1008,7 +1001,7 @@ def quantize_mlp_weights_dual(bank: torch.Tensor, scales: torch.Tensor,
 
     row    : [L, H, D] e4m3 contiguous (row-major cache), or None.
     col_t  : [L, D, H] e4m3 contiguous — pass the .transpose(1,2) view of a
-             col-major cache built with the earlier module revision idiom
+             col-major cache built with the idiom
              `zeros_like(bank).transpose(1,2).contiguous().transpose(1,2)`.
     scales : [L] fp32. When update_scales, refreshed FIRST from partial_amax
              (which holds LAST call's per-tile amaxes) with `headroom`; weights
@@ -1094,7 +1087,7 @@ def _(post_t_f8, g_t_f8, post_scale, g_scale):
 def wg1_f8_op(dpre_t_f8: torch.Tensor, x_t_f8: torch.Tensor,
               dpre_scale: torch.Tensor, x_scale: torch.Tensor) -> torch.Tensor:
     """KX_C1E: dW1 = dpre^T @ x. dpre_t_f8 [3072, T] (backward-epilogue emit,
-    e5m2 or e4m3 under GE4), x_t_f8 [768, T] e4m3 (forward dual-layout quantize
+    e5m2), x_t_f8 [768, T] e4m3 (forward dual-layout quantize
     of normed — the same quantization the up-projection already commits to)."""
     return torch._scaled_mm(
         dpre_t_f8, x_t_f8.T,
@@ -1132,9 +1125,9 @@ def _(dpre_f8, w1_f8_col, dpre_scale, w1_scale):
 
 
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
-    """the earlier module revision's fused MLP autograd function extended to the full-FP8 MLP package.
+    """Fused MLP autograd function extended to the full-FP8 MLP package.
 
-    Positional arg layout (superset of the earlier module revision's 13; all trailing args optional —
+    Positional arg layout (first 13 args are the base contract; all trailing args optional —
     the trainer passes exactly what its configuration flags require):
        0 x        [T, 768] bf16 (normed residual)
        1 W1       [3072, 768] bf16      2 W2  [3072, 768] bf16
@@ -1143,10 +1136,10 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
        6 W2_f8    e4m3 col-major        7 w2_scale (0-D)           <- KX_C1A
        8 post_scale (0-D, delayed)      9 post_amax ([1] / [NUM_SMS] slot)
       10 w2_f8_row e4m3 row-major      11 grad_s (float, static)   <- KX_C1B
-      12 dq_bwd   (0-D: w2_s*grad_s; under KX_GE4: w2_s alone)
+      12 dq_bwd   (0-D: w2_s*grad_s)
       13 x_f8_t   [768, T] e4m3        14 x_scale (0-D, amax/448)  <- KX_C1E
       15 w1_f8_col e4m3 col-major      16 w1_scale (0-D)           <- KX_C1D
-      17 g_scale  (0-D f32 = KX_GS; superseded by dynamic scale under KX_GE4)
+      17 g_scale  (0-D f32 = KX_GS)
       18 dpre_scale (0-D, delayed)     19 dpre_amax (slot)         <- KX_C1D/E
     """
 
@@ -1162,8 +1155,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         pdrop = FLAGS["PDROP"] and emit
         # bf16 post's only consumer is a bf16 dW2 (the down-proj fwd reads
         # post_f8 under C1A): once dW2 is FP8 the store is dead.
-        # C1C's fp8 dW2 additionally needs the C1B grad cast (w2_f8_row).
-        store_post_bf = not (emit and (wg2 or (FLAGS["C1C"] and w2_f8_row is not None)))
+        store_post_bf = not (emit and wg2)
         if W1_f8 is not None:
             assert x_f8 is not None and dequant_scale is not None
             x_f8v = x_f8.view((-1, x_f8.shape[-1]))
@@ -1190,14 +1182,13 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             x3 = torch.ops.nanogpt.dp_f8(post_f8, W2_f8, post_scale, w2_scale)
         else:
             x3 = post @ W2
-        # Saved-tensor contract: IDENTICAL to the earlier module revision at defaults —
-        # save_for_backward(x, W1, W2, pre, post) — with pre/post dropped only
-        # under the variant flags that delete those tensors. Defaults-regression
-        # discipline (measured +3.3mb without it): plain ctx-attr
-        # stashing of graph INTERMEDIATES (pre/post) was one of only two
-        # structural deltas from the earlier module revision inside the compiled autograd-Function HOP;
-        # extras that the earlier module revision itself ctx-stashes (post_f8, post_scale, ...) stay
-        # ctx-stashed, matching the earlier revision's layout exactly.
+        # Saved-tensor contract: save_for_backward(x, W1, W2, pre, post), with
+        # pre/post dropped only under the variant flags that delete those
+        # tensors. Graph INTERMEDIATES (pre/post) must go through
+        # save_for_backward, never plain ctx-attr stashing — inside the compiled
+        # autograd-Function HOP the latter pins them past their last use
+        # (measured +3.3mb val without this discipline). Non-graph extras
+        # (post_f8, post_scale, ...) stay ctx-stashed.
         saved = [x, W1, W2]
         if pre is not None:
             saved.append(pre)
@@ -1244,32 +1235,18 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         wg2 = ctx.wg2
         c1e = FLAGS["C1E"] and c1b and ctx.x_f8_t is not None and ctx.dpre_scale is not None
         c1d = FLAGS["C1D"] and c1b and ctx.w1_f8_col is not None and ctx.dpre_scale is not None
-        ge4 = FLAGS["GE4"]
 
         # ---- 1. incoming-grad quantize (one pass; dual layout only for WG2) --
         g_f8 = g_f8_t = None
         dq = ctx.dq_bwd
         g_scale_t = ctx.g_scale
         if c1b:
-            if ge4:
-                # e4m3 grads need a real scale: dynamic per-tensor amax (g is
-                # only [T, 768] — the reduce is cheap). dq_bwd carries w2_scale
-                # alone under GE4; multiply the grad scale back in here.
-                g_scale_t = (g_flat.detach().abs().amax().float()
-                             .clamp_min(1e-12) / E4M3_MAX_F).reshape(())
-                dq = ctx.dq_bwd * g_scale_t
-                fmt = torch.float8_e4m3fn
-            else:
-                fmt = torch.float8_e5m2
             if wg2:
                 if g_scale_t is None:
                     g_scale_t = g_flat.new_tensor(ctx.grad_s, dtype=torch.float32)
-                g_f8, g_f8_t = quantize_dual_layout(g_flat, g_scale_t, fmt=fmt)
-            elif ge4:
-                g_f8 = torch.clamp(g_flat.float() / g_scale_t,
-                                   -E4M3_MAX_F, E4M3_MAX_F).to(fmt)
+                g_f8, g_f8_t = quantize_dual_layout(g_flat, g_scale_t, fmt=torch.float8_e5m2)
             else:
-                # the earlier module revision's C1B cast, unchanged (static e5m2 scale)
+                # C1B cast (static e5m2 scale)
                 g_f8 = (g_flat / ctx.grad_s).to(torch.float8_e5m2)
 
         # ---- 2. dW2 --------------------------------------------------------
@@ -1277,7 +1254,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             dW2 = torch.ops.nanogpt.wg2_f8(ctx.post_t, g_f8_t,
                                            ctx.post_scale, g_scale_t)
         else:
-            dW2 = post.T @ grad_output  # the earlier module revision-exact default expression (unflattened)
+            dW2 = post.T @ grad_output  # default eager expression (unflattened)
 
         # ---- 3. dpre (+ fp8 emits from the same kernel's epilogue) ----------
         # Under PDROP the aux the backward reads IS the fp8 post (it has to
@@ -1290,7 +1267,6 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
                 emit_dpre=c1d, emit_dpre_t=c1e,
                 store_c_bf=not (c1d and c1e),
                 dpre_scale=ctx.dpre_scale, dpre_amax=ctx.dpre_amax,
-                grad_e4m3=ge4,
                 partial_amax_mode=FLAGS["A2P"] and not ctx.pdrop)
         else:
             dpre, dpre_f8, dpre_t = linear_relu_square(
@@ -1301,7 +1277,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             dW1 = torch.ops.nanogpt.wg1_f8(dpre_t, ctx.x_f8_t,
                                            ctx.dpre_scale, ctx.x_scale)
         else:
-            dW1 = dpre.T @ x  # the earlier module revision-exact default expression (unflattened)
+            dW1 = dpre.T @ x  # default eager expression (unflattened)
 
         # ---- 5. dx -----------------------------------------------------------
         if c1d:
@@ -1379,7 +1355,7 @@ def transpose_copy(src: torch.Tensor, dst: torch.Tensor):
 
 
 # -----------------------------------------------------------------------------
-# Tiled transpose-add kernel: dst (M, N) += src (N, M).T  (unchanged from the earlier revision of this module)
+# Tiled transpose-add kernel: dst (M, N) += src (N, M).T
 
 @triton.jit
 def _transpose_add_kernel(
@@ -1431,7 +1407,7 @@ def transpose_add(src: torch.Tensor, dst: torch.Tensor):
 
 
 # -----------------------------------------------------------------------------
-# Fused softcapped cross-entropy (unchanged from the earlier revision of this module, incl. C7 lm_head FP8 reuse)
+# Fused softcapped cross-entropy (reuses the C7 lm_head FP8 cache)
 
 CE_KERNEL_BLOCK_SIZE = 256
 CE_KERNEL_VOCAB_SIZE = 50304

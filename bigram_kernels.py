@@ -9,7 +9,7 @@
 #   a dynamo-traceable autograd.Function whose backward is a bf16 zeros +
 #   index_add_ (atomic bf16 adds). Gradient support and amax are identical;
 #   per-element values may differ by ~1 bf16 ulp (accumulation order/precision)
-#   — NOT bit-identical class; gate with seeded loss run.
+#   vs the aten path — not bit-identical to it.
 
 import torch
 import torch.nn.functional as F

@@ -9,8 +9,6 @@ thread-to-contribution mapping, and relaxed atomic stores.
 
 from __future__ import annotations
 
-import hashlib
-from pathlib import Path
 
 import torch
 
@@ -18,18 +16,7 @@ import torch
 PLANES = 5
 VOCAB = 50304
 WIDTH = 768
-EXPECTED_KERNEL_SHA256 = (
-    "882d0358ce17ffcd7957624ab6b071a06aa2f8261d31828efbbf7548ea77b360"
-)
-
-_KERNEL_PATH = Path(__file__).with_name("value_embed_kernel.py")
-_kernel_sha256 = hashlib.sha256(_KERNEL_PATH.read_bytes()).hexdigest()
-assert _kernel_sha256 == EXPECTED_KERNEL_SHA256, (
-    f"SLG kernel source mismatch: got {_kernel_sha256}, "
-    f"expected {EXPECTED_KERNEL_SHA256}"
-)
-
-from value_embed_kernel import launch_candidate  # noqa: E402
+from value_embed_kernel import launch_selected_load  # noqa: E402
 
 
 def _check_token_ids(token_ids: torch.Tensor) -> None:
@@ -74,7 +61,7 @@ def selected_load_backward_op(
         device=token_ids.device,
         dtype=torch.bfloat16,
     )
-    launch_candidate(token_ids, grads, output.view(PLANES, VOCAB, WIDTH))
+    launch_selected_load(token_ids, grads, output.view(PLANES, VOCAB, WIDTH))
     return output
 
 
@@ -97,7 +84,7 @@ def selected_load_backward_into_op(
     for grad in grads:
         _check_grad(grad, token_ids)
     _check_weight(output, token_ids)
-    launch_candidate(token_ids, grads, output.view(PLANES, VOCAB, WIDTH))
+    launch_selected_load(token_ids, grads, output.view(PLANES, VOCAB, WIDTH))
 
 
 @selected_load_backward_into_op.register_fake
