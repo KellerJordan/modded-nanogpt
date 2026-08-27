@@ -953,6 +953,21 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 
+@torch.compile(dynamic=False, fullgraph=True)
+def _recon_quantize_up_fp8(up_weights: Tensor, e4m3_max: float):
+    """[RUN-0001 H013] Fused FP8 re-quantize of the MLP up-projection.
+
+    Identical arithmetic to the eager form it replaces; the only change is that
+    the divide and the cast are fused, so the full-size bf16 intermediate is
+    never materialised. The down-projection got this treatment as a Triton
+    kernel at record 89; the up-projection never did, because it lives in a
+    module METHOD that torch.compile does not reach.
+    """
+    up_scales = up_weights.view(12, -1).abs().amax(dim=1).clamp(min=1e-12) / e4m3_max
+    return up_scales.float(), (up_weights / up_scales.view(12, 1, 1)).to(torch.float8_e4m3fn)
+
+
+
 class CastedLinearT(nn.Module):
     """
     Linear layer with transposed weight storage (in_features, out_features) which
@@ -1417,9 +1432,13 @@ class GPT(nn.Module):
                 self._mlp_down_proj_f8 = self._mlp_down_proj_f8_storage.transpose(1, 2)
 
             up_weights = self.mlp_bank[:, 0]
-            up_scales = up_weights.view(12, -1).abs().amax(dim=1).clamp(min=1e-12) / E4M3_MAX
-            self._mlp_up_proj_scales[:] = up_scales.float()
-            self._mlp_up_proj_f8[:] = (up_weights / up_scales.view(12, 1, 1)).to(torch.float8_e4m3fn)
+            # [RUN-0001 H013] was: three eager statements that computed the
+            # amax, divided (materialising a full-size bf16 temporary), then
+            # cast. Fused into one compiled helper; same arithmetic, one fewer
+            # full write and one fewer full read per step.
+            _up_scales_f, _up_f8 = _recon_quantize_up_fp8(up_weights, E4M3_MAX)
+            self._mlp_up_proj_scales[:] = _up_scales_f
+            self._mlp_up_proj_f8[:] = _up_f8
 
             down_weights = self.mlp_bank[:, 1]
             if bootstrap_down:
@@ -1566,6 +1585,9 @@ class GPT(nn.Module):
         # cache[k] is the layer-k snapshot used downstream by MUDD.
         # cache[0] = residual stream after bigram injection (input to layer 0).
         cache = {0: x}
+        # [RUN-0001 H011] memo for the hoisted norm(cache[7]).
+        # Reset per forward call, never across calls.
+        _normed_cache7 = None
         for i in range(self.num_layers):
             is_paired = i in self.paired_head_layers
             yarn = self.yarn_paired_head if is_paired else self.yarn
@@ -1595,7 +1617,17 @@ class GPT(nn.Module):
                 x = x + skip_gate_out * cache[3]
             else:
                 qkvo_w = attn_weights[i - (i > 6)]
-                attn_in_normed = norm(cache.get(7, x))
+                # [RUN-0001 H011] was: attn_in_normed = norm(cache.get(7, x))
+                # cache[7] is fixed once written, and norm is pure, so layers
+                # 8/9/10 were recomputing one identical full-size RMS norm three
+                # times. Value-identical; two redundant norms (and their two
+                # redundant backwards) removed.
+                if 7 in cache:
+                    if _normed_cache7 is None:
+                        _normed_cache7 = norm(cache[7])
+                    attn_in_normed = _normed_cache7
+                else:
+                    attn_in_normed = norm(x)
                 B, T = attn_in_normed.size(0), attn_in_normed.size(1)
 
                 if i == self.num_layers - 1:
@@ -1888,7 +1920,7 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
     num_scheduled_iterations: int = 1270  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 15  # number of steps to continue training at final lr and ws
+    num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
