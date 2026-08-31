@@ -202,6 +202,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 87 | 1.256 minutes | [Faster Implementation of Relu^2 Kernel](https://x.com/classiclarryd/status/2083739041338630372) | 06/11/26 | [log](records/track_1_short/2026-06-11_RecursiveFromBest/this_pr/00088a48-30a3-4ebd-9768-6061011337f4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/322) | @cong_ml and AI System [Recursive](https://www.recursive.com/)
 88 | 1.243 minutes | [Prefix token prediction auxiliary loss](https://x.com/classiclarryd/status/2083961001930834419) | 07/13/26 | [log](records/track_1_short/2026-07-13_PrefixTokenPrediction/prefix-1375/1b20ccf2-cb2f-4b6b-bc8a-2d9cd146f549.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/337) | @jvarho
 89 | 1.23 minutes | [MLP down projection in FP8 with efficient delayed scaling metric](https://x.com/classiclarryd/status/2086582390135406713) | 07/17/26 | [log](records/track_1_short/2026-07-17_FP8DownProjection/this_pr/11cb620c-daaf-4e85-83fc-258a5eb7ba09.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/342)  | @Mister-dev-oss, @CerovazS, @MarioPaerle, @GabrieleCirillo, @crisostomi
+90 | 0.665 minutes | ANVIL2 (supersedes [PR #349](https://github.com/KellerJordan/modded-nanogpt/pull/349)): ANVIL optimizer stack, full FP8 MLP fwd+bwd, 84.6M-row hashed n-gram table, sampled softmax over the early stages, depth reduction + mixed-width QK attention, full CUDA-graph capture of the training step | 08/30/26 | [log](records/track_1_short/2026-08-30_ANVIL2) | @devenpzak
 
 
 ## Rules
