@@ -1316,6 +1316,13 @@ class GPT(nn.Module):
             torch.empty(11, num_sms, dtype=torch.float32),
             persistent=False,
         )
+        # 1e-3, not 1.0 like the forward's: a small init clips at 448 rather than underflowing to zero.
+        self.register_buffer("_mlp_dpre_act_scales", torch.full((11,), 1e-3, dtype=torch.float32))
+        self.register_buffer(
+            "_mlp_dpre_partial_amax",
+            torch.zeros(11, num_sms, dtype=torch.float32),
+            persistent=False,
+        )
         self.register_buffer(
             "_mlp_down_weight_partial_amax",
             torch.empty(12, 576, dtype=torch.float32),
@@ -1399,6 +1406,28 @@ class GPT(nn.Module):
         x = F.gelu(F.linear(x, self.mudd_w1[id]))
         x = (F.linear(x, self.mudd_w2[id, :num_coef]) + self.mudd_b2[id, :num_coef]) * self._mudd_scale
         return x.split(1, dim=-1)
+
+    def refresh_dpre_scales(self):
+        """Folds the backward's per-SM amaxes into the next step's `dpre` scale; it cannot live in
+        the forward because the partials only exist after a backward. Skipped with FP8 off, where
+        the backward writes no amaxes and reducing the zero buffer would drive the scale to ~4e-15.
+        """
+        if not (self.training and not os.environ.get("DISABLE_FP8", False)):
+            return
+        # `c_proj` is zero-initialised, so `dpre` is identically zero on the first backward after
+        # init and after every load_state_dict reset. Reducing all-zero partials floors at 1e-12,
+        # giving 1e-12 * 1.80/448 = 4e-15 — the next step's dx would saturate to sign only.
+        prev = self._mlp_dpre_act_scales.clone()
+        had_signal = self._mlp_dpre_partial_amax.amax(dim=1) > 0
+        reduce_mlp_activation_scales(
+            self._mlp_dpre_partial_amax,
+            self._mlp_dpre_act_scales[:self.num_layers],
+            headroom=1.80,
+        )
+        n = had_signal.numel()
+        self._mlp_dpre_act_scales[:n].copy_(
+            torch.where(had_signal, self._mlp_dpre_act_scales[:n], prev[:n])
+        )
 
     def quantize_mlp_fp8(self, bootstrap_down=False):
         """Refresh FP8 copies of both MLP projections after optimizer steps."""
@@ -1649,12 +1678,15 @@ class GPT(nn.Module):
                     c_fc,
                     c_proj,
                     up_proj_f8,
+                    up_proj_scale,
                     self._mlp_dequant_scale_buf,
                     x_f8,
                     down_proj_f8,
                     down_proj_scale,
                     self._mlp_down_act_scales[i:i+1],
                     self._mlp_down_partial_amax[i],
+                    self._mlp_dpre_act_scales[i:i+1],
+                    self._mlp_dpre_partial_amax[i],
                 )
             else:
                 mlp_args = (c_fc, c_proj)
@@ -2291,6 +2323,7 @@ for step in warmup_steps:
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
+    model.refresh_dpre_scales()
     model.quantize_mlp_fp8(bootstrap_down=True)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
@@ -2362,6 +2395,7 @@ for step in range(train_steps + 1):
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
+    model.refresh_dpre_scales()
     model.quantize_mlp_fp8(bootstrap_down=(step < 16))
 
     # logging

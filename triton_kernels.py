@@ -474,6 +474,16 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
             c0_post = aux_desc.load([offs_am_c, offs_bn_c])
             c0 = 2 * c0 * tl.sqrt(c0_post.to(tl.float32))
             c_desc.store([offs_am_c, offs_bn_c], c0.to(dtype))
+            if EMIT_FP8:
+                c0_f32 = c0.to(tl.float32)
+                c0_fp8 = tl.minimum(tl.maximum(c0_f32 * inverse_activation_scale, -448.0), 448.0)
+                post_fp8_desc.store(
+                    [offs_am_c, offs_bn_c], c0_fp8.to(tl.float8e4nv)
+                )
+                partial_amax = tl.maximum(
+                    partial_amax,
+                    tl.max(tl.max(tl.abs(c0_f32), axis=1), axis=0),
+                )
 
         c1 = acc1.to(dtype)
         if FORWARD:
@@ -494,6 +504,16 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
             c1_post = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
             c1 = 2 * c1 * tl.sqrt(c1_post.to(tl.float32))
             c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1.to(dtype))
+            if EMIT_FP8:
+                c1_f32 = c1.to(tl.float32)
+                c1_fp8 = tl.minimum(tl.maximum(c1_f32 * inverse_activation_scale, -448.0), 448.0)
+                post_fp8_desc.store(
+                    [offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_fp8.to(tl.float8e4nv)
+                )
+                partial_amax = tl.maximum(
+                    partial_amax,
+                    tl.max(tl.max(tl.abs(c1_f32), axis=1), axis=0),
+                )
 
     if EMIT_FP8:
         tl.store(partial_amax_ptr + start_pid, partial_amax)
@@ -595,7 +615,9 @@ def linear_relu_square(
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 256
-    BLOCK_SIZE_K = 128 if use_fp8 else 64
+    # A narrower K buys pipeline stages under the same 232 448-byte shared-memory ceiling:
+    # for one-byte fp8 operands 7 stages at K=64 beat 3 at K=128.
+    BLOCK_SIZE_K = 64
 
     FORWARD = False
     if aux is None:
@@ -617,13 +639,19 @@ def linear_relu_square(
     aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
 
     if emit_fp8:
-        assert FORWARD and use_fp8 and partial_amax is not None
-        assert partial_amax.numel() >= NUM_SMS
+        if FORWARD:
+            assert use_fp8  # forward emits from an fp8 GEMM; backward from a bf16 one
+        assert partial_amax is not None and partial_amax.numel() >= NUM_SMS
         post_fp8 = torch.empty((M, N), device=a.device, dtype=torch.float8_e4m3fn)
         post_fp8_desc = TensorDescriptor.from_tensor(
             post_fp8, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2]
         )
-        num_stages = 3
+        # Triton reports 221 344 B at seven stages against the 232 448 B ceiling, so an eighth
+        # (+24 576 B) does not fit. Per-stage arithmetic alone understates this by ~49 KB — the
+        # epilogue buffers are not overlapped with the mainloop pipeline. bf16 costs 49 160 B a
+        # stage, so seven there raises OutOfResources at load; the backward keeps the 3 above.
+        if use_fp8:
+            num_stages = 7
     else:
         post_fp8 = None
         post_fp8_desc = aux_desc
@@ -672,12 +700,15 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         W1,
         W2,
         W1_f8=None,
+        W1_scale=None,
         dequant_scale=None,
         x_f8=None,
         W2_f8=None,
         W2_scale=None,
         activation_scale=None,
         partial_amax=None,
+        dpre_scale=None,
+        dpre_partial_amax=None,
     ):
         # Forward stores only `post = relu(x @ W1.T)^2`; `pre` is never materialized.
         x_flat = x.view((-1, x.shape[-1]))
@@ -713,20 +744,42 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             )
         else:
             x3 = post @ W2
-        # Backward stays BF16: it consumes `post` (and W2), not their FP8 copies.
+        # Only `dx` runs in fp8; the rest of the backward consumes bf16 `post` and `W2`. `dpre_scale`
+        # is the PREVIOUS step's amax-derived scale. W1_scale, not dequant_scale: the latter is
+        # (weight x activation) scale, right only for the forward, and one buffer every layer overwrites.
         ctx.save_for_backward(x, W1, W2, post)
+        ctx.fp8_dx = (W1_f8, W1_scale, dpre_scale, dpre_partial_amax)
         return x3.view(x.shape)
 
     @staticmethod
     def backward(ctx, grad_output):
         x, W1, W2, post = ctx.saved_tensors
+        W1_f8, W1_scale, dpre_scale, dpre_partial_amax = ctx.fp8_dx
         dW2 = post.T @ grad_output
         # dpre kernel reconstructs relu(pre) = sqrt(post) from `post` (passed as aux),
         # avoiding the redundant `pre` HBM read/write entirely.
-        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=post)
-        dW1 = dpre.T @ x
-        dx = dpre @ W1
-        return dx.view(x.shape), dW1, dW2, None, None, None, None, None, None, None
+        grad_flat = grad_output.view((-1, grad_output.shape[-1]))
+        if dpre_scale is not None and W1_scale is not None:
+            # dW1 stays bf16: it needs dpre TRANSPOSED, and a transposed fp8 copy costs more
+            # than the GEMM saves.
+            dpre, dpre_f8 = linear_relu_square(
+                grad_flat, W2, aux=post,
+                activation_scale=dpre_scale, partial_amax=dpre_partial_amax,
+            )
+            dW1 = dpre.T @ x
+            dx = torch._scaled_mm(
+                dpre_f8,
+                W1_f8.T.contiguous().T,  # weights are 2.4 MB; a materialised transpose is ~1 us
+                out_dtype=dpre.dtype,
+                scale_a=dpre_scale,
+                scale_b=W1_scale,
+                use_fast_accum=False,    # K is the hidden dim; deep sums lose accuracy fast here
+            )
+        else:
+            dpre = linear_relu_square(grad_flat, W2, aux=post)
+            dW1 = dpre.T @ x
+            dx = dpre @ W1
+        return dx.view(x.shape), dW1, dW2, None, None, None, None, None, None, None, None, None, None
 
 
 def reduce_mlp_activation_scales(partial_amax, scales, headroom=1.25):
@@ -954,7 +1007,7 @@ __device__ float sigmoid(float x) {
 }
 
 extern "C"
-__launch_bounds__(BLOCK_SIZE, 2)
+__launch_bounds__(BLOCK_SIZE, 3)
 __global__ void ce_fwd_bwd_kernel(
     const __nv_bfloat16* __restrict__ logits,
     const int64_t* __restrict__ targets,
@@ -1030,7 +1083,7 @@ __global__ void ce_fwd_bwd_kernel(
   }
 
   float thread_sum = 0.0f;
-  #pragma unroll 2
+  #pragma unroll 25
   for (int i = 0; i < NUM_LOADS; i++) {
     int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
     __nv_bfloat168 l;
