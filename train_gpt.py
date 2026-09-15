@@ -1,4 +1,5 @@
 import os
+import collections
 import sys
 
 # Read the current file and the kernels file code ASAP, for logging
@@ -37,6 +38,12 @@ import torch.nn.functional as F
 
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 from kernels import get_kernel
+ENGRAM_ROWS = int(os.environ.get("ENGRAM_ROWS", "80000000"))   # engram table rows (hashed n-gram host table -> attention values); 0 = off
+if ENGRAM_ROWS > 0:
+    import engram_port
+    ENGRAM_SITE_INDEX = {L: i for i, L in enumerate(engram_port.sites())}
+else:
+    ENGRAM_SITE_INDEX = {}
 from torch import Tensor, nn
 
 from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, quantize_transpose_mlp_down_weights, reduce_mlp_activation_scales, transpose_add, transpose_copy
@@ -1065,6 +1072,8 @@ class AttnArgs:
     aux_v: torch.Tensor | None
     xsa_alpha: torch.Tensor | None
     train_max_seq_len: torch.Tensor
+    eng_v: torch.Tensor | None = None   # engram: gated (B, T, head_dim) values, added into one head of v
+    eng_head: int = 0
 
 flash_attn_interface = get_kernel('kernels-community/flash-attn3', version=1).flash_attn_interface
 
@@ -1102,6 +1111,14 @@ class CausalSelfAttention(nn.Module):
 
         q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         max_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
+
+        if attn_args.eng_v is not None:
+            # engram: the gated values land in n consecutive heads starting at eng_head
+            n_h = attn_args.eng_v.shape[-1] // self.head_dim
+            assert attn_args.eng_head + n_h <= self.num_heads
+            e = attn_args.eng_v.view(B, T, n_h, self.head_dim).to(v.dtype)
+            # a padded add fuses under inductor; index_add would be an extern fallback
+            v = v + F.pad(e, (0, 0, attn_args.eng_head, self.num_heads - n_h - attn_args.eng_head))
 
         q, k = norm(q), norm(k) # QK norm @Grad62304977
 
@@ -1204,6 +1221,7 @@ class ForwardScheduleConfig:
     ws_short: int
     ws_long: int
     train_max_seq_len: int
+    engram_out: object = None       # (T, n_sites, SITE_WIDTH) engram rows, set by _fwd_args()
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
@@ -1262,6 +1280,10 @@ class GPT(nn.Module):
 
         # parameter banks for attention and value embedding gate weights
         self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 unique gates
+        if ENGRAM_ROWS > 0:   # engram gate per site: 12 residual channels -> 1, plus a bias (starts nearly closed)
+            ns = len(ENGRAM_SITE_INDEX)
+            self.engram_gate_bank = nn.Parameter(torch.empty(ns, 1, engram_port.GATE_CHANNELS).uniform_(0.0, 0.02))
+            self.engram_gate_bias = nn.Parameter(torch.full((ns,), -3.0))
         self.gate_filler_nones = [None] * (num_layers - 6)
 
         # Parameter banks for sharded optimization, by @chrisjmccormick
@@ -1616,6 +1638,10 @@ class GPT(nn.Module):
                     aux_v = (ve_gate_out * ve_view).view(B, T, -1)
                 else:
                     aux_v = None
+                eng_v, eng_head = None, 0
+                if i in ENGRAM_SITE_INDEX and schedule_cfg.engram_out is not None:
+                    eng_v = engram_port.gated_values(attn_in_normed, schedule_cfg.engram_out, self.engram_gate_bank, self.engram_gate_bias, ENGRAM_SITE_INDEX[i])
+                    eng_head = ENGRAM_SITE_INDEX[i] % self.num_heads
 
                 attn_args = AttnArgs(
                     sa_lambdas=sa_lambdas[i],
@@ -1627,6 +1653,7 @@ class GPT(nn.Module):
                     aux_v=aux_v,
                     xsa_alpha=xsa_alphas[i],
                     train_max_seq_len=train_max_seq_len,
+                    eng_v=eng_v, eng_head=eng_head,
                 )
                 dc_w = dc_weights[i] if i in self.dc_layers and not is_paired else None
                 attn_out = attn(attn_in_normed, attn_args, qkvo_w, dc_w)
@@ -1865,6 +1892,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             _cum_lengths.to(device="cuda", non_blocking=True),
             _bigram_inputs.to(device="cuda", non_blocking=True),
             _bigram_inputs.numpy(),
+            _inputs,                         # CPU copy of the ids (engram hashes them on the host)
         )
 
         if new_params is not None:
@@ -1887,7 +1915,7 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1270  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1125  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 15  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -2048,13 +2076,18 @@ class TrainingManager():
             "mudd_gate_b2": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
             "_mudd_gate_scale": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
         })
+        if ENGRAM_ROWS > 0:   # engram gates: Adam, betas 0.9/0.95, no weight decay
+            self.param_table.update({
+                "engram_gate_bank": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.95], "lr_mul": 2.5, "wd_mul": 0.0},
+                "engram_gate_bias": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.95], "lr_mul": 2.5, "wd_mul": 0.0},
+            })
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "ve_gate_bank", "mudd_b2", "mudd_gate_b2", "_mudd_gate_scale",
             "post_lambdas", "resid_lambdas",  # Small, fast
-        ] + [
+        ] + (["engram_gate_bank", "engram_gate_bias"] if ENGRAM_ROWS > 0 else []) + [
             "mudd_w2", "mudd_gate_w2",
             "value_embeds", "bigram_embed",  # Medium
             "mudd_w1", "mudd_gate_w1",
@@ -2239,6 +2272,10 @@ model: nn.Module = GPT(
     model_dim=768,
     max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
 ).cuda()
+ENGRAM = engram_port.EngramPort(ENGRAM_ROWS, rank, world_size,
+                                max_tokens=max(st.batch_size for st in TRAINING_STAGES) // world_size) if ENGRAM_ROWS > 0 else None
+if ENGRAM is not None:
+    print0(ENGRAM.describe(), console=True)
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
         m.weight.data = m.weight.data.bfloat16()
@@ -2258,6 +2295,13 @@ dist.broadcast(model.bigram_sign_table, 0)  # buffer, not in parameters()
 model.quantize_mlp_fp8(bootstrap_down=True)
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+
+
+def _fwd_args(tm, inputs):
+    cfg = tm.get_forward_args()
+    if ENGRAM is not None:
+        ENGRAM.attach(cfg, inputs, model.training)
+    return cfg
 training_manager = TrainingManager(model)
 
 
@@ -2279,23 +2323,42 @@ for step in warmup_steps:
     training_manager.advance_schedule(step)
     model.eval()
     with torch.no_grad():
-        inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+        inputs, targets, cum_seqlens, bigram_inputs, *_ = next(val_loader)
+        model(inputs, targets, cum_seqlens, bigram_inputs, _fwd_args(training_manager, inputs)).mean()
     model.train()
     for idx in range(grad_accum_steps):
         send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
+        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu, *_ = train_loader.send(send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, _fwd_args(training_manager, inputs)).sum() * grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
+    if ENGRAM is not None:
+        ENGRAM.step()
     model.quantize_mlp_fp8(bootstrap_down=True)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
+if ENGRAM is not None:
+    ENGRAM.reset()
+    # the reset invalidates one compiled variant of the forward: compile it before the clock, then restore
+    _l = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
+    training_manager.advance_schedule(0)
+    model.train()
+    inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu, *_ = _l.send(training_manager.train_loader_send_args)
+    training_manager.sparse_index_update(0, bigram_cpu)
+    loss = model(inputs, targets, cum_seqlens, bigram_inputs, _fwd_args(training_manager, inputs)).sum() * grad_scale
+    training_manager.sparse_index_share(0)
+    loss.backward()
+    del loss, _l
+    model.zero_grad(set_to_none=True)
+    model.load_state_dict(initial_state["model"])
+    training_manager.reset(initial_state["optimizer"])
+    ENGRAM.reset()
+    print0("Post-reset compile step done; state restored", console=True)
 del val_loader, train_loader, initial_state
 model.quantize_mlp_fp8(bootstrap_down=True)
 model.train()
@@ -2317,6 +2380,16 @@ t0 = time.perf_counter()
 model.prefix_table.copy_(build_prefix_table(model.vocab_size))
 # begin training
 train_steps = training_schedule.total_steps
+def _send_args_for(step):
+    """Loader send args advance_schedule() would produce at `step`, without its side effects."""
+    stage, _ = training_schedule.lookup(step)
+    prev, _ = training_schedule.lookup(step - 1)
+    if stage.batch_size != prev.batch_size or stage.train_max_seq_len != prev.train_max_seq_len:
+        return (stage.batch_size, stage.train_max_seq_len, grad_accum_steps)
+    return None
+
+_pf_q = collections.deque()   # engram: batches pulled ahead
+_pf_next = 0
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
@@ -2334,8 +2407,8 @@ for step in range(train_steps + 1):
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
-                inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+                inputs, targets, cum_seqlens, bigram_inputs, *_ = next(val_loader)
+                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, _fwd_args(training_manager, inputs)).mean()
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
@@ -2354,13 +2427,32 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    for idx in range(grad_accum_steps):
-        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
+    if ENGRAM is not None:
+        # engram: batches are pulled pf_depth steps ahead so their rows are staged before they are needed
+        assert grad_accum_steps == 1, "engram prefetch path assumes one micro-step per step"
+        if _pf_next == step:
+            _pf_q.append(train_loader.send(training_manager.train_loader_send_args)); _pf_next += 1
+        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu, *_ = _pf_q.popleft()
         training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
+        fwd = _fwd_args(training_manager, inputs)
+        ENGRAM.host.mark_fwd()
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, fwd).sum() * grad_scale
+        ENGRAM.host.issue_writes()                                    # the previous step's write-back, under this forward
+        while _pf_next < train_steps and _pf_next <= step + ENGRAM.host.pf_depth:
+            _pf_q.append(train_loader.send(_send_args_for(_pf_next)))
+            ENGRAM.prefetch(_pf_q[-1]); _pf_next += 1
         training_manager.sparse_index_share(step)
         loss.backward()
         del loss
+        ENGRAM.step()                                                 # row update before the optimizer step
+    else:
+        for idx in range(grad_accum_steps):
+            inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu, *_ = train_loader.send(training_manager.train_loader_send_args)
+            training_manager.sparse_index_update(step, bigram_cpu)
+            loss = model(inputs, targets, cum_seqlens, bigram_inputs, _fwd_args(training_manager, inputs)).sum() * grad_scale
+            training_manager.sparse_index_share(step)
+            loss.backward()
+            del loss
     training_manager.step_optimizers(step)
     model.quantize_mlp_fp8(bootstrap_down=(step < 16))
 
@@ -2379,4 +2471,6 @@ if args.run_evals:
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+if ENGRAM is not None:
+    ENGRAM.shutdown()
 dist.destroy_process_group()
