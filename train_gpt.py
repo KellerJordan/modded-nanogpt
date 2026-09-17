@@ -47,6 +47,10 @@ from dc_triton_kernels import (
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
 
+from retrieval import OnlineCache, ValidationCache, retrieval_vector
+for path in [Path(__file__).with_name("retrieval.py"), *sorted(Path(__file__).with_name("exact_match").glob("src/*.rs"))]:
+    code += f"\n# {path.name}\n" + path.read_text()
+
 dynamo.config.recompile_limit = 64
 
 # -----------------------------------------------------------------------------
@@ -1240,6 +1244,11 @@ class GPT(nn.Module):
         self.attn_gate_layers = [3, 10]
         self.init_mudd_gate(model_dim)
 
+        self.ret_next_scale = nn.Parameter(torch.ones(8))
+        self.ret_bucket_embed = nn.Parameter(torch.zeros(8, model_dim))
+        for site in ("in", "mid", "out"):
+            setattr(self, f"ret_site_scale_{site}", nn.Parameter(torch.tensor(1.0 if site == "out" else 0.5)))
+
         # Auto-label parameters
         for name, param in self.named_parameters():
             param.label = name.replace('.weight', '')
@@ -1483,8 +1492,9 @@ class GPT(nn.Module):
             bigram_gates[layer] = gate[..., offset + 1:offset + 2]
         return gate[..., 28:29]
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig, ret_r: tuple[Tensor, Tensor] | None = None):
         assert input_seq.ndim == 1
+        ret_r = retrieval_vector(self, *ret_r, input_seq.device) if ret_r is not None else torch.zeros((), device=input_seq.device, dtype=torch.bfloat16)
 
         # ---- Schedule and layer topology ----
         mtp_weights, train_max_seq_len = schedule_cfg.mtp_weights, schedule_cfg.train_max_seq_len
@@ -1530,6 +1540,8 @@ class GPT(nn.Module):
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
         
+        x = x + self.ret_site_scale_in.type_as(x) * ret_r
+
         # Use sign-trick to better compress multiple bigrams into a shared bigram embedding row
         # (details in https://github.com/KellerJordan/modded-nanogpt/pull/299 by @trianxy)
         sign_idx = torch.zeros_like(input_seq)
@@ -1587,6 +1599,9 @@ class GPT(nn.Module):
                     bigram_gates,
                 )
                 dc_weights[10] = (post_gate[..., 29:35], post_gate[..., 35:41])
+
+            if i == 7:
+                x = x + self.ret_site_scale_mid.type_as(x) * ret_r[None]
 
             # process attn. skip on layer 6 @YouJiacheng
             if i == 6:
@@ -1679,6 +1694,7 @@ class GPT(nn.Module):
         ve_bank0 = ve[1][None].to(dtype=x.dtype)  # (1, T, D), same VE as layer-1 attn
         x = x + mu[0] * cache[0] + mu[1] * cache[7] + mu[2] * cache[9] + mu[3] * ve_bank0 + mu[4] * cache[3]
 
+        x = x + self.ret_site_scale_out.type_as(x) * ret_r[None]
         x = norm(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
@@ -1865,6 +1881,8 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             _cum_lengths.to(device="cuda", non_blocking=True),
             _bigram_inputs.to(device="cuda", non_blocking=True),
             _bigram_inputs.numpy(),
+            (_inputs.numpy(), _cum_lengths.numpy(),
+             (tokens.numpy(), seq_starts, seq_ends) if align_to_bos else None),
         )
 
         if new_params is not None:
@@ -1886,8 +1904,9 @@ class Hyperparameters:
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
+
+    num_scheduled_iterations: int = int(os.environ.get("TOTAL_TRAIN_STEPS", "688")) - 15  # number of steps to complete lr and ws schedule
     # schedule
-    num_scheduled_iterations: int = 1270  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 15  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1895,7 +1914,6 @@ class Hyperparameters:
     #   - explicit sparse connectivity refactor (no generic loop)
     #   - (1 + m_r9) * x self-reference fuse on layer 9
     #   - backout_lambda fully removed (slot dropped from self.scalars; absorbed into MUDD bias init)
-    val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
@@ -1904,6 +1922,7 @@ class Hyperparameters:
     bigram_sign_table_rows: int = 8192  # prefer a power of 2 (values ~500-15000 gave similar results)
 
 args = Hyperparameters()
+assert args.num_scheduled_iterations > 0
 
 @dataclass(slots=True)
 class TrainingStage:
@@ -2061,6 +2080,10 @@ class TrainingManager():
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "qk_bank", "vo_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
         ]
+
+        ret_labels = [p.label for p in model.parameters() if p.label.startswith("ret_")]
+        self.param_table.update({label: {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 1.0, "wd_mul": 0.0} for label in ret_labels})
+        self.work_order = ret_labels + self.work_order
 
         adam_defaults = dict(
             lr=0.008,
@@ -2231,6 +2254,9 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
+torch.manual_seed(int(os.environ.get("SEED", "0")))
+print0(f"seed:{torch.initial_seed()} total_train_steps:{training_schedule.total_steps}", console=True)
+
 model: nn.Module = GPT(
     vocab_size=50257,
     num_layers=11,
@@ -2260,6 +2286,22 @@ model.quantize_mlp_fp8(bootstrap_down=True)
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
+def forward(inputs, targets, cum_seqlens, bigram_inputs, schedule, matches=None):
+    if matches is None:
+        matches = (torch.zeros(inputs.numel(), dtype=torch.int32, device=device), torch.full((inputs.numel(), 4), -1, dtype=torch.int32, device=device))
+    ret_r = tuple(torch.as_tensor(x, device=device, dtype=torch.int64) for x in matches)
+    return model(inputs, targets, cum_seqlens, bigram_inputs, schedule, ret_r)
+
+online_tokens = sum(training_schedule.lookup(step)[0].batch_size + world_size * grad_accum_steps
+                    for step in range(training_schedule.total_steps))
+online_cache = OnlineCache(8, online_tokens)
+cache_group = dist.new_group(backend="gloo")
+val_cache = ValidationCache(args.train_files, args.val_files, 8,
+                            args.val_batch_size // (world_size * grad_accum_steps),
+                            args.val_tokens, group=cache_group)
+print0(f"Preallocated online cache for {online_tokens:,} tokens per rank; "
+       f"offline cache capacity {val_cache.training_token_capacity:,} tokens sharded across ranks", console=True)
+dist.barrier()
 
 ########################################
 #            Warmup kernels            #
@@ -2279,14 +2321,14 @@ for step in warmup_steps:
     training_manager.advance_schedule(step)
     model.eval()
     with torch.no_grad():
-        inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+        inputs, targets, cum_seqlens, bigram_inputs, _, cpu_batch = next(val_loader)
+        forward(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
     model.train()
     for idx in range(grad_accum_steps):
         send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
+        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu, cpu_batch = train_loader.send(send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
+        loss = forward(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
         del loss
@@ -2311,6 +2353,11 @@ training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
+val_cache.start()
+
+loader_args = lambda step: (training_schedule.lookup(step)[0].batch_size, training_schedule.lookup(step)[0].train_max_seq_len, grad_accum_steps)
+train_loader = online_cache.prefetch(train_loader, loader_args, training_schedule.total_steps, grad_accum_steps, device)
+
 # Prefix-token table build, inside the timed region. The tokenizer was loaded at import
 # (get_encoding is cached in tiktoken's registry), so this pays only the table construction.
 # In-place copy keeps the buffer's tensor identity, which the compiled graph holds.
@@ -2321,21 +2368,28 @@ for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
     # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-        if last_step:
-            training_manager.apply_final_ws_ext()
+    if last_step:
+        training_manager.apply_final_ws_ext()
+        online_cache.finish()
+        t_finish = time.perf_counter()
+        val_cache.finish()
+        t_finish = time.perf_counter() - t_finish
+
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
+        print0(f"offline cache wait: {1000 * t_finish:.0f}ms", console=True)
         model.eval()
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
         val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
         val_loss = 0
         with torch.no_grad():
-            for _ in range(val_steps):
-                inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+            for val_step in range(val_steps):
+                inputs, targets, cum_seqlens, bigram_inputs, _, cpu_batch = next(val_loader)
+                offset = (val_step * world_size + rank) * inputs.numel()
+                matches = val_cache.query(offset, cpu_batch)
+                val_loss += forward(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(), matches).mean()
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
@@ -2355,9 +2409,9 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
-        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
+        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu, matches = train_loader.send(training_manager.train_loader_send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
+        loss = forward(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(), matches).sum() * grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
         del loss
