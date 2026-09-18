@@ -204,7 +204,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 88 | 1.243 minutes | [Prefix token prediction auxiliary loss](https://x.com/classiclarryd/status/2083961001930834419) | 07/13/26 | [log](records/track_1_short/2026-07-13_PrefixTokenPrediction/prefix-1375/1b20ccf2-cb2f-4b6b-bc8a-2d9cd146f549.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/337) | @jvarho
 89 | 1.23 minutes | [MLP down projection in FP8 with efficient delayed scaling metric](https://x.com/classiclarryd/status/2086582390135406713) | 07/17/26 | [log](records/track_1_short/2026-07-17_FP8DownProjection/this_pr/11cb620c-daaf-4e85-83fc-258a5eb7ba09.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/342)  | @Mister-dev-oss, @CerovazS, @MarioPaerle, @GabrieleCirillo, @crisostomi
 90 | 1.13 minutes | 128 -> 96 dim QK, Fuse QK Norm, RoPE, and KeyOffset into Triton, Move MLP bwk to FP8, Move QKV fwd and bwk to FP8.  | 08/03/26 | [log](records/track_1_short/2026-08-03_FP8MLPBackwardPackedQKV),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/344)  | @theonlyglitch_
-
+91 | 1.126 minutes | Mask logits for infeasible token continuations during validation.  | 08/06/26 | [log](records/track_1_short/2026-08-06-CanonicalMasking)  | @jvarho
 ## Rules
 
 New records must:
