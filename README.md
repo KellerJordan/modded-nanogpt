@@ -60,7 +60,8 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@EmmettBicker](https://github.com/EmmettBicker), [@dualverse-ai](https://github.com/dualverse-ai), [@sisovicm](https://x.com/sisovicm),
 [@moof2x](https://github.com/moof2x), [@samacqua](https://github.com/samacqua), [@Lisennlp](https://github.com/Lisennlp),
 [@_djdumpling](https://x.com/_djdumpling), [@TrianX](https://x.com/TrianX), [@aryavohra](https://github.com/aryavohra),
-[@cong_ml](https://x.com/cong_ml), [@jvarho](https://github.com/jvarho), [@Mister-dev-oss](https://github.com/Mister-dev-oss), [@CerovazS](https://github.com/CerovazS), [@MarioPaerle](https://github.com/MarioPaerle), [@GabrieleCirillo](https://github.com/GabrieleCirillo), [@crisostomi](https://github.com/crisostomi)
+[@cong_ml](https://x.com/cong_ml), [@jvarho](https://github.com/jvarho), [@Mister-dev-oss](https://github.com/Mister-dev-oss), [@CerovazS](https://github.com/CerovazS), [@MarioPaerle](https://github.com/MarioPaerle), [@GabrieleCirillo](https://github.com/GabrieleCirillo), [@crisostomi](https://github.com/crisostomi),
+[@theonlyglitch_](https://x.com/theonlyglitch_)
 
 
 ---
@@ -196,13 +197,13 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 81 | 1.363 minutes | [MUDD Skip Connections](https://x.com/classiclarryd/status/2058486428255035457) | 04/22/26 | [log](records/track_1_short/2026-04-22_MuddFormer/this_pr_v3),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/259) | @Lisennlp
 82 | 1.353 minutes | [Learnable XSA](https://x.com/classiclarryd/status/2058975556520329302) | 04/29/26 | [log](records/track_1_short/2026-04-29_XSAGatedLayers/this_pr_v1-s1410/06563169-6435-48ba-a1ad-f3e61bfcc573.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/264) | @_djdumpling
 83 | 1.328 minutes | [Sign Trick on Bigram Embed](https://x.com/classiclarryd/status/2063061926092099868) | 05/20/26 | [log](records/track_1_short/2026-05-20_BigramsSignTrick/pr299/0cf91274-eda8-49cd-9a97-9369f730f271.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/299) | @TrianX
-84 | 1.320 minutes | FP8 on MLP up-projection forward pass | 05/21/26 | [log](records/track_1_short/2026-05-19_FP8MLPUpProj/this_record/008bb79d-d5bc-4205-bd4e-5e4ae82e658c.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/306) | @sisovicm
-85 | 1.271 minutes | MUDD gates and Lightweight Dynamically Composable MHA | 05/27/26 | [log](records/track_1_short/2026-05-27-MuddGatedAndDC),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/315) | @Lisennlp
-86 | 1.266 minutes | Algebraic rewrite of XSA, same math faster execution | 05/27/26 | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/317) | @aryavohra
-87 | 1.256 minutes | Faster Implementation of Relu^2 Kernel | 06/11/26 | [log](records/track_1_short/2026-06-11_RecursiveFromBest/this_pr/00088a48-30a3-4ebd-9768-6061011337f4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/322) | @cong_ml and AI System [Recursive](https://www.recursive.com/)
-88 | 1.243 minutes | Prefix token prediction auxiliary loss | 07/13/26 | [log](records/track_1_short/2026-07-13_PrefixTokenPrediction/prefix-1375/1b20ccf2-cb2f-4b6b-bc8a-2d9cd146f549.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/337) | @jvarho
-89 | 1.23 minutes | MLP down projection in FP8 with efficient delayed scaling metric | 07/17/26 | [log](records/track_1_short/2026-07-17_FP8DownProjection/this_pr/11cb620c-daaf-4e85-83fc-258a5eb7ba09.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/342)  | @Mister-dev-oss, @CerovazS, @MarioPaerle, @GabrieleCirillo, @crisostomi
-
+84 | 1.320 minutes | [FP8 on MLP up-projection forward pass]() | 05/21/26 | [log](records/track_1_short/2026-05-19_FP8MLPUpProj/this_record/008bb79d-d5bc-4205-bd4e-5e4ae82e658c.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/306) | @sisovicm
+85 | 1.271 minutes | [MUDD gates and Lightweight Dynamically Composable MHA](https://x.com/classiclarryd/status/2081451521229881374) | 05/27/26 | [log](records/track_1_short/2026-05-27-MuddGatedAndDC),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/315) | @Lisennlp
+86 | 1.266 minutes | [Algebraic rewrite of XSA, same math faster execution](https://x.com/classiclarryd/status/2081909171554071027) | 05/27/26 | [PR](https://github.com/KellerJordan/modded-nanogpt/pull/317) | @aryavohra
+87 | 1.256 minutes | [Faster Implementation of Relu^2 Kernel](https://x.com/classiclarryd/status/2083739041338630372) | 06/11/26 | [log](records/track_1_short/2026-06-11_RecursiveFromBest/this_pr/00088a48-30a3-4ebd-9768-6061011337f4.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/322) | @cong_ml and AI System [Recursive](https://www.recursive.com/)
+88 | 1.243 minutes | [Prefix token prediction auxiliary loss](https://x.com/classiclarryd/status/2083961001930834419) | 07/13/26 | [log](records/track_1_short/2026-07-13_PrefixTokenPrediction/prefix-1375/1b20ccf2-cb2f-4b6b-bc8a-2d9cd146f549.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/337) | @jvarho
+89 | 1.23 minutes | [MLP down projection in FP8 with efficient delayed scaling metric](https://x.com/classiclarryd/status/2086582390135406713) | 07/17/26 | [log](records/track_1_short/2026-07-17_FP8DownProjection/this_pr/11cb620c-daaf-4e85-83fc-258a5eb7ba09.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/342)  | @Mister-dev-oss, @CerovazS, @MarioPaerle, @GabrieleCirillo, @crisostomi
+90 | 1.13 minutes | 128 -> 96 dim QK, Fuse QK Norm, RoPE, and KeyOffset into Triton, Move MLP bwk to FP8, Move QKV fwd and bwk to FP8.  | 08/03/26 | [log](records/track_1_short/2026-08-03_FP8MLPBackwardPackedQKV),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/344)  | @theonlyglitch_
 
 ## Rules
 
