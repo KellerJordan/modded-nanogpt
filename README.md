@@ -68,12 +68,21 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 
 ## Running the current record
 
-To run the current record, run the following commands.
+This branch proposes approximate head and attention backward on top of
+[PR #360](https://github.com/KellerJordan/modded-nanogpt/pull/360).
+See the [method and reproduction notes](approx_backward/README.md) and
+[eight-H100 results](records/track_1_short/2026-09-24_ApproximateBackward/RESULTS.md).
+The record history below is preserved from accepted master.
+
+Use Linux, Python 3.12, eight H100s, and a CUDA 13 development toolkit (including
+`nvcc`), with `git`, `patch`, and a C++ compiler installed. From this branch's
+checkout, run:
 ```bash
-git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
-pip install -r requirements.txt
+python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -r requirements.txt
 # downloads only the first 900M training tokens to save time
 python data/cached_fineweb10B.py 9
+python approx_backward/prepare.py
 ./run.sh
 ```
 Add torchrun to path if ./run.sh gives error `torchrun: command not found`.
@@ -89,10 +98,11 @@ This approach standardizes versions for CUDA, NCCL, CUDNN, and Python, reducing 
 Note: an NVIDIA driver must already be installed on the system (useful if only the NVIDIA driver and Docker are available).
 
 ```bash
-git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
+# Run from this branch's checkout.
 sudo docker build -t modded-nanogpt .
-sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt python data/cached_fineweb10B.py 8
-sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt sh run.sh
+sudo docker run -it --rm --gpus all -v "$(pwd)":/modded-nanogpt modded-nanogpt python data/cached_fineweb10B.py 9
+sudo docker run -it --rm --gpus all -v "$(pwd)":/modded-nanogpt modded-nanogpt python approx_backward/prepare.py
+sudo docker run -it --rm --gpus all -v "$(pwd)":/modded-nanogpt modded-nanogpt sh run.sh
 ```
 
 To get an interactive docker, you can use

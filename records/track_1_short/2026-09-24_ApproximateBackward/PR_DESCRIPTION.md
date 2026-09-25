@@ -1,40 +1,36 @@
-Title: Approximate head and attention backward: 39.58 s on 8×H100 (stacked on #360)
+Title: Approximate backward: 39.58 s on 8×H100, 1.88% faster than #360
 
-This adds two cheaper backward computations to #360 while retaining its forward
-pass, 1,194 training updates and full-vocabulary validation:
+This builds on #360 and saves **0.759 seconds (1.88%)** on the same eight-H100
+SXM node by approximating two backward computations during training.
 
-- **Head dW:** sample one paired activation/positive-gradient row per four rows;
-  accumulate all negative logit-gradient entries separately. Keep dX unchanged.
-- **Attention:** use two training steps to select shorter backward windows per
-  head, limiting measured Q/K/V error across all eight ranks. Keep the original
-  forward probabilities and omit distant backward tiles without renormalization.
-
-Both approximations stop for the final 87 updates. Calibration is on the
-training clock; no learned state is transferred between runs.
-
-On one Runpod node with eight H100 SXM GPUs and NV18 links, a fixed interleaved
-cohort produced the following means ± sample SD:
-
-| Method | Runs | Training seconds | Validation CE |
+| Method | Runs | Training seconds, mean ± SD | Validation CE, mean ± SD |
 |---|---:|---:|---:|
 | Unmodified #360 | 6 | 40.342 ± 0.184 | 3.279000 ± 0.004737 |
 | This change | 12 | 39.583 ± 0.266 | 3.278705 ± 0.001276 |
 
-The incremental saving is **0.759 seconds / 1.88%**. Including both matching-source
-candidate pilots, all 14 candidate runs average **3.278684** loss; the one-sided
-t-test against 3.28 gives **p=0.00114**. Every run is included. Baseline loss
-variance was high, so these results do not establish improved or equal quality.
-Compiler caches were retained for both arms; pilot timing is reported separately.
+The fixed cohort was interleaved. Including both matching-source candidate
+pilots, all **14 candidate runs** average **3.278684 CE**, with one-sided
+**p=0.00114** against 3.28. The fixed 12-run cohort alone also passes
+(**p=0.00242**). Every run is retained. Baseline loss variance is high;
+this is a speed claim, not a claim of improved validation loss.
 
-As a control, unmodified #360 with 12 fewer updates averaged **39.799 s /
-3.281225** loss; 24 fewer averaged **39.389 s / 3.281125** (four runs each).
-Both observed means exceed the loss target. These controls support the proposed
-tradeoff but do not establish an exact equal-loss speedup.
+- **LM-head dW:** select one paired activation/positive-gradient row per group
+  of four, scale its contribution by four, and accumulate every negative
+  logit-gradient entry separately. Keep dX unchanged.
+- **Attention backward:** use two training steps to choose shorter windows per
+  head from measured Q/K/V errors across all eight ranks. Keep the original
+  forward output and normalization, and skip distant backward tiles.
 
-Two unmodified accepted-master runs on the same node averaged **69.387 s /
-3.276450** loss. The improvement over that version mostly comes from #360.
+The forward computation, data stream and full-vocabulary validation are
+unchanged from #360. Calibration is timed, all 1,194 updates are retained, and
+the original backward is restored for the final 87 updates. No learned state
+is reused across runs. Compiler caches were retained for both arms.
 
-The implementation, complete logs, fixed run order, numerical checks and pinned
-source/environment manifests accompany this submission. All inherited ANVIL2
-changes belong to #360; the speedup claimed here is measured against that source
-on the same machine. The original one-second improvement target was not reached.
+Unmodified #360 with 12 or 24 fewer updates averaged **3.281225** and **3.281125**
+CE respectively (four runs each); both means exceed the target. These controls
+support the tradeoff but do not determine an exact equal-loss speedup.
+
+[Full results and all logs](RESULTS.md), [method and reproduction](../../../approx_backward/README.md),
+and [evidence verification](verify_evidence.py) are included. The results also
+include two same-node accepted-master reference runs. Credit for the inherited
+ANVIL2 changes belongs to #360; the incremental claim here is measured against it.

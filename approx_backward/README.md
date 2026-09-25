@@ -37,16 +37,18 @@ calibration durations are written into each training log along with the source.
 
 ## Reproduction
 
-Use eight H100s on one node, with an appropriate NVLink topology, CUDA 13 runtime,
-driver 580 or newer, and PR #360's stable `torch==2.10.0+cu128`, Triton 3.6,
+Use Linux and Python 3.12, eight H100s on one node with NVLink, a CUDA 13
+development toolkit including `nvcc`, driver 580 or newer, and PR #360's stable
+`torch==2.10.0+cu128`, Triton 3.6,
 `kernels==0.16.1` and `huggingface-hub==1.29.0`. Do not substitute an unpinned
 nightly. The checked FA3 binary is identical to PR #360's.
 
-Install `ninja` and the base requirements, then prepare the source dependencies:
+Install `git`, `patch`, and a host C++ compiler. From the repository root in a
+fresh Python environment, install the pinned dependencies and prepare the headers:
 
 ```bash
-pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
-pip install -r requirements.txt
+python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -r requirements.txt
 python data/cached_fineweb10B.py 9
 python approx_backward/prepare.py
 python -m approx_backward.check
