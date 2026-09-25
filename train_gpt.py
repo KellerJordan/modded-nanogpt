@@ -10,8 +10,8 @@ synchronize at each validation break. First-batch fetch, shard loading, the pref
 weight ships are all inside it.
 
 Launch with the stock `./run.sh` -- `torchrun --standalone --nproc_per_node=8 train_gpt.py`, no environment
-prefix. The only variable this file SETS is PYTORCH_ALLOC_CONF; the only ones it READS are torchrun's own
-RANK / LOCAL_RANK / WORLD_SIZE plus DATA_PATH, KX_STEPS and KX_SEED. Everything else is hardcoded.
+prefix. The training approximation is enabled by default. AB_ENABLE=0 and HEAD_SAMPLE_GROUP=0
+disable its two components for ablations. Dependency paths and build settings are documented in approx_backward/README.md.
 
 The attention kernel is NOT the community FA3 build but a patched FA3 -- `get_kernel('devenpzak/flash-attn3-12864',
 version=1)` -- carrying the (64,128) and (128,64) head-dim pairs upstream does not instantiate; its Python surface
@@ -25,7 +25,11 @@ import sys
 # Read this file and every kernel module it ships with, for the run log.
 code = ""
 for _src_file in (sys.argv[0], 'triton_kernels.py', 'anvil_attn_kernels.py',
-                  'bigram_kernels.py', 'fuse_tiny_kernels.py', 'value_embed_op.py'):
+                  'bigram_kernels.py', 'fuse_tiny_kernels.py', 'value_embed_op.py',
+                  'approx_backward/__init__.py', 'approx_backward/attention.py', 'approx_backward/head.py',
+                  'approx_backward/cuda.py', 'approx_backward/reference.py',
+                  'approx_backward/csrc/wrapper.cpp', 'approx_backward/csrc/runner.cu',
+                  'approx_backward/flash_attention.patch', 'approx_backward/dependencies.json'):
     _p = _src_file if _src_file == sys.argv[0] else os.path.join(os.path.dirname(sys.argv[0]), _src_file)
     with open(_p, 'r') as f:
         if code:
@@ -47,6 +51,7 @@ import gc
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
+from approx_backward import attention as backend
 import triton
 import triton.language as tl
 import numpy as np
@@ -99,6 +104,7 @@ grad_scale = 1 / grad_accum_steps # consistent grad magnitudes between different
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
+backend.initialize(device)
 dist.init_process_group(backend="cuda:nccl,cpu:gloo", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
@@ -1786,7 +1792,7 @@ class AttnArgs:
     dv64: bool           # this layer runs the halved-value (d_v=64) attention path
     o_gain: torch.Tensor | None = None   # RF1: extra 0-D gain folded into the O-projection weight
 
-_fa3 = get_kernel('devenpzak/flash-attn3-12864', revision='64c1e6d1f2780e7931839f41426ddcdb564a7cb9')  # immutable commit of the v1 tag
+_fa3 = backend.module  # same SHA-256 checked, pinned PR360 binary
 flash_attn_interface = _fa3.flash_attn_interface
 # The loaded binary is checked against the sha256 published in that repo's src_patches/: a retagged
 # or swapped artifact fails here instead of changing behaviour silently.
@@ -1810,7 +1816,7 @@ class CausalSelfAttention(nn.Module):
         self.fold_qk_wide = full_qk
         # Weights are stored in parameter banks and passed via forward()
 
-    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor, qkv_fp8=None):
+    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor, qkv_fp8=None, ab_mode: int = 0, layer: int = -1):
         """`self.fold_qk_wide` and `attn_args.dv64` are per-layer constants burned into the trace and between them pick one of three modes."""
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "varlen sequences requires B == 1"
@@ -1890,9 +1896,8 @@ class CausalSelfAttention(nn.Module):
             max_len = 2 * max_len
 
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q.squeeze(0), k.squeeze(0), v.squeeze(0), cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+        y = backend.attention(q.squeeze(0), k.squeeze(0), v.squeeze(0), seqlens,
+                              max_len, yarn.attn_scale, bm_size, ab_mode if self.training else 0, layer)
         if attn_args.dv64:
             y = y.view(B, T, self.num_heads, 64)
         else:
@@ -2037,6 +2042,7 @@ class ForwardScheduleConfig:
     ws_long: int
     train_max_seq_len: int
     sns_p: int = 0        # padded candidate count for this step; 0 => full softmax
+    attention_backward: int = 0
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
@@ -2690,7 +2696,7 @@ class GPT(nn.Module):
                     train_max_seq_len=train_max_seq_len,
                     o_gain=post_lambdas_attn[i] if _rf1_here else None,
                 )
-                attn_out = attn(attn_in_normed, attn_args, qkvo_w, _qkv_fp8)
+                attn_out = attn(attn_in_normed, attn_args, qkvo_w, _qkv_fp8, schedule_cfg.attention_backward, i)
 
                 if mu is not None:
                     x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0] 
@@ -3243,7 +3249,7 @@ def _cg_key_at(step: int):
     _T = _stage.batch_size // (world_size * grad_accum_steps)
     return (_T, TRAIN_MAX_NUM_DOCS.get(_T, next_multiple_of_n(_T // 300, n=128)),
             int(training_schedule.mtp_weights[step].shape[0]), _sns_p_at(step), _ptp_w_at(step),
-            _stage.window_sizes[0], _stage.window_sizes[1], _stage.train_max_seq_len)
+            _stage.window_sizes[0], _stage.window_sizes[1], _stage.train_max_seq_len, backend.mode_at(step))
 
 # ---- terminal weight ships --------------------------------------------------
 # Rather than the raw final iterate the run ships a blend of tail accumulators: four ships.
@@ -3489,6 +3495,7 @@ class TrainingManager():
             ws_long = self.ws_long * self.block_size,
             train_max_seq_len = self.train_max_seq_len,
             sns_p = self._sns_p_now,
+            attention_backward = getattr(self, "_ab_mode", 0),
         )
 
     def cg_forward_args(self, mtp_buf):
@@ -3579,6 +3586,7 @@ class TrainingManager():
 
     def advance_schedule(self, step: int):
         """This step's windows (YaRN on a ws_long change), batch geometry, MTP and prefix-CE weights."""
+        self._ab_mode = backend.mode_at(step)
         _prev_ws_short = self.ws_short
         stage, _ = training_schedule.lookup(step)
         self.ws_short, new_ws_long = stage.window_sizes
@@ -4160,7 +4168,7 @@ class _CGraphRunner:
                 int(training_schedule.mtp_weights[step].shape[0]),
                 int(training_manager._sns_p_now), float(_fk._PTP_W_RUNTIME),
                 int(training_manager.ws_short), int(training_manager.ws_long),
-                int(training_manager.train_max_seq_len))
+                int(training_manager.train_max_seq_len), int(training_manager._ab_mode))
 
     def _sink_views(self, g):                     # this key's view of every shared flat ring slot
         return [_f[:g.numel()].view_as(g) for _f in self._sink_flat]
@@ -4305,9 +4313,9 @@ TAIL_GRAPH2_FLOOR_MIB = 512
 # optimizer step, and tgr2 needs `_a2p_calls >= 16` plus both refresh_lm values on later steps so each of its three
 # graphs gets a self-check. Hence a contiguous prefix, VISITED LAST, whose steps supply the alternating parity.
 _CF_PREFIX_N, _CF_TGR_AT, _CF_TGR2_AT = 8, 4, 5   # contiguous prefix length; prefix positions of the tgr and tgr2 captures
-# Untimed-warmup-step budget. The realized count (37 here) is printed every run, so the budget sitting above it
+# Untimed-warmup-step budget. The realized count (37 baseline, 41 with attention approximation) is printed, so the budget
 # makes a schedule edit fail at startup instead of mid-warmup.
-_CF_MAX, _CF_PREFIX = 40, frozenset(range(_CF_PREFIX_N))
+_CF_MAX, _CF_PREFIX = 40 + (4 if backend.ENABLED else 0), frozenset(range(_CF_PREFIX_N))
 assert 0 <= _CF_TGR_AT < _CF_TGR_AT + 1 <= _CF_TGR2_AT, \
     "[warmup:capture] the tgr capture must precede the tgr2 capture and leave a step for its self-check"
 # The two self-check steps the assert below reserves must carry OPPOSITE refresh_lm; `_is_adam_step` is `step % 2 == 1`, so any contiguous prefix gives it.
@@ -4691,6 +4699,7 @@ def nvidia_smi():
 print0(f"Running FA3 build {flash_attn_interface.__file__}")
 print0(f"[schedule] stage ends={training_schedule.ends}")
 print0(nvidia_smi())
+print0(f"[approx-backward] {backend.configuration()}", console=True)
 print0("="*100)
 
 # KX_SEED (reproduction runs only): common-random-numbers init, default-off.
@@ -4799,6 +4808,18 @@ warmup_steps = sorted(set(warmup_steps)
                          if _s + _o < training_schedule.total_steps})
 # The capture prefix joins the SAME set before the >=2-visits assert, so that assert covers it.
 warmup_steps = sorted(set(warmup_steps) | set(_CF_PREFIX))
+# A phase boundary can leave a configuration with only one scheduled step
+# (step 591 here). Replay that SAME configuration again during warmup so the
+# capture is checked; all warmup state is reset before the timed run.
+_ab_visits = {}
+for _s in warmup_steps:
+    _key = _cg_key_at(_s)
+    _ab_visits[_key] = _ab_visits.get(_key, 0) + 1
+warmup_steps = sorted(warmup_steps + [_s for _key, _s in _cg_first.items()
+                                   for _ in range(max(0, 2 - _ab_visits.get(_key, 0)))])
+if backend.ENABLED:
+    assert backend.START+2<training_schedule.total_steps
+    assert _cg_key_at(backend.START)==_cg_key_at(backend.START+1), "Calibration must stay within a single training configuration"
 assert len(warmup_steps) <= _CF_MAX, (
     f"[warmup:capture] {len(warmup_steps)} untimed warmup steps exceeds the budget of {_CF_MAX} "
     f"(the last two records shipped 14 and 21): {warmup_steps}")
@@ -4849,6 +4870,8 @@ _cf_check_ptrs(_CF_PTRS)
 del _CF_PTRS
 del train_loader, initial_state
 rebuild_fp8_caches_after_reset()
+_fk.reset_head_sampling_counter()
+backend.reset()
 
 ########################################
 #        Training and validation       #
@@ -5016,6 +5039,7 @@ for step in range(train_steps + 1):
         training_manager.sparse_index_share(step)
         training_manager.ve_index_share(step)
         _CG.bwd(step, bigram_inputs)
+        backend.after_backward(step, training_manager)  # paid calibration, before this step's update
         # Retire the batch; the next step's SNS build stages under this step's backward.
         _bgpull_advance()
         if step + 1 < train_steps:
@@ -5045,4 +5069,5 @@ for step in range(train_steps + 1):
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+print0(backend.report(training_time_ms, val_loss), console=True)
 dist.destroy_process_group()

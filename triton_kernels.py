@@ -7,6 +7,7 @@
 import os
 
 import torch
+from approx_backward import head as _hs
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -1328,7 +1329,7 @@ def _ce_scalar(ref: torch.Tensor, v: float) -> torch.Tensor:
         _CE_SCALAR_CACHE[key] = t = ref.new_tensor(v, dtype=torch.float32)
     return t
 
-def _ce_backward_gemms(grad_input, w_t, x_f8, x_s, w_s, grad_s):
+def _ce_backward_gemms(grad_input, w_t, x_f8, x_s, w_s, grad_s, n_predict=0):
     """The CE backward tail both CE Functions share: the three scale scalars,
     dx = grad @ W, and the bf16 wgrad via two fp8 transposes (dW = x^T @ grad)."""
     n_rows, n_cols = grad_input.shape
@@ -1343,6 +1344,12 @@ def _ce_backward_gemms(grad_input, w_t, x_f8, x_s, w_s, grad_s):
         scale_b=w_scale,
         use_fast_accum=False,
     )
+
+    if _hs.GROUP and n_predict and n_rows >= _hs.MIN_ROWS:
+        grad_w = torch.ops.nanogpt.sampled_head_wg(
+            grad_input, x_f8, _SNS_IDX["TPOS"][:n_rows], _SNS_IDX["PPOS"][:n_rows],
+            x_scale, grad_scale, _hs.COUNTER, n_predict, _hs.GROUP)
+        return grad_x, grad_w
 
     x_f8_T = torch.empty((x_f8.shape[1], x_f8.shape[0]), dtype=x_f8.dtype, device=x_f8.device)
     transpose_copy(x_f8, x_f8_T)  # (768, n_rows) row-major
@@ -1434,6 +1441,8 @@ _SNS_IDX: dict = {}       # name -> its int64 device buffer, ONE identity for th
 def sns_init(device, p_values, vocab_size: int, max_rows: int, model_dim: int):
     """One CE kernel per distinct candidate count P, plus every persistent SNS buffer. Called ONCE at module scope BEFORE torch.compile: nvrtc is untimed."""
     global _SNS_POSD, _SNS_ARD
+    if _hs.GROUP:
+        _hs.init(device)
     for p in p_values:
         # The 8-wide smem / grad_input stores need P % (BLOCK_SIZE * 8) == 0; the weight pair is per P because a sliced (768, P) view is not _scaled_mm's mat2.
         assert 0 < p <= vocab_size and p % (CE_KERNEL_BLOCK_SIZE * 8) == 0, f"X_SNS candidate count {p} is not a legal CE vocabulary"
@@ -1507,6 +1516,7 @@ class SampledSoftcappedCrossEntropy(torch.autograd.Function):
         grad_input = torch.empty((n_rows, sns_p), dtype=torch.float8_e5m2, device=logits.device)
         sns_ce_fwd_bwd(logits.contiguous(), _SNS_IDX["TPOS"][:n_rows], mtp_weights.contiguous(), _SNS_IDX["PPOS"][:n_rows], losses,
                        grad_input, n_rows, mtp_weights.shape[0], A, B, C, grad_s, grad_scale, float(prefix_weight), sns_p)
+        ctx.n_predict = mtp_weights.shape[0]
         ctx.save_for_backward(x_f8, _SNS_WCT[sns_p], grad_input)
         ctx.params = (x_s, w_s, grad_s)
         return losses
@@ -1514,10 +1524,15 @@ class SampledSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         x_f8, wc_t, grad_input = ctx.saved_tensors
-        grad_x, grad_w_c = _ce_backward_gemms(grad_input, wc_t, x_f8, *ctx.params)
+        grad_x, grad_w_c = _ce_backward_gemms(grad_input, wc_t, x_f8, *ctx.params, ctx.n_predict)
         # Dense full-extent grad, sized from _SNS_POSD -- it IS the vocab-length map densify gathers through. The tied
         # transpose_add writes into it in place and the reduce_scatter needs a contiguous payload; freshly allocated every
         # backward (AccumulateGrad may adopt it as .grad) and never zeroed, since the gather writes every element.
         grad_w = torch.empty((x_f8.shape[1], _SNS_POSD.numel()), dtype=grad_w_c.dtype, device=grad_w_c.device)
         torch.ops.nanogpt.sns_densify(grad_w_c.contiguous(), _SNS_POSD, grad_w)
         return grad_x, None, None, grad_w, None, None, None, None, None, None, None, None
+
+
+def reset_head_sampling_counter():
+    """Restore the same counter address after the untimed warmup."""
+    _hs.reset()
