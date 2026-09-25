@@ -45,9 +45,6 @@ nightly. The checked FA3 binary is identical to PR #360's.
 Install `ninja` and the base requirements, then prepare the source dependencies:
 
 ```bash
-pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
-pip install -r requirements.txt
-python data/cached_fineweb10B.py 9
 python approx_backward/prepare.py
 python -m approx_backward.check
 torchrun --standalone --nproc_per_node=8 -m approx_backward.check
@@ -77,26 +74,9 @@ With torchrun it also checks the all-rank maximum reduction.
 
 ## Submission evidence
 
-The completed [submission packet](../records/track_1_short/2026-09-24_ApproximateBackward/README.md)
-contains all 32 real eight-H100 runs, numerical checks, frozen source and
-environment manifests, and a script to recompute the statistics.
-
-The fixed interleaved cohort averaged **39.583 s** for this change (12 runs)
-versus **40.342 s** for unmodified PR #360 (6 runs): **0.759 s / 1.88% faster**.
-Across all 14 candidate runs including both pilots, mean validation CE was
-**3.278684**, with one-sided **p=0.00114** against 3.28. Every outcome is retained.
-The original one-second improvement target was not reached.
-
-Four ordinary PR360 runs with 12 fewer updates averaged 39.799 s / 3.281225 CE;
-four with 24 fewer averaged 39.389 s / 3.281125 CE. Both observed mean losses
-exceed the target. These comparisons support the tradeoff but do not identify
-an exact equal-loss speedup. Baseline loss variance was high, so no improvement
-or equivalence in quality is claimed.
-
-Two unmodified accepted-master reference runs averaged 69.387 s / 3.276450 CE
-on the same node. Most of that larger improvement belongs to PR #360. Compiler
-caches were retained for both arms; pilots are reported separately from the
-primary timing comparison. Earlier single-GPU research is excluded from these
-statistics. See the [full results](../records/track_1_short/2026-09-24_ApproximateBackward/RESULTS.md)
-for individual outcomes, uncertainty and timing conventions. This is a
-submission candidate, pending maintainer review and reproduction.
+The cleaned implementation still needs complete eight-H100 training runs.
+Earlier one-H200 experiments are exploratory evidence, not record logs. The
+submission must report all runs in a frozen cohort, a one-sided test of mean
+validation loss below 3.28, and a same-machine comparison to unmodified PR #360.
+If the approximation consumes loss margin, compare against a simple step-count
+reduction at comparable loss before claiming a useful improvement.
