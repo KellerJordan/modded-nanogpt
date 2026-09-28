@@ -1,7 +1,7 @@
-# Track 3: IsoMuon — Muon with an isothermal polar decomposition, and the metric can be fixed early -- 3.28 in 3190 steps (n=8)
+# Track 3: IsoMuon — Muon with a noise-calibrated diagonal response metric; 3.28 in 3190 steps (n=8)
 
 ## TL;DR
-IsoMuon takes Muon's Newton–Schulz polar decomposition in a diagonal metric set by the **gradient's own sampling-noise variance**, so that every output row and input column of a hidden matrix receives a step at the same noise level. It adds two vector EMAs per matrix and negligible compute; its two constants (λ = 0.5, c = 2) were chosen in a few single-seed runs during development (see the ablations) and were not tuned on this benchmark. On the tuned Muon + aux AdamW baseline (result #36, 3250 steps) it reaches 3.28 at **3190 steps** (mean 3.27842, n=8 non-cherry-picked seeds 0–7, `(3.28 − mean)·√8 = 0.00446 ≥ 0.004`).
+IsoMuon takes Muon's Newton–Schulz polar decomposition in a diagonal response metric calibrated by the **gradient's own sampling-noise variance**: each output row and input column is weighted by the square root of its relative noise (bounded), so that noisier channels are damped more. It adds two vector EMAs per matrix and negligible compute; its two constants (λ = 0.5, c = 2) were chosen in a few single-seed runs during development (see the ablations) and were not tuned on this benchmark. On the tuned Muon + aux AdamW baseline (result #36, 3250 steps) it reaches 3.28 at **3190 steps** (mean 3.27842, n=8 non-cherry-picked seeds 0–7, `(3.28 − mean)·√8 = 0.00446 ≥ 0.004`).
 
 ## What is new
 Muon's orthogonalization makes every singular direction of the update move at unit speed. It does not ask *which coordinates are noisy*. In a language model the gradient of a hidden matrix is dominated by label-sampling noise, and its variance is strongly non-uniform across output channels (rows) and input channels (columns). IsoMuon measures that variance for free — from the micro-batch gradients that every step already computes — and whitens the momentum update by a diagonal metric: each channel's relative noise raised to the power λ and clipped to [1/c, c],
@@ -9,7 +9,7 @@ Muon's orthogonalization makes every singular direction of the update move at un
     B = clamp((row_heat / mean)^λ, 1/c, c),  A = clamp((col_heat / mean)^λ, 1/c, c),  λ = 0.5, c = 2
     D = B^-1/2 · polar(B^-1/2 U A^-1/2) · A^-1/2,   ‖D‖_F re-aligned to ‖polar(U)‖_F
 
-where `row_heat`/`col_heat` are EMAs (β = 0.95) of the row/column means of `Var_k[g_k]` over the micro-batches `k` of the step. λ = 0 is exactly Muon. Put physically, the sampling noise acts like a temperature that differs from channel to channel, and IsoMuon takes the orthogonalized step as if every channel were at the same temperature, which is where the name comes from.
+where `row_heat`/`col_heat` are EMAs (β = 0.95) of the row/column means of `Var_k[g_k]` over the micro-batches `k` of the step. With λ = 0 the metric is the identity and IsoMuon reduces to Muon up to the final Frobenius re-alignment, a scalar step-size factor. With λ = 0.5 each channel's damping is proportional to the standard deviation of its gradient noise rather than to its variance.
 
 The estimator does not depend on the number of GPUs: the per-micro-batch squared-gradient row/column sums are all-reduced together with the gradient, so 1, 2, 4 or 8 GPUs give the same expected noise estimates.
 
@@ -28,7 +28,7 @@ the polar decomposition is taken:
 Here `h` is an EMA of the momentum's column energy for `A` and of its row energy for `B`. Because a weight gradient
 is an outer product of the output gradient and the input, its column energy tracks the input second moment and its
 row energy the output-gradient second moment, up to a common factor that the mean-log normalisation removes. So the
-metric needs no extra hooks. λ = 0 is exactly Muon.
+metric needs no extra hooks. With λ = 0 it reduces to Muon up to the same scalar re-alignment.
 
 | EMP strength λ | Δ final loss vs Muon (3 paired seeds) | seeds improved |
 |---|---|---|
@@ -42,7 +42,7 @@ steps earlier, and the mean wall-clock to the target was unchanged. The effect c
 
 IsoMuon keeps EMP's structure and changes only the statistic `h`: the gradient's sampling-noise variance instead of the
 momentum's energy. On the #36 baseline the momentum-energy statistic recovers about half of IsoMuon's gain (−0.0021 and
-−0.0019 on two seeds, against −0.0038 to −0.0041 for IsoMuon in the same set of runs). The sampling-noise variance is the better-founded choice, because it is what the metric is supposed to equalize.
+−0.0019 on two seeds, against −0.0038 to −0.0041 for IsoMuon in the same set of runs). The sampling-noise variance is the better-founded choice, because the metric is meant to be calibrated by the gradient noise.
 
 ## IsoMuon stacked on the current SOTA
 
@@ -62,7 +62,7 @@ we removed behaved this way.
 So the two draw on the same information, and the usable form is a **replacement, not an addition**: with SOAP swapped out for IsoMuon, 3.28 is first reached 0–85 steps later (2700–2725, against 2625–2700 for the full stack on the same GPU type) for **22–43 %
 less wall-clock**.
 
-One further check on what that shared information is. We tried the full-matrix version of the isothermal metric
+One further check on what that shared information is. We tried the full-matrix version of the noise-calibrated metric
 — the row- and column-side noise covariance matrices with bounded eigenvalues, so that channels may also rotate
 into each other: it costs 1.85× the wall-clock and brings no additional gain (same result within seed noise).
 The usable part of the noise covariance is its diagonal, the channel scales; the off-diagonal channel
@@ -112,7 +112,7 @@ The sections below were added after the n=8 result above. All of them use the fu
 
 ### 1. The gain reproduces in an independent implementation (n=8 paired)
 
-The same isothermal metric, implemented from scratch in a separate single-GPU trainer
+The same noise-calibrated metric, implemented from scratch in a separate single-GPU trainer
 derived from a different baseline script, reproduces the effect at full strength:
 
 | | mean @ 3250 | seed sd | `(3.28 − mean)·√8` |
@@ -204,3 +204,7 @@ Panel (a) shows why they barely interfere. IsoMuon's lead is largest in the firs
 switches on at step 1000, and from then on the combined curve tracks the sum of the two. IsoMuon applied only
 *after* step 1000 gives nothing at the end (+0.00027). The two act in different stages of training, so they add up because they are separated in time, rather than two corrections competing for the same steps. These are
 single-seed runs, so 93% should be read as "close to additive", not as a measured constant.
+
+## Update (2026-09-28): interpretation of the metric
+
+IsoMuon uses a tempered, bounded diagonal response metric estimated from micro-batch gradient variance. The metric changes both the input to the polar step and the mapping of its output back to the original coordinates; a final scalar normalization aligns the update magnitude with Muon's reference scale. This construction does not in general equalize the channels' noise variances, and it does not establish a common thermodynamic temperature. Earlier versions of this description, and the comments in the submitted source, called the metric "isothermal"; this note supersedes that description. The title and the wording above were changed accordingly. The submitted training code, logs and reported numerical results are unchanged.
