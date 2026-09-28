@@ -21,7 +21,7 @@ import traceback
 import unicodedata
 import uuid
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import accumulate, pairwise
 from pathlib import Path
 import gc
@@ -1232,6 +1232,34 @@ def build_prefix_table(vocab_size: int) -> Tensor:
         stack_ids.append(tid)
     return torch.tensor(table, dtype=torch.int64)
 
+def get_token_counts_estimate(train_files: str, num_tokens: int, vocab_size: int) -> tuple[Tensor, str]:
+    """Return token counts over the first num_tokens of the first training shard."""
+    file = sorted(glob.glob(train_files))[0]
+    tokens = np.fromfile(file, dtype=np.uint16, count=num_tokens, offset=256 * 4)
+    tokens = torch.from_numpy(tokens).to(device=device, dtype=torch.int32)
+    return torch.bincount(tokens, minlength=vocab_size), os.path.basename(file)
+
+def build_token_to_lm_head_column(order: Tensor, vocab_size: int, head_tokens: int, num_clusters: int) -> Tensor:
+    """Map token ids to lm_head columns, given the real token ids ordered most frequent first.
+
+    The head_tokens most frequent tokens take the first columns, followed by one column per
+    tail cluster. The remaining tokens fill the tail clusters in frequency order. Padding ids
+    take the cluster columns and the unused end of the last cluster.
+
+    With the default head of 16382 tokens and two clusters, columns 0..16381 are the frequent
+    tokens, 16382 and 16383 are the cluster logits, and the remaining real tokens start at 16384.
+    """
+    num_real = order.numel()
+    slots = torch.arange(num_real, device=order.device)
+    slots[head_tokens:] += num_clusters
+    tok2slot = torch.empty(vocab_size, dtype=torch.int64, device=order.device)
+    tok2slot[order] = slots
+    tok2slot[num_real:] = torch.cat([
+        torch.arange(head_tokens, head_tokens + num_clusters, device=order.device),
+        torch.arange(num_real + num_clusters, vocab_size, device=order.device),
+    ])
+    return tok2slot
+
 # Whether a merge may span the seam between a prev-token end and a cur-token start, by the
 # pretokenizer class of the character on either side of it.
 _CLS = "SNLO?"  # whitespace, number, letter, other, inside a character
@@ -1420,6 +1448,11 @@ class ForwardScheduleConfig:
     ws_long: int
     train_max_seq_len: int
 
+def softcap_logits(z: Tensor) -> Tensor:
+    # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
+    # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
+    return 23 * torch.sigmoid((z + 5) / 7.5)
+
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
         super().__init__()
@@ -1443,6 +1476,7 @@ class GPT(nn.Module):
         self.use_fp8 = not os.environ.get("DISABLE_FP8", False)
         self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=self.use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
+        self.init_adaptive_softmax(vocab_size)
 
         self.embed = nn.Embedding(self.vocab_size, model_dim)
         with torch.no_grad():
@@ -1462,6 +1496,87 @@ class GPT(nn.Module):
         # Auto-label parameters
         for name, param in self.named_parameters():
             param.label = name.replace('.weight', '')
+
+    def init_adaptive_softmax(self, num_real_tokens: int):
+        """A softmax over only a subset of the vocabulary for the target
+        tokens falling into this subset.
+
+        The approach follows https://arxiv.org/abs/1609.04309 closely.
+        """
+        self.head_tokens = args.adaptive_softmax_head_tokens
+        num_clusters = len(args.adaptive_softmax_cluster_sizes) + 1
+        self.head_width = self.head_tokens + num_clusters
+        bounds = [*accumulate([self.head_width, *args.adaptive_softmax_cluster_sizes]), self.vocab_size]
+        real_end = num_real_tokens + num_clusters  # later slots hold padding ids
+        self.tail_clusters = [(start, end, min(end, real_end) - start) for start, end in pairwise(bounds)]
+        assert real_end <= self.vocab_size and all(live > 0 for _, _, live in self.tail_clusters)
+        assert all(b % 128 == 0 for b in bounds)
+        assert all(len(caps) == num_clusters for caps in args.adaptive_softmax_tail_capacity.values())
+
+        # Placeholder ranking (token id order) for warmup. The actual ranking is built inside the timed training run.
+        tok2slot = build_token_to_lm_head_column(torch.arange(num_real_tokens), self.vocab_size, self.head_tokens, num_clusters)
+        self.register_buffer("tok2slot", tok2slot, persistent=False)
+        self.register_buffer("slot2tok", torch.argsort(tok2slot), persistent=False)
+        # Rows with a target in each tail cluster, rows dropped for exceeding capacity, rows seen.
+        self.register_buffer("tail_row_stats", torch.zeros(3, num_clusters, dtype=torch.int64), persistent=False)
+
+    def set_vocab_ranking(self, order: Tensor):
+        tok2slot = build_token_to_lm_head_column(order, self.vocab_size, self.head_tokens, len(self.tail_clusters))
+        self.tok2slot.copy_(tok2slot)
+        self.slot2tok.copy_(torch.argsort(tok2slot))
+
+    def head_targets(self, slots: Tensor) -> Tensor:
+        cluster = sum((slots >= start).long() for start, _, _ in self.tail_clusters[1:])
+        return torch.where(slots < self.head_tokens, slots, self.head_tokens + cluster)
+
+    def adaptive_softmax_tail_loss(self, x: Tensor, slot_targets: Tensor, weights: Tensor) -> Tensor:
+        """Tail terms of the adaptive softmax loss, per row."""
+        n_rows = x.size(0)
+        n_predict = slot_targets.size(1) - 1  # last column is the prefix target
+        capacities = args.adaptive_softmax_tail_capacity[n_predict]
+        loss = x.new_zeros(n_rows, dtype=torch.float32)
+        for c, (start, end, live) in enumerate(self.tail_clusters):
+            in_cluster = (slot_targets >= start) & (slot_targets < start + live) & (weights > 0)
+            needed = in_cluster.any(dim=1)
+            capacity = min(n_rows, next_multiple_of_n(capacities[c] * n_rows, n=128))
+            rows = torch.sort(needed.to(torch.uint8), descending=True, stable=True).indices[:capacity]
+            z = softcap_logits((x[rows] @ self.lm_head.weight[:, start:end]).float())[:, :live]
+            lse = z.logsumexp(dim=1, keepdim=True)
+            z_target = z.gather(1, (slot_targets[rows] - start).clamp(0, live - 1))
+            row_loss = ((lse - z_target) * in_cluster[rows] * weights).sum(dim=1)
+            loss = loss.index_add(0, rows, row_loss)
+            num_needed = needed.sum()
+            self.tail_row_stats[:, c] += torch.stack([num_needed, (num_needed - capacity).clamp(min=0), num_needed.new_tensor(n_rows)])
+        return loss
+
+    def canonical_keep(self, input_seq: Tensor, start: int, end: int) -> Tensor:
+        """1 where the token in slot [start, end) may follow input_seq under GPT-2 tokenization, else 0."""
+        tok = self.slot2tok[start:end]
+        bits = self.canon_mask[input_seq[:, None], (tok >> 3)[None, :]] >> (tok & 7).to(torch.uint8)
+        return 1 - (bits & 1).float()
+
+    def adaptive_softmax_eval_loss(self, x: Tensor, input_seq: Tensor, target_seq: Tensor) -> Tensor:
+        """Exact adaptive softmax loss over all tokens, renormalized over the canonical continuations."""
+        target_slots = self.tok2slot[target_seq]
+        head_tokens = self.head_tokens
+        z_head = softcap_logits((x @ self.lm_head.weight[:, :self.head_width]).float())
+        lse_head = z_head.logsumexp(dim=1)
+        target_logp = z_head.gather(1, target_slots.clamp(max=head_tokens - 1)[:, None]).squeeze(1) - lse_head
+        kept_mass = ((z_head[:, :head_tokens] - lse_head[:, None]).exp() * self.canonical_keep(input_seq, 0, head_tokens)).sum(dim=1)
+        for c, (start, end, live) in enumerate(self.tail_clusters):
+            cluster_logp = z_head[:, head_tokens + c] - lse_head
+            z = softcap_logits((x @ self.lm_head.weight[:, start:end]).float())[:, :live]
+            lse = z.logsumexp(dim=1)
+            z_target = z.gather(1, (target_slots - start).clamp(0, live - 1)[:, None]).squeeze(1)
+            in_cluster = (target_slots >= start) & (target_slots < start + live)
+            target_logp = torch.where(in_cluster, cluster_logp + z_target - lse, target_logp)
+            kept = ((z - lse[:, None]).exp() * self.canonical_keep(input_seq, start, start + live)).sum(dim=1)
+            kept_mass = kept_mass + cluster_logp.exp() * kept
+        kept_loss = kept_mass.log() - target_logp
+        dropped = (self.canon_mask[input_seq, target_seq >> 3] >> (target_seq & 7).to(torch.uint8)) & 1
+        floor_logp = -60.0 - lse_head
+        dropped_loss = (kept_mass + floor_logp.exp()).log() - floor_logp
+        return torch.where(dropped.bool(), dropped_loss, kept_loss)
 
     def init_attn(self, model_dim, head_dim, num_heads, num_layers, max_seq_len):
         # Cache layers for skip / backout snapshots taken at end of loop iter.
@@ -1892,7 +2007,7 @@ class GPT(nn.Module):
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
 
         # ---- Embeddings and input preparation ----
-        x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
+        x = self.embed(self.tok2slot[input_seq]) # embed is synced from lm_head during tied phase by optimizer
 
         # Use sign-trick to better compress multiple bigrams into a shared bigram embedding row
         # (details in https://github.com/KellerJordan/modded-nanogpt/pull/299 by @trianxy)
@@ -2051,23 +2166,25 @@ class GPT(nn.Module):
         ve_bank0 = ve[1][None].to(dtype=x.dtype)  # (1, T, D), same VE as layer-1 attn
         x = x + mu[0] * cache[0] + mu[1] * cache[7] + mu[2] * cache[9] + mu[3] * ve_bank0 + mu[4] * cache[3]
 
-        x = norm(x)
-        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
-        # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
-        if self.training:
-            prefix_target_seq = self.prefix_table[target_seq]
-            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
-        else:
-            logits = self.lm_head(x)
-            logits = 23 * torch.sigmoid((logits.float() + 5) / 7.5)
-            logits = logits.view(-1, logits.size(-1))
-            # Drop the tokens the tokenizer would never emit after input_seq. -60 is well below
-            # the 0..23 the softcap leaves, so a dropped token contributes nothing to the softmax.
-            shifts = torch.arange(8, dtype=torch.uint8, device=logits.device)
-            dropped = (self.canon_mask[input_seq, :, None] >> shifts & 1).view(logits.shape).bool()
-            logits = logits.masked_fill(dropped, -60.0)
-            loss_per_token = F.cross_entropy(logits, target_seq, reduction="none")
-        return loss_per_token
+        x = norm(x).view(-1, x.size(-1))
+        if not self.training:
+            return self.adaptive_softmax_eval_loss(x, input_seq, target_seq)
+
+        target_slots = self.tok2slot[target_seq]
+        prefix_seq = self.prefix_table[target_seq]
+        prefix_slots = torch.where(prefix_seq >= 0, self.tok2slot[prefix_seq.clamp(min=0)], -1)
+        head_prefix = torch.where(prefix_slots >= 0, self.head_targets(prefix_slots), -1)
+        loss_per_token = FusedSoftcappedCrossEntropy.apply(
+            x, self.head_targets(target_slots), mtp_weights, head_prefix, prefix_weight, self.lm_head.weight[:, :self.head_width],
+            self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale,
+        )
+        n_predict = mtp_weights.size(0)
+        slot_targets = torch.stack(
+            [F.pad(target_slots[k:], (0, k), value=-1) for k in range(n_predict)] + [prefix_slots], dim=1,
+        )
+        weights = torch.cat([mtp_weights, prefix_weight.reshape(1)])
+        return loss_per_token + self.adaptive_softmax_tail_loss(x, slot_targets, weights)
+
 # -----------------------------------------------------------------------------
 # Distributed data loader
 
@@ -2265,20 +2382,40 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
     num_scheduled_iterations: int = 1250  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = int(os.environ.get("NUM_EXTENSION_ITERATIONS", "40"))  # number of steps to continue training at final lr and ws
+    num_extension_iterations: int = int(os.environ.get("NUM_EXTENSION_ITERATIONS", "75"))  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
-    # Descriptive run_id for this iteration:
-    #   - explicit sparse connectivity refactor (no generic loop)
-    #   - (1 + m_r9) * x self-reference fuse on layer 9
-    #   - backout_lambda fully removed (slot dropped from self.scalars; absorbed into MUDD bias init)
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    # every how many extension steps to run the final validation (window extension and canonical mask), 0 for off
+    val_probe_every: int = int(os.environ.get("VAL_PROBE_EVERY", "0"))
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 15 // 2
     bigram_dim: int = 768
     bigram_sign_table_rows: int = 8192  # prefer a power of 2 (values ~500-15000 gave similar results)
+    # adaptive softmax
+    vocab_stats_tokens: int = 20_000_000  # training tokens counted after the speedrun timer starts to rank the vocabulary
+    adaptive_softmax_head_tokens: int = int(os.environ.get("ADAPTIVE_HEAD_TOKENS", "18430"))
+    # width of every tail cluster except the last, which takes the tokens left over
+    adaptive_softmax_cluster_sizes: tuple[int, ...] = (
+        16384,
+    )
+    # fraction of tokens we compute tail softmax for, grouped by the number of MTP targets; 99th percentiles computed from the first vocab_stats_tokens of the dataset
+    adaptive_softmax_tail_capacity: dict[int, tuple[float, ...]] = field(default_factory=lambda: {
+        3: (  # three MTP targets
+            0.27,
+            0.16,
+        ),
+        2: (  # two MTP targets
+            0.21,
+            0.12,
+        ),
+        1: (  # one MTP target
+            0.07,
+            0.03,
+        ),
+    })
 
 args = Hyperparameters()
 
@@ -2649,6 +2786,8 @@ training_manager = TrainingManager(model)
 #            Warmup kernels            #
 ########################################
 print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True)
+torch.cuda.synchronize()
+t_compile = time.perf_counter()
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizer=training_manager.get_state()) # save the initial state
@@ -2685,6 +2824,8 @@ del val_loader, train_loader, initial_state
 model.quantize_attn_fp8()
 model.quantize_mlp_fp8(update_activation_scales=False)
 model.train()
+torch.cuda.synchronize()
+print0(f"compile and warmup: {time.perf_counter() - t_compile:.1f}s", console=True)
 
 ########################################
 #        Training and validation       #
@@ -2708,19 +2849,45 @@ canon_mask_builder.start()
 # (get_encoding is cached in tiktoken's registry), so this pays only the table construction.
 # In-place copy keeps the buffer's tensor identity, which the compiled graph holds.
 model.prefix_table.copy_(build_prefix_table(model.vocab_size))
+# Count, broadcast, and ranking stay inside the timed region.
+t_stats = time.perf_counter()
+vocab_counts, stats_file = get_token_counts_estimate(args.train_files, args.vocab_stats_tokens, BOS_ID + 1)
+vocab_order = torch.sort(vocab_counts, descending=True, stable=True).indices
+dist.broadcast(vocab_order, 0)
+model.set_vocab_ranking(vocab_order)
+model.tail_row_stats.zero_()
+sorted_counts = vocab_counts[vocab_order].double().cpu()
+stats_ms = 1000 * (time.perf_counter() - t_stats)
+groups = [("head", model.head_tokens)] + [(f"cluster {c + 1}", live) for c, (_, _, live) in enumerate(model.tail_clusters)]
+rank_bounds = [0, *accumulate(size for _, size in groups)]
+coverage = [f"{name} {size} tokens {sorted_counts[lo:hi].sum() / sorted_counts.sum():.2%}"
+            for (name, size), (lo, hi) in zip(groups, pairwise(rank_bounds))]
+print0(f"vocab stats: counted {int(sorted_counts.sum()):,} tokens of {stats_file} in {stats_ms:.0f}ms, "
+       f"{int((sorted_counts == 0).sum())} token ids unseen", console=True)
+print0(f"vocab stats: most frequent tokens {[tiktoken.get_encoding('gpt2').decode([i]) for i in vocab_order[:8].tolist()]}", console=True)
+print0(f"adaptive softmax coverage: {', '.join(coverage)}", console=True)
+print0(f"adaptive softmax config: head_width {model.head_width}, clusters {model.tail_clusters}, "
+       f"tail capacity {args.adaptive_softmax_tail_capacity}", console=True)
 # begin training
 train_steps = training_schedule.total_steps
+canon_mask_collected = False
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
+    extension_step = step - args.num_scheduled_iterations
+    probe_step = args.val_probe_every > 0 and extension_step > 0 and extension_step % args.val_probe_every == 0
+    final_eval = last_step or probe_step
     training_manager.advance_schedule(step)
     # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-        if last_step:
+    if final_eval or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        if final_eval:
+            ws_long = training_manager.ws_long
             training_manager.apply_final_ws_ext()
-            # Both on the clock: the wait in case the build is somehow not done, and the copy
-            # and broadcast of the result because they are part of the mask's cost.
-            canon_mask_builder.wait()
-            canon_mask_builder.collect(model.canon_mask)
+            if not canon_mask_collected:
+                # Both on the clock: the wait in case the build is somehow not done, and the copy
+                # and broadcast of the result because they are part of the mask's cost.
+                canon_mask_builder.wait()
+                canon_mask_builder.collect(model.canon_mask)
+                canon_mask_collected = True
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
@@ -2736,7 +2903,10 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms"
+               + (" final_eval" if final_eval else ""), console=True)
+        if probe_step and not last_step:
+            training_manager.ws_long = ws_long
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -2765,6 +2935,11 @@ for step in range(train_steps + 1):
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+
+needed, dropped, seen = model.tail_row_stats.cpu().double()
+print0("adaptive softmax tail rows on rank 0: " + ", ".join(
+    f"cluster {c + 1} needed by {needed[c] / seen[c]:.2%} of rows, {dropped[c] / needed[c].clamp(min=1):.3%} of those over capacity"
+    for c in range(len(model.tail_clusters))), console=True)
 
 if args.run_evals:
     model.eval()

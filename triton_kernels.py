@@ -1,3 +1,5 @@
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -916,12 +918,6 @@ def transpose_add(src: torch.Tensor, dst: torch.Tensor):
 
 
 CE_KERNEL_BLOCK_SIZE = 256
-CE_KERNEL_VOCAB_SIZE = 50304
-
-CE_KERNEL_DECLS = f"""
-constexpr int VOCAB_SIZE = {CE_KERNEL_VOCAB_SIZE};
-constexpr int BLOCK_SIZE = {CE_KERNEL_BLOCK_SIZE};
-"""
 
 CE_KERNEL_SOURCE = """
 #include <cuda_bf16.h>
@@ -1182,14 +1178,23 @@ __global__ void ce_fwd_bwd_kernel(
 }
 """
 
-ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
-    CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
-    "ce_fwd_bwd_kernel",
-    compute_capability="90",
-    cuda_include_dirs=["/usr/local/cuda/include/"],
-    nvcc_options=["-lineinfo", "--use_fast_math"],
-)
-ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
+@functools.cache
+def get_ce_fwd_bwd_kernel(vocab_size: int):
+    """The kernel keeps a row of logits in shared memory, so the vocab size is a compile-time constant."""
+    assert vocab_size % 8 == 0
+    decls = f"""
+constexpr int VOCAB_SIZE = {vocab_size};
+constexpr int BLOCK_SIZE = {CE_KERNEL_BLOCK_SIZE};
+"""
+    kernel = torch.cuda._compile_kernel(
+        decls + CE_KERNEL_SOURCE,
+        "ce_fwd_bwd_kernel",
+        compute_capability="90",
+        cuda_include_dirs=["/usr/local/cuda/include/"],
+        nvcc_options=["-lineinfo", "--use_fast_math"],
+    )
+    kernel.set_shared_memory_config(vocab_size * 2)
+    return kernel
 
 @torch.library.custom_op("nanogpt::ce_fwd_bwd", mutates_args={"losses", "grad_input"})
 def ce_fwd_bwd(
@@ -1209,12 +1214,13 @@ def ce_fwd_bwd(
     grad_scale: float,
 ) -> None:
     grid = (n_rows, 1, 1)
-    ce_fwd_bwd_kernel(
+    vocab_size = logits.shape[1]
+    get_ce_fwd_bwd_kernel(vocab_size)(
         grid,
         (CE_KERNEL_BLOCK_SIZE, 1, 1),
         (logits, targets, mtp_weights, prefix_targets, prefix_weight, losses, grad_input,
          n_rows, n_predict, A, B, C, grad_s, grad_scale),
-        shared_mem=CE_KERNEL_VOCAB_SIZE * 2,
+        shared_mem=vocab_size * 2,
     )
 
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
