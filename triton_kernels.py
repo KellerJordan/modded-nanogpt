@@ -1,7 +1,22 @@
+# triton_kernels.py -- the full-FP8 MLP + fused-CE kernels.  Owns the "nanogpt" custom-op namespace: NEVER import two
+# copies in one process.  Dual-layout rule: every transposed fp8 operand is written by the kernel that already holds
+# the tile in registers, never by a standalone transpose pass (even a bandwidth-optimal one measured +10.7 s/run).
+# use_fast_accum=False on EVERY gradient GEMM (NaN otherwise), and an explicit clamp before every fp8 cast.
+
+
+import os
+
 import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
+
+try:
+    from triton.runtime.errors import OutOfResources as _TritonOOR
+except Exception:  # triton version drift
+    class _TritonOOR(Exception):
+        pass
+
 
 # -----------------------------------------------------------------------------
 # Triton kernel for symmetric matrix multiplication by @byronxu99
@@ -398,20 +413,24 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
 
 # -----------------------------------------------------------------------------
 # Triton kernel for MLP: relu(x @ W1.T)^2, by @andrewbriand, @jrauvola
+# Extension: dual-layout fp8 epilogue emission on BOTH passes.  The constexpr EMIT_*/STORE_*/RECON_SQRT flags select
+# the epilogue, dead-code-eliminated when off; each transposed store is a register-tile tl.trans, so it costs writes
+# only.  EMIT_T is the fp8 complement of STORE_POST_BF, EMIT_DPRE of the bf16 dpre store.
 
 @triton.jit
 def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
-                                 post_fp8_desc, partial_amax_ptr,
-                                 dequant_scale_ptr, activation_scale_ptr,
+                                 dequant_scale_ptr,
                                  M, N, K,
+                                 aux_f8_desc, post_scale_ptr, post_amax_ptr, aux_t_desc,
+                                 c_f8_desc, c_t_desc, dpre_scale_ptr, dpre_amax_ptr, aux_w_desc,
                                  BLOCK_SIZE_M: tl.constexpr,
                                  BLOCK_SIZE_N: tl.constexpr,
                                  BLOCK_SIZE_K: tl.constexpr,
-                                 GROUP_SIZE_M: tl.constexpr,
                                  NUM_SMS: tl.constexpr,
                                  FORWARD: tl.constexpr,
                                  USE_FP8: tl.constexpr,
-                                 EMIT_FP8: tl.constexpr,
+                                 EMIT_F8: tl.constexpr, EMIT_T: tl.constexpr, STORE_PRE: tl.constexpr,
+                                 STORE_POST_BF: tl.constexpr, RECON_SQRT: tl.constexpr, EMIT_DPRE: tl.constexpr,
                                  ):
     dtype = tl.bfloat16
     start_pid = tl.program_id(axis=0)
@@ -419,12 +438,24 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     num_tiles = num_pid_m * num_pid_n
-    partial_amax = 0.0
-    if EMIT_FP8:
-        inverse_activation_scale = 1.0 / tl.load(activation_scale_ptr)
 
-    tile_id_c = start_pid - NUM_SMS
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    # Epilogue scalars load once per CTA, ABOVE the tile loop: no desc.store target ever aliases them.
+    if USE_FP8:
+        dq_h = tl.load(dequant_scale_ptr)
+    else:
+        dq_h = 1.0
+    if EMIT_F8:
+        inv_ps_h = 1.0 / tl.load(post_scale_ptr)
+    else:
+        inv_ps_h = 1.0
+    if RECON_SQRT:
+        ps_h = tl.load(post_scale_ptr)
+    else:
+        ps_h = 1.0
+    if EMIT_DPRE:
+        inv_ds_h = 1.0 / tl.load(dpre_scale_ptr)
+    else:
+        inv_ds_h = 1.0
 
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
         pid_m = tile_id // num_pid_n
@@ -440,355 +471,392 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
             accumulator = tl.dot(a, b.T, accumulator)
 
         if USE_FP8:
-            accumulator *= tl.load(dequant_scale_ptr)
-
-        tile_id_c += NUM_SMS
-        pid_m = tile_id // num_pid_n
-        pid_n = tile_id % num_pid_n
-        offs_am_c = pid_m * BLOCK_SIZE_M
-        offs_bn_c = pid_n * BLOCK_SIZE_N
+            accumulator *= dq_h
 
         acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
         acc = tl.permute(acc, (0, 2, 1))
         acc0, acc1 = tl.split(acc)
 
-        c0 = acc0.to(dtype)
         if FORWARD:
-            # Store ONLY post = relu(pre)^2 (drop the redundant `pre` materialization).
-            # Backward reconstructs relu(pre) = sqrt(post) in-kernel, so the full
-            # (M, N) pre tensor never round-trips HBM.
+            c0 = acc0.to(dtype)                      # pre (bf16-rounded)
+            if STORE_PRE:
+                c_desc.store([offs_am, offs_bn], c0)
             c0_post = tl.maximum(c0, 0)
             c0_post = c0_post * c0_post
-            c_desc.store([offs_am_c, offs_bn_c], c0_post)
-            if EMIT_FP8:
-                c0_fp8 = tl.minimum(c0_post * inverse_activation_scale, 448.0)
-                post_fp8_desc.store(
-                    [offs_am_c, offs_bn_c], c0_fp8.to(tl.float8e4nv)
-                )
-                partial_amax = tl.maximum(
-                    partial_amax,
-                    tl.max(tl.max(c0_post.to(tl.float32), axis=1), axis=0),
-                )
-        else:
-            # aux holds `post`; relu(pre) = sqrt(post). dpre = 2 * (grad @ W2) * relu(pre).
-            c0_post = aux_desc.load([offs_am_c, offs_bn_c])
-            c0 = 2 * c0 * tl.sqrt(c0_post.to(tl.float32))
-            c_desc.store([offs_am_c, offs_bn_c], c0.to(dtype))
-
-        c1 = acc1.to(dtype)
-        if FORWARD:
+            if STORE_POST_BF:
+                aux_desc.store([offs_am, offs_bn], c0_post)
+            if EMIT_F8:
+                q0 = tl.minimum(c0_post.to(tl.float32) * inv_ps_h, 448.0).to(tl.float8e4nv)
+                aux_f8_desc.store([offs_am, offs_bn], q0)
+                if EMIT_T:
+                    aux_t_desc.store([offs_bn, offs_am], tl.trans(q0))
+            c1 = acc1.to(dtype)
+            if STORE_PRE:
+                c_desc.store([offs_am, offs_bn + BLOCK_SIZE_N // 2], c1)
             c1_post = tl.maximum(c1, 0)
             c1_post = c1_post * c1_post
-            c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
-            if EMIT_FP8:
-                c1_fp8 = tl.minimum(c1_post * inverse_activation_scale, 448.0)
-                post_fp8_desc.store(
-                    [offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2],
-                    c1_fp8.to(tl.float8e4nv),
-                )
-                partial_amax = tl.maximum(
-                    partial_amax,
-                    tl.max(tl.max(c1_post.to(tl.float32), axis=1), axis=0),
-                )
+            if STORE_POST_BF:
+                aux_desc.store([offs_am, offs_bn + BLOCK_SIZE_N // 2], c1_post)
+            if EMIT_F8:
+                q1 = tl.minimum(c1_post.to(tl.float32) * inv_ps_h, 448.0).to(tl.float8e4nv)
+                aux_f8_desc.store([offs_am, offs_bn + BLOCK_SIZE_N // 2], q1)
+                if EMIT_T:
+                    aux_t_desc.store([offs_bn + BLOCK_SIZE_N // 2, offs_am], tl.trans(q1))
+                # atomic_max, not a loop-carried scalar (tl.range(flatten=True) does not guarantee those); max is
+                # order-free, so one reduce(maximum(c0, c1)) equals maxing the two reductions.
+                tile_max = tl.max(tl.max(tl.maximum(c0_post.to(tl.float32), c1_post.to(tl.float32)), axis=1), axis=0)
+                tl.atomic_max(post_amax_ptr, tile_max)
         else:
-            c1_post = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
-            c1 = 2 * c1 * tl.sqrt(c1_post.to(tl.float32))
-            c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1.to(dtype))
+            # aux holds `post`; relu(pre) = sqrt(post). dpre = 2 * (grad @ W2) * relu(pre).
+            if RECON_SQRT:
+                # ONE [BM, BN] TMA box, re-split by the SAME reshape -> permute -> split as the accumulator.
+                _qe = aux_w_desc.load([offs_am, offs_bn])
+                _qe = tl.reshape(_qe, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+                _qe = tl.permute(_qe, (0, 2, 1))
+                a0_raw, a1_raw = tl.split(_qe)
+                c0 = (2.0 * acc0 * tl.sqrt(a0_raw.to(tl.float32) * ps_h)).to(dtype)
+            else:
+                c0_pre = aux_desc.load([offs_am, offs_bn])
+                c0 = acc0.to(dtype)
+                c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
+            if not EMIT_DPRE:
+                c_desc.store([offs_am, offs_bn], c0)
+            if RECON_SQRT:
+                c1 = (2.0 * acc1 * tl.sqrt(a1_raw.to(tl.float32) * ps_h)).to(dtype)
+            else:
+                c1_pre = aux_desc.load([offs_am, offs_bn + BLOCK_SIZE_N // 2])
+                c1 = acc1.to(dtype)
+                c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
+            if not EMIT_DPRE:
+                c_desc.store([offs_am, offs_bn + BLOCK_SIZE_N // 2], c1)
+            if EMIT_DPRE:
+                c0f = c0.to(tl.float32)
+                c1f = c1.to(tl.float32)
+                q0 = tl.maximum(tl.minimum(c0f * inv_ds_h, 57344.0), -57344.0).to(tl.float8e5)
+                q1 = tl.maximum(tl.minimum(c1f * inv_ds_h, 57344.0), -57344.0).to(tl.float8e5)
+                c_f8_desc.store([offs_am, offs_bn], q0)
+                c_f8_desc.store([offs_am, offs_bn + BLOCK_SIZE_N // 2], q1)
+                c_t_desc.store([offs_bn, offs_am], tl.trans(q0))
+                c_t_desc.store([offs_bn + BLOCK_SIZE_N // 2, offs_am], tl.trans(q1))
+                tile_max = tl.max(tl.max(tl.maximum(tl.abs(c0f), tl.abs(c1f)), axis=1), axis=0)
+                tl.atomic_max(dpre_amax_ptr, tile_max)
 
-    if EMIT_FP8:
-        tl.store(partial_amax_ptr + start_pid, partial_amax)
+
+# -----------------------------------------------------------------------------
+# fp8 glue between the GEMMs.  The cost here is PASSES over the [T, 768] residual stream, not arithmetic: the row-major
+# half is ATen that inductor folds into the producer's epilogue, the transposed half one coalesced fp8->fp8 pass
+# (75.5 MB not 151.0 MB, -43.6 us).
+# -----------------------------------------------------------------------------
+
+@torch.library.custom_op("nanogpt::glue_fp8_t", mutates_args=())
+def glue_fp8_t_op(src: torch.Tensor) -> torch.Tensor:
+    """dst [N, M] = src [M, N].T for a row-major 1-byte tensor.  Opaque to inductor so the transpose stays one
+    coalesced pass, not a strided pointwise; CUDA-graph safe; byte-exact (transpose_copy sees a uint8 view)."""
+    assert src.ndim == 2 and src.stride(1) == 1 and src.element_size() == 1
+    dst = torch.empty((src.shape[1], src.shape[0]), device=src.device, dtype=src.dtype)
+    transpose_copy(src.view(torch.uint8), dst.view(torch.uint8))
+    return dst
+
+@glue_fp8_t_op.register_fake
+def _(src):
+    return src.new_empty((src.shape[1], src.shape[0]), dtype=src.dtype)
+
+def quantize_dual_layout_fused(src: torch.Tensor, scale: torch.Tensor, fmt: torch.dtype):
+    """Dual-layout fp8 quantize of src [M, N] (0-D fp32 `scale`): (row [M, N], t [N, M]) from ONE read.  The row-major
+    half is ATen, so inductor fuses it into src's producer and rounds THAT kernel's fp32 registers, not the stored
+    bf16 -- one rounding, not two: never bit-identical to a standalone quantize, never farther."""
+    assert src.ndim == 2
+    lim = 448.0 if fmt == torch.float8_e4m3fn else 57344.0
+    row = torch.clamp(src.to(torch.float32) * (1.0 / scale), -lim, lim).to(fmt)
+    return row, torch.ops.nanogpt.glue_fp8_t(row)
 
 
 @triton.jit
-def reduce_mlp_activation_scales_kernel(
-    partial_amax_ptr,
-    scale_ptr,
-    partial_stride,
-    partial_count: tl.constexpr,
-    HEADROOM: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    layer = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK_SIZE)
-    values = tl.load(
-        partial_amax_ptr + layer * partial_stride + offsets,
-        mask=offsets < partial_count,
-        other=0.0,
-    )
-    amax = tl.max(values, axis=0)
-    tl.store(scale_ptr + layer, tl.maximum(amax, 1.0e-12) * (HEADROOM / 448.0))
-
-
-@triton.jit
-def quantize_transpose_mlp_down_weights_kernel(
-    weight_ptr,
-    output_ptr,
-    row_output_ptr,
-    scale_ptr,
-    weight_layer_stride,
-    hidden_dim: tl.constexpr,
-    model_dim: tl.constexpr,
-    num_tiles_d: tl.constexpr,
-    EMIT_ROW: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
+def _quantize_weights_dual_kernel(w_ptr, row_ptr, col_ptr, scale_ptr, partial_amax_ptr, w_stride_l, w_stride_h,
+                                  w_stride_d, H: tl.constexpr, D: tl.constexpr, num_tiles_d: tl.constexpr,
+                                  num_tiles: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_D: tl.constexpr):
     layer = tl.program_id(0)
     tile = tl.program_id(1)
     tile_h = tile // num_tiles_d
     tile_d = tile % num_tiles_d
-    offsets_h = tile_h * BLOCK_H + tl.arange(0, BLOCK_H)
-    offsets_d = tile_d * BLOCK_D + tl.arange(0, BLOCK_D)
-    mask = (offsets_h[:, None] < hidden_dim) & (offsets_d[None, :] < model_dim)
-    input_offsets = (
-        layer * weight_layer_stride
-        + offsets_h[:, None] * model_dim
-        + offsets_d[None, :]
-    )
-    values = tl.load(weight_ptr + input_offsets, mask=mask, other=0.0).to(tl.float32)
-    scale = tl.load(scale_ptr + layer)
-    quantized = tl.maximum(tl.minimum(values / scale, 448.0), -448.0)
-    output_offsets = (
-        layer * model_dim * hidden_dim
-        + offsets_d[:, None] * hidden_dim
-        + offsets_h[None, :]
-    )
-    tl.store(
-        output_ptr + output_offsets,
-        tl.trans(quantized).to(tl.float8e4nv),
-        mask=tl.trans(mask),
-    )
-    if EMIT_ROW:
-        # Row-major (hidden, model) copy for the FP8 backward's dpre GEMM, which
-        # needs a contiguous last dim. Free here: the tile is already in registers.
-        # NB: must use the output's own contiguous layer stride, NOT input_offsets --
-        # `weights` is a non-contiguous bank slice whose layer stride is 2x this one.
-        row_offsets = (
-            layer * hidden_dim * model_dim
-            + offsets_h[:, None] * model_dim
-            + offsets_d[None, :]
-        )
-        tl.store(row_output_ptr + row_offsets, quantized.to(tl.float8e4nv), mask=mask)
+    offs_h = tile_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    offs_d = tile_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = (offs_h[:, None] < H) & (offs_d[None, :] < D)
+    v = tl.load(w_ptr + layer * w_stride_l + offs_h[:, None] * w_stride_h + offs_d[None, :] * w_stride_d, mask=mask, other=0.0).to(tl.float32)
+    s = tl.load(scale_ptr + layer)
+    q = tl.maximum(tl.minimum(v / s, 448.0), -448.0).to(tl.float8e4nv)
+    tl.store(row_ptr + layer * H * D + offs_h[:, None] * D + offs_d[None, :], q, mask=mask)
+    mask_t = (offs_d[:, None] < D) & (offs_h[None, :] < H)
+    tl.store(col_ptr + layer * H * D + offs_d[:, None] * H + offs_h[None, :], tl.trans(q), mask=mask_t)
+    tl.store(partial_amax_ptr + layer * num_tiles + tile, tl.max(tl.max(tl.abs(v), axis=1), axis=0))
+
+def quantize_weights_dual_ntiles(H: int, D: int) -> int:
+    """Partial-amax slots per layer: one per tile of _quantize_weights_dual_kernel's 64x64 grid."""
+    return triton.cdiv(H, 64) * triton.cdiv(D, 64)
+
+def quantize_mlp_weights_dual(bank: torch.Tensor, scales: torch.Tensor, partial_amax: torch.Tensor,
+                              row: torch.Tensor, col_t: torch.Tensor, update_scales: bool = True):
+    """Quantize a weight bank [L, H, D] (bf16) into BOTH fp8 caches from ONE read: `row` [L, H, D] e4m3 contiguous,
+    `col_t` [L, D, H] e4m3, the .transpose(1,2) view of zeros_like(bank).transpose(1,2).contiguous().  The per-layer
+    `scales` [L] LAG by a step -- update_scales refreshes them FIRST from the LAST call's per-tile amaxes, taking the
+    reduction off the critical path; weights move <<1%/step under ANVIL, so the lag is loss-neutral."""
+    L, H, D = bank.shape
+    BLOCK_H = BLOCK_D = 64
+    num_tiles_d = triton.cdiv(D, BLOCK_D)
+    num_tiles = triton.cdiv(H, BLOCK_H) * num_tiles_d
+    assert partial_amax.shape == (L, num_tiles)
+    if update_scales:
+        # 12% headroom, wider than FP8_POST_HEADROOM (1.03) because this amax is a step behind.
+        torch.clamp(partial_amax.amax(dim=1) * (1.12 / 448.0), min=1e-12, out=scales)
+    _quantize_weights_dual_kernel[(L, num_tiles)](
+        bank, row, col_t, scales, partial_amax, bank.stride(0), bank.stride(1), bank.stride(2), H=H, D=D,
+        num_tiles_d=num_tiles_d, num_tiles=num_tiles, BLOCK_H=BLOCK_H, BLOCK_D=BLOCK_D, num_warps=4, num_stages=2)
 
 
-_dummy_f32 = None  # lazily initialized 1-element tensor for unused pointer args
+# COMPILE-SAFETY INVARIANT: linear_relu_square executes inside torch.compile's autograd-Function HOP subgraphs,
+# where dynamo rejects any Python-state mutation from an outer scope ("Mutating a variable not in the current scope
+# (SideEffects)").  So nothing reachable from it may write a module global, a module-level dict or a closure cell:
+# unused pointer args take a per-call torch.empty(1), and the num_stages cache below is READ-ONLY under compile.
+# It holds num_stages per constexpr variant -- emit variants start at 3 and step down if one exceeds H100 smem --
+# and is written ONLY by eager calls, i.e. prime_stage_cache().
+_lrs_stage_cache = {}
 
-def _get_dummy_f32(device):
-    global _dummy_f32
-    if _dummy_f32 is None or _dummy_f32.device != device:
-        _dummy_f32 = torch.zeros(1, dtype=torch.float32, device=device)
-    return _dummy_f32
-
-def linear_relu_square(
-    a,
-    b,
-    aux=None,
-    a_f8=None,
-    b_f8=None,
-    dequant_scale_ptr=None,
-    activation_scale=None,
-    partial_amax=None,
-):
+def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=None,
+                       emit_f8=False, post_scale=None, post_amax=None,
+                       emit_t=False, store_pre=True, store_post_bf=True,
+                       emit_dpre=False, dpre_scale=None, dpre_amax=None):
+    """Fused MLP GEMM with dual-layout fp8 epilogue emission.  Returns (pre, post, post_f8, post_t) forward and
+    (dpre, dpre_f8, dpre_t) backward, None where not requested; emit_dpre asks for BOTH fp8 dpre layouts, exactly
+    when the bf16 dpre is dead, so the backward emits fp8 or bf16 and never both."""
     M, K = a.shape
     N, K = b.shape
     dtype = a.dtype
     use_fp8 = b_f8 is not None
-    emit_fp8 = activation_scale is not None
-
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
-
+    FORWARD = aux is None
+    recon_sqrt = (not FORWARD) and aux.dtype == torch.float8_e4m3fn
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-
+    # One tile shape for BOTH passes: the backward measured 0.3824 ms on 128x256, 0.4102 ms transposed.
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 256
     BLOCK_SIZE_K = 128 if use_fp8 else 64
-
-    FORWARD = False
-    if aux is None:
-        FORWARD = True
-        # Forward stores only `post` (into `c`); aux_desc is never accessed on the
-        # forward path. Use a SEPARATE minimal [BM, BN//2] dummy (NOT `c`) so the two
-        # TMA descriptors don't alias the same buffer (aliasing can perturb the
-        # forward kernel's memory analysis / pipelining).
-        aux = torch.empty((BLOCK_SIZE_M, BLOCK_SIZE_N // 2), device=a.device, dtype=dtype)
-
-    num_stages = 4 if FORWARD else 3
     num_warps = 8
-
+    # EMIT_T rides on EMIT_F8's quantize, and post_t only exists once dW2 is FP8 -- when the bf16 post is dead.
+    assert emit_f8 or not emit_t
+    assert not (emit_t and store_post_bf)
+    _e4, _e5 = torch.float8_e4m3fn, torch.float8_e5m2
+    _dpre8 = emit_dpre and not FORWARD
+    c, aux_out, aux_f8, aux_t, c_f8, c_t = [
+        torch.empty((_r, _n), device=a.device, dtype=_d) if _w else None
+        for _w, _r, _n, _d in (
+            (store_pre if FORWARD else not emit_dpre, M, N, dtype),   # c       pre | bf16 dpre
+            (FORWARD and store_post_bf,               M, N, dtype),   # aux     bf16 post
+            (FORWARD and emit_f8,                     M, N, _e4),     # aux_f8  e4m3 post, row
+            (FORWARD and emit_t,                      N, M, _e4),     # aux_t   e4m3 post, .T
+            (_dpre8,                                  M, N, _e5),     # c_f8    e5m2 dpre, row
+            (_dpre8,                                  N, M, _e5))]    # c_t     e5m2 dpre, .T
+    if not FORWARD:
+        aux_out = aux
+    # A dummy tile keeps an unused TMA descriptor off a live output buffer; an epilogue that is off aliases a live
+    # descriptor instead, and the wide [BM, BN] box exists exactly when RECON_SQRT reads it.  Straight-line, all
+    # trace-time bools: a lazily-mutated cell is what the HOP rejects, and dynamo will not trace `is_` on descriptors.
+    dummy_tile = torch.empty((BLOCK_SIZE_M, BLOCK_SIZE_N // 2), device=a.device, dtype=dtype) if c is None or aux_out is None else None
+    _box, _tbox = [BLOCK_SIZE_M, BLOCK_SIZE_N // 2], [BLOCK_SIZE_N // 2, BLOCK_SIZE_M]
     a_kernel = a_f8 if use_fp8 else a
     a_desc = TensorDescriptor.from_tensor(a_kernel, [BLOCK_SIZE_M, BLOCK_SIZE_K])
     b_kernel = b_f8 if use_fp8 else b
     b_desc = TensorDescriptor.from_tensor(b_kernel, [BLOCK_SIZE_N, BLOCK_SIZE_K])
-    c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
-    aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+    c_desc = TensorDescriptor.from_tensor(c if c is not None else dummy_tile, _box)
+    aux_desc = TensorDescriptor.from_tensor(aux_out if aux_out is not None else dummy_tile, _box)
+    aux_f8_desc = TensorDescriptor.from_tensor(aux_f8, _box) if aux_f8 is not None else aux_desc
+    aux_t_desc = TensorDescriptor.from_tensor(aux_t, _tbox) if aux_t is not None else aux_desc
+    c_f8_desc = TensorDescriptor.from_tensor(c_f8, _box) if c_f8 is not None else c_desc
+    c_t_desc = TensorDescriptor.from_tensor(c_t, _tbox) if c_t is not None else c_desc
+    aux_w_desc = (TensorDescriptor.from_tensor(aux_out, [BLOCK_SIZE_M, BLOCK_SIZE_N]) if recon_sqrt else aux_desc)
+    # The Triton signature always wants a pointer even where the kernel never loads it, so an off scalar arg takes
+    # one scratch element -- per-call, never a module global.  An emit arm without its scale would read uninitialized
+    # memory, hence the asserts.
+    assert use_fp8 == (dequant_scale_ptr is not None)
+    assert post_scale is not None or not ((FORWARD and emit_f8) or recon_sqrt)
+    assert not emit_dpre or (dpre_scale is not None and dpre_amax is not None)
+    _unused_ptr = torch.empty(1, dtype=torch.float32, device=a.device)
+    dequant_scale_ptr, post_scale, post_amax, dpre_scale, dpre_amax = [
+        _unused_ptr if _p is None else _p
+        for _p in (dequant_scale_ptr, post_scale, post_amax, dpre_scale, dpre_amax)]
 
-    if emit_fp8:
-        assert FORWARD and use_fp8 and partial_amax is not None
-        assert partial_amax.numel() >= NUM_SMS
-        post_fp8 = torch.empty((M, N), device=a.device, dtype=torch.float8_e4m3fn)
-        post_fp8_desc = TensorDescriptor.from_tensor(
-            post_fp8, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2]
+    key = (FORWARD, use_fp8, emit_f8, emit_t, store_pre, store_post_bf, recon_sqrt, emit_dpre,
+           BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, num_warps)
+    num_stages = _lrs_stage_cache.get(key, 4 if (FORWARD and not (emit_f8 or emit_t)) else 3)
+    _alt_grid = (min(NUM_SMS, triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N)), )
+
+    def _launch(_ns):
+        linear_relu_square_kernel[_alt_grid](
+            a_desc, b_desc, c_desc, aux_desc, dequant_scale_ptr, M, N, K,
+            aux_f8_desc, post_scale, post_amax, aux_t_desc,
+            c_f8_desc, c_t_desc, dpre_scale, dpre_amax, aux_w_desc,
+            BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K, NUM_SMS=NUM_SMS,
+            FORWARD=FORWARD, USE_FP8=use_fp8,
+            EMIT_F8=aux_f8 is not None, EMIT_T=aux_t is not None,
+            STORE_PRE=FORWARD and store_pre, STORE_POST_BF=FORWARD and store_post_bf,
+            RECON_SQRT=recon_sqrt, EMIT_DPRE=c_f8 is not None,
+            num_stages=_ns, num_warps=num_warps,
         )
-        num_stages = 3
+
+    if torch.compiler.is_compiling():
+        _launch(num_stages)     # deferred into the artifact: the OOR retry cannot fire, unprimed keys take the default
     else:
-        post_fp8 = None
-        post_fp8_desc = aux_desc
-        activation_scale = _get_dummy_f32(a.device)
-        partial_amax = _get_dummy_f32(a.device)
+        while True:
+            try:
+                _launch(num_stages)
+                break
+            except _TritonOOR:      # smem overflow on this emit variant: step the pipeline down
+                if num_stages <= 1:
+                    raise
+                num_stages -= 1
+        _lrs_stage_cache[key] = num_stages
+    return (c, aux_out, aux_f8, aux_t) if FORWARD else (c, c_f8, c_t)
 
-    def grid(META):
-        return (min(
-            NUM_SMS,
-            triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
-        ), )
+def prime_stage_cache():
+    """Resolve num_stages for every linear_relu_square variant the trainer reaches by launching each once on
+    one-tile inputs -- smem pressure depends only on the constexpr variant, NOT on M/N/K.  Call once, BEFORE
+    torch.compile traces: under compile the OOR retry cannot fire."""
+    if not torch.cuda.is_available():
+        return
+    dev = torch.device("cuda")
+    M, N, K = (128, 256, 128)  # one (BLOCK_M, BLOCK_N) tile, one fp8 K-block
+    nsm = torch.cuda.get_device_properties(dev).multi_processor_count
+    _z = lambda fmt, *shape: torch.zeros(*shape, device=dev, dtype=fmt)
+    a, b = _z(torch.bfloat16, M, K), _z(torch.bfloat16, N, K)
+    a_e4, b_e4 = _z(torch.float8_e4m3fn, M, K), _z(torch.float8_e4m3fn, N, K)
+    g_f8, aux_e4 = _z(torch.float8_e5m2, M, K), _z(torch.float8_e4m3fn, M, N)
+    one = torch.ones(1, dtype=torch.float32, device=dev)
+    amax = torch.zeros(nsm, dtype=torch.float32, device=dev)
+    # NOT mechanical (recon_sqrt comes from aux.dtype), so each row names the caller it mirrors.  ReLUSqrdMLP takes
+    # fp8 weights iff fp8 activations and eval has no backward, so these are the three reachable rows.
+    for _kw in ({},                                                       # eval-path fwd, bf16
+                {"a_f8": a_e4, "b_f8": b_e4, "dequant_scale_ptr": one, "emit_f8": True,
+                 "emit_t": True, "post_scale": one, "post_amax": amax,
+                 "store_pre": False, "store_post_bf": False},             # .forward
+                {"aux": aux_e4, "a_f8": g_f8, "b_f8": b_e4, "dequant_scale_ptr": one,
+                 "post_scale": one, "emit_dpre": True, "dpre_scale": one,
+                 "dpre_amax": amax}):                                     # .backward
+        linear_relu_square(a, b, **_kw)
+    torch.cuda.synchronize(dev)
 
-    if use_fp8:
-        assert dequant_scale_ptr is not None
-    else:
-        # The unified Triton signature requires a pointer, but bf16 kernels never load it.
-        dequant_scale_ptr = _get_dummy_f32(a.device)
 
-    linear_relu_square_kernel[grid](
-        a_desc, b_desc, c_desc, aux_desc,
-        post_fp8_desc, partial_amax,
-        dequant_scale_ptr, activation_scale,
-        M, N, K,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        GROUP_SIZE_M=1,
-        NUM_SMS=NUM_SMS,
-        FORWARD=FORWARD,
-        USE_FP8=use_fp8,
-        EMIT_FP8=emit_fp8,
-        num_stages=num_stages,
-        num_warps=num_warps
-    )
+# FP8 MLP scaled_mm wrappers: ONE emitter, four registered names.  Each stays its own op so it is opaque to inductor and
+# appears by name in the traced graph; they differ only in which operand needs transposing and in use_fast_accum -- False
+# on EVERY gradient GEMM (NaN otherwise).  Operands arrive in the layout _scaled_mm wants: dp takes the row-major post
+# against the col-major W2 cache; wg2 and wg1 take the two epilogue emits, whose .T is a zero-copy column-major view --
+# the TN pair Hopper FP8 WGMMA needs; dx takes the row-major dpre against w1_f8_col.  Output is bf16 to match the bank
+# grad dtype; fp32 would double the reduce_scatter volume.
 
-    # On the forward path `c` now holds `post`; no separate `pre` tensor is produced.
-    if emit_fp8:
-        return c, post_fp8
-    return c
+def _f8_mm_op(name, transpose_b, fast_accum):
+    def _fn(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: torch.Tensor) -> torch.Tensor:
+        return torch._scaled_mm(a, b.T if transpose_b else b, out_dtype=torch.bfloat16, scale_a=a_scale,
+                                scale_b=b_scale, use_fast_accum=fast_accum)
+    _fn.__name__ = name + "_op"
+    _op = torch.library.custom_op("nanogpt::" + name, _fn, mutates_args=())
+    _op.register_fake(lambda a, b, a_scale, b_scale:
+                      a.new_empty((a.shape[0], b.shape[0] if transpose_b else b.shape[1]), dtype=torch.bfloat16))
+    return _op
+
+dp_f8_op = _f8_mm_op("dp_f8", False, True)     # x3  = post_f8 @ W2_f8       (down projection)
+wg2_f8_op = _f8_mm_op("wg2_f8", True, False)   # dW2 = post_t_f8 @ g_t_f8.T
+wg1_f8_op = _f8_mm_op("wg1_f8", True, False)   # dW1 = dpre_t_f8 @ x_t_f8.T
+dx_f8_op = _f8_mm_op("dx_f8", False, False)    # dx  = dpre_f8 @ w1_f8_col
 
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
+    """Fused MLP autograd function extended to the full-FP8 MLP package. x is the [T, 768] bf16 normed residual and
+    W1/W2 the [H, 768] bf16 bank slices; every trailing arg is an fp8 cache or scale, None when not supplied, and
+    together they select the fp8 arms. Layouts: x_f8 is e4m3 [T, 768] and x_f8_t its [768, T] transpose; W2_f8
+    (col-major) and w2_f8_row are the same weights in the two layouts _scaled_mm needs; dequant_scale is x_s*w1_s,
+    dq_bwd w2_s*grad_s, and post_scale/dpre_scale are delayed, fed by the amax slots post_amax/dpre_amax."""
     @staticmethod
-    def forward(
-        ctx,
-        x,
-        W1,
-        W2,
-        W1_f8=None,
-        dequant_scale=None,
-        x_f8=None,
-        W2_f8=None,
-        W2_scale=None,
-        activation_scale=None,
-        partial_amax=None,
-    ):
-        # Forward stores only `post = relu(x @ W1.T)^2`; `pre` is never materialized.
+    def forward(ctx, x, W1, W2, W1_f8=None, dequant_scale=None, x_f8=None, W2_f8=None, w2_scale=None,
+                post_scale=None, post_amax=None, w2_f8_row=None, dq_bwd=None, x_f8_t=None, x_scale=None,
+                w1_f8_col=None, w1_scale=None, g_scale=None, dpre_scale=None, dpre_amax=None, p_fold=None):
+        # `emit` is ONE decision for the whole fp8 MLP (fp8 down projection, transposed post emit, fp8 dW2); under it
+        # both bf16 stores are dead.  The saved-tensor layout and the backward's flags assume all-or-nothing pairs.
+        assert (W2_f8 is None) == (w2_f8_row is None)
+        assert (x_f8_t is None) == (w1_f8_col is None)
+        emit = W2_f8 is not None
         x_flat = x.view((-1, x.shape[-1]))
         if W1_f8 is not None:
             assert x_f8 is not None and dequant_scale is not None
-            x_f8 = x_f8.view((-1, x_f8.shape[-1]))
-            if W2_f8 is not None:
-                # Also emit an FP8 copy of `post` (plus per-SM partial amax) so the down
-                # projection can run through _scaled_mm.
-                assert W2_scale is not None and activation_scale is not None
-                assert partial_amax is not None
-                post, post_f8 = linear_relu_square(
-                    x_flat,
-                    W1,
-                    a_f8=x_f8,
-                    b_f8=W1_f8,
-                    dequant_scale_ptr=dequant_scale,
-                    activation_scale=activation_scale,
-                    partial_amax=partial_amax,
-                )
-            else:
-                post = linear_relu_square(x_flat, W1, a_f8=x_f8, b_f8=W1_f8, dequant_scale_ptr=dequant_scale)
+            pre, post, post_f8, post_t = linear_relu_square(
+                x_flat, W1, a_f8=x_f8.view((-1, x_f8.shape[-1])), b_f8=W1_f8, emit_f8=emit, emit_t=emit,
+                dequant_scale_ptr=dequant_scale, post_scale=post_scale, post_amax=post_amax,
+                store_pre=not emit, store_post_bf=not emit)
         else:
-            post = linear_relu_square(x_flat, W1)
-        if W2_f8 is not None:
-            x3 = torch._scaled_mm(
-                post_f8,
-                W2_f8,
-                out_dtype=torch.bfloat16,
-                scale_a=activation_scale,
-                scale_b=W2_scale,
-                use_fast_accum=True,
-            )
-        else:
-            x3 = post @ W2
-        # Backward stays BF16: it consumes `post` (and W2), not their FP8 copies.
-        ctx.save_for_backward(x, W1, W2, post)
+            pre, post, post_f8, post_t = linear_relu_square(x_flat, W1, emit_f8=emit, post_scale=post_scale, post_amax=post_amax)
+        x3 = (torch.ops.nanogpt.dp_f8(post_f8, W2_f8, post_scale, w2_scale) if emit else post @ W2)
+        # Graph INTERMEDIATES must go through save_for_backward: ctx-attr stashing inside the compiled HOP pins them
+        # past their last use (+3.3 MB).  `p_fold` is the residual site's post-lambda, folded by the caller into the
+        # down-projection dequant scales, so it rides along only for its own gradient.  Both tails are trace-time
+        # constant, so the concatenation resolves before the HOP sees the call.
+        ctx.save_for_backward(*((x, W1, W2) + ((pre, post) if pre is not None else ()) + ((p_fold,) if p_fold is not None else ())))
+        # Persistent caches and scales, kept by NAME so the backward reads them unindexed.
+        ctx.saved_bf16, ctx.fold_p = pre is not None, p_fold is not None
+        ctx.post_f8, ctx.post_t, ctx.post_scale = (post_f8 if emit else None), post_t, post_scale
+        ctx.w2_f8_row, ctx.dq_bwd, ctx.x_f8_t, ctx.x_scale = w2_f8_row, dq_bwd, x_f8_t, x_scale
+        ctx.w1_f8_col, ctx.w1_scale, ctx.g_scale = w1_f8_col, w1_scale, g_scale
+        ctx.dpre_scale, ctx.dpre_amax = dpre_scale, dpre_amax
         return x3.view(x.shape)
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, W1, W2, post = ctx.saved_tensors
-        dW2 = post.T @ grad_output
-        # dpre kernel reconstructs relu(pre) = sqrt(post) from `post` (passed as aux),
-        # avoiding the redundant `pre` HBM read/write entirely.
-        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=post)
-        dW1 = dpre.T @ x
-        dx = dpre @ W1
-        return dx.view(x.shape), dW1, dW2, None, None, None, None, None, None, None
+        # Dynamo-robust unpack: no star-unpack of saved_tensors, no bool-as-index; ctx.saved_bf16 is metadata.
+        st = ctx.saved_tensors
+        x, W1, W2 = st[0], st[1], st[2]
+        if ctx.saved_bf16:            # bf16 MLP
+            pre, post = st[3], st[4]
+            p_fold = st[5] if ctx.fold_p else None
+        else:                         # fp8 path: the fp8 post is the aux
+            pre = post = None
+            p_fold = st[3] if ctx.fold_p else None
+        g_flat = grad_output.view((-1, grad_output.shape[-1]))
+        # The forward's pair asserts make "w2_f8_row present" exactly its `emit`, and the epilogue emits both fp8
+        # dpre layouts or neither, so dW1 and dx pair up.
+        fp8_gemm = ctx.w2_f8_row is not None
+        fp8_emit = fp8_gemm and ctx.x_f8_t is not None and ctx.w1_f8_col is not None and ctx.dpre_scale is not None
 
+        # ---- 1. incoming-grad quantize (one pass, dual layout) and 2. dW2 = post^T @ g ----
+        if fp8_gemm:
+            g_f8, g_f8_t = quantize_dual_layout_fused(g_flat, ctx.g_scale, fmt=torch.float8_e5m2)
+            dW2 = torch.ops.nanogpt.wg2_f8(ctx.post_t, g_f8_t, ctx.post_scale, ctx.g_scale)
+        else:
+            g_f8 = None
+            dW2 = post.T @ grad_output  # default eager expression (unflattened)
 
-def reduce_mlp_activation_scales(partial_amax, scales, headroom=1.25):
-    num_layers, partial_count = partial_amax.shape
-    assert scales.numel() >= num_layers
-    block_size = triton.next_power_of_2(partial_count)
-    reduce_mlp_activation_scales_kernel[(num_layers,)](
-        partial_amax,
-        scales,
-        partial_amax.stride(0),
-        partial_count=partial_count,
-        HEADROOM=headroom,
-        BLOCK_SIZE=block_size,
-        num_stages=1,
-        num_warps=4,
-    )
+        # ---- 2b. MLPFOLD: p's fold moved into weight space.  Forward computed out = post @ (p * W2), so dW2 above
+        # is d/d(p*W2) = post^T g, dL/dW2 = p * dW2 and dL/dp = <dW2, W2> -- a [mlp_hdim, 768] dot, NO division by p,
+        # replacing the residual site's two [T, 768] passes (13.0 MB against 151.0 MB).  grad_p stays None unfolded,
+        # which is also autograd's trailing slot for it.
+        grad_p = None
+        if ctx.fold_p:
+            grad_p = (dW2.float() * W2.float()).sum().to(p_fold.dtype)
+            dW2 = dW2 * p_fold
 
+        # ---- 3. dpre (+ fp8 emits from the same epilogue), then dW1 and dx.  The aux read IS the fp8 post where
+        # there is one: half the bf16 pre's bytes.
+        aux_src = pre if ctx.post_f8 is None else ctx.post_f8
+        if fp8_gemm:
+            dpre, dpre_f8, dpre_t = linear_relu_square(
+                g_flat, W2, aux=aux_src, a_f8=g_f8, b_f8=ctx.w2_f8_row,
+                dequant_scale_ptr=ctx.dq_bwd, post_scale=ctx.post_scale,
+                emit_dpre=fp8_emit, dpre_scale=ctx.dpre_scale, dpre_amax=ctx.dpre_amax)
+        else:
+            dpre, dpre_f8, dpre_t = linear_relu_square(g_flat, W2, aux=aux_src, post_scale=ctx.post_scale)
+        if fp8_emit:
+            dW1 = torch.ops.nanogpt.wg1_f8(dpre_t, ctx.x_f8_t, ctx.dpre_scale, ctx.x_scale)
+            dx = torch.ops.nanogpt.dx_f8(dpre_f8, ctx.w1_f8_col, ctx.dpre_scale, ctx.w1_scale)
+        else:
+            dW1 = dpre.T @ x  # default eager expressions (unflattened)
+            dx = dpre @ W1
 
-def quantize_transpose_mlp_down_weights(
-    weights,
-    output_storage,
-    scales,
-    row_output=None,
-):
-    """Quantize the MLP down weights with an exact-current scale.
-
-    Always emits the transposed (model, hidden) storage used by the forward
-    _scaled_mm. Pass `row_output` to additionally emit the row-major
-    (hidden, model) copy that the FP8 backward's dpre GEMM requires; both come
-    from a single read of the weights.
-    """
-    num_layers, hidden_dim, model_dim = weights.shape
-    assert output_storage.shape == (num_layers, model_dim, hidden_dim)
-    emit_row = row_output is not None
-    if emit_row:
-        assert row_output.shape == (num_layers, hidden_dim, model_dim)
-        assert row_output.is_contiguous()
-    block_h = 64
-    block_d = 64
-    num_tiles_d = triton.cdiv(model_dim, block_d)
-    num_tiles = triton.cdiv(hidden_dim, block_h) * num_tiles_d
-    quantize_transpose_mlp_down_weights_kernel[(num_layers, num_tiles)](
-        weights,
-        output_storage,
-        row_output if emit_row else weights,  # unused pointer when EMIT_ROW is False
-        scales,
-        weights.stride(0),
-        hidden_dim=hidden_dim,
-        model_dim=model_dim,
-        num_tiles_d=num_tiles_d,
-        EMIT_ROW=emit_row,
-        BLOCK_H=block_h,
-        BLOCK_D=block_d,
-        num_stages=1,
-        num_warps=4,
-    )
+        # One return slot per forward input (19, + p_fold).
+        return (dx.view(x.shape), dW1, dW2) + (None,) * 16 + (grad_p,)
 
 
 # -----------------------------------------------------------------------------
@@ -839,6 +907,10 @@ def transpose_copy(src: torch.Tensor, dst: torch.Tensor):
     assert dst.shape == (N, M), f"Expected dst shape ({N}, {M}), got {dst.shape}"
 
     BLOCK_M, BLOCK_N = 64, 128
+    if src.element_size() == 1 and dst.stride(1) == 1:
+        # BLOCK_M is the length in ELEMENTS of each contiguous destination run, so at
+        # 64x128 a 1-byte dtype would store half a 128-byte L2 line. Pure copy: BIT-EXACT.
+        BLOCK_M = 128
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     _transpose_copy_kernel[grid](
@@ -892,7 +964,7 @@ def _transpose_add_kernel(
 def transpose_add(src: torch.Tensor, dst: torch.Tensor):
     """Tiled transpose-add: dst += src.T where src is (M, N) and dst is (N, M).
 
-    Uses a 32x32 tiled Triton kernel with coalesced access on both src and dst,
+    Uses a 64x128 tiled Triton kernel with coalesced access on both src and dst,
     replacing PyTorch's .add_(src.T) which has non-coalesced reads from the
     transposed operand.
     """
@@ -900,7 +972,9 @@ def transpose_add(src: torch.Tensor, dst: torch.Tensor):
     M, N = src.shape
     assert dst.shape == (N, M), f"Expected dst shape ({N}, {M}), got {dst.shape}"
 
-    BLOCK_M, BLOCK_N = 32, 32
+    # 64x128 / 8 warps rather than 32x32 / 4: both streams then issue 128-byte
+    # segments (src offs_n-fastest at BLOCK_N, dst offs_m-fastest at BLOCK_M).
+    BLOCK_M, BLOCK_N = 64, 128
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     _transpose_add_kernel[grid](
@@ -910,10 +984,15 @@ def transpose_add(src: torch.Tensor, dst: torch.Tensor):
         dst.stride(0), dst.stride(1),
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        num_warps=4,
+        num_warps=8,
         num_stages=2,
     )
 
+
+# ---- fused softcapped cross-entropy (reuses the lm_head FP8 weight cache) ----
+# ONE CUDA kernel does the forward AND backward in a single pass over the vocabulary, so the [T, 50304] logits are never re-read: the lm_head GEMM writes
+# them as e4m3 CODE BYTES, decoded by a ~4-op hardware conversion (an arithmetic decode costs 0.643 ms/step more at the bandwidth-bound 2.109 TB/s). A
+# row's loss adds a prefix-token CE at prefix_weight to the MTP look-ahead, a no-op at weight 0; its sigmoid cache is fp16 as bf16 rounds 1-sigma to 0.
 
 CE_KERNEL_BLOCK_SIZE = 256
 CE_KERNEL_VOCAB_SIZE = 50304
@@ -924,7 +1003,9 @@ constexpr int BLOCK_SIZE = {CE_KERNEL_BLOCK_SIZE};
 """
 
 CE_KERNEL_SOURCE = """
+
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <math_constants.h>
 
 #define __nv_fp8_e5m2 char
@@ -932,22 +1013,10 @@ CE_KERNEL_SOURCE = """
 #define uint8_t unsigned char
 #define int64_t long long
 
-__device__ __forceinline__ __nv_fp8_e5m2 f32_to_fp8_e5m2(float x) {
-    uint16_t packed;
-    asm volatile(
-        "cvt.rn.satfinite.e5m2x2.f32 %0, %1, %2;"
-        : "=h"(packed)
-        : "f"(x), "f"(0.0f)
-    );
-    __nv_fp8_e5m2 result;
-    *reinterpret_cast<uint8_t*>(&result) = (packed & (0xFF << 8)) >> 8;
-    return result;
-}
-
-struct __align__(16) __nv_bfloat168 {
-    __nv_bfloat16 data[8];
-    __device__ __nv_bfloat16& operator[](int i) { return data[i]; }
-    __device__ const __nv_bfloat16& operator[](int i) const { return data[i]; }
+struct __align__(16) __half8 {
+    __half data[8];
+    __device__ __half& operator[](int i) { return data[i]; }
+    __device__ const __half& operator[](int i) const { return data[i]; }
 };
 
 struct __align__(8) __nv_fp8_e5m28 {
@@ -955,6 +1024,46 @@ struct __align__(8) __nv_fp8_e5m28 {
     __device__ __nv_fp8_e5m2& operator[](int i) { return data[i]; }
     __device__ const __nv_fp8_e5m2& operator[](int i) const { return data[i]; }
 };
+
+__device__ __forceinline__ __nv_fp8_e5m2 f32_to_fp8_e5m2_fast(float x) {
+    uint16_t packed;
+    asm("cvt.rn.satfinite.e5m2x2.f32 %0, %1, %2;" : "=h"(packed) : "f"(0.0f), "f"(x));
+    __nv_fp8_e5m2 result;
+    *reinterpret_cast<uint8_t*>(&result) = (uint8_t)(packed & 0xFFu);
+    return result;
+}
+
+__device__ __forceinline__ uint16_t f32x2_to_fp8_e5m2x2(float lo, float hi) {
+    uint16_t packed;
+    asm("cvt.rn.satfinite.e5m2x2.f32 %0, %1, %2;" : "=h"(packed) : "f"(hi), "f"(lo));
+    return packed;
+}
+
+__device__ __forceinline__ unsigned int fp8_e5m2x2_pair_to_word(uint16_t a, uint16_t b) {
+    unsigned int w;
+    asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(w) : "r"((unsigned int)a), "r"((unsigned int)b));
+    return w;
+}
+
+struct __align__(8) __nv_uchar8 {
+    unsigned char data[8];
+    __device__ unsigned char& operator[](int i) { return data[i]; }
+    __device__ const unsigned char& operator[](int i) const { return data[i]; }
+};
+
+__device__ __forceinline__ float ce_e4m3_logit_to_f32(unsigned char b) {
+    unsigned int h2;
+    unsigned short in = (unsigned short)b;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(in));
+    unsigned short lo = (unsigned short)(h2 & 0xFFFFu);
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(lo));
+    return f;
+}
+
+#define CE_IN_T unsigned char
+#define CE_IN8_T __nv_uchar8
+#define CE_LOGIT_TO_F32(v) ce_e4m3_logit_to_f32(v)
 
 template<typename T> __device__ constexpr T CEIL_DIV(T a, T b) { return (a + b - 1) / b; }
 
@@ -968,11 +1077,10 @@ __device__ float sigmoid(float x) {
 extern "C"
 __launch_bounds__(BLOCK_SIZE, 2)
 __global__ void ce_fwd_bwd_kernel(
-    const __nv_bfloat16* __restrict__ logits,
+    const CE_IN_T* __restrict__ logits,
     const int64_t* __restrict__ targets,
     const float* __restrict__ mtp_weights,
     const int64_t* __restrict__ prefix_targets,
-    const float* __restrict__ prefix_weight_ptr,
     float* __restrict__ losses,
     __nv_fp8_e5m2* grad_input,
     int batch_size,
@@ -981,7 +1089,8 @@ __global__ void ce_fwd_bwd_kernel(
     double B_param,
     double C_param,
     double grad_s_param,
-    double grad_scale_param)
+    double grad_scale_param,
+    double prefix_weight_param)
 {
   constexpr int VEC_WIDTH = 8;
   constexpr int NUM_FULL_LOADS = VOCAB_SIZE / (BLOCK_SIZE * VEC_WIDTH);
@@ -992,72 +1101,45 @@ __global__ void ce_fwd_bwd_kernel(
   float C = (float)C_param;
   float grad_s = (float)grad_s_param;
   float grad_scale = (float)grad_scale_param;
-  float prefix_weight = prefix_weight_ptr[0];
 
-  extern __shared__ __nv_bfloat16 smem[];
+  extern __shared__ __half smem[];
 
   static_assert(VEC_WIDTH == 8);
 
-  const __nv_bfloat16 *block_logit_ptr = logits + VOCAB_SIZE * blockIdx.x;
+  const CE_IN_T *block_logit_ptr = logits + VOCAB_SIZE * blockIdx.x;
 
   float inv_C = 1 / C;
   float B_div_C = B * inv_C;
-  float thread_max = -CUDART_INF_F;
+  // FIXED-MAX lse. z = A*sigmoid((l+B)/C) with A=23 is bounded to (0, A], so exp(z - A) is in (exp(-A), 1] and the block sum in [VOCAB*exp(-A),
+  // VOCAB] -- 5e-6 .. 5e4 at VOCAB=50304, nowhere near fp32's range. The online block max exists only to bound that exponent, so the constant A
+  // stands in for it, the exp-sum rides the SAME smem pass, and the __syncthreads below is the only one before smem is read cross-thread.
+
+  float thread_sum = 0.0f;
 
   #pragma unroll 25
   for (int i = 0; i < NUM_LOADS; i++) {
     int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
     if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
-      __nv_bfloat168 result = *(__nv_bfloat168*)(&block_logit_ptr[idx]);
-      __nv_bfloat168 result_sigmoid;
+      CE_IN8_T result = *(CE_IN8_T*)(&block_logit_ptr[idx]);
+      __half8 result_sigmoid;
       #pragma unroll
       for (int k = 0; k < VEC_WIDTH; k++) {
-        float tmp = __bfloat162float(result[k]);
+        float tmp = CE_LOGIT_TO_F32(result[k]);
         tmp = sigmoid(tmp * inv_C + B_div_C);
-        result_sigmoid[k] = __float2bfloat16(tmp);
-        tmp = A * tmp;
-        thread_max = max(tmp, thread_max);
+        result_sigmoid[k] = __float2half(tmp);
       }
-      *(__nv_bfloat168*)(&smem[idx]) = result_sigmoid;
+      *(__half8*)(&smem[idx]) = result_sigmoid;
+      #pragma unroll
+      for (int k = 0; k < VEC_WIDTH; k++) {
+        float tmp = A * __half2float(result_sigmoid[k]);
+        thread_sum += __expf(tmp - A);
+      }
     }
   }
 
   constexpr int NUM_WARPS = BLOCK_SIZE / 32;
   int warp_id = threadIdx.x / 32;
-  __shared__ float block_maxs[NUM_WARPS];
   __shared__ float block_sums[NUM_WARPS];
-
-  for (int offset = 16; offset > 0; offset >>= 1)
-    thread_max = fmaxf(thread_max, __shfl_down_sync(0xFFFFFFFF, thread_max, offset));
-
-  if (threadIdx.x % 32 == 0) {
-    block_maxs[warp_id] = thread_max;
-  }
-
-  __syncthreads();
-
-  float block_max = -CUDART_INF_F;
-  for (int i = 0; i < NUM_WARPS; i++) {
-    block_max = fmaxf(block_max, block_maxs[i]);
-  }
-
-  float thread_sum = 0.0f;
-  #pragma unroll 2
-  for (int i = 0; i < NUM_LOADS; i++) {
-    int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
-    __nv_bfloat168 l;
-    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
-      l = *(__nv_bfloat168*)(&smem[idx]);
-    }
-    #pragma unroll
-    for (int k = 0; k < VEC_WIDTH; k++) {
-      float tmp = A * __bfloat162float(l[k]);
-      tmp = __expf(tmp - block_max);
-      if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
-        thread_sum += tmp;
-      }
-    }
-  }
 
   for (int offset = 16; offset > 0; offset >>= 1)
     thread_sum += __shfl_down_sync(0xFFFFFFFF, thread_sum, offset);
@@ -1073,13 +1155,10 @@ __global__ void ce_fwd_bwd_kernel(
     block_sum += block_sums[i];
   }
 
-  float lse = block_max + __logf(block_sum);
+  float lse = A + __logf(block_sum);
 
   // Prefix token prediction target for this position (T' = longest-prefix token of
   // the immediate next-token target T). prefix_targets[i] < 0 => no valid prefix, ignored.
-  int64_t prefix_target = prefix_targets[blockIdx.x];
-  bool prefix_valid = (prefix_target >= 0 && prefix_target < VOCAB_SIZE);
-
   if (threadIdx.x == 0) {
     float total_loss = 0.0f;
     for (int k = 0; k < n_predict; k++) {
@@ -1088,25 +1167,32 @@ __global__ void ce_fwd_bwd_kernel(
         float weight = mtp_weights[k];
         int64_t target = targets[target_idx];
         if (target >= 0 && target < VOCAB_SIZE) {
-          float z_target = A * __bfloat162float(smem[target]);
+          float z_target = A * __half2float(smem[target]);
           total_loss += weight * (lse - z_target);
         }
       }
     }
     // Same CE logic as MTP, but the target is the prefix token T' at this position.
-    if (prefix_valid) {
-      float z_target = A * __bfloat162float(smem[prefix_target]);
-      total_loss += prefix_weight * (lse - z_target);
+    {
+      int64_t ptgt = prefix_targets[blockIdx.x];
+      if (ptgt >= 0 && ptgt < VOCAB_SIZE) {
+        float z_p = A * __half2float(smem[ptgt]);
+        total_loss += (float)prefix_weight_param * (lse - z_p);
+      }
     }
     losses[blockIdx.x] = total_loss;
   }
 
   // Total weight over active predictions at this position (used in the softmax-normalizer
   // gradient term). Include the prefix prediction only when it has a valid target.
-  float S_w = prefix_valid ? prefix_weight : 0.0f;
+  float S_w = 0.0f;
 
   for (int i = 0; i < n_predict; i++) {
     S_w += mtp_weights[i];
+  }
+  int64_t ptgt_row = prefix_targets[blockIdx.x];
+  if (ptgt_row >= 0) {
+    S_w += (float)prefix_weight_param;
   }
 
   #pragma unroll 4
@@ -1115,22 +1201,29 @@ __global__ void ce_fwd_bwd_kernel(
     __nv_fp8_e5m28 result;
 
     if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
-      __nv_bfloat168 sigmoid_us = *(__nv_bfloat168*)(&smem[idx]);
+      __half8 sigmoid_us = *(__half8*)(&smem[idx]);
+      uint16_t pk[VEC_WIDTH / 2];
       #pragma unroll
-      for (int j = 0; j < VEC_WIDTH; j++) {
-        float sigmoid_u = __bfloat162float(sigmoid_us[j]);
-        float z = A * sigmoid_u;
-        float p = __expf(z - lse);
+      for (int j = 0; j < VEC_WIDTH; j += 2) {
+        float g[2];
+        #pragma unroll
+        for (int t = 0; t < 2; t++) {
+          float sigmoid_u = __half2float(sigmoid_us[j + t]);
+          float z = A * sigmoid_u;
+          float p = __expf(z - lse);
 
-        float term1 = S_w * p;
-        float term2 = 0.0f;
+          float term1 = S_w * p;
+          float term2 = 0.0f;
 
-        float grad_z = term1 - term2;
-        float grad_x = grad_scale * (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
-        auto result_tmp = f32_to_fp8_e5m2(grad_x);
-        result[j] = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
+          float grad_z = term1 - term2;
+          g[t] = grad_scale * (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
+        }
+        pk[j >> 1] = f32x2_to_fp8_e5m2x2(g[0], g[1]);
       }
-      *(__nv_fp8_e5m28*)(&grad_input[blockIdx.x * VOCAB_SIZE + idx]) = result;
+      unsigned long long packed8 =
+          ((unsigned long long)fp8_e5m2x2_pair_to_word(pk[2], pk[3]) << 32)
+          | (unsigned long long)fp8_e5m2x2_pair_to_word(pk[0], pk[1]);
+      *(unsigned long long*)(&grad_input[blockIdx.x * VOCAB_SIZE + idx]) = packed8;
     }
   }
 
@@ -1140,56 +1233,56 @@ __global__ void ce_fwd_bwd_kernel(
   // targets; thread n_predict handles the prefix target. term2 for a column sums the
   // weights of every prediction (MTP + prefix) whose target lands on that column, so
   // duplicate columns across threads write identical values (idempotent, race-free).
-  if (threadIdx.x <= n_predict) {
+  bool is_pfx = (threadIdx.x == n_predict) && (ptgt_row >= 0) && ((float)prefix_weight_param > 0.0f);
+  if ((threadIdx.x < n_predict && blockIdx.x + threadIdx.x < batch_size) || is_pfx) {
     int i = threadIdx.x;
-    int64_t target;
-    bool valid;
-    if (i < n_predict) {
-      int64_t target_idx = blockIdx.x + i;
-      valid = (target_idx < batch_size);
-      target = valid ? targets[target_idx] : -1;
-      valid = valid && (target >= 0 && target < VOCAB_SIZE);
-    } else {
-      target = prefix_target;
-      valid = prefix_valid;
-    }
+    int64_t target = is_pfx ? ptgt_row : targets[blockIdx.x + i];
 
-    if (valid) {
-      float sigmoid_u = __bfloat162float(smem[target]);
-      float z = A * sigmoid_u;
-      float p = __expf(z - lse);
+    float sigmoid_u = __half2float(smem[target]);
+    float z = A * sigmoid_u;
+    float p = __expf(z - lse);
 
-      float term1 = S_w * p;
-      float term2 = 0.0f;
+    float term1 = S_w * p;
+    float term2 = 0.0f;
 
-      for (int k = 0; k < n_predict; k++) {
-        int64_t target_idx = blockIdx.x + k;
-        if (target_idx < batch_size && targets[target_idx] == target) {
+    #pragma unroll
+    for (int k = 0; k < 3; k++) {
+      int64_t target_idx = blockIdx.x + k;
+      if (target_idx < batch_size && k < n_predict) {
+        if (targets[target_idx] == target) {
           term2 += mtp_weights[k];
         }
       }
-      if (prefix_valid && prefix_target == target) {
-        term2 += prefix_weight;
-      }
-
-      float grad_z = term1 - term2;
-      float grad_x = grad_scale * (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
-      auto result_tmp = f32_to_fp8_e5m2(grad_x);
-      auto result = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
-      grad_input[blockIdx.x * VOCAB_SIZE + target] = result;
     }
+    if (ptgt_row >= 0 && ptgt_row == target) {
+      term2 += (float)prefix_weight_param;
+    }
+
+    float grad_z = term1 - term2;
+    float grad_x = grad_scale * (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
+    auto result_tmp = f32_to_fp8_e5m2_fast(grad_x);
+    auto result = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
+    grad_input[blockIdx.x * VOCAB_SIZE + target] = result;
   }
 }
 """
+
+# nvrtc needs the CUDA headers; CUDA_HOME is what torch's own extension builder consults.
+CUDA_INCLUDE_DIRS = [os.path.join(os.environ.get("CUDA_HOME") or "/usr/local/cuda", "include")]
 
 ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
     CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
     "ce_fwd_bwd_kernel",
     compute_capability="90",
-    cuda_include_dirs=["/usr/local/cuda/include/"],
+    cuda_include_dirs=CUDA_INCLUDE_DIRS,
     nvcc_options=["-lineinfo", "--use_fast_math"],
 )
 ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
+
+# Live prefix-CE weight, read EAGERLY inside the opaque custom op: a python float
+# reaching the graph forces a full recompile at every ramp flip (~12 s on-clock), so
+# the graph passes a constant sentinel.
+_PTP_W_RUNTIME = None
 
 @torch.library.custom_op("nanogpt::ce_fwd_bwd", mutates_args={"losses", "grad_input"})
 def ce_fwd_bwd(
@@ -1197,7 +1290,6 @@ def ce_fwd_bwd(
     targets: torch.Tensor,
     mtp_weights: torch.Tensor,
     prefix_targets: torch.Tensor,
-    prefix_weight: torch.Tensor,
     losses: torch.Tensor,
     grad_input: torch.Tensor,
     n_rows: int,
@@ -1207,1336 +1299,225 @@ def ce_fwd_bwd(
     C: float,
     grad_s: float,
     grad_scale: float,
+    prefix_weight: float,
 ) -> None:
+    if _PTP_W_RUNTIME is not None and prefix_weight > 0.0:
+        prefix_weight = _PTP_W_RUNTIME
     grid = (n_rows, 1, 1)
     ce_fwd_bwd_kernel(
         grid,
         (CE_KERNEL_BLOCK_SIZE, 1, 1),
-        (logits, targets, mtp_weights, prefix_targets, prefix_weight, losses, grad_input,
-         n_rows, n_predict, A, B, C, grad_s, grad_scale),
+        (logits, targets, mtp_weights, prefix_targets, losses, grad_input,
+         n_rows, n_predict, A, B, C, grad_s, grad_scale, prefix_weight),
         shared_mem=CE_KERNEL_VOCAB_SIZE * 2,
     )
 
+
+# ---- cached fp32 scale scalars ----------------------------------------------
+# torch._scaled_mm wants per-tensor scales as 0-d fp32 CUDA tensors, and the CE's are the lm_head's FIXED
+# x_s / w_s / grad_s: 19.04 us per rebuild against 6.46 us cached, and the cached tensor is bit-identical --
+# _scaled_mm never writes its scales.  Inert under torch.compile: a dict gaining a key guards a ~12 s recompile.
+_CE_SCALAR_CACHE = {}
+
+def _ce_scalar(ref: torch.Tensor, v: float) -> torch.Tensor:
+    if torch.compiler.is_compiling():
+        return ref.new_tensor(v, dtype=torch.float32)
+    key = (float(v), ref.device)
+    t = _CE_SCALAR_CACHE.get(key)
+    if t is None:
+        _CE_SCALAR_CACHE[key] = t = ref.new_tensor(v, dtype=torch.float32)
+    return t
+
+def _ce_backward_gemms(grad_input, w_t, x_f8, x_s, w_s, grad_s):
+    """The CE backward tail both CE Functions share: the three scale scalars,
+    dx = grad @ W, and the bf16 wgrad via two fp8 transposes (dW = x^T @ grad)."""
+    n_rows, n_cols = grad_input.shape
+    x_scale = _ce_scalar(grad_input, x_s)
+    w_scale = _ce_scalar(grad_input, w_s)
+    grad_scale = _ce_scalar(grad_input, grad_s)
+
+    grad_x = torch._scaled_mm(
+        grad_input, w_t.T,
+        out_dtype=torch.bfloat16,
+        scale_a=grad_scale,
+        scale_b=w_scale,
+        use_fast_accum=False,
+    )
+
+    x_f8_T = torch.empty((x_f8.shape[1], x_f8.shape[0]), dtype=x_f8.dtype, device=x_f8.device)
+    transpose_copy(x_f8, x_f8_T)  # (768, n_rows) row-major
+
+    grad_input_T = torch.empty((n_cols, n_rows), dtype=grad_input.dtype, device=grad_input.device)
+    transpose_copy(grad_input, grad_input_T)  # (n_cols, n_rows) row-major
+
+    grad_w = torch._scaled_mm(
+        x_f8_T, grad_input_T.T,    # (768, n_rows) row-major @ (n_rows, n_cols) column-major view
+        out_dtype=torch.bfloat16,  # bf16 wgrad: halves the grad_w write + reduce_scatter bytes
+        scale_a=x_scale,
+        scale_b=grad_scale,
+        use_fast_accum=False,
+    )
+    return grad_x, grad_w
+
+def _ce_logit_gemm(x, x_f8, w_col, x_s, w_s):
+    """The lm_head GEMM, emitting the RAW logit as an e4m3 code byte; w_col must be column-major.
+    torch._scaled_mm IGNORES scale_result for an fp8 out_dtype, so scale_a/scale_b descale the
+    accumulator and the stored byte is the raw e4m3 RNE logit."""
+    return torch._scaled_mm(
+        x_f8, w_col,
+        out_dtype=torch.float8_e4m3fn,
+        scale_a=_ce_scalar(x, x_s),
+        scale_b=_ce_scalar(x, w_s),
+        use_fast_accum=True,
+    )
+
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
+    """Full-vocabulary softcapped CE: the fp8 lm_head GEMM into e4m3 logit code bytes, the fused fwd+bwd kernel, then the two fp8 gradient GEMMs --
+    the e5m2 grad_input the kernel leaves behind IS the backward's input, and no logit tensor survives the forward. Both GEMM halves are staticmethods
+    because SampledSoftcappedCrossEntropy runs the same two. w_f8_in (col-major) and w_f8_row are the trainer's post-step fp8 lm_head copies from the
+    comm-overlapped optimizer phase; lm_head_weight only carries the grad. A, B, C are spelled again in train_gpt.py's eval arm and in CE_KERNEL_SOURCE."""
     @staticmethod
-    def forward(ctx, x, targets, mtp_weights, prefix_targets, prefix_weight, lm_head_weight, x_s, w_s, grad_s, grad_scale, A=23.0, B=5.0, C=7.5):
+    def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, grad_scale, w_f8_in, prefix_targets, prefix_weight, w_f8_row):
+        # softcap z = A*sigmoid((l+B)/C); train_gpt.py's eval arm and CE_KERNEL_SOURCE
+        # hold the same constants -- the three copies must move together.
+        A, B, C = 23.0, 5.0, 7.5
 
+        assert w_f8_in is not None and w_f8_row is not None, "the fp8 lm_head caches are required, col-major and row-major together"
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
-        w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
-
-        w_f8_col_major = w_f8.T.contiguous().T
-
-        logits = torch._scaled_mm(
-            x_f8,
-            w_f8_col_major,
-            out_dtype=torch.bfloat16,
-            scale_a=x.new_tensor(x_s, dtype=torch.float32),
-            scale_b=x.new_tensor(w_s, dtype=torch.float32),
-            use_fast_accum=True,
-        )
+        # The trainer's post-step fp8 lm_head copies in the two layouts, quantized in
+        # the comm-overlapped optimizer phase; lm_head_weight only carries the grad.
+        logits = _ce_logit_gemm(x, x_f8, w_f8_in.T.contiguous().T, x_s, w_s)
 
         n_rows, n_cols = logits.shape
-        if mtp_weights is None:
-             mtp_weights = torch.tensor([1.0], device=logits.device, dtype=torch.float32)
         n_predict = mtp_weights.shape[0]
 
         losses = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
-        lse = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
 
         logits = logits.contiguous()
         targets = targets.contiguous()
         mtp_weights = mtp_weights.contiguous()
 
-        if prefix_targets is None:
-            prefix_targets = torch.full((n_rows,), -1, dtype=torch.int64, device=logits.device)
-        prefix_targets = prefix_targets.contiguous()
-
-        if prefix_weight is None:
-            prefix_weight = torch.zeros(1, dtype=torch.float32, device=logits.device)
-        prefix_weight = prefix_weight.reshape(1).to(torch.float32).contiguous()
-
         grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
 
-        ce_fwd_bwd(logits, targets, mtp_weights, prefix_targets, prefix_weight, losses, grad_input,
-             n_rows, n_predict, A, B, C, grad_s, grad_scale)
+        prefix_targets = prefix_targets.contiguous()
+        ce_fwd_bwd(logits, targets, mtp_weights, prefix_targets, losses, grad_input,
+             n_rows, n_predict, A, B, C, grad_s, grad_scale, float(prefix_weight))
 
-        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, grad_input)
-        ctx.params = (A, B, C, x_s, w_s, grad_s)
+        # The backward's mat2 needs w_f8.T column-major, so it takes the ROW-major cache.
+        ctx.save_for_backward(x_f8, w_f8_row, grad_input)
+        ctx.params = (x_s, w_s, grad_s)
         return losses
 
     @staticmethod
     def backward(ctx, grad_output):
-        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, grad_input = ctx.saved_tensors
-        A, B, C, x_s, w_s, grad_s = ctx.params
-        n_rows, n_cols = logits.shape
-        n_predict = mtp_weights.shape[0]
+        x_f8, w_f8, grad_input = ctx.saved_tensors
+        x_s, w_s, grad_s = ctx.params
+        grad_x, grad_w = _ce_backward_gemms(grad_input, w_f8, x_f8, x_s, w_s, grad_s)
+        # One return slot per forward arg; grad_w lands on lm_head_weight (slot 4).
+        return grad_x, None, None, grad_w, None, None, None, None, None, None, None, None
 
-        grad_output = grad_output.contiguous()
+# SNS -- Shared-Negative Sampled softmax for the EARLY stages, where the full vocabulary's 2.5-5 GB of logit traffic per
+# step buys resolution not yet worth paying for.  Until the cutover the three GEMMs run at width P << 50304 against a
+# per-step SHARED candidate set C, with the CE CUDA kernel reused UNCHANGED at VOCAB_SIZE = P.
+_SNS_KERNELS: dict = {}   # P -> ce_fwd_bwd kernel compiled at VOCAB_SIZE = P
+_SNS_WC: dict = {}        # P -> fp8 (P, 768)  gathered lm_head rows, row-major
+_SNS_WCT: dict = {}       # P -> fp8 (768, P)  the same rows transposed (the backward's mat2)
+_SNS_POSD = None          # int32 [vocab]  C's device inverse, -1 off-set
+_SNS_ARD = None           # int32 [P_max]  0..P_max-1, the scatter payload
+# The per-step index buffers, in upload order, each with the row count a step slices out of it: C is the candidate class
+# ids (ascending), TPOS and PPOS the position IN C of each token's target and prefix target, -1 for an absent prefix.
+_SNS_BUFS = (("C", "P"), ("TPOS", "T"), ("PPOS", "T"))
+_SNS_IDX: dict = {}       # name -> its int64 device buffer, ONE identity for the process's life: dynamo never sees a new tensor
+# RACE CONTRACT: SampledSoftcappedCrossEntropy keeps no defensive copy of _SNS_WCT[P], legal only because exactly one
+# micro-batch runs per step, so its backward is enqueued before the next sns_gather().  The H2D half: sns_upload_async.
 
-        x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
-        w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)
-        grad_scale = grad_input.new_tensor(grad_s, dtype=torch.float32)
+def sns_init(device, p_values, vocab_size: int, max_rows: int, model_dim: int):
+    """One CE kernel per distinct candidate count P, plus every persistent SNS buffer. Called ONCE at module scope BEFORE torch.compile: nvrtc is untimed."""
+    global _SNS_POSD, _SNS_ARD
+    for p in p_values:
+        # The 8-wide smem / grad_input stores need P % (BLOCK_SIZE * 8) == 0; the weight pair is per P because a sliced (768, P) view is not _scaled_mm's mat2.
+        assert 0 < p <= vocab_size and p % (CE_KERNEL_BLOCK_SIZE * 8) == 0, f"X_SNS candidate count {p} is not a legal CE vocabulary"
+        _src = f"\nconstexpr int VOCAB_SIZE = {p};\nconstexpr int BLOCK_SIZE = {CE_KERNEL_BLOCK_SIZE};\n" + CE_KERNEL_SOURCE
+        _SNS_KERNELS[p] = torch.cuda._compile_kernel(_src, "ce_fwd_bwd_kernel", compute_capability="90",
+                                                     cuda_include_dirs=CUDA_INCLUDE_DIRS, nvcc_options=["-lineinfo", "--use_fast_math"])
+        _SNS_KERNELS[p].set_shared_memory_config(p * 2)
+        _SNS_WC[p], _SNS_WCT[p] = (torch.zeros(_s, dtype=torch.float8_e4m3fn, device=device) for _s in ((p, model_dim), (model_dim, p)))
+    for _nm, _k in _SNS_BUFS:   # PPOS starts at the kernel's no-op, so a step that skips its upload reads no prefix
+        _SNS_IDX[_nm] = torch.full(({"P": max(p_values), "T": max_rows}[_k],), -1 if _nm == "PPOS" else 0, dtype=torch.int64, device=device)
+    _SNS_POSD = torch.empty(vocab_size, dtype=torch.int32, device=device)   # C's inverse: rebuilt in sns_gather, never uploaded
+    _SNS_ARD = torch.arange(max(p_values), dtype=torch.int32, device=device)
 
-        grad_x = torch._scaled_mm(
-            grad_input,
-            w_f8.T,
-            out_dtype=torch.bfloat16,
-            scale_a=grad_scale,
-            scale_b=w_scale,
-            use_fast_accum=False,
-        )
+def sns_gather(w_f8_cm, sns_p: int):
+    """EAGER (never traced): refill _SNS_WC / _SNS_WCT from this step's candidate rows of the col-major lm_head fp8 cache, and rebuild C's device
+    inverse. The cache's strides are (1, 768), so its transpose IS the contiguous matrix the gather wants; the uint8 reinterpret moves identical bytes."""
+    cand, wc, wct = _SNS_IDX["C"][:sns_p], _SNS_WC[sns_p], _SNS_WCT[sns_p]
+    torch.index_select(w_f8_cm.T.view(torch.uint8), 0, cand, out=wc.view(torch.uint8))
+    transpose_copy(wc.view(torch.uint8), wct.view(torch.uint8))
+    _SNS_POSD.fill_(-1)
+    _SNS_POSD.index_copy_(0, cand, _SNS_ARD[:sns_p])
 
-        x_f8_T = torch.empty((x_f8.shape[1], x_f8.shape[0]), dtype=x_f8.dtype, device=x_f8.device)
-        transpose_copy(x_f8, x_f8_T)  # (768, n_rows) row-major
 
-        grad_input_T = torch.empty((n_cols, n_rows), dtype=grad_input.dtype, device=grad_input.device)
-        transpose_copy(grad_input, grad_input_T)  # (50304, n_rows) row-major
-
-        grad_w = torch._scaled_mm(
-            x_f8_T,            # (768, n_rows) row-major
-            grad_input_T.T,    # (n_rows, 50304) column-major view
-            out_dtype=torch.float32,
-            scale_a=x_scale,
-            scale_b=grad_scale,
-            use_fast_accum=False,
-        )
-
-        return grad_x, None, None, None, None, grad_w, None, None, None
-
-# -----------------------------------------------------------------------------
-# FP8 MLP kernels and quantization helpers
-
-@triton.jit
-def _fp8_relu_square_forward_kernel(
-    a_desc, b_desc, post_desc, post_t_desc,
-    dequant_scale_ptr, post_scale_ptr, partial_amax_ptr,
-    M, N, K,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-):
-    start_pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    num_tiles = num_pid_m * num_pid_n
-    local_amax = 0.0
-
-    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
-        pid_m = tile_id // num_pid_n
-        pid_n = tile_id % num_pid_n
-        offs_m = pid_m * BLOCK_M
-        offs_n = pid_n * BLOCK_N
-        acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
-        for ki in range(tl.cdiv(K, BLOCK_K)):
-            offs_k = ki * BLOCK_K
-            a = a_desc.load([offs_m, offs_k])
-            b = b_desc.load([offs_n, offs_k])
-            acc = tl.dot(a, b.T, acc)
-        acc *= tl.load(dequant_scale_ptr)
-
-        acc = tl.reshape(acc, (BLOCK_M, 2, BLOCK_N // 2))
-        acc = tl.permute(acc, (0, 2, 1))
-        acc0, acc1 = tl.split(acc)
-        post_scale = tl.load(post_scale_ptr)
-
-        pre0 = acc0.to(tl.bfloat16)
-        post0 = tl.maximum(pre0, 0.0)
-        post0 *= post0
-        post0_f32 = post0.to(tl.float32)
-        q0 = (post0_f32 / post_scale).to(tl.float8e4nv)
-        post_desc.store([offs_m, offs_n], q0)
-        post_t_desc.store([offs_n, offs_m], tl.trans(q0))
-        local_amax = tl.maximum(local_amax, tl.max(tl.max(post0_f32, axis=1), axis=0))
-
-        pre1 = acc1.to(tl.bfloat16)
-        post1 = tl.maximum(pre1, 0.0)
-        post1 *= post1
-        post1_f32 = post1.to(tl.float32)
-        q1 = (post1_f32 / post_scale).to(tl.float8e4nv)
-        n1 = offs_n + BLOCK_N // 2
-        post_desc.store([offs_m, n1], q1)
-        post_t_desc.store([n1, offs_m], tl.trans(q1))
-        local_amax = tl.maximum(local_amax, tl.max(tl.max(post1_f32, axis=1), axis=0))
-
-    tl.store(partial_amax_ptr + start_pid, local_amax)
-
+# ---- fused SNS grad_w densify -----------------------------------------------
+# The SNS backward's wgrad is a dense (768, P) slab of candidate POSITIONS; the optimizer wants a contiguous
+# (768, vocab) grad with non-candidate columns zeroed.  Rather than `zeros(); index_copy_(1, cand, ...)` -- a
+# 77 MB zero pass plus dim-1 SCATTERED 2-byte stores -- this kernel writes DENSELY and gathers:
+# out[r, c] = src[r, pos[c]] or 0.  No arithmetic touches the payload, so stored bits are loaded bits: BIT-EXACT.
 
 @triton.jit
-def _fp8_relu_square_backward_kernel(
-    a_desc, b_desc, post_desc, dpre_desc, dpre_t_desc,
-    dequant_scale_ptr, dpre_scale_ptr, post_scale_ptr, partial_amax_ptr,
-    M, N, K,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-):
-    start_pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    num_tiles = num_pid_m * num_pid_n
-    local_amax = 0.0
+def _sns_densify_kernel(SRC, POS, DST, R, V, src_stride_r, dst_stride_r,
+                        BLOCK_R: tl.constexpr, BLOCK_V: tl.constexpr):
+    offs_v = tl.program_id(0) * BLOCK_V + tl.arange(0, BLOCK_V)
+    offs_r = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)
+    m_v, m_r = offs_v < V, offs_r < R
+    pos = tl.load(POS + offs_v, mask=m_v, other=-1)
+    keep = pos >= 0
+    p = tl.where(keep, pos, 0).to(tl.int64)          # in-range dummy for the masked lanes
+    # C is ascending, so a vocab tile's kept positions are CONSECUTIVE: one short contiguous run per src row.
+    src = tl.load(SRC + offs_r[:, None].to(tl.int64) * src_stride_r + p[None, :],
+                  mask=m_r[:, None] & keep[None, :], other=0.0)
+    tl.store(DST + offs_r[:, None].to(tl.int64) * dst_stride_r + offs_v[None, :].to(tl.int64),
+             src, mask=m_r[:, None] & m_v[None, :])
 
-    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
-        pid_m = tile_id // num_pid_n
-        pid_n = tile_id % num_pid_n
-        offs_m = pid_m * BLOCK_M
-        offs_n = pid_n * BLOCK_N
-        acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
-        for ki in range(tl.cdiv(K, BLOCK_K)):
-            offs_k = ki * BLOCK_K
-            a = a_desc.load([offs_m, offs_k])
-            b = b_desc.load([offs_n, offs_k])
-            acc = tl.dot(a, b.T, acc)
-        acc *= tl.load(dequant_scale_ptr)
+@torch.library.custom_op("nanogpt::sns_densify", mutates_args={"dst"})
+def sns_densify(src: torch.Tensor, pos: torch.Tensor, dst: torch.Tensor) -> None:
+    _sns_densify_kernel[(triton.cdiv(dst.shape[1], 256), triton.cdiv(dst.shape[0], 32))](
+        src, pos, dst, *dst.shape, src.stride(0), dst.stride(0), BLOCK_R=32, BLOCK_V=256, num_warps=4, num_stages=3)
 
-        acc = tl.reshape(acc, (BLOCK_M, 2, BLOCK_N // 2))
-        acc = tl.permute(acc, (0, 2, 1))
-        acc0, acc1 = tl.split(acc)
-        dpre_scale = tl.load(dpre_scale_ptr)
+@torch.library.custom_op("nanogpt::sns_ce_fwd_bwd", mutates_args={"losses", "grad_input"})
+def sns_ce_fwd_bwd(logits: torch.Tensor, targets: torch.Tensor, mtp_weights: torch.Tensor, prefix_targets: torch.Tensor,
+                   losses: torch.Tensor, grad_input: torch.Tensor, n_rows: int, n_predict: int, A: float, B: float,
+                   C: float, grad_s: float, grad_scale: float, prefix_weight: float, sns_p: int) -> None:
+    if _PTP_W_RUNTIME is not None and prefix_weight > 0.0:
+        prefix_weight = _PTP_W_RUNTIME
+    _SNS_KERNELS[sns_p]((n_rows, 1, 1), (CE_KERNEL_BLOCK_SIZE, 1, 1), (logits, targets, mtp_weights, prefix_targets, losses,
+                        grad_input, n_rows, n_predict, A, B, C, grad_s, grad_scale, prefix_weight), shared_mem=sns_p * 2)
 
-        post0 = post_desc.load([offs_m, offs_n]).to(tl.float32) * tl.load(post_scale_ptr)
-        dpre0 = 2.0 * acc0.to(tl.bfloat16) * tl.sqrt(post0).to(tl.bfloat16)
-        dpre0_f32 = dpre0.to(tl.float32)
-        q0 = (dpre0_f32 / dpre_scale).to(tl.float8e4nv)
-        dpre_desc.store([offs_m, offs_n], q0)
-        dpre_t_desc.store([offs_n, offs_m], tl.trans(q0))
-        local_amax = tl.maximum(local_amax, tl.max(tl.max(tl.abs(dpre0_f32), axis=1), axis=0))
-
-        n1 = offs_n + BLOCK_N // 2
-        post1 = post_desc.load([offs_m, n1]).to(tl.float32) * tl.load(post_scale_ptr)
-        dpre1 = 2.0 * acc1.to(tl.bfloat16) * tl.sqrt(post1).to(tl.bfloat16)
-        dpre1_f32 = dpre1.to(tl.float32)
-        q1 = (dpre1_f32 / dpre_scale).to(tl.float8e4nv)
-        dpre_desc.store([offs_m, n1], q1)
-        dpre_t_desc.store([n1, offs_m], tl.trans(q1))
-        local_amax = tl.maximum(local_amax, tl.max(tl.max(tl.abs(dpre1_f32), axis=1), axis=0))
-
-    tl.store(partial_amax_ptr + start_pid, local_amax)
-
-
-@triton.jit
-def _quantize_dual_layout_kernel(
-    src, row, transposed, scale_ptr, partial_amax_ptr,
-    M, N,
-    src_stride_m, src_stride_n,
-    NUM_PID_N: tl.constexpr,
-    EMIT_AMAX: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    x = tl.load(
-        src + offs_m[:, None] * src_stride_m + offs_n[None, :] * src_stride_n,
-        mask=mask,
-        other=0.0,
-    )
-    scaled = x.to(tl.float32) / tl.load(scale_ptr)
-    # E4M3FN overflow becomes NaN rather than infinity. Delayed scales can miss
-    # a transient range spike, so saturate explicitly instead of poisoning all
-    # downstream GEMMs from a single outlier.
-    q = tl.maximum(tl.minimum(scaled, 448.0), -448.0).to(tl.float8e4nv)
-    tl.store(row + offs_m[:, None] * N + offs_n[None, :], q, mask=mask)
-    transposed_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)
-    tl.store(
-        transposed + offs_n[:, None] * M + offs_m[None, :],
-        tl.trans(q),
-        mask=transposed_mask,
-    )
-    if EMIT_AMAX:
-        tile_amax = tl.max(tl.max(tl.abs(x.to(tl.float32)), axis=1), axis=0)
-        tl.store(partial_amax_ptr + pid_m * NUM_PID_N + pid_n, tile_amax)
-
-
-@triton.jit
-def _quantize_dual_layout_batched_kernel(
-    src, row, transposed, scale_ptr,
-    M, N,
-    src_stride_b, src_stride_m, src_stride_n,
-    row_stride_b, transposed_stride_b,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    batch = tl.program_id(2)
-    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    x = tl.load(
-        src + batch * src_stride_b + offs_m[:, None] * src_stride_m + offs_n[None, :] * src_stride_n,
-        mask=mask,
-        other=0.0,
-    )
-    q = (x.to(tl.float32) / tl.load(scale_ptr + batch)).to(tl.float8e4nv)
-    tl.store(
-        row + batch * row_stride_b + offs_m[:, None] * N + offs_n[None, :],
-        q,
-        mask=mask,
-    )
-    transposed_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)
-    tl.store(
-        transposed + batch * transposed_stride_b + offs_n[:, None] * M + offs_m[None, :],
-        tl.trans(q),
-        mask=transposed_mask,
-    )
-
-
-@triton.jit
-def _batched_matrix_amax_partial_kernel(
-    src, partial_amax,
-    MATRIX_ELEMENTS: tl.constexpr,
-    SRC_STRIDE_B: tl.constexpr,
-    NUM_PARTS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Read each matrix once and emit a small set of exact amax partials."""
-    batch = tl.program_id(0)
-    part = tl.program_id(1)
-    offsets = tl.arange(0, BLOCK_SIZE)
-    local_amax = tl.zeros((BLOCK_SIZE,), tl.float32)
-    for start in tl.range(
-        part * BLOCK_SIZE, MATRIX_ELEMENTS, NUM_PARTS * BLOCK_SIZE,
-    ):
-        indices = start + offsets
-        values = tl.load(
-            src + batch * SRC_STRIDE_B + indices,
-            mask=indices < MATRIX_ELEMENTS,
-            other=0.0,
-        ).to(tl.float32)
-        local_amax = tl.maximum(local_amax, tl.abs(values))
-    tl.store(
-        partial_amax + batch * NUM_PARTS + part,
-        tl.max(local_amax, axis=0),
-    )
-
-
-@triton.jit
-def _packed_batched_matrix_amax_partial_kernel(
-    first, second, partial_amax,
-    FIRST_ELEMENTS: tl.constexpr,
-    SECOND_ELEMENTS: tl.constexpr,
-    FIRST_STRIDE_B: tl.constexpr,
-    SECOND_STRIDE_B: tl.constexpr,
-    NUM_PARTS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Amax over a logical row-pack without materializing the concatenation."""
-    batch = tl.program_id(0)
-    part = tl.program_id(1)
-    total_elements = FIRST_ELEMENTS + SECOND_ELEMENTS
-    offsets = tl.arange(0, BLOCK_SIZE)
-    local_amax = tl.zeros((BLOCK_SIZE,), tl.float32)
-    for start in tl.range(
-        part * BLOCK_SIZE, total_elements, NUM_PARTS * BLOCK_SIZE,
-    ):
-        indices = start + offsets
-        valid = indices < total_elements
-        in_first = indices < FIRST_ELEMENTS
-        first_values = tl.load(
-            first + batch * FIRST_STRIDE_B + indices,
-            mask=valid & in_first,
-            other=0.0,
-        )
-        second_indices = tl.maximum(indices - FIRST_ELEMENTS, 0)
-        second_values = tl.load(
-            second + batch * SECOND_STRIDE_B + second_indices,
-            mask=valid & ~in_first,
-            other=0.0,
-        )
-        values = first_values.to(tl.float32) + second_values.to(tl.float32)
-        local_amax = tl.maximum(local_amax, tl.abs(values))
-    tl.store(
-        partial_amax + batch * NUM_PARTS + part,
-        tl.max(local_amax, axis=0),
-    )
-
-
-@triton.jit
-def _reduce_mlp_weight_scales_kernel(
-    partial_amax, up_scales, down_scales,
-    NUM_PARTS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    layer = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < NUM_PARTS
-    up = tl.load(
-        partial_amax + (2 * layer) * NUM_PARTS + offsets,
-        mask=mask, other=0.0,
-    )
-    down = tl.load(
-        partial_amax + (2 * layer + 1) * NUM_PARTS + offsets,
-        mask=mask, other=0.0,
-    )
-    tl.store(
-        up_scales + layer,
-        tl.maximum(tl.max(up, axis=0), 1.0e-12) / 448.0,
-    )
-    tl.store(
-        down_scales + layer,
-        tl.maximum(tl.max(down, axis=0), 1.0e-12) / 448.0,
-    )
-
-
-@triton.jit
-def _quantize_dual_layout_packed_batched_kernel(
-    first, second, row, transposed, scale_ptr,
-    M, N,
-    FIRST_ROWS: tl.constexpr,
-    FIRST_STRIDE_B: tl.constexpr,
-    SECOND_STRIDE_B: tl.constexpr,
-    ROW_STRIDE_B: tl.constexpr,
-    TRANSPOSED_STRIDE_B: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    """Quantize a logical row-pack directly from its two source allocations."""
-    batch = tl.program_id(2)
-    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
-    valid = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    in_first = offs_m[:, None] < FIRST_ROWS
-    first_offsets = offs_m[:, None] * N + offs_n[None, :]
-    second_rows = tl.maximum(offs_m - FIRST_ROWS, 0)
-    second_offsets = second_rows[:, None] * N + offs_n[None, :]
-    source_ptrs = tl.where(
-        in_first,
-        first + batch * FIRST_STRIDE_B + first_offsets,
-        second + batch * SECOND_STRIDE_B + second_offsets,
-    )
-    values = tl.load(
-        source_ptrs,
-        mask=valid,
-        other=0.0,
-    ).to(tl.float32)
-    scaled = values / tl.load(scale_ptr + batch)
-    quantized = tl.maximum(tl.minimum(scaled, 448.0), -448.0).to(tl.float8e4nv)
-    tl.store(
-        row + batch * ROW_STRIDE_B + offs_m[:, None] * N + offs_n[None, :],
-        quantized,
-        mask=valid,
-    )
-    transposed_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)
-    tl.store(
-        transposed + batch * TRANSPOSED_STRIDE_B
-        + offs_n[:, None] * M + offs_m[None, :],
-        tl.trans(quantized),
-        mask=transposed_mask,
-    )
-
-
-def quantize_dual_layout(
-    src: torch.Tensor,
-    scale: torch.Tensor,
-    partial_amax: torch.Tensor | None = None,
-    row: torch.Tensor | None = None,
-    transposed: torch.Tensor | None = None,
-):
-    M, N = src.shape
-    if row is None:
-        assert transposed is None
-        row = torch.empty((M, N), device=src.device, dtype=torch.float8_e4m3fn)
-        transposed = torch.empty((N, M), device=src.device, dtype=torch.float8_e4m3fn)
-    else:
-        assert row.shape == (M, N) and row.dtype == torch.float8_e4m3fn
-        assert transposed is not None
-        assert transposed.shape == (N, M) and transposed.dtype == torch.float8_e4m3fn
-    block_m, block_n = 64, 128
-    num_pid_m, num_pid_n = triton.cdiv(M, block_m), triton.cdiv(N, block_n)
-    emit_amax = partial_amax is not None
-    if emit_amax:
-        assert src.is_contiguous() and partial_amax.numel() >= num_pid_m * num_pid_n
-    else:
-        partial_amax = _get_dummy_f32(src.device)
-    _quantize_dual_layout_kernel[(num_pid_m, num_pid_n)](
-        src, row, transposed, scale, partial_amax,
-        M, N, src.stride(0), src.stride(1),
-        NUM_PID_N=num_pid_n, EMIT_AMAX=emit_amax,
-        BLOCK_M=block_m, BLOCK_N=block_n,
-        num_stages=2, num_warps=8,
-    )
-    return row, transposed
-
-
-def quantize_dual_layout_batched(
-    src: torch.Tensor,
-    scales: torch.Tensor,
-    row: torch.Tensor | None = None,
-    transposed: torch.Tensor | None = None,
-):
-    B, M, N = src.shape
-    assert scales.shape == (B,)
-    if row is None:
-        row = torch.empty((B, M, N), device=src.device, dtype=torch.float8_e4m3fn)
-    else:
-        assert row.shape == (B, M, N) and row.dtype == torch.float8_e4m3fn
-    if transposed is None:
-        transposed = torch.empty((B, N, M), device=src.device, dtype=torch.float8_e4m3fn)
-    else:
-        assert transposed.shape == (B, N, M)
-        assert transposed.dtype == torch.float8_e4m3fn
-    assert row.is_contiguous() and transposed.is_contiguous()
-    block_m, block_n = 64, 128
-    grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n), B)
-    _quantize_dual_layout_batched_kernel[grid](
-        src, row, transposed, scales,
-        M, N,
-        src.stride(0), src.stride(1), src.stride(2),
-        row.stride(0), transposed.stride(0),
-        BLOCK_M=block_m, BLOCK_N=block_n,
-        num_stages=2, num_warps=8,
-    )
-    return row, transposed
-
-
-def update_mlp_weight_scales(weights, partial_amax, up_scales, down_scales):
-    """Compute exact per-projection scales without a full-size `abs` temporary."""
-    B, projections, M, N = weights.shape
-    assert projections == 2 and weights.is_contiguous()
-    num_parts = partial_amax.shape[-1]
-    assert partial_amax.shape == (B, projections, num_parts)
-    assert up_scales.shape == down_scales.shape == (B,)
-    flat = weights.view(B * projections, M, N)
-    block_size = 2048
-    _batched_matrix_amax_partial_kernel[(B * projections, num_parts)](
-        flat, partial_amax,
-        MATRIX_ELEMENTS=M * N,
-        SRC_STRIDE_B=flat.stride(0),
-        NUM_PARTS=num_parts,
-        BLOCK_SIZE=block_size,
-        num_stages=1,
-        num_warps=8,
-    )
-    _reduce_mlp_weight_scales_kernel[(B,)](
-        partial_amax, up_scales, down_scales,
-        NUM_PARTS=num_parts,
-        BLOCK_SIZE=triton.next_power_of_2(num_parts),
-        num_stages=1,
-        num_warps=4,
-    )
-
-
-def quantize_dual_layout_packed_batched(
-    first, second, scales, partial_amax, row, transposed,
-):
-    """Exact-scale dual-layout quantization of a logical row concatenation."""
-    B, first_rows, N = first.shape
-    B2, second_rows, N2 = second.shape
-    assert (B2, N2) == (B, N)
-    assert first.device == second.device and first.dtype == second.dtype
-    assert first.stride(1) == second.stride(1) == N
-    assert first.stride(2) == second.stride(2) == 1
-    total_rows = first_rows + second_rows
-    assert scales.shape == (B,)
-    num_parts = partial_amax.shape[-1]
-    assert partial_amax.shape == (B, num_parts)
-    assert row.shape == (B, total_rows, N) and row.dtype == torch.float8_e4m3fn
-    assert transposed.shape == (B, N, total_rows)
-    assert transposed.dtype == torch.float8_e4m3fn
-    assert row.is_contiguous() and transposed.is_contiguous()
-
-    block_size = 2048
-    _packed_batched_matrix_amax_partial_kernel[(B, num_parts)](
-        first, second, partial_amax,
-        FIRST_ELEMENTS=first_rows * N,
-        SECOND_ELEMENTS=second_rows * N,
-        FIRST_STRIDE_B=first.stride(0),
-        SECOND_STRIDE_B=second.stride(0),
-        NUM_PARTS=num_parts,
-        BLOCK_SIZE=block_size,
-        num_stages=1,
-        num_warps=8,
-    )
-    reduce_mlp_activation_scales(partial_amax, scales, headroom=1.0)
-
-    block_m, block_n = 64, 128
-    grid = (triton.cdiv(total_rows, block_m), triton.cdiv(N, block_n), B)
-    _quantize_dual_layout_packed_batched_kernel[grid](
-        first, second, row, transposed, scales,
-        total_rows, N,
-        FIRST_ROWS=first_rows,
-        FIRST_STRIDE_B=first.stride(0),
-        SECOND_STRIDE_B=second.stride(0),
-        ROW_STRIDE_B=row.stride(0),
-        TRANSPOSED_STRIDE_B=transposed.stride(0),
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        num_stages=2,
-        num_warps=8,
-    )
-    return row, transposed
-
-
-def fp8_relu_square_forward(
-    x_f8: torch.Tensor,
-    w_f8: torch.Tensor,
-    dequant_scale: torch.Tensor,
-    post_scale: torch.Tensor,
-    partial_amax: torch.Tensor | None = None,
-):
-    M, K = x_f8.shape
-    N, Kw = w_f8.shape
-    assert K == Kw
-    post = torch.empty((M, N), device=x_f8.device, dtype=torch.float8_e4m3fn)
-    post_t = torch.empty((N, M), device=x_f8.device, dtype=torch.float8_e4m3fn)
-    num_sms = torch.cuda.get_device_properties(x_f8.device).multi_processor_count
-    if partial_amax is None:
-        partial_amax = torch.empty(num_sms, device=x_f8.device, dtype=torch.float32)
-    block_m, block_n, block_k = 128, 256, 128
-    grid = (min(num_sms, triton.cdiv(M, block_m) * triton.cdiv(N, block_n)),)
-    _fp8_relu_square_forward_kernel[grid](
-        TensorDescriptor.from_tensor(x_f8, [block_m, block_k]),
-        TensorDescriptor.from_tensor(w_f8, [block_n, block_k]),
-        TensorDescriptor.from_tensor(post, [block_m, block_n // 2]),
-        TensorDescriptor.from_tensor(post_t, [block_n // 2, block_m]),
-        dequant_scale, post_scale, partial_amax,
-        M, N, K,
-        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, NUM_SMS=num_sms,
-        num_stages=3, num_warps=8,
-    )
-    return post, post_t, partial_amax
-
-
-def fp8_relu_square_backward(
-    grad_f8: torch.Tensor,
-    w_f8: torch.Tensor,
-    dequant_scale: torch.Tensor,
-    post: torch.Tensor,
-    dpre_scale: torch.Tensor,
-    post_scale: torch.Tensor,
-    partial_amax: torch.Tensor | None = None,
-):
-    M, K = grad_f8.shape
-    N, Kw = w_f8.shape
-    assert K == Kw and post.shape == (M, N)
-    dpre = torch.empty((M, N), device=grad_f8.device, dtype=torch.float8_e4m3fn)
-    dpre_t = torch.empty((N, M), device=grad_f8.device, dtype=torch.float8_e4m3fn)
-    num_sms = torch.cuda.get_device_properties(grad_f8.device).multi_processor_count
-    if partial_amax is None:
-        partial_amax = torch.empty(num_sms, device=grad_f8.device, dtype=torch.float32)
-    block_m, block_n, block_k = 128, 256, 128
-    grid = (min(num_sms, triton.cdiv(M, block_m) * triton.cdiv(N, block_n)),)
-    _fp8_relu_square_backward_kernel[grid](
-        TensorDescriptor.from_tensor(grad_f8, [block_m, block_k]),
-        TensorDescriptor.from_tensor(w_f8, [block_n, block_k]),
-        TensorDescriptor.from_tensor(post, [block_m, block_n // 2]),
-        TensorDescriptor.from_tensor(dpre, [block_m, block_n // 2]),
-        TensorDescriptor.from_tensor(dpre_t, [block_n // 2, block_m]),
-        dequant_scale, dpre_scale, post_scale, partial_amax,
-        M, N, K,
-        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, NUM_SMS=num_sms,
-        num_stages=3, num_warps=8,
-    )
-    return dpre, dpre_t, partial_amax
-
-
-def _scaled_mm(a, b, a_scale, b_scale, *, fast_accum=False):
-    return torch._scaled_mm(
-        a,
-        b,
-        out_dtype=torch.bfloat16,
-        scale_a=a_scale,
-        scale_b=b_scale,
-        use_fast_accum=fast_accum,
-    )
-
-
-class FusedFP8MLPFunction(torch.autograd.Function):
+class SampledSoftcappedCrossEntropy(torch.autograd.Function):
+    """Sampled-candidate variant of FusedSoftcappedCrossEntropy: the same arguments plus a trailing `sns_p`, this stage's padded candidate
+    count (a python int, so a traced constant). The three GEMMs run at width P against the row-gather sns_gather leaves in _SNS_WC/_SNS_WCT.
+    `targets` / `prefix_targets` are taken for signature parity and shape checking only; the kernel is fed the host-built POSITION vectors."""
     @staticmethod
-    def forward(
-        ctx,
-        x,
-        W1,
-        W2,
-        W1_f8,
-        W1_f8_t,
-        W2_f8,
-        W2_f8_t,
-        W1_scale,
-        W2_scale,
-        x_scale,
-        post_scale,
-        dpre_scale,
-        post_partial_amax,
-        dpre_partial_amax,
-        x_f8,
-        x_f8_t,
-    ):
-        x_flat = x.view((-1, x.shape[-1]))
-        post_f8, post_f8_t, _ = fp8_relu_square_forward(
-            x_f8.view_as(x_flat),
-            W1_f8,
-            x_scale * W1_scale,
-            post_scale,
-            post_partial_amax,
-        )
-        out = _scaled_mm(post_f8, W2_f8_t.T, post_scale, W2_scale, fast_accum=True)
-        ctx.save_for_backward(
-            W1_f8_t,
-            W2_f8,
-            post_f8,
-            post_f8_t,
-            x_f8_t,
-            W1_scale,
-            W2_scale,
-            x_scale,
-            post_scale,
-            dpre_scale,
-            dpre_partial_amax,
-        )
-        ctx.input_shape = x.shape
-        return out.view(x.shape)
+    def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, grad_scale, w_f8_cm, prefix_targets, prefix_weight, sns_p):
+        A, B, C = 23.0, 5.0, 7.5      # softcap, as in FusedSoftcappedCrossEntropy.forward
+        n_rows = x.shape[0]
+        assert targets.shape[0] == n_rows and prefix_targets.shape[0] == n_rows
+        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+        logits = _ce_logit_gemm(x, x_f8, _SNS_WC[sns_p].T, x_s, w_s)   # .T is column-major
+        losses = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+        grad_input = torch.empty((n_rows, sns_p), dtype=torch.float8_e5m2, device=logits.device)
+        sns_ce_fwd_bwd(logits.contiguous(), _SNS_IDX["TPOS"][:n_rows], mtp_weights.contiguous(), _SNS_IDX["PPOS"][:n_rows], losses,
+                       grad_input, n_rows, mtp_weights.shape[0], A, B, C, grad_s, grad_scale, float(prefix_weight), sns_p)
+        ctx.save_for_backward(x_f8, _SNS_WCT[sns_p], grad_input)
+        ctx.params = (x_s, w_s, grad_s)
+        return losses
 
     @staticmethod
     def backward(ctx, grad_output):
-        (
-            W1_f8_t,
-            W2_f8,
-            post_f8,
-            post_f8_t,
-            x_f8_t,
-            W1_scale,
-            W2_scale,
-            x_scale,
-            post_scale,
-            dpre_scale,
-            dpre_partial_amax,
-        ) = ctx.saved_tensors
-        grad = grad_output.view((-1, grad_output.shape[-1])).contiguous()
-        # Output gradients are substantially more volatile than RMS-normalized
-        # MLP inputs, so keep their scale exact-current rather than clipping to a
-        # one-step-lagged range.
-        grad_scale = (grad.detach().abs().amax().float().clamp_min(1e-12) / 448.0).view(1)
-        grad_f8, grad_f8_t = quantize_dual_layout(grad, grad_scale)
-        dW2 = _scaled_mm(
-            post_f8_t, grad_f8_t.T, post_scale, grad_scale,
-            fast_accum=False,
-        )
-        dpre_f8, dpre_f8_t, _ = fp8_relu_square_backward(
-            grad_f8,
-            W2_f8,
-            grad_scale * W2_scale,
-            post_f8,
-            dpre_scale,
-            post_scale,
-            dpre_partial_amax,
-        )
-        dW1 = _scaled_mm(
-            dpre_f8_t, x_f8_t.T, dpre_scale, x_scale,
-            fast_accum=False,
-        )
-        dx = _scaled_mm(
-            dpre_f8, W1_f8_t.T, dpre_scale, W1_scale,
-            fast_accum=False,
-        )
-        return (
-            dx.view(ctx.input_shape),
-            dW1,
-            dW2,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-
-# -----------------------------------------------------------------------------
-# Reduced-dimensional QK and packed QKV kernels
-
-@triton.jit
-def _qk_norm_rope_pad_forward_kernel(
-    qk, factor1, factor2, out_q, out_k,
-    tokens: tl.constexpr,
-    rows: tl.constexpr,
-    num_heads: tl.constexpr,
-    heads2: tl.constexpr,
-    qk_dim: tl.constexpr,
-    rotary_dim: tl.constexpr,
-    padded_dim: tl.constexpr,
-    stride_qkt: tl.constexpr,
-    stride_qkh: tl.constexpr,
-    factor_stride_t: tl.constexpr,
-    stride_out_t: tl.constexpr,
-    PAIRED: tl.constexpr,
-    KEY_OFFSET: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, BLOCK_D)
-    mask = (offs_m[:, None] < rows) & (offs_d[None, :] < qk_dim)
-
-    token = offs_m // heads2
-    input_head = offs_m % heads2
-    x_ptrs = (
-        qk + token[:, None] * stride_qkt + input_head[:, None] * stride_qkh
-        + offs_d[None, :]
-    )
-    x = tl.load(
-        x_ptrs,
-        mask=mask, other=0.0,
-    )
-    # RoPE swaps adjacent lanes.  The full Q/K tile is already resident, so
-    # form the swapped view in registers instead of reading it from HBM again.
-    x_flip = tl.reshape(
-        tl.flip(tl.reshape(x, (BLOCK_M, BLOCK_D // 2, 2)), dim=2),
-        (BLOCK_M, BLOCK_D),
-    )
-    x = x.to(tl.float32)
-    x_flip = x_flip.to(tl.float32)
-    rstd = tl.rsqrt(
-        tl.sum(x * x, axis=1) / qk_dim + 1.1920928955078125e-7
-    )
-    if PAIRED:
-        logical_head = input_head % num_heads
-        head_parity = logical_head % 2
-        output_token = 2 * token + logical_head // (num_heads // 2)
-        output_head = logical_head % (num_heads // 2)
-        factor_offset = head_parity * qk_dim
-    else:
-        logical_head = input_head % num_heads
-        output_token = token
-        output_head = logical_head
-        factor_offset = 0
-    f1 = tl.load(
-        factor1 + token[:, None] * factor_stride_t + factor_offset[:, None] + offs_d[None, :]
-        if PAIRED else factor1 + token[:, None] * factor_stride_t + offs_d[None, :],
-        mask=mask, other=0.0,
-    ).to(tl.float32)
-    f2 = tl.load(
-        factor2 + token[:, None] * factor_stride_t + factor_offset[:, None] + offs_d[None, :]
-        if PAIRED else factor2 + token[:, None] * factor_stride_t + offs_d[None, :],
-        mask=mask, other=0.0,
-    ).to(tl.float32)
-    normalized = x * rstd[:, None]
-    normalized_flip = x_flip * rstd[:, None]
-    y = f1 * normalized + f2 * normalized_flip
-
-    if KEY_OFFSET:
-        shift_row = (input_head >= num_heads) & (token > 0)
-        previous_token = tl.maximum(token - 1, 0)
-        x_previous = tl.load(
-            qk + previous_token[:, None] * stride_qkt + input_head[:, None] * stride_qkh
-            + offs_d[None, :],
-            mask=mask & shift_row[:, None], other=0.0,
-        ).to(tl.float32)
-        previous_rstd = tl.rsqrt(
-            tl.sum(x_previous * x_previous, axis=1) / qk_dim
-            + 1.1920928955078125e-7
-        )
-        shift = shift_row[:, None] & (offs_d[None, :] >= rotary_dim)
-        y = tl.where(shift, x_previous * previous_rstd[:, None], y)
-
-    output_ptrs = (
-        output_token[:, None] * stride_out_t
-        + output_head[:, None] * padded_dim + offs_d[None, :]
-    )
-    tl.store(
-        out_q + output_ptrs,
-        y,
-        mask=mask & (input_head[:, None] < num_heads),
-    )
-    tl.store(
-        out_k + output_ptrs,
-        y,
-        mask=mask & (input_head[:, None] >= num_heads),
-    )
-    padding = padded_dim - qk_dim
-    padding_ptrs = output_ptrs + qk_dim
-    padding_mask = (offs_m[:, None] < rows) & (offs_d[None, :] < padding)
-    tl.store(
-        out_q + padding_ptrs, 0.0,
-        mask=padding_mask & (input_head[:, None] < num_heads),
-    )
-    tl.store(
-        out_k + padding_ptrs, 0.0,
-        mask=padding_mask & (input_head[:, None] >= num_heads),
-    )
-
-
-@triton.jit
-def _qk_norm_rope_pad_backward_kernel(
-    grad_q, grad_k, qk, factor1, factor2, grad_qk,
-    tokens: tl.constexpr,
-    rows: tl.constexpr,
-    num_heads: tl.constexpr,
-    heads2: tl.constexpr,
-    qk_dim: tl.constexpr,
-    rotary_dim: tl.constexpr,
-    padded_dim: tl.constexpr,
-    stride_qkt: tl.constexpr,
-    stride_qkh: tl.constexpr,
-    factor_stride_t: tl.constexpr,
-    stride_grad_t: tl.constexpr,
-    PAIRED: tl.constexpr,
-    KEY_OFFSET: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, BLOCK_D)
-    mask = (offs_m[:, None] < rows) & (offs_d[None, :] < qk_dim)
-    offs_flip = offs_d ^ 1
-
-    token = offs_m // heads2
-    input_head = offs_m % heads2
-    if PAIRED:
-        logical_head = input_head % num_heads
-        head_parity = logical_head % 2
-        output_token = 2 * token + logical_head // (num_heads // 2)
-        output_head = logical_head % (num_heads // 2)
-        factor_offset = head_parity * qk_dim
-    else:
-        logical_head = input_head % num_heads
-        output_token = token
-        output_head = logical_head
-        factor_offset = 0
-
-    output_ptrs = (
-        output_token[:, None] * stride_grad_t
-        + output_head[:, None] * padded_dim + offs_d[None, :]
-    )
-    is_query = input_head[:, None] < num_heads
-
-    x = tl.load(
-        qk + token[:, None] * stride_qkt + input_head[:, None] * stride_qkh
-        + offs_d[None, :],
-        mask=mask, other=0.0,
-    ).to(tl.float32)
-    grad = tl.where(
-        is_query,
-        tl.load(grad_q + output_ptrs, mask=mask & is_query, other=0.0),
-        tl.load(grad_k + output_ptrs, mask=mask & ~is_query, other=0.0),
-    )
-    grad_flip = tl.reshape(
-        tl.flip(tl.reshape(grad, (BLOCK_M, BLOCK_D // 2, 2)), dim=2),
-        (BLOCK_M, BLOCK_D),
-    )
-    grad = grad.to(tl.float32)
-    grad_flip = grad_flip.to(tl.float32)
-    f1 = tl.load(
-        factor1 + token[:, None] * factor_stride_t + factor_offset[:, None] + offs_d[None, :]
-        if PAIRED else factor1 + token[:, None] * factor_stride_t + offs_d[None, :],
-        mask=mask, other=0.0,
-    ).to(tl.float32)
-    f2_flip = tl.load(
-        factor2 + token[:, None] * factor_stride_t + factor_offset[:, None] + offs_flip[None, :]
-        if PAIRED else factor2 + token[:, None] * factor_stride_t + offs_flip[None, :],
-        mask=mask, other=0.0,
-    ).to(tl.float32)
-
-    rstd = tl.rsqrt(
-        tl.sum(x * x, axis=1) / qk_dim + 1.1920928955078125e-7
-    )
-    normalized = x * rstd[:, None]
-    grad_normalized = f1 * grad + f2_flip * grad_flip
-    if KEY_OFFSET:
-        next_token = tl.minimum(token + 1, tokens - 1)
-        grad_next = tl.load(
-            grad_k + next_token[:, None] * stride_grad_t
-            + logical_head[:, None] * padded_dim + offs_d[None, :],
-            mask=mask & ~is_query & (token[:, None] < tokens - 1), other=0.0,
-        ).to(tl.float32)
-        stationary_grad = tl.where(
-            token[:, None] == 0, grad + grad_next, grad_next
-        )
-        stationary = (
-            (input_head[:, None] >= num_heads)
-            & (offs_d[None, :] >= rotary_dim)
-        )
-        grad_normalized = tl.where(stationary, stationary_grad, grad_normalized)
-    correction = tl.sum(grad_normalized * normalized, axis=1) / qk_dim
-    dx = rstd[:, None] * (
-        grad_normalized - normalized * correction[:, None]
-    )
-    tl.store(
-        grad_qk + offs_m[:, None] * qk_dim + offs_d[None, :],
-        dx,
-        mask=mask,
-    )
-
-
-def qk_norm_rope_pad_forward(
-    qk, factor1, factor2, num_heads, padded_dim,
-    paired=False, key_offset=False, block_m=None, num_warps=2,
-):
-    tokens, heads2, qk_dim = qk.shape
-    rotary_dim = qk_dim // 2
-    factor_dim = qk_dim * (2 if paired else 1)
-    assert heads2 == 2 * num_heads
-    assert factor1.shape == factor2.shape == (tokens, factor_dim)
-    assert not (paired and key_offset)
-    assert qk_dim <= padded_dim
-    # Shifted keys require an extra token-row load and favor smaller row tiles.
-    if block_m is None:
-        block_m = 4 if key_offset else 8
-    output_tokens = tokens * (2 if paired else 1)
-    output_heads = num_heads // 2 if paired else num_heads
-    # Keep Q and K in independent allocations. Returning views into one shared
-    # allocation makes functionalization clone both views before this mutating
-    # Triton call and copy them back afterwards to preserve alias semantics.
-    output_shape = (output_tokens, output_heads, padded_dim)
-    out_q = torch.empty(output_shape, device=qk.device, dtype=qk.dtype)
-    out_k = torch.empty(output_shape, device=qk.device, dtype=qk.dtype)
-    rows = tokens * heads2
-    block_d = triton.next_power_of_2(qk_dim)
-    _qk_norm_rope_pad_forward_kernel[(triton.cdiv(rows, block_m),)](
-        qk, factor1, factor2, out_q, out_k,
-        tokens=tokens, rows=rows, num_heads=num_heads, heads2=heads2,
-        qk_dim=qk_dim, rotary_dim=rotary_dim, padded_dim=padded_dim,
-        stride_qkt=qk.stride(0), stride_qkh=qk.stride(1),
-        factor_stride_t=factor1.stride(0), stride_out_t=out_q.stride(0),
-        PAIRED=paired, KEY_OFFSET=key_offset,
-        BLOCK_M=block_m, BLOCK_D=block_d, num_warps=num_warps,
-    )
-    return out_q, out_k
-
-
-def qk_norm_rope_pad_backward(
-    grad_q, grad_k, qk, factor1, factor2, num_heads, paired=False, key_offset=False,
-    block_m=8, num_warps=4,
-):
-    tokens, heads2, qk_dim = qk.shape
-    rotary_dim = qk_dim // 2
-    padded_dim = grad_q.shape[-1]
-    grad_qk = torch.empty_like(qk)
-    rows = tokens * heads2
-    block_d = triton.next_power_of_2(qk_dim)
-    _qk_norm_rope_pad_backward_kernel[(triton.cdiv(rows, block_m),)](
-        grad_q, grad_k, qk, factor1, factor2, grad_qk,
-        tokens=tokens, rows=rows, num_heads=num_heads, heads2=heads2,
-        qk_dim=qk_dim, rotary_dim=rotary_dim, padded_dim=padded_dim,
-        stride_qkt=qk.stride(0), stride_qkh=qk.stride(1),
-        factor_stride_t=factor1.stride(0), stride_grad_t=grad_q.stride(0),
-        PAIRED=paired, KEY_OFFSET=key_offset,
-        BLOCK_M=block_m, BLOCK_D=block_d, num_warps=num_warps,
-    )
-    return grad_qk
-
-
-class QKNormRoPEPadFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx, qk, factor1, factor2, num_heads, padded_dim, paired, key_offset,
-    ):
-        out_q, out_k = qk_norm_rope_pad_forward(
-            qk, factor1, factor2, num_heads, padded_dim, paired, key_offset,
-        )
-        ctx.save_for_backward(qk, factor1, factor2)
-        ctx.num_heads = num_heads
-        ctx.paired = paired
-        ctx.key_offset = key_offset
-        return out_q, out_k
-
-    @staticmethod
-    def backward(ctx, grad_q, grad_k):
-        qk, factor1, factor2 = ctx.saved_tensors
-        grad_qk = qk_norm_rope_pad_backward(
-            grad_q, grad_k, qk, factor1, factor2,
-            ctx.num_heads, ctx.paired, ctx.key_offset,
-        )
-        return grad_qk, None, None, None, None, None, None
-
-
-QKNormRoPEPad = QKNormRoPEPadFunction.apply
-
-
-@triton.jit
-def _qkv_norm_rope_pack_fp8_backward_kernel(
-    grad_q, grad_k, grad_v, qk, factor1, factor2,
-    grad_row, grad_transposed, grad_scale_ptr,
-    tokens: tl.constexpr,
-    num_heads: tl.constexpr,
-    qk_dim: tl.constexpr,
-    rotary_dim: tl.constexpr,
-    head_dim: tl.constexpr,
-    padded_dim: tl.constexpr,
-    qkv_dim: tl.constexpr,
-    stride_qkt: tl.constexpr,
-    stride_qkh: tl.constexpr,
-    factor_stride_t: tl.constexpr,
-    stride_grad_q_t: tl.constexpr,
-    stride_grad_q_h: tl.constexpr,
-    stride_grad_k_t: tl.constexpr,
-    stride_grad_k_h: tl.constexpr,
-    stride_grad_v_t: tl.constexpr,
-    stride_grad_v_h: tl.constexpr,
-    PAIRED: tl.constexpr,
-    KEY_OFFSET: tl.constexpr,
-    BLOCK_T: tl.constexpr,
-    BLOCK_QK: tl.constexpr,
-    BLOCK_V: tl.constexpr,
-):
-    token = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
-    logical_head = tl.program_id(1)
-    offs_d = tl.arange(0, BLOCK_QK)
-    token_mask = token < tokens
-    qk_mask = token_mask[:, None] & (offs_d[None, :] < qk_dim)
-    offs_flip = offs_d ^ 1
-
-    if PAIRED:
-        output_token = 2 * token + logical_head // (num_heads // 2)
-        output_head = logical_head % (num_heads // 2)
-        factor_offset = (logical_head % 2) * qk_dim
-    else:
-        output_token = token
-        output_head = logical_head
-        factor_offset = 0
-
-    factor_ptrs = (
-        token[:, None] * factor_stride_t + factor_offset + offs_d[None, :]
-        if PAIRED else token[:, None] * factor_stride_t + offs_d[None, :]
-    )
-    factor_flip_ptrs = (
-        token[:, None] * factor_stride_t + factor_offset + offs_flip[None, :]
-        if PAIRED else token[:, None] * factor_stride_t + offs_flip[None, :]
-    )
-    f1 = tl.load(factor1 + factor_ptrs, mask=qk_mask, other=0.0).to(tl.float32)
-    f2_flip = tl.load(
-        factor2 + factor_flip_ptrs, mask=qk_mask, other=0.0
-    ).to(tl.float32)
-    scale = tl.load(grad_scale_ptr)
-
-    for qk_kind in tl.static_range(2):
-        input_head = logical_head + qk_kind * num_heads
-        x = tl.load(
-            qk + token[:, None] * stride_qkt + input_head * stride_qkh
-            + offs_d[None, :],
-            mask=qk_mask, other=0.0,
-        ).to(tl.float32)
-        if qk_kind == 0:
-            grad_ptr = (
-                grad_q + output_token[:, None] * stride_grad_q_t
-                + output_head * stride_grad_q_h + offs_d[None, :]
-            )
-        else:
-            grad_ptr = (
-                grad_k + output_token[:, None] * stride_grad_k_t
-                + output_head * stride_grad_k_h + offs_d[None, :]
-            )
-        grad = tl.load(grad_ptr, mask=qk_mask, other=0.0)
-        grad_flip = tl.reshape(
-            tl.flip(
-                tl.reshape(grad, (BLOCK_T, BLOCK_QK // 2, 2)), dim=2
-            ),
-            (BLOCK_T, BLOCK_QK),
-        )
-        grad = grad.to(tl.float32)
-        grad_flip = grad_flip.to(tl.float32)
-
-        rstd = tl.rsqrt(
-            tl.sum(x * x, axis=1) / qk_dim + 1.1920928955078125e-7
-        )
-        normalized = x * rstd[:, None]
-        grad_normalized = f1 * grad + f2_flip * grad_flip
-        if KEY_OFFSET and qk_kind == 1:
-            next_token = tl.minimum(token + 1, tokens - 1)
-            grad_next = tl.load(
-                grad_k + next_token[:, None] * stride_grad_k_t
-                + output_head * stride_grad_k_h + offs_d[None, :],
-                mask=qk_mask & (token[:, None] < tokens - 1), other=0.0,
-            ).to(tl.float32)
-            stationary_grad = tl.where(
-                token[:, None] == 0, grad + grad_next, grad_next
-            )
-            grad_normalized = tl.where(
-                offs_d[None, :] >= rotary_dim,
-                stationary_grad,
-                grad_normalized,
-            )
-        correction = tl.sum(grad_normalized * normalized, axis=1) / qk_dim
-        dx = rstd[:, None] * (
-            grad_normalized - normalized * correction[:, None]
-        )
-        # Match the old BF16 QK-gradient materialization before FP8 conversion.
-        q = (dx.to(tl.bfloat16).to(tl.float32) / scale).to(tl.float8e4nv)
-        feature = input_head * qk_dim + offs_d
-        tl.store(
-            grad_row + token[:, None] * qkv_dim + feature[None, :],
-            q,
-            mask=qk_mask,
-        )
-        tl.store(
-            grad_transposed + feature[:, None] * tokens + token[None, :],
-            tl.trans(q),
-            mask=(offs_d[:, None] < qk_dim) & token_mask[None, :],
-        )
-
-    offs_v = tl.arange(0, BLOCK_V)
-    v_mask = token_mask[:, None] & (offs_v[None, :] < head_dim)
-    grad_v_value = tl.load(
-        grad_v + token[:, None] * stride_grad_v_t
-        + logical_head * stride_grad_v_h + offs_v[None, :],
-        mask=v_mask, other=0.0,
-    ).to(tl.float32)
-    qv = (grad_v_value / scale).to(tl.float8e4nv)
-    v_feature = 2 * num_heads * qk_dim + logical_head * head_dim + offs_v
-    tl.store(
-        grad_row + token[:, None] * qkv_dim + v_feature[None, :],
-        qv,
-        mask=v_mask,
-    )
-    tl.store(
-        grad_transposed + v_feature[:, None] * tokens + token[None, :],
-        tl.trans(qv),
-        mask=(offs_v[:, None] < head_dim) & token_mask[None, :],
-    )
-
-
-def qkv_norm_rope_pack_fp8_backward(
-    grad_q, grad_k, grad_v, qk, factor1, factor2,
-    grad_scale, num_heads, head_dim, paired=False, key_offset=False,
-):
-    tokens, heads2, qk_dim = qk.shape
-    rotary_dim = qk_dim // 2
-    assert heads2 == 2 * num_heads
-    assert grad_v.shape == (tokens, num_heads, head_dim)
-    assert not (paired and key_offset)
-    padded_dim = grad_q.shape[-1]
-    qkv_dim = 2 * num_heads * qk_dim + num_heads * head_dim
-    grad_row = torch.empty(
-        (tokens, qkv_dim), device=qk.device, dtype=torch.float8_e4m3fn
-    )
-    grad_transposed = torch.empty(
-        (qkv_dim, tokens), device=qk.device, dtype=torch.float8_e4m3fn
-    )
-    block_t = 16 if qk_dim <= 64 else 8
-    num_token_blocks = triton.cdiv(tokens, block_t)
-    _qkv_norm_rope_pack_fp8_backward_kernel[
-        (num_token_blocks, num_heads)
-    ](
-        grad_q, grad_k, grad_v, qk, factor1, factor2,
-        grad_row, grad_transposed, grad_scale,
-        tokens=tokens, num_heads=num_heads, qk_dim=qk_dim, rotary_dim=rotary_dim,
-        head_dim=head_dim, padded_dim=padded_dim, qkv_dim=qkv_dim,
-        stride_qkt=qk.stride(0), stride_qkh=qk.stride(1),
-        factor_stride_t=factor1.stride(0),
-        stride_grad_q_t=grad_q.stride(0), stride_grad_q_h=grad_q.stride(1),
-        stride_grad_k_t=grad_k.stride(0), stride_grad_k_h=grad_k.stride(1),
-        stride_grad_v_t=grad_v.stride(0), stride_grad_v_h=grad_v.stride(1),
-        PAIRED=paired, KEY_OFFSET=key_offset,
-        BLOCK_T=block_t,
-        BLOCK_QK=triton.next_power_of_2(qk_dim),
-        BLOCK_V=triton.next_power_of_2(head_dim),
-        num_warps=4,
-    )
-    return grad_row, grad_transposed
-
-
-class PackedFP8QKVFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx, x, qk_weight, v_weight, weight_f8, weight_f8_t,
-        weight_scale, qkv_scale, x_scale, grad_scale,
-        factor1, factor2, num_heads, paired, key_offset,
-    ):
-        qk_dim = qk_weight.shape[0] // (2 * num_heads)
-        head_dim = v_weight.shape[0] // num_heads
-        attn_qk_dim = qk_dim if qk_dim <= 64 else head_dim
-        qk_features = 2 * num_heads * qk_dim
-        x_flat = x.reshape(-1, x.shape[-1])
-        x_f8, x_f8_t = quantize_dual_layout(x_flat, x_scale)
-        scaled_weight_scale = weight_scale * qkv_scale
-        if paired:
-            # A packed QKV result leaves V as a strided suffix of every token
-            # row.  Paired attention must then materialize V to merge the token
-            # and head axes.  Two column-sliced GEMMs read X once more but make
-            # V dense at birth, avoiding the larger BF16 read/write repack.
-            qk = torch._scaled_mm(
-                x_f8, weight_f8[:qk_features].T,
-                out_dtype=torch.bfloat16,
-                scale_a=x_scale,
-                scale_b=scaled_weight_scale,
-                use_fast_accum=True,
-            ).view(-1, 2 * num_heads, qk_dim)
-            v = torch._scaled_mm(
-                x_f8, weight_f8[qk_features:].T,
-                out_dtype=torch.bfloat16,
-                scale_a=x_scale,
-                scale_b=scaled_weight_scale,
-                use_fast_accum=True,
-            ).view(-1, num_heads, head_dim)
-        else:
-            qkv = torch._scaled_mm(
-                x_f8, weight_f8.T,
-                out_dtype=torch.bfloat16,
-                scale_a=x_scale,
-                scale_b=scaled_weight_scale,
-                use_fast_accum=True,
-            )
-            qk = qkv[:, :qk_features].view(-1, 2 * num_heads, qk_dim)
-            v = qkv[:, qk_features:].view(-1, num_heads, head_dim)
-        q, k = qk_norm_rope_pad_forward(
-            qk, factor1, factor2, num_heads, attn_qk_dim,
-            paired, key_offset,
-        )
-        ctx.save_for_backward(
-            qk_weight, v_weight,
-            x_f8_t, weight_f8_t, scaled_weight_scale, qkv_scale,
-            x_scale, grad_scale,
-            qk, factor1, factor2,
-        )
-        ctx.input_shape = x.shape
-        ctx.num_heads = num_heads
-        ctx.head_dim = head_dim
-        ctx.paired = paired
-        ctx.key_offset = key_offset
-        return q, k, v
-
-    @staticmethod
-    def backward(ctx, grad_q, grad_k, grad_v):
-        (
-            qk_weight, v_weight,
-            x_f8_t, weight_f8_t, scaled_weight_scale, qkv_scale,
-            x_scale, grad_scale,
-            qk, factor1, factor2,
-        ) = ctx.saved_tensors
-        grad_v = grad_v.reshape(-1, ctx.num_heads, ctx.head_dim)
-        grad_f8, grad_f8_t = qkv_norm_rope_pack_fp8_backward(
-            grad_q, grad_k, grad_v, qk, factor1, factor2,
-            grad_scale, ctx.num_heads, ctx.head_dim,
-            ctx.paired, ctx.key_offset,
-        )
-        grad_weight = torch._scaled_mm(
-            grad_f8_t, x_f8_t.T,
-            out_dtype=torch.bfloat16,
-            scale_a=grad_scale,
-            scale_b=x_scale,
-            use_fast_accum=False,
-        )
-        grad_input = torch._scaled_mm(
-            grad_f8, weight_f8_t.T,
-            out_dtype=torch.bfloat16,
-            scale_a=grad_scale,
-            scale_b=scaled_weight_scale,
-            use_fast_accum=False,
-        )
-        grad_qkv_scale = (
-            grad_weight * torch.cat((qk_weight, v_weight))
-        ).sum()
-        qk_features = 2 * ctx.num_heads * qk.shape[-1]
-        grad_qk_weight, grad_v_weight = grad_weight.split(
-            (qk_features, ctx.num_heads * ctx.head_dim)
-        )
-        grad_qk_weight = grad_qk_weight * qkv_scale
-        grad_v_weight = grad_v_weight * qkv_scale
-        return (
-            grad_input.view(ctx.input_shape), grad_qk_weight, grad_v_weight,
-            None, None, None, grad_qkv_scale, None, None, None, None,
-            None, None, None,
-        )
-
-
-PackedFP8QKV = PackedFP8QKVFunction.apply
+        x_f8, wc_t, grad_input = ctx.saved_tensors
+        grad_x, grad_w_c = _ce_backward_gemms(grad_input, wc_t, x_f8, *ctx.params)
+        # Dense full-extent grad, sized from _SNS_POSD -- it IS the vocab-length map densify gathers through. The tied
+        # transpose_add writes into it in place and the reduce_scatter needs a contiguous payload; freshly allocated every
+        # backward (AccumulateGrad may adopt it as .grad) and never zeroed, since the gather writes every element.
+        grad_w = torch.empty((x_f8.shape[1], _SNS_POSD.numel()), dtype=grad_w_c.dtype, device=grad_w_c.device)
+        torch.ops.nanogpt.sns_densify(grad_w_c.contiguous(), _SNS_POSD, grad_w)
+        return grad_x, None, None, grad_w, None, None, None, None, None, None, None, None

@@ -205,6 +205,9 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 89 | 1.23 minutes | [MLP down projection in FP8 with efficient delayed scaling metric](https://x.com/classiclarryd/status/2086582390135406713) | 07/17/26 | [log](records/track_1_short/2026-07-17_FP8DownProjection/this_pr/11cb620c-daaf-4e85-83fc-258a5eb7ba09.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/342)  | @Mister-dev-oss, @CerovazS, @MarioPaerle, @GabrieleCirillo, @crisostomi
 90 | 1.13 minutes | 128 -> 96 dim QK, Fuse QK Norm, RoPE, and KeyOffset into Triton, Move MLP bwk to FP8, Move QKV fwd and bwk to FP8.  | 08/03/26 | [log](records/track_1_short/2026-08-03_FP8MLPBackwardPackedQKV),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/344)  | @theonlyglitch_
 91 | 1.126 minutes | Mask logits for infeasible token continuations during validation.  | 08/06/26 | [log](records/track_1_short/2026-08-06-CanonicalMasking),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/350)  | @jvarho
+92 | 0.665 minutes | ANVIL2 (supersedes [PR #349](https://github.com/KellerJordan/modded-nanogpt/pull/349)): ANVIL optimizer stack, full FP8 MLP fwd+bwd, 84.6M-row hashed n-gram table, sampled softmax over the early stages, depth reduction + mixed-width QK attention, full CUDA-graph capture of the training step | 08/30/26 | [log](records/track_1_short/2026-08-30_ANVIL2) | @devenpzak
+
+
 ## Rules
 
 New records must:
