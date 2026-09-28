@@ -1,0 +1,554 @@
+"""
+Hi reader, sorry this method is still slop. It is more principled than k-maxwell from #357 and #359.
+It is not yet a complete theory of momentum, nor would I necessarily recommend it yet outside nanogpt.
+I'm PRing this since the gains appear to be legitimate and I want others in the community to be able
+to build on top of these findings while I figure out why this works. -- @jeffreycider
+
+train_gpt_muon_maxentslop.py
+
+This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt)
+and is PR #357's `train_gpt_kmaxwell_anneal.py` (the tuned Muon + aux AdamW baseline, result #36 /
+PR #340, with K-Maxwell momentum) with two changes:
+
+1. Momentum. From step 780 the Muon momentum direction is a weighted sum of the parameter's last
+   256 raw gradients. The 256 weights, a MomentumKernel, are solved at startup from a
+   MomentumDesiderata (mean gradient age, log-age moment, the two newest weights) and anneal
+   linearly from an early kernel (mean age 90 steps) to a late kernel (mean age 24.05 steps)
+   over 2340 steps. Before step 780 the momentum is the baseline's single-EMA Nesterov momentum.
+2. Weight decay. Muon's weight decay is 0.1 at the peak learning rate and follows the learning-rate
+   schedule (decay_t = 0.1 * eta_t), instead of a constant 0.05.
+
+Everything else (architecture, data, batch size, one forward-backward per step, aux AdamW, LR
+schedule, Newton-Schulz orthogonalisation) is the #36 / #340 baseline, unchanged. The submitted
+step count is 3080; only --seed varies across the confirmation seeds:
+
+    torchrun --standalone --nproc_per_node=8 -- \
+        train_gpt_muon_maxentslop.py --seed 0 --train_steps 3080
+"""
+
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import uuid
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+import torch
+from torch import Tensor, nn
+from torch.optim import AdamW
+import torch.nn.functional as F
+import torch.distributed as dist
+
+# single reproducibility argument: the trial seed (paired across the fleet)
+SEED = 0
+if "--seed" in sys.argv:
+    SEED = int(sys.argv[sys.argv.index("--seed") + 1])
+TRAIN_STEPS = 3080
+if "--train_steps" in sys.argv:
+    TRAIN_STEPS = int(sys.argv[sys.argv.index("--train_steps") + 1])
+
+MAXENTSLOP_START = 780                      # first Muon step that uses a momentum kernel; before it, the baseline's Nesterov momentum
+MAXENTSLOP_ANNEAL_STEPS = 2340              # the anneal's length in steps (it ends at step 3120; a 3080-step run stops at fraction 0.983)
+MAXENTSLOP_HISTORY_LENGTH = 256             # how many past gradients each parameter keeps = the length of a momentum kernel
+
+# I call a "momentum kernel" the weights that we assign to lagged gradients.
+# At lag t (t = 0 is the current gradient), EMA momentum has kernel weight (1 - beta) * beta**t.
+# To calculate momentum, we just do np.dot(momentum_kernel, gradient_history).
+MomentumKernel = torch.Tensor      # 1-D float32, length MAXENTSLOP_HISTORY_LENGTH, entry t = weight of the lag-t gradient
+
+@dataclass(frozen=True)
+class MomentumDesiderata:
+    """We numerically solve for momentum kernels that have certain properties. Just a bookkeeping class to track the desiderata.
+
+    mean_lag:             sum_k k * kernel[k], the mean age in steps of the gradients the direction averages over.
+    log_moment:           sum_k log(1 + k) * kernel[k], the mean log-age; together with mean_lag it fixes how
+                          the weight is spread between recent and old gradients.
+    newest_weight:        kernel[0], the weight of the current gradient.
+    second_newest_weight: kernel[1], the weight of the previous gradient.
+    length:               number of kernel entries (ages 0 .. length-1).
+    Always also imposed: the weights sum to 1, and sum_k (-1)**k * kernel[k] = 0, so a gradient that flips sign
+    every step (a period-2 oscillation) contributes nothing to the direction.
+    """
+    mean_lag: float
+    log_moment: float
+    newest_weight: float
+    second_newest_weight: float
+    length: int = MAXENTSLOP_HISTORY_LENGTH
+
+def solve_for_momentum_kernel_given_desiderata(d: MomentumDesiderata) -> MomentumKernel:
+    """Maximum-entropy momentum kernel meeting the desiderata exactly.
+
+    kernel[0] and kernel[1] are set to the two requested weights. Entries for ages k >= 2 maximise the entropy
+    -sum(w log w) subject to the four equalities (sum, zero period-2 response, mean_lag, log_moment). The maximiser
+    has the exponential-family form w[k] = exp(a + b*(-1)**k + c*k + d*log(1+k)); its four multipliers are found by
+    Newton's method on the convex dual with a backtracking line search, to machine precision in a few dozen steps.
+    """
+    k = np.arange(2, d.length, dtype=float)
+    feats = np.vstack([(-1.0) ** k, k, np.log1p(k)])                       # 3 x (length - 2)
+    w0, w1 = d.newest_weight, d.second_newest_weight
+    mass = 1.0 - w0 - w1                                                     # weight left for ages >= 2
+    target = np.array([-(w0 - w1), d.mean_lag - w1, d.log_moment - w1 * np.log(2.0)]) / mass
+    scale = np.ptp(feats, axis=1)                                            # condition the features
+    F_, t = feats / scale[:, None], target / scale
+    def dual(lam):
+        z = F_.T @ lam
+        return z.max() + np.log(np.exp(z - z.max()).sum()) - lam @ t
+    lam = np.zeros(3)
+    for _ in range(500):
+        z = F_.T @ lam
+        p = np.exp(z - z.max()); p /= p.sum()                                # tail weights, normalised to 1
+        grad = F_ @ p - t
+        if np.max(np.abs(grad)) < 1e-14:
+            break
+        hess = (F_ * p) @ F_.T - np.outer(F_ @ p, F_ @ p)
+        step = -np.linalg.solve(hess, grad)
+        f0, a = dual(lam), 1.0
+        while dual(lam + a * step) > f0 + 1e-4 * a * (grad @ step) and a > 1e-10:
+            a *= 0.5
+        lam = lam + a * step
+    z = F_.T @ lam
+    p = np.exp(z - z.max()); p /= p.sum()
+    w = np.concatenate([[w0, w1], mass * p])
+    ages = np.arange(d.length)
+    check = np.array([w.sum(), ((-1.0) ** ages) @ w, ages @ w, np.log1p(ages) @ w])
+    assert np.allclose(check, [1.0, 0.0, d.mean_lag, d.log_moment], rtol=0.0, atol=1e-9), check
+    assert w.min() > 0.0 and len(w) == d.length, (w.min(), len(w))
+    return torch.as_tensor(w, dtype=torch.float32)
+
+# I tuned the desiderata for an early momentum kernel and the ending momentum kernel. We solve for each.
+# For checkpoints in the middle, we linearly interpolate.
+# (The solve reproduces the kernels the n=8 runs used, stored as literals in the submitted logs' script, to 5e-12.)
+EARLY_MOMENTUM_DESIDERATA = MomentumDesiderata(mean_lag=90.0, log_moment=3.7153849427, newest_weight=0.07235, second_newest_weight=0.02235)
+LATE_MOMENTUM_DESIDERATA = MomentumDesiderata(mean_lag=24.05, log_moment=2.3786333904, newest_weight=0.137, second_newest_weight=0.087)
+early_momentum_kernel = solve_for_momentum_kernel_given_desiderata(EARLY_MOMENTUM_DESIDERATA)
+late_momentum_kernel = solve_for_momentum_kernel_given_desiderata(LATE_MOMENTUM_DESIDERATA)
+
+def momentum_anneal_fraction(step: int) -> float:
+    """Position of `step` in the anneal: 0 at MAXENTSLOP_START (early kernel), 1 at step 3120 (late kernel). At the
+    default 3080-step clock the last executed update (step 3079) sits at fraction 0.9825; the late kernel is not reached."""
+    return min(1.0, max(0.0, (step - MAXENTSLOP_START) / MAXENTSLOP_ANNEAL_STEPS))
+
+def interpolate_momentum_kernels(early_momentum_kernel: MomentumKernel, late_momentum_kernel: MomentumKernel,
+                                 fraction: float) -> MomentumKernel:
+    """The kernel in force at a step: the entrywise linear interpolation (1 - fraction) * early + fraction * late."""
+    return early_momentum_kernel.lerp(late_momentum_kernel, fraction)
+
+########################################
+#              Dataloader              #
+########################################
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2]) # number of tokens (claimed)
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
+    files = sorted(Path.cwd().glob(filename_pattern))
+    assert batch_size % dist.get_world_size() == 0
+    local_batch_size = batch_size // dist.get_world_size()
+    file_iter = iter(files)
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    while True:
+        if pos + batch_size + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+        buf = tokens[pos + dist.get_rank() * local_batch_size:][:local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        pos += batch_size
+        yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
+
+
+########################################
+#             Architecture             #
+########################################
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gains = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return F.rms_norm(x, (x.size(-1),), weight=self.gains.type_as(x))
+
+class Linear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=True)
+
+    def forward(self, x):
+        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        # half-truncate RoPE (w/ base freq tuning)
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        self.register_buffer("angular_freq", torch.cat([angular_freq, angular_freq.new_zeros(dim//4)]))
+
+    def forward(self, x_BTHD: Tensor):
+        pos = torch.arange(x_BTHD.size(1), dtype=torch.float32, device=x_BTHD.device)
+        theta = torch.outer(pos, self.angular_freq)[None, :, None, :]
+        cos, sin = theta.cos(), theta.sin()
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, head_dim=128):
+        super().__init__()
+        self.num_heads = dim // head_dim
+        self.head_dim = head_dim
+        hdim = self.num_heads * self.head_dim
+        self.q = Linear(dim, hdim)
+        self.k = Linear(dim, hdim)
+        self.v = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+        self.rotary = Rotary(head_dim)
+
+    def forward(self, x: Tensor):
+        B, T = x.size(0), x.size(1)
+        q = self.q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.v(x).view(B, T, self.num_heads, self.head_dim)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
+        q, k = self.rotary(q), self.rotary(k)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
+                                           v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+        y = self.proj(y)
+        return y
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.fc = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+
+    def forward(self, x: Tensor):
+        x = self.fc(x)
+        x = x.relu().square()
+        x = self.proj(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.attn = CausalSelfAttention(dim)
+        self.mlp = MLP(dim)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+
+    def forward(self, x: Tensor):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
+        self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
+        self.proj = Linear(model_dim, vocab_size)
+        self.norm1 = RMSNorm(model_dim)
+        self.norm2 = RMSNorm(model_dim)
+
+    def forward(self, inputs: Tensor, targets: Tensor):
+        x = self.norm1(self.embed(inputs))
+        for block in self.blocks:
+            x = block(x)
+        logits = self.proj(self.norm2(x)).float()
+        logits = 15 * logits * (logits.square() + 15**2).rsqrt()
+        return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
+
+
+########################################
+#              Optimizer               #
+########################################
+
+def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
+    assert G.ndim >= 2
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Perform the NS iterations, not optimizing for wallclock speed
+    a, b, c = 2, -1.5, 0.5
+    for _ in range(12):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+@torch.compile
+def muon_update(grad, momentum, mu=0.95, nesterov=True):
+    momentum.lerp_(grad, 1 - mu)
+    update = grad.lerp_(momentum, mu) if nesterov else momentum
+    update = zeropower_via_newtonschulz5(update)
+    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    return update
+
+class RawGradientHistory:
+    """The last `length` raw gradients of one parameter, oldest overwritten first.
+
+    `buffer` is a (length, numel) float32 tensor, one flattened gradient per row. Rows are written cyclically:
+    the gradient of step s lives in row s % length, so `newest_row` holds the age-0 gradient, the row before it
+    the age-1 gradient, and so on, wrapping around. Rows not yet written (the first `length` steps) are zero.
+    """
+    def __init__(self, length: int, numel: int, device: torch.device):
+        self.length = length
+        self.buffer = torch.zeros(length, numel, dtype=torch.float32, device=device)
+        self.newest_row = length - 1          # so the first push lands in row 0
+
+    def push(self, grad: Tensor) -> None:
+        """Record this step's gradient as the age-0 entry."""
+        self.newest_row = (self.newest_row + 1) % self.length
+        self.buffer[self.newest_row].copy_(grad.flatten().float())
+
+@torch.compile
+def _weighted_sum_over_history(momentum_kernel: MomentumKernel, buffer: Tensor, newest_row: int) -> Tensor:
+    length = buffer.size(0)
+    row_ages = (newest_row - torch.arange(length, device=buffer.device)) % length   # age of the gradient in each row
+    return momentum_kernel[row_ages] @ buffer
+
+def apply_momentum_kernel_to_raw_gradient_history(momentum_kernel: MomentumKernel,
+                                                  raw_gradient_history: RawGradientHistory) -> Tensor:
+    """The momentum direction: sum over ages k of momentum_kernel[k] * (the gradient k steps old). Shape (numel,)."""
+    return _weighted_sum_over_history(momentum_kernel, raw_gradient_history.buffer, raw_gradient_history.newest_row)
+
+@torch.compile
+def muon_update_maxentslop(grad: Tensor, momentum_direction: Tensor) -> Tensor:
+    """Muon's update from a momentum direction: Newton-Schulz orthogonalisation and the aspect-ratio scale, as in muon_update."""
+    update = zeropower_via_newtonschulz5(momentum_direction.view_as(grad))
+    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    return update
+
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
+        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
+        super().__init__(params, defaults)
+        self._step = 0
+        self.early_momentum_kernel = early_momentum_kernel
+        self.late_momentum_kernel = late_momentum_kernel
+        self.history_length = MAXENTSLOP_HISTORY_LENGTH
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        for group in self.param_groups:
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum"] = torch.zeros_like(p)
+                        state["history"] = RawGradientHistory(self.history_length, p.numel(), p.device)
+                    state["history"].push(p.grad)          # the history is recorded from step 0
+                    if self._step >= MAXENTSLOP_START:
+                        if "early_kernel_gpu" not in state:
+                            state["early_kernel_gpu"] = self.early_momentum_kernel.to(device=p.device)
+                            state["late_kernel_gpu"] = self.late_momentum_kernel.to(device=p.device)
+                        momentum_kernel = interpolate_momentum_kernels(
+                            state["early_kernel_gpu"], state["late_kernel_gpu"], momentum_anneal_fraction(self._step))
+                        momentum_direction = apply_momentum_kernel_to_raw_gradient_history(momentum_kernel, state["history"])
+                        update = muon_update_maxentslop(p.grad, momentum_direction)
+                    else:
+                        update = muon_update(p.grad, state["momentum"], mu=group["mu"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+        self._step += 1
+
+
+########################################
+#                Setup                 #
+########################################
+
+# torchrun sets these env variables
+device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+torch.cuda.set_device(device)
+dist.init_process_group(backend="nccl", device_id=device)
+dist.barrier()
+# the predecessor ran equivalently on 1, 2, 4 or 8 gpus; the gradient history (256 rows per owned matrix, about
+# 10 GiB per worker at 8 workers) makes fewer than 8 x 80 GB impractical without changing the storage. Tested at 8.
+assert 8 % dist.get_world_size() == 0
+
+# logging setup
+if dist.get_rank() == 0:
+    os.makedirs("logs", exist_ok=True)
+    logfile = f"logs/{uuid.uuid4()}.txt"
+    print(logfile)
+def print0(s, console=False, log=True):
+    if dist.get_rank() == 0:
+        if console:
+            print(s)
+        if log:
+            with open(logfile, "a") as f:
+                print(s, file=f)
+
+# we begin by logging this file itself
+print0(code)
+print0("="*100)
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
+       + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
+print0(f"MaxEntSlop recipe: history_length={MAXENTSLOP_HISTORY_LENGTH} start={MAXENTSLOP_START} anneal_steps={MAXENTSLOP_ANNEAL_STEPS} "
+       f"early={EARLY_MOMENTUM_DESIDERATA} late={LATE_MOMENTUM_DESIDERATA} muon_weight_decay=0.1*eta", console=True)
+print0("="*100)
+
+val_tokens = 20 * 524288
+batch_size = 8 * 64 * 1024
+mbs = 64
+val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
+
+model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
+model.compile(dynamic=False)
+
+
+num_trials = 1
+
+for _ in range(num_trials):
+
+
+    ########################################
+    #       Init & Optim Hyperparams       #
+    ########################################
+
+    # we want to minimize this while still reaching 3.28 val loss
+    train_steps = TRAIN_STEPS
+
+    # deterministic paired trials: seed the global RNG right before param init
+    torch.manual_seed(1337 + SEED)
+
+    # initialize model parameters
+    for name, p in model.named_parameters():
+        w = p.data
+        if name.endswith("weight"):
+            if "proj" in name:
+                w.zero_()
+            elif "embed" in name:
+                w.normal_()  # default torch init
+            else:
+                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+        elif name.endswith("bias"):
+            w.zero_()
+        elif name.endswith("gains"):
+            w.normal_(mean=1, std=0)
+        else:
+            raise Exception(f"Uninitialized parameter: {name}")
+
+    # create the optimizer(s)
+    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
+                        dict(params=[model.proj.weight], lr=0.004),
+                        dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
+                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
+    optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
+                      lr=0.025, weight_decay=0.1)       # decay at the peak rate; it follows the schedule below
+    optimizers = [optimizer1, optimizer2]
+    assert set(p for opt in optimizers for group in opt.param_groups
+               for p in group["params"]) == set(model.parameters())
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["initial_lr"] = group["lr"]
+    for group in optimizer2.param_groups:
+        group["initial_weight_decay"] = group["weight_decay"]
+
+    # learning rate schedule: stable then decay
+    def set_hparams(step, cooldown_frac=0.7):
+        progress = step / train_steps
+        assert 0 <= progress < 1
+        if progress < 1 - cooldown_frac:
+            eta = 1.0
+        else:
+            eta = (1 - progress) / cooldown_frac
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * eta
+        for group in optimizer2.param_groups:      # Muon's weight decay follows the learning-rate schedule
+            group["weight_decay"] = group["initial_weight_decay"] * eta
+
+
+    ########################################
+    #        Training and Validation       #
+    ########################################
+
+    train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+    for p in model.parameters():
+        dist.broadcast(p.detach(), 0)
+    # start the clock
+    training_time = 0
+    last_val_step = 0
+    dist.barrier()
+    t0 = time.perf_counter()
+    for step in range(train_steps + 1):
+
+        # --------------- VALIDATION SECTION -----------------
+        # dense eval-only validation over the crossing zone (uniform across all seeds;
+        # the earliest formally-passing step is selected the same way for every trial)
+        dense = 2900 <= step <= train_steps and step % 10 == 0
+        val_step_freq = 125 if step / train_steps < 0.9 else 25
+        if step == train_steps or step % val_step_freq == 0 or dense:
+            # stop the clock
+            dist.barrier()
+            time_since_last_val = time.perf_counter() - t0
+            step_avg = time_since_last_val / (step - last_val_step) if step > 0 else float("nan")
+            last_val_step = step
+            training_time += time_since_last_val
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                assert len(val_inputs) % mbs == 0
+                for i in range(len(val_inputs) // mbs):
+                    val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+            dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+            val_loss /= val_tokens
+            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
+                   + f" step_avg:{1000*step_avg:.2f}ms", console=True)
+            model.train()
+            # start the clock again
+            dist.barrier()
+            t0 = time.perf_counter()
+
+        if step == train_steps:
+            break
+
+        # --------------- TRAINING SECTION -----------------
+        inputs, targets = next(train_loader)
+        # accumulate across microbatches in case we are running with fewer than 8 gpus
+        assert len(inputs) % mbs == 0
+        for i in range(len(inputs) // mbs):
+            model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+        for name, p in model.named_parameters():
+            assert p.grad is not None, name
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        # set optimization hyperparameters and take a step
+        set_hparams(step)
+        for opt in optimizers:
+            opt.step()
+        model.zero_grad(set_to_none=True)
+        approx_training_time = training_time + (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
+               + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
+
+dist.destroy_process_group()
