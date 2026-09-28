@@ -7,14 +7,14 @@ This repository hosts the *NanoGPT speedrun*, in which we (collaboratively|compe
 The target (3.28 validation loss on FineWeb) follows Andrej Karpathy's [GPT-2 replication in llm.c, which attains that loss after running for 45 minutes](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 The speedrun code also descends from llm.c's [PyTorch trainer](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py), which itself descends from NanoGPT, hence the name of the repo.
 Thanks to the efforts of many contributors, this repo now contains a training algorithm which attains the target performance in:
-* Under 75 seconds on 8xH100 (the llm.c GPT-2 replication needed 45 minutes)
-* under 400M tokens (the llm.c GPT-2 replication needed 10B)
+* Under 40 seconds on 8xH100 (the llm.c GPT-2 replication needed 45 minutes)
+* under 330M tokens (the llm.c GPT-2 replication needed 10B)
 
 This improvement in training speed has been brought about by the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU²
 * The Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[repo](https://github.com/KellerJordan/Muon)]
 * Use FP8 for head, and asymmetric rescale and softcap logits
-* Use FP8 on MLP forward pass
+* FP8 for the MLP forward and backward passes and the QKV projections
 * Initialization of projections to zero (muP-like)
 * Skip connections from embedding to every block as well as from block 3 to 6
 * Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
@@ -35,11 +35,17 @@ This improvement in training speed has been brought about by the following techn
 * Untie embed and lm_head at 2/3 of training
 * Additional gating on value embeddings and skip connection
 * Paired head attention
-* Bigram hash embedding on 1/4 of model_dim w/ sign trick
+* Hashed bigram + trigram embedding table (84.6M rows, 65B parameters) w/ sign trick, sharded across GPUs
 * MUDD skip connections to residual stream and attention values
 * Learnable XSA
 * Lightweight Dynamically Composable MHA
 * Prefix token prediction auxiliary loss
+* ANVIL optimizer: twin-rail (fast + slow) momentum, re-derived orthogonalization maps, cautious decay gated on the slow rail
+* Sampled softmax over a shared candidate set for most of training
+* Sparse row-wise embedding updates: only touched rows are exchanged and updated (beta1 = 0, one second-moment value per row), every 4 steps
+* Depth reduction and mixed-width attention (64-dim QK on most layers, half-width V on two layers)
+* Tail weight averaging (EMA) with a raised LR floor
+* CUDA-graph capture of the training step, optimizer and FP8 weight refresh
 
 As well as many systems optimizations.
 
@@ -61,7 +67,7 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@moof2x](https://github.com/moof2x), [@samacqua](https://github.com/samacqua), [@Lisennlp](https://github.com/Lisennlp),
 [@_djdumpling](https://x.com/_djdumpling), [@TrianX](https://x.com/TrianX), [@aryavohra](https://github.com/aryavohra),
 [@cong_ml](https://x.com/cong_ml), [@jvarho](https://github.com/jvarho), [@Mister-dev-oss](https://github.com/Mister-dev-oss), [@CerovazS](https://github.com/CerovazS), [@MarioPaerle](https://github.com/MarioPaerle), [@GabrieleCirillo](https://github.com/GabrieleCirillo), [@crisostomi](https://github.com/crisostomi),
-[@theonlyglitch_](https://x.com/theonlyglitch_)
+[@theonlyglitch_](https://x.com/theonlyglitch_), [@DevenPzak](https://x.com/DevenPzak)
 
 
 ---
@@ -72,11 +78,22 @@ To run the current record, run the following commands.
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install -r requirements.txt
+pip install torch==2.10 --index-url https://download.pytorch.org/whl/cu128  # the pinned build, not a nightly
 # downloads only the first 900M training tokens to save time
 python data/cached_fineweb10B.py 9
 ./run.sh
 ```
 Add torchrun to path if ./run.sh gives error `torchrun: command not found`.
+
+The attention kernel is a patched FlashAttention-3 build (`devenpzak/flash-attn3-12864`) that links `libcudart.so.13`,
+so the system needs a CUDA 13 runtime (the Docker image below provides one). If `get_kernel` fails to download it
+anonymously, either run `hf auth login`, or pre-seed the kernel cache and run offline:
+```bash
+hf download devenpzak/flash-attn3-12864 --revision 64c1e6d1f2780e7931839f41426ddcdb564a7cb9
+HUB=${HF_HOME:-~/.cache/huggingface}/hub
+cp -rl $HUB/models--devenpzak--flash-attn3-12864 $HUB/kernels--devenpzak--flash-attn3-12864
+HF_HUB_OFFLINE=1 ./run.sh
+```
 
 **Note: torch.compile will add around 7 minutes of latency the first time you run the code.**
 
@@ -210,7 +227,7 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 89 | 1.23 minutes | [MLP down projection in FP8 with efficient delayed scaling metric](https://x.com/classiclarryd/status/2086582390135406713) | 07/17/26 | [log](records/track_1_short/2026-07-17_FP8DownProjection/this_pr/11cb620c-daaf-4e85-83fc-258a5eb7ba09.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/342)  | @Mister-dev-oss, @CerovazS, @MarioPaerle, @GabrieleCirillo, @crisostomi
 90 | 1.13 minutes | 128 -> 96 dim QK, Fuse QK Norm, RoPE, and KeyOffset into Triton, Move MLP bwk to FP8, Move QKV fwd and bwk to FP8.  | 08/03/26 | [log](records/track_1_short/2026-08-03_FP8MLPBackwardPackedQKV),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/344)  | @theonlyglitch_
 91 | 1.126 minutes | Mask logits for infeasible token continuations during validation.  | 08/06/26 | [log](records/track_1_short/2026-08-06-CanonicalMasking),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/350)  | @jvarho
-92 | 0.665 minutes | ANVIL2 (supersedes [PR #349](https://github.com/KellerJordan/modded-nanogpt/pull/349)): ANVIL optimizer stack, full FP8 MLP fwd+bwd, 84.6M-row hashed n-gram table, sampled softmax over the early stages, depth reduction + mixed-width QK attention, full CUDA-graph capture of the training step | 08/30/26 | [log](records/track_1_short/2026-08-30_ANVIL2) | @devenpzak
+92 | 0.665 minutes | ANVIL2 (supersedes [PR #349](https://github.com/KellerJordan/modded-nanogpt/pull/349)): ANVIL optimizer stack, full FP8 MLP fwd+bwd, 84.6M-row hashed n-gram table, sampled softmax over the early stages, depth reduction + mixed-width QK attention, full CUDA-graph capture of the training step | 08/30/26 | [log](records/track_1_short/2026-08-30_ANVIL2),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/360) | @DevenPzak
 
 
 ## Rules
