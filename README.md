@@ -80,6 +80,11 @@ Add torchrun to path if ./run.sh gives error `torchrun: command not found`.
 
 **Note: torch.compile will add around 7 minutes of latency the first time you run the code.**
 
+The track-1 trainer is `train_gpt.py` plus the `track_1_short/` package. `train_gpt.py` is the outline of a run
+(setup, model, warmup and CUDA-graph capture, the timed loop, the final validation); `track_1_short/` holds the model,
+optimizer, data and schedules, and `track_1_short/perf/` holds the kernels and systems tricks that make it fast, which
+can be skipped when reading for the algorithm. Every run log embeds the full source of both.
+
 Official records are timed on 8 NVIDIA H100 GPUs from https://app.primeintellect.ai/. PrimeIntellect has generously sponsored recent validation runs.
 
 ## Alternative: Running with Docker (recommended for precise timing)
