@@ -26,6 +26,7 @@ from track_1_short.perf.kernels.sampled_cross_entropy import SampledSoftcappedCr
 from track_1_short.perf.kernels.value_embed import value_embed_lookup
 from track_1_short.perf.residual_fusion import rms_norm_with_head, scale, scale_add
 from track_1_short.sampled_softmax import SampledLoss
+from track_1_short.token_norm import NORM_MAP
 
 # Layer topology (11 layers). Depth cut from record #360 (ANVIL2): layer 7 is removed whole -- its
 # residual scaling and x0 injection stay, so cache[7] still exists -- and layers 4 and 9 run
@@ -165,6 +166,10 @@ class GPT(nn.Module):
         # which also holds a training cycle (NgramTable asserts it).
         self.register_buffer("ngram_cache", torch.zeros(2 * max_seq_len, ngram_dim, dtype=torch.bfloat16, device=device),
                              persistent=False)
+        # Token id -> its normalization class id (track_1_short/token_norm.py), read by the n-gram
+        # sign hashes only; the row hashes map on the host (ngram_table.ngram_row_ids).
+        assert NORM_MAP.numel() == self.vocab_size
+        self.register_buffer("ngram_norm_map", NORM_MAP.to(device), persistent=False)
 
         # Canonical token mask for the validation softmax, one bit per (prev, cur) pair.
         # Allocated all-zero == no masking.
@@ -595,8 +600,9 @@ class GPT(nn.Module):
         #   rows = ngram_cache[slots] + ngram_sink    # the sink is exact zeros: it only catches the gradient
         #   x0_bigram = rows[:T] * sign_pool[bigram_sign] + rows[T:] * sign_pool[trigram_sign]
         # computed by one opaque kernel so x0_bigram is materialised once (perf/kernels/ngram_embed.py).
-        x0_bigram = ngram_embedding(self.ngram_cache, bigram_input_seq, self.ngram_sign_pool, input_seq,
-                                    ngram_sink)[None]                                     # (1, seq, ngram_dim)
+        # The sign hashes read normalized ids, as the row hashes do (track_1_short/token_norm.py).
+        x0_bigram = ngram_embedding(self.ngram_cache, bigram_input_seq, self.ngram_sign_pool,
+                                    self.ngram_norm_map[input_seq], ngram_sink)[None]    # (1, seq, ngram_dim)
 
         # Value embeddings - always computed (not precomputed)
         # Shifted .01 ... 234 structure on token value embeddings by @photomz

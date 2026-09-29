@@ -47,6 +47,7 @@ from torch import Tensor
 from track_1_short.perf.kernels.ngram_adam import adam_rows_, bring_rows_current, claim_rows
 from track_1_short.perf.kernels.row_scatter import scatter_add_rows
 from track_1_short.sharded_rows import RowOwners, RowPull, all_to_all_rows
+from track_1_short.token_norm import NORM_MAP
 
 # 224x the 377,280-row bigram table of earlier records. Rows [0, V/2) are the bigram channel,
 # [V/2, V) the trigram channel. Divisible by 8 (the shard) and < 2**31 (row ids are int32).
@@ -61,7 +62,7 @@ NGRAM_SIGN_POOL_ROWS = 8192
 BIGRAM_ROW_MULS = (36313, 27191)            # x[t], x[t-1]
 TRIGRAM_ROW_MULS = (17351, 60961, 45259)    # x[t], x[t-1], x[t-2]
 # Sign-pool hashes (record #360), independent of the row hashes; computed in the embedding kernel
-# (perf/kernels/ngram_embed.py). Position t reads pool row
+# (perf/kernels/ngram_embed.py) from the normalized ids (token_norm.py), like the row hashes. Position t reads pool row
 #   bigram:  (m[1] * x[t-1] ^ m[0] * x[t]) & (pool_rows - 1), row 0 at t < 1
 #   trigram: (m[2] * x[t-2] ^ m[1] * x[t-1] ^ m[0] * x[t]) & (pool_rows - 1), row 0 at t < 2
 BIGRAM_SIGN_MULS = (48271, 30011)           # x[t], x[t-1]
@@ -97,11 +98,12 @@ assert NGRAM_ADAM_PERIOD4_START % 4 == 0
 def ngram_row_ids(x: Tensor) -> Tensor:
     """Token ids [T] (host) -> table row ids [2T] int32: out[:T] bigram rows, out[T:] trigram rows.
 
+    The hashes read normalized token ids (token_norm.py): tokens of one normalization class share rows.
     Positions without enough history get the channel's reserved last row. Note the bigram hash at
     t = 1 reads the reserved id, not x[0], as its previous token (it is computed in place after
     out[0] is set, exactly as in record #360).
     """
-    x = x.to(torch.int32)
+    x = torch.index_select(NORM_MAP, 0, x.cpu())  # int32 ids index directly: no int64 copy
     half = NGRAM_VOCAB_SIZE // 2
     bigram_mod, trigram_mod = half - 1, NGRAM_VOCAB_SIZE - half - 1
     n = x.numel()
