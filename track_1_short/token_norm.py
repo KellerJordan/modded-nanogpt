@@ -16,6 +16,7 @@ padded to the model's 50,304-row vocab with identity.
 Checks: 32,980 classes over the 50,257 tokens, 17,277 ids remapped, and NORM_MAP_SHA256 below.
 """
 import hashlib
+import re
 
 import numpy as np
 import tiktoken
@@ -43,24 +44,39 @@ def _normalizer():
     ])
 
 
+# The ASCII fast path's equivalent of the normalizer: on ASCII text NFKC, NFD and StripAccents are the
+# identity, Lowercase is bytes.lower(), and Strip removes exactly these (Rust's char::is_whitespace).
+_WS_RUN = re.compile(rb"[ \t\r\n]+")
+_ASCII_WHITESPACE = b" \t\n\x0b\x0c\r"
+
+
+def _key(token: bytes, norm) -> bytes:
+    """A token's normalized text as UTF-8; b"" for the tokens that keep their own id."""
+    if token.isascii():  # 49,383 of the 50,256 tokens
+        key = _WS_RUN.sub(b" ", token.lower())
+        return key if key == b" " else key.strip(_ASCII_WHITESPACE)
+    try:
+        return norm.normalize_str(token.decode("utf-8")).encode("utf-8")
+    except UnicodeDecodeError:  # a partial UTF-8 byte token
+        return b""
+
+
 def build_norm_map() -> np.ndarray:
-    """[NORM_MAP_SIZE] int32: each id -> the smallest id with the same normalized text."""
-    enc = tiktoken.get_encoding("gpt2")
+    """[NORM_MAP_SIZE] int32: each id -> the smallest id with the same normalized text.
+
+    ~70 ms on a laptop CPU: only the 873 non-ASCII tokens go through the (per-call slow) HF normalizer. <|endoftext|>
+    is not a mergeable token, so it keeps its id with the padding.
+    """
+    ranks = tiktoken.get_encoding("gpt2")._mergeable_ranks  # token bytes -> id, ids 0..50255
+    tokens = [b""] * len(ranks)
+    for token, i in ranks.items():
+        tokens[i] = token
     norm = _normalizer()
+    first: dict[bytes, int] = {}
+    ids = [first.setdefault(key, i) if key else i for i, key in enumerate(_key(t, norm) for t in tokens)]
     out = np.arange(NORM_MAP_SIZE, dtype=np.int32)
-    first: dict[str, int] = {}
-    for i in range(enc.n_vocab):
-        if i == enc.eot_token:
-            continue
-        try:
-            text = enc.decode_single_token_bytes(i).decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-        key = norm.normalize_str(text)
-        if key == "":
-            continue
-        out[i] = first.setdefault(key, i)
-    digest = hashlib.sha256(out[:enc.n_vocab].astype("<i4").tobytes()).hexdigest()
+    out[:len(ids)] = ids
+    digest = hashlib.sha256(out[:len(ranks) + 1].astype("<i4").tobytes()).hexdigest()
     assert digest == NORM_MAP_SHA256, f"token normalization map mismatch (sha256 {digest}); check the tokenizers version"
     return out
 

@@ -103,7 +103,7 @@ def ngram_row_ids(x: Tensor) -> Tensor:
     t = 1 reads the reserved id, not x[0], as its previous token (it is computed in place after
     out[0] is set, exactly as in record #360).
     """
-    x = NORM_MAP[x.cpu().long()]
+    x = torch.index_select(NORM_MAP, 0, x.cpu())  # int32 ids index directly: no int64 copy
     half = NGRAM_VOCAB_SIZE // 2
     bigram_mod, trigram_mod = half - 1, NGRAM_VOCAB_SIZE - half - 1
     n = x.numel()
