@@ -1,5 +1,6 @@
 """Data loading: FineWeb .bin shards -> BOS-aligned varlen batches, plus the n-gram table row ids."""
 import glob
+import itertools
 import os
 import threading
 from collections.abc import Sequence
@@ -46,13 +47,14 @@ def pread_parallel(fd: int, out: np.ndarray, offset: int, nbytes: int) -> int:
         return sum(pool.map(read_range, edges, edges[1:]))
 
 
-def _load_data_shard(file: Path):
+def _load_data_shard(file: Path, buf: Tensor | None = None):
+    """`buf`: a pinned shard slot of the timed loader, filled in place of a fresh pinned allocation."""
     header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
     assert header[0] == 20240520, "magic number mismatch in the data .bin file"
     assert header[1] == 1, "unsupported version"
     num_tokens = int(header[2]) # number of tokens (claimed)
     with file.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) if buf is None else buf[:num_tokens] # avoid pin_memory copy by @YouJiacheng
         # straight into the array: avoids a bytes->array copy (@YouJiacheng)
         nbytes = pread_parallel(f.fileno(), tokens.numpy(), HEADER_BYTES, 2 * num_tokens)
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
@@ -69,6 +71,7 @@ class Batch(NamedTuple):
     ngram_ids_cpu: np.ndarray  # the same, host: the row-pull want lists are built from it
     targets_cpu: Tensor    # host copy: the sampled-softmax candidate build reads targets without a D2H
     inputs_cpu: np.ndarray  # host copy: the value_embeds row-pull want lists are built from it
+    docs: tuple | None = None  # (shard tokens, every rank's document starts, ends): checked against the online retrieval plan
 
 # Rows of the packed cu_seqlens table per local batch size (tokens per rank); 40960 is the batch-20 taper.
 TRAIN_MAX_NUM_DOCS = {16384: 64, 32768: 96, 40960: 128, 49152: 128}
@@ -113,6 +116,10 @@ class Shard:
         for r in range(self.world_size):
             cur_len = 0
             while cur_len <= num_tokens_local:
+                if idx + 1 >= n and self.bos_idx is not self._full_idx:  # the partial index ran out: wait for the full one
+                    self._loader_thread.join()
+                    self.bos_idx = self._full_idx
+                    n = len(self.bos_idx)
                 if idx >= n:
                     raise StopIteration("Insufficient BOS ahead; hit tail of shard.")
                 cur = self.bos_idx[idx]
@@ -129,12 +136,12 @@ class Shard:
         return starts, ends
 
     @staticmethod
-    def load_async(file: Path, world_size: int = 1):
+    def load_async(file: Path, world_size: int = 1, buf: Tensor | None = None):
         """Returns getter function for async shard loading"""
         result = {}
         ready = threading.Event()
         def load():
-            tokens = _load_data_shard(file)
+            tokens = _load_data_shard(file, buf)
             result['shard'] = Shard(tokens, world_size)
             ready.set()
         thread = threading.Thread(target=load)
@@ -153,9 +160,10 @@ def split_attention_segments(cum_lengths: Tensor, cap: int) -> Tensor:
     return torch.tensor(ends, dtype=cum_lengths.dtype)
 
 def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, staging: PinnedBatchStaging,
-                               align_to_bos: bool = True):
+                               align_to_bos: bool = True, shard_slots: list[Tensor] | None = None):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
     # staging: the pinned slots every batch's H2D copies go through (perf/pinned_batches.py)
+    # shard_slots: pinned shard buffers, used round-robin instead of a fresh pinned allocation per shard
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     assert num_tokens % world_size == 0, "Batch size must be divisible by world size"
@@ -165,10 +173,12 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
 
     file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
-    tokens = _load_data_shard(next(file_iter))
+    slots = itertools.cycle(shard_slots) if shard_slots else None
+    next_slot = lambda: next(slots) if slots else None
+    tokens = _load_data_shard(next(file_iter), next_slot())
     if align_to_bos:
         shard = Shard(tokens, world_size)
-        next_shard_getter = Shard.load_async(next(file_iter), world_size)
+        next_shard_getter = Shard.load_async(next(file_iter), world_size, next_slot())
     else:
         pos = 0  # for unaligned case
 
@@ -185,7 +195,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
                 shard = next_shard_getter()
                 tokens = shard.tokens
                 try:
-                    next_shard_getter = Shard.load_async(next(file_iter), world_size)
+                    next_shard_getter = Shard.load_async(next(file_iter), world_size, next_slot())
                 except StopIteration:
                     next_shard_getter = None  # no more shards to preload
                 continue
@@ -195,13 +205,14 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             _targets = buf[1:]
             end_idxs[-1] -= 1  # last document was too long to account for _targets offset
             cum_lengths = (end_idxs - start_idxs).cumsum(0)
+            docs = (tokens.numpy(), seq_starts, seq_ends)
             if max_seq_len > VIRTUAL_SEQ_CAP:
                 cum_lengths = split_attention_segments(cum_lengths, VIRTUAL_SEQ_CAP)
                 assert len(cum_lengths) < max_num_docs, f"{len(cum_lengths)} attention segments overflow the {max_num_docs}-row cu_seqlens table"
 
         else:
             if pos + num_tokens + 1 >= len(tokens):  # should not occur for val data
-                tokens, pos = _load_data_shard(next(file_iter)), 0
+                tokens, pos = _load_data_shard(next(file_iter), next_slot()), 0
 
             pos_local = pos + rank * num_tokens_local
             buf = tokens[pos_local: pos_local + num_tokens_local + 1]
@@ -210,6 +221,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 
             cum_lengths = torch.nonzero(_inputs == BOS_ID)[:, 0]
             pos += num_tokens
+            docs = None
 
 
         _cum_lengths = torch.full((max_num_docs,), num_tokens_local)
@@ -231,6 +243,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             ngram_ids_cpu=_ngram_ids.numpy(),
             targets_cpu=_targets,
             inputs_cpu=_inputs.numpy(),
+            docs=docs,
         )
 
         if new_params is not None:
@@ -246,10 +259,12 @@ class ScheduledBatches:
     the loader when it changes. Batches are fetched in step order and held until taken, so peek() can
     look ahead: the sampled-softmax candidate build peeks one step ahead, the row prefetch up to
     MAX_CYCLE_STEPS + PREP_SLACK_STEPS (perf/row_prefetch.py). `steps` is range(total_steps) for the
-    timed run and the sampled, non-consecutive steps for warmup.
+    timed run and the sampled, non-consecutive steps for warmup. `on_fetch(step, batch)` sees every batch as it
+    is fetched (the online retrieval cache submits the step's job).
     """
-    def __init__(self, loader, schedule: TrainingSchedule, steps: Sequence[int]):
+    def __init__(self, loader, schedule: TrainingSchedule, steps: Sequence[int], on_fetch=None):
         self.loader = loader
+        self.on_fetch = on_fetch
         self.schedule = schedule
         self.steps = list(steps)
         stage, _ = schedule.lookup(0)
@@ -265,6 +280,8 @@ class ScheduledBatches:
         new_params = geometry if geometry != self.geometry else None
         self.geometry = geometry
         self.ahead[step] = self.loader.send(new_params)
+        if self.on_fetch is not None:
+            self.on_fetch(step, self.ahead[step])
 
     def peek(self, step: int) -> Batch:
         while step not in self.ahead:
