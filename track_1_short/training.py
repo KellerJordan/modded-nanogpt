@@ -79,6 +79,10 @@ class TrainingManager():
             "mudd_gate_b2": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
             "_mudd_gate_scale": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
         })
+        # ---- exact-match retrieval: the scales at 10x lr ----
+        ret_labels = [p.label for p in model.parameters() if p.label.startswith("ret_")]
+        self.param_table.update({label: {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99],
+                                         "lr_mul": 10.0 if "scale" in label else 1.0, "wd_mul": 0.0} for label in ret_labels})
 
         # NCCL runs one stream in enqueue order and future.wait() is a stream wait, so scatter_order is
         # the comms schedule (record #360). The replicated params are all-reduced as one flat buffer ahead
@@ -90,7 +94,7 @@ class TrainingManager():
             "scalars", "smear_gate", "ve_gate_bank", "post_lambdas", "resid_lambdas",
             "mudd_w1", "mudd_w2", "mudd_w2g", "mudd_b2", "mudd_gate_w1", "mudd_gate_w2", "mudd_gate_b2",
             "_mudd_gate_scale",
-        ]
+        ] + ret_labels
         # work_order is the compute schedule (record #360):
         # - qk_bank and vo_bank first: their gathers are the first ones the next step's fp8 refresh waits
         #   for (perf/deferred_gathers.py), and Phase 3's lm_head wait queues behind only these two
@@ -98,8 +102,8 @@ class TrainingManager():
         # - value_embeds: both tables' row-sparse updates, then their row serves, queued ahead of the
         #   mlp_bank gather
         # - the replicated params (one fused update at the first of them), then mlp_bank, the largest
-        #   gather, last
-        self.work_order = [
+        #   gather, last; the retrieval params lead, which moves that fused update to the front
+        self.work_order = ret_labels + [
             "qk_bank", "vo_bank", "lm_head", "embed", "value_embeds",
             "scalars", "smear_gate", "ve_gate_bank", "mudd_b2", "mudd_gate_b2", "_mudd_gate_scale",
             "post_lambdas", "resid_lambdas", "mudd_w2", "mudd_w2g", "mudd_gate_w2", "mudd_w1", "mudd_gate_w1",

@@ -23,7 +23,7 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule: the base step count of the main stages (SCHEDULE_GROWTH_STEPS are added on top), then
     # the extension stage. The override is for step-count sweeps (record #360's KX_STEPS).
-    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "1122"))
+    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "538"))
     num_extension_iterations: int = 20
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"

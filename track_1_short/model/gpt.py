@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from exact_match import CELLS as RET_CELLS
+
 from track_1_short.model.attention import AttnArgs, CausalSelfAttention, Yarn
 from track_1_short.model.layers import CastedLinearT, next_multiple_of_n, norm
 from track_1_short.ngram_table import NGRAM_SIGN_POOL_ROWS
@@ -189,6 +191,13 @@ class GPT(nn.Module):
         self.init_misc(model_dim, num_layers)
         self.init_mudd(num_layers, model_dim)
         self.init_mudd_gate(model_dim)
+        # Exact-match retrieval (track_1_short/retrieval.py): per cell a scale of the candidates' mean embedding and an
+        # embedding of its own, and a scale per injection site.
+        self.ret_next_scale = nn.Parameter(torch.full((RET_CELLS,), 4.0))
+        self.ret_bucket_embed = nn.Parameter(torch.zeros(RET_CELLS, model_dim))
+        self.ret_site_scale_in = nn.Parameter(torch.tensor(0.1))
+        self.ret_site_scale_mid = nn.Parameter(torch.tensor(8.0))
+        self.ret_site_scale_out = nn.Parameter(torch.tensor(8.0))
 
         # Auto-label parameters
         for name, param in self.named_parameters():
@@ -531,7 +540,7 @@ class GPT(nn.Module):
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor,
                 schedule_cfg: ForwardScheduleConfig, ngram_sink: Tensor | None = None,
-                value_embed_grad: Tensor | None = None):
+                value_embed_grad: Tensor | None = None, ret: Tensor | None = None):
         """Per-token loss for one packed varlen batch (B=1, documents separated by `seqlens`).
 
         bigram_input_seq: [2T] int32 slots in `ngram_cache` of each token's bigram (first T) and
@@ -540,6 +549,8 @@ class GPT(nn.Module):
         ngram_sink (training only) is NgramTable.grad_sink: the table rows' gradient lands on it.
         value_embed_grad (training only) is the persistent fp16 buffer value_embeds' gradient accumulates
         into (perf/value_embed_pull.py); value_embeds itself never gets a .grad.
+        ret: [T, 3] int32 exact-match retrieval rows (track_1_short/retrieval.py), added to the residual
+        stream at the input, at layer 7 and before the output head; None (hellaswag) adds nothing.
 
         Layer topology (11 layers, 0-indexed):
           - attention on ATTN_LAYERS (0, 1, 2, 3, 5, 8, 10); short sliding window except layers 3 and 10
@@ -588,6 +599,16 @@ class GPT(nn.Module):
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
+        if ret is not None:
+            # Exact-match retrieval: the mean embedding of each position's candidates, each weighted by k * its
+            # count / the k candidates' count sum and read without a gradient, times its cell's scale, plus its
+            # cell's embedding; zero where nothing matched.
+            cell, tokens, counts = ret[:, 0].long(), ret[:, 1:] & 0xFFFF, ret[:, 1:] >> 16
+            k = (counts > 0).sum(1, keepdim=True)
+            weights = (counts * k).float() / counts.sum(1, keepdim=True).clamp_min(1).float()
+            mean = sum(self.embed.weight.detach()[tokens[:, i]].float() * weights[:, i, None] for i in range(2)) / k.clamp_min(1)
+            ret = ((mean * self.ret_next_scale[cell, None] + self.ret_bucket_embed[cell]) * (cell > 0)[:, None]).bfloat16()
+            x = x + self.ret_site_scale_in.type_as(x) * ret
 
         # Hashed n-gram embedding: each token's bigram row and trigram row, each times its own +-1 sign
         # row, summed. The sign trick compresses several n-grams into a shared row (details in
@@ -643,6 +664,9 @@ class GPT(nn.Module):
             if i == POST_GATE_LAYER:
                 post_gate = self.forward_mudd_gate(x, id=1, num_coef=self._mudd_gate_post_num_coef)
                 post_skip_gate = self.unpack_post_mudd_gate(post_gate, attn_gates, x0_gates, bigram_gates)
+
+            if i == 7 and ret is not None:
+                x = x + self.ret_site_scale_mid.type_as(x) * ret[None]
 
             # process attn. skip on layer 6 @YouJiacheng
             if i == 6:
@@ -770,6 +794,8 @@ class GPT(nn.Module):
         for k, src in enumerate(sources):
             mixed = mixed + (mu[k] + deltas[..., k, :]).unsqueeze(-1) * grouped(src)
         x = mixed.flatten(-2)
+        if ret is not None:
+            x = x + self.ret_site_scale_out.type_as(x) * ret[None]
 
         return self._loss(norm(x), input_seq, target_seq, mtp_weights, prefix_weight, schedule_cfg.sampled_loss)
 

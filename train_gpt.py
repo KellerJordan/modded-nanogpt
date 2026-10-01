@@ -1,6 +1,7 @@
 """NanoGPT speedrun, track 1: train a GPT-2 small-scale model to 3.28 FineWeb val loss on 8xH100.
 
-Launch: torchrun --standalone --nproc_per_node=8 train_gpt.py
+Launch: torchrun --standalone --nproc_per_node=8 train_gpt.py, after building the exact-match extension once
+(`pip install ./exact_match`, needs a Rust toolchain).
 
 This file is the outline of the whole run. The model, optimizer, data and schedules live in
 the `track_1_short/` package; `track_1_short/perf/` holds the kernels and precision tricks that make it
@@ -18,6 +19,7 @@ code = read_source(sys.argv[0])
 
 import copy
 import gc
+import glob
 import time
 
 import torch
@@ -38,7 +40,7 @@ from track_1_short.config import (
     WS_POST_YARN_EXT,
     Hyperparameters,
 )
-from track_1_short.data import ScheduledBatches, cu_seqlens_rows, distributed_data_generator
+from track_1_short.data import HEADER_BYTES, ScheduledBatches, cu_seqlens_rows, distributed_data_generator
 from track_1_short.distributed import setup_distributed
 from track_1_short.model.gpt import ATTN_BANK_ORDER, FP8_EXACT_SCALE_CALLS, GPT
 from track_1_short.model.prefix_prediction import build_prefix_table_bucket
@@ -57,8 +59,9 @@ from track_1_short.perf.cuda_graphs.step_graphs import StepGraphs
 from track_1_short.perf.deferred_gathers import DEFERRED_LABELS, DeferredGathers
 from track_1_short.perf.kernels.mlp import prime_stage_cache
 from track_1_short.perf.pinned_batches import PinnedBatchStaging
-from track_1_short.perf.row_prefetch import PrefetchStaging, RowPrefetch
+from track_1_short.perf.row_prefetch import PREP_SLACK_STEPS, PrefetchStaging, RowPrefetch
 from track_1_short.perf.value_embed_pull import ValueEmbedPull
+from track_1_short.retrieval import OnlineCache, ValidationCache, pin_cpus, pin_threads
 from track_1_short.sampled_softmax import SampledSoftmax
 from track_1_short.schedule import TrainingSchedule
 from track_1_short.tail_average import TailAverages
@@ -72,7 +75,7 @@ dynamo.config.recompile_limit = 64
 PRINT_EVERY = 25
 
 
-def train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, batches, deferred_gathers,
+def train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, batches, deferred_gathers, online_cache,
                step: int, lm_head_f8_col, prefetch_next: bool):
     """One optimizer step on one microbatch: requantize for the previous update, forward/backward, update.
 
@@ -97,7 +100,8 @@ def train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, bat
     # Before the forward, after the lm_head fp8 refresh just above: the candidates' lm_head rows. None on
     # full-softmax steps.
     sampled_loss = sampled_softmax.gather(step, lm_head_f8_col)
-    step_graphs.forward(step, batch, ngram_slots, training_manager.get_forward_args(sampled_loss))
+    step_graphs.forward(step, batch, ngram_slots, training_manager.get_forward_args(sampled_loss),
+                        online_cache.rows(step, batch.inputs.numel()))
     # Eager, between the two replays: the next cycle's row-id exchange hides under the backward.
     row_prefetch.after_forward(step)
     ngram_grad = step_graphs.backward()
@@ -115,6 +119,8 @@ def train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, bat
 
 def main():
     args = Hyperparameters()
+    # Before the process group, so that every thread inherits this rank's cores (track_1_short/retrieval.py).
+    cpus = pin_cpus(int(os.environ["LOCAL_RANK"]), int(os.environ["WORLD_SIZE"]))
     env = setup_distributed()
     if args.train_seed is not None:
         torch.manual_seed(args.train_seed)
@@ -127,9 +133,10 @@ def main():
     batch_tokens = [s.batch_size // env.world_size for s in TRAINING_STAGES] + [val_tokens_per_rank]
     batch_staging = PinnedBatchStaging(max(batch_tokens), max(map(cu_seqlens_rows, batch_tokens)), env.device)
 
-    def train_loader():
+    def train_loader(shard_slots=None):
         return distributed_data_generator(
             args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, batch_staging,
+            shard_slots=shard_slots,
         )
 
     def val_loader():
@@ -209,6 +216,17 @@ def main():
     fp8_refresh = Fp8RefreshGraphs(uncompiled_model)
     deferred_gathers = DeferredGathers(value_embed_pull, fp8_refresh)
 
+    # Exact-match retrieval (track_1_short/retrieval.py), allocated and prefaulted before the clock. The online index
+    # plans every step's documents and resolves each step's rows on the clock ahead of training; the validation index
+    # over all training shards is built on the clock while training runs, and looked up only after training, when the
+    # validation tokens are read.
+    retrieval_schedule = [(stage.batch_size // env.world_size, stage.train_max_seq_len)
+                          for stage, _ in map(training_schedule.lookup, range(training_schedule.total_steps))]
+    online_cache = OnlineCache(args.train_files, retrieval_schedule, env.rank, env.world_size, env.device,
+                               lookahead=MAX_CYCLE_STEPS + PREP_SLACK_STEPS)
+    val_cache = ValidationCache(args.train_files, args.val_files, val_tokens_per_rank, args.val_tokens,
+                                dist.new_group(backend="gloo"), cpus.val_build, cpus.val_lookup)
+
     ########################################
     #            Warmup kernels            #
     ########################################
@@ -250,7 +268,7 @@ def main():
             fp8_refresh.capture()
         # Warmup steps are not consecutive, so no sampled-softmax build is prefetched.
         train_step(training_manager, step_graphs, warmup_prefetch, sampled_softmax, warmup_batches, deferred_gathers,
-                   step, uncompiled_model.lm_head_f8_col, prefetch_next=False)
+                   online_cache, step, uncompiled_model.lm_head_f8_col, prefetch_next=False)
     print0("Resetting Model", console=True)
     deferred_gathers.flush_final()  # the reset below requantizes from the restored weights
     warmup_prefetch.close()
@@ -284,7 +302,14 @@ def main():
     ########################################
     #        Training and validation       #
     ########################################
-    batches = ScheduledBatches(train_loader(), training_schedule, steps=range(training_schedule.total_steps))
+    gc.collect()  # frees the warmup loader's shards first, so the slots below reuse their cached pinned blocks
+    # Pinned shard slots for the timed loader, allocated before the clock: a fresh 256 MB cudaHostAlloc on the clock
+    # holds the driver lock ~144 ms and stalls the main thread's H2Ds. Three, round-robin: the current shard, the next
+    # one loading, and the retired one, a whole shard past its last reader (a fetched batch's docs, the BOS scan).
+    shard_tokens = max((os.path.getsize(f) - HEADER_BYTES) // 2 for f in glob.glob(args.train_files))
+    shard_slots = [torch.empty(shard_tokens, dtype=torch.uint16, pin_memory=True) for _ in range(3)]
+    batches = ScheduledBatches(train_loader(shard_slots), training_schedule, steps=range(training_schedule.total_steps),
+                               on_fetch=online_cache.submit)
     row_prefetch = RowPrefetch(ngram_table, value_embed_pull, batches, range(training_schedule.total_steps),
                                is_update_step, prefetch_staging)
 
@@ -306,9 +331,12 @@ def main():
     uncompiled_model.limit_yarn_rebuild(max_step_tokens)
 
     training_time_ms = 0
-    # start the clock
+    # start the clock, on every rank at once: ranks finish their pre-clock prefaults at different times
+    dist.barrier()
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+    online_cache.start()
+    val_cache.start(online_cache.ready)
     canon_mask_builder.start()
     # Prefix-token table build, inside the timed region. The tokenizer was loaded at import
     # (get_encoding is cached in tiktoken's registry), so this pays only the table construction,
@@ -321,6 +349,8 @@ def main():
     # begin training
     for step in range(training_schedule.total_steps + 1):
         last_step = (step == training_schedule.total_steps)
+        if step == 1:
+            pin_threads(cpus, canon_mask_builder.pid)
         training_manager.advance_schedule(step)
         # --------------- VALIDATION SECTION -----------------
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
@@ -352,19 +382,24 @@ def main():
             val_loader_iter = val_loader()
             val_batches = [next(val_loader_iter) for _ in range(val_steps)]
             del val_loader_iter
+            # Training is over: read this rank's validation chunks and look them up on the CPU, beside the row pull
+            # below.
+            assert last_step, "the validation index is looked up once, after training"
+            val_cache.lookup()
             val_pulls = ngram_table.eval_pulls([batch.ngram_ids for batch in val_batches])
             for pull in val_pulls:
                 ngram_table.land(pull)
+            val_rows = val_cache.rows()
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
             model.eval()
             val_loss = 0
             with torch.no_grad():
-                for batch, pull in zip(val_batches, val_pulls):
+                for batch, pull, rows in zip(val_batches, val_pulls, val_rows):
                     ngram_table.land(pull)
                     val_loss += model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
-                                      training_manager.get_forward_args()).mean()
+                                      training_manager.get_forward_args(), ret=torch.as_tensor(rows, device=env.device)).mean()
             val_loss /= val_steps
             del val_batches, val_pulls
             dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
@@ -387,7 +422,7 @@ def main():
             break
 
         # --------------- TRAINING SECTION -----------------
-        train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, batches, deferred_gathers,
+        train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, batches, deferred_gathers, online_cache,
                    step, uncompiled_model.lm_head_f8_col, prefetch_next=step + 1 < training_schedule.total_steps)
         tail_averages.tick(step)
 
