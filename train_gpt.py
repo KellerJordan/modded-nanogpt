@@ -182,7 +182,6 @@ def main():
     max_step_tokens = max(s.batch_size for s in TRAINING_STAGES) // env.world_size
     val_tokens_per_rank = args.val_batch_size // env.world_size
     if os.environ.get("ALLOW_4_GPUS") == "1":  # the n-gram row cache must hold a training cycle (model/gpt.py)
-        from track_1_short.ngram_table import MAX_CYCLE_STEPS
         os.environ["NGRAM_CACHE_MIN_ROWS"] = str(2 * MAX_CYCLE_STEPS * max_step_tokens)
     # Pinned slots for every batch's H2D copies, training and validation (perf/pinned_batches.py), sized
     # for the largest batch per rank either reads.
