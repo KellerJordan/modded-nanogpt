@@ -78,6 +78,10 @@ class TrainingManager():
             "mudd_gate_w2": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1},
             "mudd_gate_b2": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
             "_mudd_gate_scale": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
+            # the document-local copy feature (doc_copy.py): per-bucket scales and embeddings, injection gains
+            "copy_doc_scale":        {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "wd_mul": 0.0},
+            "copy_doc_bucket_embed": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "wd_mul": 0.0},
+            "copy_doc_site":         {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "wd_mul": 0.0},
         })
 
         # NCCL runs one stream in enqueue order and future.wait() is a stream wait, so scatter_order is
@@ -89,7 +93,7 @@ class TrainingManager():
             "lm_head", "embed",
             "scalars", "smear_gate", "ve_gate_bank", "post_lambdas", "resid_lambdas",
             "mudd_w1", "mudd_w2", "mudd_w2g", "mudd_b2", "mudd_gate_w1", "mudd_gate_w2", "mudd_gate_b2",
-            "_mudd_gate_scale",
+            "_mudd_gate_scale", "copy_doc_scale", "copy_doc_bucket_embed", "copy_doc_site",
         ]
         # work_order is the compute schedule (record #360):
         # - qk_bank and vo_bank first: their gathers are the first ones the next step's fp8 refresh waits
@@ -103,6 +107,7 @@ class TrainingManager():
             "qk_bank", "vo_bank", "lm_head", "embed", "value_embeds",
             "scalars", "smear_gate", "ve_gate_bank", "mudd_b2", "mudd_gate_b2", "_mudd_gate_scale",
             "post_lambdas", "resid_lambdas", "mudd_w2", "mudd_w2g", "mudd_gate_w2", "mudd_w1", "mudd_gate_w1",
+            "copy_doc_scale", "copy_doc_bucket_embed", "copy_doc_site",
             "mlp_bank",
         ]
 
