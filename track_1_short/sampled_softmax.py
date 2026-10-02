@@ -47,7 +47,21 @@ CANDIDATES_BY_STAGE = {
     1: (10240,),
     2: (14336, 14336, 24576),
 }
+# ALLOW_4_GPUS (one 4-GPU node): each rank's microbatch holds 2x the tokens, so ~2x the distinct targets;
+# double every pool (still multiples of 2048, still < V) to cover them. Validation is unaffected.
+if __import__("os").environ.get("ALLOW_4_GPUS") == "1":
+    CANDIDATES_BY_STAGE = {i: tuple(2 * p for p in counts) for i, counts in CANDIDATES_BY_STAGE.items()}
+    # Capped at 28672: a 49152-wide pool (98% of V) made training blow up at the stage-2 ramp (step 965).
+    _cap = int(__import__("os").environ.get("SAMPLED_P_CAP", "28672"))
+    if _cap:
+        CANDIDATES_BY_STAGE = {i: tuple(min(p, _cap) for p in counts) for i, counts in CANDIDATES_BY_STAGE.items()}
 ALL_CANDIDATE_COUNTS = tuple(sorted({p for counts in CANDIDATES_BY_STAGE.values() for p in counts}))
+# SAMPLED_OFF=1 (diagnostic): no sampled softmax, every step normalizes over the full vocabulary.
+if __import__("os").environ.get("SAMPLED_OFF") == "1":
+    CANDIDATES_BY_STAGE = {}
+    ALL_CANDIDATE_COUNTS = ()
+_CPLM = __import__("os").environ.get("CPLM") == "1"
+_COPY_TOKEN_ID = 50257
 # Coprime with the vocabulary, so k * stride mod V is a permutation (record #360).
 NEGATIVE_STRIDE = 20011
 
@@ -122,6 +136,8 @@ class CandidateBuilder:
         V, mark, pos, T = self.vocab_size, self.mark, self.pos, targets.shape[0]
         mark.fill(False)
         mark[targets] = True
+        if _CPLM:
+            mark[_COPY_TOKEN_ID] = True  # the copy-sink gate's <copy> slot is always a candidate
         num_targets = int(np.count_nonzero(mark[:V]))
         assert num_targets <= P, f"{num_targets} distinct targets > P={P}"
         if num_targets != P:
@@ -154,8 +170,8 @@ class SampledSoftmax:
         self.rank, self.world_size = rank, world_size
         self.counts = [candidate_count_at(schedule, s) for s in range(schedule.total_steps + 1)]
         p_values = sorted(set(self.counts) - {0})
-        assert p_values
-        max_p = max(p_values)
+        assert p_values or __import__("os").environ.get("SAMPLED_OFF") == "1"
+        max_p = max(p_values, default=2048)  # SAMPLED_OFF: buffers stay allocated but are never used
         self.builder = CandidateBuilder(vocab_size, max_p, max_rows)
         self.staging = CandidateStaging(max_candidates=max_p, max_rows=max_rows, device=device)
         self.prefix_table = None  # host copy of model.prefix_table, set once it is built
