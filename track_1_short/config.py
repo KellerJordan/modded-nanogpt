@@ -22,9 +22,11 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule: the base step count of the main stages (SCHEDULE_GROWTH_STEPS are added on top), then
-    # the extension stage. The override is for step-count sweeps (record #360's KX_STEPS). 1107 = record
-    # #360's 1122 minus the 15 steps the n-gram token normalization (token_norm.py) buys back.
-    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "1107"))
+    # the extension stage. The override is for step-count sweeps (record #360's KX_STEPS). 1060 = record
+    # #360's 1122 minus the 15 steps the n-gram token normalization (token_norm.py) buys back, minus 47 for
+    # the document-local copy feature (doc_copy.py). A single development run at 1050 ended within a
+    # millinat of #360's val loss on 8xH100; the 10 extra steps are margin for the mean-over-runs criterion.
+    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "1060"))
     num_extension_iterations: int = 20
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"

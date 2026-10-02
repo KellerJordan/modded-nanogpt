@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from track_1_short.doc_copy import COPY_BUCKETS, doc_copy_features, hash_power_tables
 from track_1_short.model.attention import AttnArgs, CausalSelfAttention, Yarn
 from track_1_short.model.layers import CastedLinearT, next_multiple_of_n, norm
 from track_1_short.ngram_table import NGRAM_SIGN_POOL_ROWS
@@ -167,9 +168,15 @@ class GPT(nn.Module):
         self.register_buffer("ngram_cache", torch.zeros(2 * max_seq_len, ngram_dim, dtype=torch.bfloat16, device=device),
                              persistent=False)
         # Token id -> its normalization class id (track_1_short/token_norm.py), read by the n-gram
-        # sign hashes only; the row hashes map on the host (ngram_table.ngram_row_ids).
+        # sign hashes and the copy matcher (doc_copy.py); the row hashes map on the host
+        # (ngram_table.ngram_row_ids).
         assert NORM_MAP.numel() == self.vocab_size
         self.register_buffer("ngram_norm_map", NORM_MAP.to(device), persistent=False)
+        # Rolling-hash power tables of the document-local copy matcher (doc_copy.py), for the longest
+        # forward (validation's). The matcher hashes the normalized ids above.
+        copy_pow_fwd, copy_pow_bwd = hash_power_tables(max_seq_len, device)
+        self.register_buffer("copy_pow_fwd", copy_pow_fwd, persistent=False)
+        self.register_buffer("copy_pow_bwd", copy_pow_bwd, persistent=False)
 
         # Canonical token mask for the validation softmax, one bit per (prev, cur) pair.
         # Allocated all-zero == no masking.
@@ -353,6 +360,19 @@ class GPT(nn.Module):
         self.register_buffer('ngram_sign_pool', ngram_sign_pool)
 
         self.post_lambdas = nn.Parameter(torch.ones(num_layers, 2))
+
+        # Document-local copy feature (doc_copy.py). Per match bucket: a scale of the candidate token's
+        # (tied) embedding and a bucket embedding, both zero-init so the feature starts switched off (a
+        # unit init perturbed the input by a whole other token's embedding and made runs seed-sensitive);
+        # site: the copy vector's gains at the input and before the final norm. This parameterization and
+        # the gain init follow #367's retrieval injection, at two of its three sites (#367 also uses layer 7).
+        self.copy_doc_scale = nn.Parameter(torch.zeros(COPY_BUCKETS))
+        self.copy_doc_bucket_embed = nn.Parameter(torch.zeros(COPY_BUCKETS, model_dim))
+        self.copy_doc_site = nn.Parameter(torch.tensor([0.5, 1.0]))
+        # 0 for bucket 0 (no match), 1 elsewhere: zeroes the no-match row of the two small tables.
+        copy_doc_live = torch.ones(COPY_BUCKETS, device=self.device)
+        copy_doc_live[0] = 0
+        self.register_buffer("copy_doc_live", copy_doc_live, persistent=False)
 
         # Per-sublayer residual scaling: [num_layers, 2] where [:,0]=attn, [:,1]=mlp
         # sqrt(1.1) per sublayer so cumulative per-layer scaling is 1.1
@@ -592,7 +612,16 @@ class GPT(nn.Module):
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
 
         # ---- Embeddings and input preparation ----
-        x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
+        # Document-local copy feature (doc_copy.py): each position's candidate next token from the longest
+        # earlier match of its context in its document, computed from input_seq alone inside the compiled
+        # forward. One embedding lookup serves the tokens and the candidates: two lookups would each build
+        # their own dense [vocab, dim] gradient in the backward.
+        copy_candidate, copy_bucket = doc_copy_features(input_seq, (self.copy_pow_fwd, self.copy_pow_bwd),
+                                                        self.ngram_norm_map)
+        num_tokens = input_seq.numel()
+        rows = self.embed(torch.cat([input_seq.long(), copy_candidate.clamp_min(0)]))
+        x = rows[:num_tokens]  # embed is synced from lm_head during tied phase by optimizer
+        copy_rows = rows[num_tokens:]
 
         # Hashed n-gram embedding: each token's bigram row and trigram row, each times its own +-1 sign
         # row, summed. The sign trick compresses several n-grams into a shared row (details in
@@ -618,6 +647,15 @@ class GPT(nn.Module):
         # smear token embed forward 1 position @classiclarryd
         smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
+        # The copy vector: candidate embedding times its bucket's scale, plus the bucket's embedding (zero
+        # for no match). The per-bucket lookups go through F.embedding on small tables whose no-match row
+        # is zeroed: advanced indexing's backward (index_put with accumulate) sorts all T x dim entries.
+        copy_scale = F.embedding(copy_bucket, (self.copy_doc_scale * self.copy_doc_live).unsqueeze(-1).type_as(x))
+        copy_embed = F.embedding(copy_bucket, (self.copy_doc_bucket_embed * self.copy_doc_live.unsqueeze(-1)).type_as(x))
+        copy_vec = copy_rows * copy_scale + copy_embed
+        copy_site = self.copy_doc_site.type_as(x)
+        x = x + copy_site[0] * copy_vec
+        copy_out = copy_site[1] * copy_vec
         x = x0 = norm(x[None])
 
         pre_gate = self.forward_mudd_gate(x0, id=0, num_coef=self._mudd_gate_pre_num_coef)
@@ -777,6 +815,7 @@ class GPT(nn.Module):
             mixed = mixed + (mu[k] + deltas[..., k, :]).unsqueeze(-1) * grouped(src)
         x = mixed.flatten(-2)
 
+        x = x + copy_out[None]  # the copy vector's second site, before the final norm
         return self._loss(norm(x), input_seq, target_seq, mtp_weights, prefix_weight, schedule_cfg.sampled_loss)
 
     def _loss(self, x, input_seq, target_seq, mtp_weights, prefix_weight, sampled_loss):

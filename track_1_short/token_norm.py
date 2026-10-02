@@ -5,8 +5,8 @@ whitespace collapsed to one space, outer whitespace stripped) share one id -- th
 class -- so " The", "THE" and " the" hash to the same bigram / trigram row and sign row.
 
 Only the n-gram hashes read the mapped ids (ngram_table.ngram_row_ids and the sign-pool hashes of the
-model's ngram_embedding call). The token embedding, value embeddings, lm_head, targets and the data
-stream all keep raw GPT-2 ids.
+model's ngram_embedding call), and the document-local copy matcher's context hashes (doc_copy.py). The
+token embedding, value embeddings, lm_head, targets and the data stream all keep raw GPT-2 ids.
 
 Tokens that keep their own id: <|endoftext|>, the byte tokens that are not whole UTF-8, and the 9
 tokens that normalize to "" (the vertical-tab and form-feed controls, lone combining marks, the emoji
