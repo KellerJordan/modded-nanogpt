@@ -11,8 +11,8 @@ import sys
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 # CPLM record settings (all overridable from the environment): the copy-sink pointer LM with QK-normed pointer
-# queries/keys, 1035 training steps (963 scheduled + 72 growth/extension), and an 8192-token copy band at validation.
-for _k, _v in (("CPLM", "1"), ("CPLM_QK_NORM", "1"), ("NUM_SCHEDULED_ITERATIONS", "963"), ("CPLM_EVAL_BLOCK", "8192")):
+# queries/keys, 1050 training steps (978 scheduled + 72 growth/extension), and an 8192-token copy band at validation.
+for _k, _v in (("CPLM", "1"), ("CPLM_QK_NORM", "1"), ("NUM_SCHEDULED_ITERATIONS", "978"), ("CPLM_EVAL_BLOCK", "8192")):
     os.environ.setdefault(_k, _v)
 
 from track_1_short.run_log import log_environment, read_source, start_run_log
