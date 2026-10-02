@@ -6,6 +6,7 @@ model/gpt.py. FA3 reads the widths unpadded, which needs record #360's patched F
 """
 import hashlib
 import math
+import os
 import pathlib
 from dataclasses import dataclass
 
@@ -36,7 +37,28 @@ def load_flash_attn3():
     return fa3.flash_attn_interface
 
 
-flash_attn_interface = load_flash_attn3()
+# Clariden (GH200, aarch64): the pinned build is x86_64-only. FA3_LOCAL_DIR imports a stock aarch64 FA3 build instead;
+# FA3_PAD=1 zero-pads the narrower of (q/k, v) head widths to the wider one, which leaves the math unchanged
+# (softmax_scale is passed explicitly; padded v columns are sliced off).
+if os.environ.get("FA3_NATIVE") == "1":  # FA3 built from source into the venv (at::cuda stream API; graph-safe)
+    import flash_attn_interface
+elif os.environ.get("FA3_LOCAL_DIR"):  # a kernels build variant dir holding a flash_attention_3/ package
+    import sys
+    sys.path.insert(0, os.environ["FA3_LOCAL_DIR"])
+    from flash_attention_3 import flash_attn_interface
+else:
+    flash_attn_interface = load_flash_attn3()
+_FA3_PAD = os.environ.get("FA3_PAD", "0") == "1"
+
+
+def _fa3_varlen(q, k, v, **kw):
+    dq, dv = q.shape[-1], v.shape[-1]
+    if not _FA3_PAD or dq == dv:
+        return flash_attn_interface.flash_attn_varlen_func(q, k, v, **kw)
+    if dq < dv:
+        q, k = F.pad(q, (0, dv - dq)), F.pad(k, (0, dv - dq))
+        return flash_attn_interface.flash_attn_varlen_func(q, k, v, **kw)
+    return flash_attn_interface.flash_attn_varlen_func(q, k, F.pad(v, (0, dq - dv)), **kw)[..., :dv]
 
 
 class Yarn(nn.Module):
@@ -215,7 +237,7 @@ class CausalSelfAttention(nn.Module):
             max_len = 2 * max_len
 
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+        y = _fa3_varlen(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, H, self.v_dim)

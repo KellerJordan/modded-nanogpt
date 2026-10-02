@@ -25,7 +25,11 @@ def setup_distributed() -> DistEnv:
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     # The sampled softmax and the sparse row exchanges assume one microbatch per step on 8 ranks.
-    assert world_size == WORLD_SIZE, f"track 1 runs on exactly {WORLD_SIZE} GPUs, got world_size={world_size}"
+    # ALLOW_4_GPUS=1 (Clariden, one 4-GPU node): same global batch, each rank takes twice the tokens in its
+    # single microbatch. Everything else is written in world_size; gradients come out 2x (per-rank loss sums,
+    # AVG over ranks), which Adam/ANVIL's normalized updates absorb.
+    allowed = (WORLD_SIZE, 4) if os.environ.get("ALLOW_4_GPUS") == "1" else (WORLD_SIZE,)
+    assert world_size in allowed, f"track 1 runs on exactly {WORLD_SIZE} GPUs, got world_size={world_size}"
     assert torch.cuda.is_available()
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)

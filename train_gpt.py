@@ -10,6 +10,10 @@ import os
 import sys
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+# CPLM record settings (all overridable from the environment): the copy-sink pointer LM with QK-normed pointer
+# queries/keys, 1035 training steps (963 scheduled + 72 growth/extension), and an 8192-token copy band at validation.
+for _k, _v in (("CPLM", "1"), ("CPLM_QK_NORM", "1"), ("NUM_SCHEDULED_ITERATIONS", "963"), ("CPLM_EVAL_BLOCK", "8192")):
+    os.environ.setdefault(_k, _v)
 
 from track_1_short.run_log import log_environment, read_source, start_run_log
 
@@ -72,6 +76,50 @@ dynamo.config.recompile_limit = 64
 PRINT_EVERY = 25
 
 
+_CPLM_WARMUP = int(os.environ.get("CPLM_WARMUP", "0")) if os.environ.get("CPLM") == "1" else 0
+_CPLM_SINK_WARMUP = int(os.environ.get("CPLM_SINK_WARMUP", "0")) if os.environ.get("CPLM") == "1" else 0
+# CPLM_STATS=1: log copy-branch weights / grads / activations (rank 0), every 2nd Adam step for the first 300 steps,
+# then every 25 steps. Grads are read after backward (local rank, before the reduce), weights after the update.
+_CPLM_STATS = os.environ.get("CPLM_STATS") == "1" and os.environ.get("CPLM") == "1"
+_cstat_prev = {}
+
+
+def _cstat_due(step):
+    return step % 2 == 1 and (step < 300 or step % 25 == 1)
+
+
+@torch.no_grad()
+def _cstat_log(model, step, phase):
+    if int(os.environ.get("RANK", "0")) != 0:
+        return
+    from track_1_short.model.gpt import STATS_NAMES, COPY_TOKEN_ID
+    W, ks, lm = model.copy_qk_bank, model.copy_k_sink, model.lm_head.weight
+    h = model.cplm_train_stats[16:]
+    hn = h / h.norm().clamp_min(1e-12)
+    f = lambda t: float(t.float().norm())
+    out = {}
+    if phase == "grad":
+        st = model.cplm_train_stats[:len(STATS_NAMES)].tolist()
+        out.update({k: v for k, v in zip(STATS_NAMES, st)})
+        if W.grad is not None:
+            out.update(g_q=f(W.grad[0]), g_k=f(W.grad[1]))
+        if ks.grad is not None:
+            out["g_sink"] = f(ks.grad)
+        if lm.grad is not None:
+            gc = lm.grad[:, COPY_TOKEN_ID].float()
+            out.update(g_col=f(gc), g_col_push=float(-(gc @ hn)), g_lm_colmean=f(lm.grad) / lm.shape[1] ** 0.5)
+    else:
+        wc = lm[:, COPY_TOKEN_ID].float()
+        if hasattr(model, "copy_qk_gain"):
+            out["qk_gain"] = float(model.copy_qk_gain)
+        out.update(w_q=f(W[0]), w_k=f(W[1]), w_sink=f(ks), w_col=f(wc), w_col_dot_h=float(wc @ hn),
+                   w_lm_colmean=f(lm) / lm.shape[1] ** 0.5)
+        if "wc" in _cstat_prev:
+            out["dw_col"] = f(wc - _cstat_prev["wc"])
+        _cstat_prev["wc"] = wc.clone()
+    print(f"cstat step:{step} {phase} " + " ".join(f"{k}={v:.5g}" for k, v in out.items()), flush=True)
+
+
 def train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, batches, deferred_gathers,
                step: int, lm_head_f8_col, prefetch_next: bool):
     """One optimizer step on one microbatch: requantize for the previous update, forward/backward, update.
@@ -97,10 +145,18 @@ def train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, bat
     # Before the forward, after the lm_head fp8 refresh just above: the candidates' lm_head rows. None on
     # full-softmax steps.
     sampled_loss = sampled_softmax.gather(step, lm_head_f8_col)
+    # CPLM copy-gate warmup: alpha -> lambda * alpha with lambda = min(1, step / CPLM_WARMUP) (a device scalar the
+    # captured graphs read). Only set when CPLM_WARMUP is given; otherwise lambda stays 1.
+    if _CPLM_WARMUP > 0:
+        training_manager.model.copy_gate_lambda.fill_(min(1.0, step / _CPLM_WARMUP))
+    if _CPLM_SINK_WARMUP > 0:
+        training_manager.model.copy_sink_lambda.fill_(min(1.0, step / _CPLM_SINK_WARMUP))
     step_graphs.forward(step, batch, ngram_slots, training_manager.get_forward_args(sampled_loss))
     # Eager, between the two replays: the next cycle's row-id exchange hides under the backward.
     row_prefetch.after_forward(step)
     ngram_grad = step_graphs.backward()
+    if _CPLM_STATS and _cstat_due(step):
+        _cstat_log(training_manager.model, step, "grad")
     ngram_table.accumulate_grad(ngram_slots, step_graphs.hold_ngram_grad(
         ngram_grad, pending=len(ngram_table.pending), event_this_step=row_prefetch.is_update(step)))
     sampled_softmax.mark_readers_done()
@@ -108,6 +164,9 @@ def train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, bat
     if prefetch_next:
         sampled_softmax.prefetch(step + 1, batches.peek(step + 1).targets_cpu)
     gathers = training_manager.step_optimizers(step, row_prefetch, DEFERRED_LABELS)
+    if _CPLM_STATS and _cstat_due(step):
+        torch.cuda.synchronize()
+        _cstat_log(training_manager.model, step, "weight")
     # lm_head is Adam-updated, i.e. only on Adam steps, so its fp8 copies only change then.
     deferred_gathers.hand_over(gathers, refresh_lm=training_manager.is_adam_step(step))
     batches.take(step)
@@ -122,6 +181,9 @@ def main():
     # Tokens per rank of the largest training batch, and of a validation batch.
     max_step_tokens = max(s.batch_size for s in TRAINING_STAGES) // env.world_size
     val_tokens_per_rank = args.val_batch_size // env.world_size
+    if os.environ.get("ALLOW_4_GPUS") == "1":  # the n-gram row cache must hold a training cycle (model/gpt.py)
+        from track_1_short.ngram_table import MAX_CYCLE_STEPS
+        os.environ["NGRAM_CACHE_MIN_ROWS"] = str(2 * MAX_CYCLE_STEPS * max_step_tokens)
     # Pinned slots for every batch's H2D copies, training and validation (perf/pinned_batches.py), sized
     # for the largest batch per rank either reads.
     batch_tokens = [s.batch_size // env.world_size for s in TRAINING_STAGES] + [val_tokens_per_rank]
@@ -360,15 +422,37 @@ def main():
             training_time_ms += 1000 * (time.perf_counter() - t0)
             model.eval()
             val_loss = 0
+            if getattr(model, "cplm", False):
+                model.cplm_diag.zero_()
             with torch.no_grad():
                 for batch, pull in zip(val_batches, val_pulls):
                     ngram_table.land(pull)
                     val_loss += model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
                                       training_manager.get_forward_args()).mean()
             val_loss /= val_steps
+            if last_step and getattr(model, "cplm", False) and os.environ.get("CPLM_EVAL_BLOCKS"):
+                # Diagnostic: re-evaluate the same final model with wider copy bands (validation only; the
+                # official val_loss above keeps the training band). Off the clock.
+                eval_block0 = uncompiled_model.copy_eval_block
+                for blk in (int(b) for b in os.environ["CPLM_EVAL_BLOCKS"].replace("+", ",").split(",")):
+                    uncompiled_model.copy_eval_block = blk
+                    vl = 0
+                    with torch.no_grad():
+                        for batch, pull in zip(val_batches, val_pulls):
+                            ngram_table.land(pull)
+                            vl += model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
+                                        training_manager.get_forward_args()).mean()
+                    vl = vl / val_steps
+                    dist.reduce(vl, 0, op=dist.ReduceOp.AVG)
+                    print0(f"step:{step}/{training_schedule.total_steps} val_loss@copyL{blk}:{vl:.4f}", console=True)
+                uncompiled_model.copy_eval_block = eval_block0
             del val_batches, val_pulls
             dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
             print0(f"step:{step}/{training_schedule.total_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            if getattr(model, "cplm", False):  # CPLM diagnostics (token-averaged over all ranks)
+                d = model.cplm_diag.clone(); dist.all_reduce(d)
+                n = d[0].clamp_min(1)
+                print0(f"step:{step} cplm_diag nll:{d[1]/n:.4f} lm_nll:{d[2]/n:.4f} alpha:{d[3]/n:.4f} a_sink:{d[4]/n:.4f} copy_share:{d[5]/n:.4f}", console=True)
             # The clock is stopped: flush the log and collect the loop's garbage here.
             flush_log()
             gc.collect()
@@ -387,8 +471,24 @@ def main():
             break
 
         # --------------- TRAINING SECTION -----------------
-        train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, batches, deferred_gathers,
-                   step, uncompiled_model.lm_head_f8_col, prefetch_next=step + 1 < training_schedule.total_steps)
+        # PROFILE_STEPS=a+b: kernel-level profile of those steps on rank 0 (diagnostic; perturbs their timing)
+        if str(step) in os.environ.get("PROFILE_STEPS", "").split("+"):
+            from torch.profiler import profile, ProfilerActivity
+            torch.cuda.synchronize()
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+                train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, batches, deferred_gathers,
+                           step, uncompiled_model.lm_head_f8_col, prefetch_next=step + 1 < training_schedule.total_steps)
+                torch.cuda.synchronize()
+            if env.master_process:
+                ka = prof.key_averages()
+                tot = sum(e.self_device_time_total for e in ka)
+                print0(f"PROFILE step {step}: total device self time {tot/1000:.2f} ms", console=True)
+                for e in sorted(ka, key=lambda e: -e.self_device_time_total)[:int(os.environ.get("PROFILE_TOP", 40))]:
+                    if e.self_device_time_total > 0:
+                        print0(f"PROFILE {e.self_device_time_total/1000:8.3f} ms  x{e.count:<4d} {e.key[:110]}", console=True)
+        else:
+            train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, batches, deferred_gathers,
+                       step, uncompiled_model.lm_head_f8_col, prefetch_next=step + 1 < training_schedule.total_steps)
         tail_averages.tick(step)
 
         # logging, thinned to every PRINT_EVERY steps and the last two
