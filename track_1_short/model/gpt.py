@@ -6,6 +6,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from exact_match import CELLS as RET_CELLS
+
+from track_1_short.config import MODEL_DIM
+RET_CELLS = RET_CELLS * 4  # cells tagged by source (6-, 4- (unused), 3-, 2-token index)
 from track_1_short.model.attention import AttnArgs, CausalSelfAttention, Yarn
 from track_1_short.model.layers import CastedLinearT, next_multiple_of_n, norm
 from track_1_short.ngram_table import NGRAM_SIGN_POOL_ROWS
@@ -26,6 +30,7 @@ from track_1_short.perf.kernels.sampled_cross_entropy import SampledSoftcappedCr
 from track_1_short.perf.kernels.value_embed import value_embed_lookup
 from track_1_short.perf.residual_fusion import rms_norm_with_head, scale, scale_add
 from track_1_short.sampled_softmax import SampledLoss
+from track_1_short.token_norm import NORM_MAP
 
 # Layer topology (11 layers). Depth cut from record #360 (ANVIL2): layer 7 is removed whole -- its
 # residual scaling and x0 injection stay, so cache[7] still exists -- and layers 4 and 9 run
@@ -93,18 +98,18 @@ assert all(i < POST_GATE_LAYER for i in XSA_LAYERS), "the XSA strengths come fro
 # Layer 8 runs a second MLP in parallel, from MLP bank slot 11 (the slot that was sharding padding).
 PARALLEL_MLP_LAYER, PARALLEL_MLP_SLOT = 8, 11
 # The post-loop MUDD mix splits model_dim into this many channel groups, each with its own coefficient delta.
-MUDD_GROUPS = 12
+MUDD_GROUPS = MODEL_DIM // 64
 # MUDD coefficients at the start of the last layer (init_mudd lists them).
 LAST_LAYER_MUDD_COEFS = 14
 # MUDD gate lane widths (init_mudd_gate): one lane per head for the XSA strengths and the attention
 # gates, one lane per injection site for x0 / the n-gram embedding, one for the layer-6 skip.
-MUDD_GATE_HEAD_LANES = 6
+MUDD_GATE_HEAD_LANES = MODEL_DIM // 128
 MUDD_GATE_SCALE = 0.1  # the gates' output scale at init; biases are stored pre-divided by it
 # MLP bank: 12 slots of (c_fc, c_proj), 24 matrices for even sharding over 8 GPUs. Slot i is layer i's
 # MLP, slot 11 is PARALLEL_MLP_SLOT, slot 7 is dead (NO_MLP_LAYERS) but keeps the bank even.
 NUM_MLP_SLOTS = 12
 # MLP hidden size, cut from 4 * 768 = 3072 in record #360.
-MLP_HIDDEN_DIM = 2816
+MLP_HIDDEN_DIM = 2816 if MODEL_DIM == 768 else 1792
 
 # Static FP8 scales of the attention projection's input (e4m3, saturates entries beyond |8|) and of
 # its incoming gradient, both from record #360.
@@ -114,6 +119,11 @@ FP8_ATTN_GRAD_SCALE = 1.0 / 448.0
 # Validation computes the loss over slabs of this many rows (record #360), so its [rows, vocab] fp32
 # logits (6.6 GB per slab) stay small next to the rank's 16 GB n-gram shard.
 EVAL_CE_SLAB_ROWS = 32768
+CPLM = True  # PR #379's copy-sink pointer, its record settings (QK norm, an 8192-token validation band)
+if CPLM:
+    from track_1_short.cplm_copy import copy_sink_probs_fused
+    from track_1_short.perf.kernels.cplm_cross_entropy import COPY_TOKEN_ID, FusedCPLMCrossEntropy, SampledCPLMCrossEntropy
+    COPY_BLOCK = 2048  # copy lookback band: one to two blocks
 
 # FP8 MLP scales (see perf/kernels/mlp.py), from record #360.
 FP8_MLP_X_SCALE = 2 ** -4      # static: post-RMS-norm rows have max|x| <= sqrt(768) = 27.7 < 448 * 2^-4
@@ -165,6 +175,8 @@ class GPT(nn.Module):
         # which also holds a training cycle (NgramTable asserts it).
         self.register_buffer("ngram_cache", torch.zeros(2 * max_seq_len, ngram_dim, dtype=torch.bfloat16, device=device),
                              persistent=False)
+        # PR #375: token id -> its normalization class id, read by the n-gram sign hashes
+        self.register_buffer("ngram_norm_map", NORM_MAP.to(device), persistent=False)
 
         # Canonical token mask for the validation softmax, one bit per (prev, cur) pair.
         # Allocated all-zero == no masking.
@@ -178,6 +190,9 @@ class GPT(nn.Module):
         self.register_buffer("_lm_head_f8_row", torch.empty(model_dim, self.vocab_size, dtype=torch.float8_e4m3fn, device=device), persistent=False)
         self.register_buffer("_lm_head_f8_col", torch.empty_strided((model_dim, self.vocab_size), (1, model_dim), dtype=torch.float8_e4m3fn, device=device), persistent=False)
         self.register_buffer("_lm_head_inv_w_s", lm_head_inverse_scale(self.lm_head.w_s, device), persistent=False)
+        # the final normed hidden states of the full-softmax training forwards and of validation
+        self.register_buffer("fit_hidden", torch.zeros(65536, model_dim, dtype=torch.bfloat16, device=device), persistent=False)
+        self.register_buffer("val_hidden", torch.zeros(262144, model_dim, dtype=torch.bfloat16, device=device), persistent=False)
 
         self.embed = nn.Embedding(self.vocab_size, model_dim)
         with torch.no_grad():
@@ -189,6 +204,32 @@ class GPT(nn.Module):
         self.init_misc(model_dim, num_layers)
         self.init_mudd(num_layers, model_dim)
         self.init_mudd_gate(model_dim)
+        # Exact-match retrieval (track_1_short/retrieval.py): per cell a scale of the candidates' mean embedding and an
+        # embedding of its own, and a scale per injection site.
+        self.ret_next_scale = nn.Parameter(torch.full((RET_CELLS,), 4.0))
+        self.ret_bucket_embed = nn.Parameter(torch.zeros(RET_CELLS, model_dim))
+        self.ret_site_scale_in = nn.Parameter(torch.tensor(0.1))
+        self.ret_site_scale_mid = nn.Parameter(torch.tensor(8.0))
+        self.ret_site_scale_out = nn.Parameter(torch.tensor(8.0))
+
+        # CPLM: copy-sink pointer, K=1 head of dim 128 over the final hidden state, plus a learned sink key. <copy> is
+        # the first padding row of the vocab, so lm_head needs no new rows.
+        self.cplm = CPLM
+        if self.cplm:
+            copy_dim = 128
+            bound = (3 ** 0.5) * model_dim ** -0.5
+            self.copy_qk_bank = nn.Parameter(torch.empty(3, copy_dim, model_dim, device=device).uniform_(-bound, bound))
+            self.copy_k_sink = nn.Parameter(torch.randn(copy_dim, device=device) * copy_dim ** -0.5)
+            # keys also read the previous position's hidden state, through a zero-initialized slice
+            with torch.no_grad():
+                self.copy_qk_bank[2].zero_()
+            self.copy_qk_gain = nn.Parameter(torch.full((1,), 1.0, device=device))
+            self.copy_eval_block = 8192
+            self.register_buffer("copy_col_full", torch.full((1,), COPY_TOKEN_ID, dtype=torch.int32, device=device),
+                                 persistent=False)
+            # copy-gate scale lambda and sink-route scale (alpha -> lambda * alpha; a_sink -> lambda * a_sink), both 1
+            self.register_buffer("copy_gate_lambda", torch.ones(1, dtype=torch.float32, device=device), persistent=False)
+            self.register_buffer("copy_sink_lambda", torch.ones(1, dtype=torch.float32, device=device), persistent=False)
 
         # Auto-label parameters
         for name, param in self.named_parameters():
@@ -531,7 +572,7 @@ class GPT(nn.Module):
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor,
                 schedule_cfg: ForwardScheduleConfig, ngram_sink: Tensor | None = None,
-                value_embed_grad: Tensor | None = None):
+                value_embed_grad: Tensor | None = None, ret: Tensor | None = None):
         """Per-token loss for one packed varlen batch (B=1, documents separated by `seqlens`).
 
         bigram_input_seq: [2T] int32 slots in `ngram_cache` of each token's bigram (first T) and
@@ -540,6 +581,8 @@ class GPT(nn.Module):
         ngram_sink (training only) is NgramTable.grad_sink: the table rows' gradient lands on it.
         value_embed_grad (training only) is the persistent fp16 buffer value_embeds' gradient accumulates
         into (perf/value_embed_pull.py); value_embeds itself never gets a .grad.
+        ret: [T, 3] int32 exact-match retrieval rows (track_1_short/retrieval.py), added to the residual
+        stream at the input, at layer 7 and before the output head; None (hellaswag) adds nothing.
 
         Layer topology (11 layers, 0-indexed):
           - attention on ATTN_LAYERS (0, 1, 2, 3, 5, 8, 10); short sliding window except layers 3 and 10
@@ -588,6 +631,16 @@ class GPT(nn.Module):
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
+        if ret is not None:
+            # Exact-match retrieval: the mean embedding of each position's candidates, each weighted by k * its
+            # count / the k candidates' count sum and read without a gradient, times its cell's scale, plus its
+            # cell's embedding; zero where nothing matched.
+            cell, tokens, counts = ret[:, 0].long(), ret[:, 1:] & 0xFFFF, ret[:, 1:] >> 16
+            k = (counts > 0).sum(1, keepdim=True)
+            weights = (counts * k).float() / counts.sum(1, keepdim=True).clamp_min(1).float()
+            mean = sum(self.embed.weight.detach()[tokens[:, i]].float() * weights[:, i, None] for i in range(2)) / k.clamp_min(1)
+            ret = ((mean * self.ret_next_scale[cell, None] + self.ret_bucket_embed[cell]) * (cell > 0)[:, None]).bfloat16()
+            x = x + self.ret_site_scale_in.type_as(x) * ret
 
         # Hashed n-gram embedding: each token's bigram row and trigram row, each times its own +-1 sign
         # row, summed. The sign trick compresses several n-grams into a shared row (details in
@@ -595,8 +648,8 @@ class GPT(nn.Module):
         #   rows = ngram_cache[slots] + ngram_sink    # the sink is exact zeros: it only catches the gradient
         #   x0_bigram = rows[:T] * sign_pool[bigram_sign] + rows[T:] * sign_pool[trigram_sign]
         # computed by one opaque kernel so x0_bigram is materialised once (perf/kernels/ngram_embed.py).
-        x0_bigram = ngram_embedding(self.ngram_cache, bigram_input_seq, self.ngram_sign_pool, input_seq,
-                                    ngram_sink)[None]                                     # (1, seq, ngram_dim)
+        x0_bigram = ngram_embedding(self.ngram_cache, bigram_input_seq, self.ngram_sign_pool,  # normalized ids
+                                    self.ngram_norm_map[input_seq], ngram_sink)[None]
 
         # Value embeddings - always computed (not precomputed)
         # Shifted .01 ... 234 structure on token value embeddings by @photomz
@@ -643,6 +696,9 @@ class GPT(nn.Module):
             if i == POST_GATE_LAYER:
                 post_gate = self.forward_mudd_gate(x, id=1, num_coef=self._mudd_gate_post_num_coef)
                 post_skip_gate = self.unpack_post_mudd_gate(post_gate, attn_gates, x0_gates, bigram_gates)
+
+            if i == 7 and ret is not None:
+                x = x + self.ret_site_scale_mid.type_as(x) * ret[None]
 
             # process attn. skip on layer 6 @YouJiacheng
             if i == 6:
@@ -770,10 +826,12 @@ class GPT(nn.Module):
         for k, src in enumerate(sources):
             mixed = mixed + (mu[k] + deltas[..., k, :]).unsqueeze(-1) * grouped(src)
         x = mixed.flatten(-2)
+        if ret is not None:
+            x = x + self.ret_site_scale_out.type_as(x) * ret[None]
 
-        return self._loss(norm(x), input_seq, target_seq, mtp_weights, prefix_weight, schedule_cfg.sampled_loss)
+        return self._loss(norm(x), input_seq, target_seq, mtp_weights, prefix_weight, schedule_cfg.sampled_loss, seqlens)
 
-    def _loss(self, x, input_seq, target_seq, mtp_weights, prefix_weight, sampled_loss):
+    def _loss(self, x, input_seq, target_seq, mtp_weights, prefix_weight, sampled_loss, seqlens=None):
         """Per-token loss from the final normed hidden state.
 
         Training: fused softcapped CE over next-token + multi-token + prefix-token targets, normalized
@@ -783,6 +841,12 @@ class GPT(nn.Module):
         """
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
+        if self.training and sampled_loss is None:
+            self.fit_hidden[:x.numel() // x.size(-1)].copy_(x.view(-1, x.size(-1)).detach())
+        elif not self.training:
+            self.val_hidden[:x.numel() // x.size(-1)].copy_(x.view(-1, x.size(-1)))
+        if self.cplm:
+            return self._cplm_loss(x, input_seq, target_seq, mtp_weights, prefix_weight, sampled_loss, seqlens)
         if self.training and sampled_loss is not None:
             # Targets and prefix targets arrive as positions in the candidate set, built on the host.
             n = target_seq.size(0)
@@ -816,6 +880,52 @@ class GPT(nn.Module):
             loss_per_token = torch.cat(slab_losses)
         return loss_per_token
 
+    def _cplm_loss(self, x, input_seq, target_seq, mtp_weights, prefix_weight, sampled_loss, seqlens):
+        """_loss with the next-token CE replaced by the copy-sink mixture (training: inside the fused CE kernel;
+        validation: on the canonical-masked full-softmax logits, <copy> exempt from the mask)."""
+        xf = x.view(-1, x.size(-1))
+        bank = self.copy_qk_bank.type_as(xf)
+        q, k = F.linear(xf, bank[:2].flatten(0, 1)).chunk(2, dim=-1)
+        k = k + F.linear(torch.cat([xf.new_zeros(1, xf.size(-1)), xf[:-1]]), bank[2])
+        q = (F.rms_norm(q.float(), (q.size(-1),)) * self.copy_qk_gain).type_as(xf)
+        k = F.rms_norm(k.float(), (k.size(-1),)).type_as(xf)
+        block = COPY_BLOCK if self.training else self.copy_eval_block
+        p_copy, a_sink = copy_sink_probs_fused(q, k, self.copy_k_sink, input_seq, target_seq, seqlens, block,
+                                               doc_starts=None, shifts=1, max_lookback=None)
+        gate = self.copy_gate_lambda.expand(xf.size(0))  # (unused by the kernel without EXT_GATE)
+        a_sink = a_sink * self.copy_sink_lambda
+        if self.training and sampled_loss is not None:
+            n = target_seq.size(0)
+            copy_col = sampled_loss.vocab_pos[COPY_TOKEN_ID:COPY_TOKEN_ID + 1]  # <copy> is forced into C
+            return SampledCPLMCrossEntropy.apply(
+                xf, mtp_weights, sampled_loss.target_pos[:n], sampled_loss.prefix_pos[:n], prefix_weight,
+                p_copy, a_sink, copy_col, self.copy_gate_lambda, gate, self.lm_head.weight, sampled_loss.rows, sampled_loss.rows_t,
+                sampled_loss.vocab_pos, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, None)
+        if self.training:
+            return FusedCPLMCrossEntropy.apply(
+                xf, target_seq, mtp_weights, self.prefix_table[target_seq], prefix_weight, p_copy, a_sink,
+                self.copy_col_full, self.copy_gate_lambda, gate, self.lm_head.weight, self._lm_head_f8_col, self._lm_head_f8_row,
+                self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, None)
+        shifts = torch.arange(8, dtype=torch.uint8, device=xf.device)
+        slab_losses = []
+        for lo in range(0, xf.size(0), EVAL_CE_SLAB_ROWS):
+            hi = min(lo + EVAL_CE_SLAB_ROWS, xf.size(0))
+            raw = self.lm_head(xf[lo:hi])
+            logits = (23 * torch.sigmoid((raw + 5) / 7.5)).float()
+            dropped = (self.canon_mask[input_seq[lo:hi], :, None] >> shifts & 1).view(logits.shape).bool()
+            dropped[:, COPY_TOKEN_ID] = False  # the <copy> gate is not a token: never masked
+            logits = logits.masked_fill(dropped, -60.0)
+            # Copy mass on tokens the mask rules out is simply lost (the mixture then sums to <= 1 over the
+            # feasible tokens), so the mask never overstates the copy branch.
+            lse = logits.logsumexp(-1)
+            p_lm = torch.exp(logits.gather(1, target_seq[lo:hi, None])[:, 0] - lse)
+            pc, asink = p_copy[lo:hi], a_sink[lo:hi]
+            alpha = self.copy_gate_lambda * torch.exp(logits[:, COPY_TOKEN_ID] - lse)
+            p_t = p_lm / (1.0 - alpha).clamp_min(1e-6)  # LM over the real vocab
+            p = p_t * (1.0 - alpha * (1.0 - asink)) + alpha * pc
+            slab_losses.append(-torch.log(p + 1e-9))
+        return torch.cat(slab_losses)
+
     # -------------------------------------------------------------------------
     # Setup and run-level hooks main() calls on the uncompiled model.
 
@@ -829,6 +939,8 @@ class GPT(nn.Module):
                       self.mudd_w1, self.mudd_w2, self.mudd_w2g, self.mudd_b2,
                       self.mudd_gate_w1, self.mudd_gate_w2, self.mudd_gate_b2):
             param.data = param.data.bfloat16()
+        if self.cplm:
+            self.copy_qk_bank.data = self.copy_qk_bank.data.bfloat16()
 
     @property
     def yarns(self) -> tuple[Yarn, ...]:

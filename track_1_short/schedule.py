@@ -3,7 +3,7 @@ from itertools import accumulate, pairwise
 
 import torch
 
-from track_1_short.config import SCHEDULE_GROWTH_STAGE, SCHEDULE_GROWTH_STEPS, TrainingStage
+from track_1_short.config import SCHEDULE_GROWTH_STAGE, SCHEDULE_GROWTH_STEPS, TrainingStage, scaled_steps
 
 # The lr cooldown decays linearly to this absolute multiplier (record #360's code; its README says 0.20).
 LR_FLOOR = 0.30
@@ -75,7 +75,7 @@ class TrainingSchedule:
         return lr
 
 
-def get_rail_beta(step: int, total_steps: int, beta_warmup_steps=240, beta_cooldown_steps=50, beta_min=0.85, beta_max=0.93):
+def get_rail_beta(step: int, total_steps: int, beta_warmup_steps=scaled_steps(240), beta_cooldown_steps=scaled_steps(50), beta_min=0.85, beta_max=0.93):
     """ANVIL's fast-rail beta, also its Nesterov lookahead: linear warmup from beta_min to beta_max,
     flat for the bulk of the run, linear cooldown back over the last beta_cooldown_steps."""
     beta_cd_start = total_steps - beta_cooldown_steps

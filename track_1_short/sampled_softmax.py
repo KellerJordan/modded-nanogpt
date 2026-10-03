@@ -122,6 +122,7 @@ class CandidateBuilder:
         V, mark, pos, T = self.vocab_size, self.mark, self.pos, targets.shape[0]
         mark.fill(False)
         mark[targets] = True
+        mark[50257] = True  # the copy-sink gate's <copy> slot is always a candidate
         num_targets = int(np.count_nonzero(mark[:V]))
         assert num_targets <= P, f"{num_targets} distinct targets > P={P}"
         if num_targets != P:

@@ -90,7 +90,7 @@ from track_1_short.sharded_rows import RowPull
 # GPU idle 10-21 ms per event waiting for the join; 4 hides it).
 PREP_SLACK_STEPS = 4
 # Deeper than the host's run-ahead of the device, so a slot's previous upload is long done when reused.
-PINNED_SLOTS = 4
+PINNED_SLOTS = 16
 
 
 class PinnedUploadRing:

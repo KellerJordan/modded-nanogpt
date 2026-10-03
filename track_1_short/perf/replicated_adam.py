@@ -33,7 +33,7 @@ from torch import Tensor, nn
 from track_1_short.perf.kernels.replicated_adam import SCALAR_COLUMNS, fused_adam_
 
 # Deeper than the host's run-ahead of the device in optimizer steps, so a slot is long retired when reused.
-SCALAR_TABLE_SLOTS = 8
+SCALAR_TABLE_SLOTS = 16
 
 
 @dataclass
