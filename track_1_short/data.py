@@ -47,18 +47,22 @@ def pread_parallel(fd: int, out: np.ndarray, offset: int, nbytes: int) -> int:
         return sum(pool.map(read_range, edges, edges[1:]))
 
 
-def _load_data_shard(file: Path, buf: Tensor | None = None):
+def _load_data_shard(file: Path, buf: Tensor | None = None, max_tokens: int | None = None):
     """`buf`: a pinned shard slot of the timed loader, filled in place of a fresh pinned allocation."""
     header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
     assert header[0] == 20240520, "magic number mismatch in the data .bin file"
     assert header[1] == 1, "unsupported version"
-    num_tokens = int(header[2]) # number of tokens (claimed)
+    num_tokens = int(header[2]) if max_tokens is None else max_tokens # number of tokens (claimed)
     with file.open("rb", buffering=0) as f:
         tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) if buf is None else buf[:num_tokens] # avoid pin_memory copy by @YouJiacheng
         # straight into the array: avoids a bytes->array copy (@YouJiacheng)
         nbytes = pread_parallel(f.fileno(), tokens.numpy(), HEADER_BYTES, 2 * num_tokens)
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
+
+
+def read_val_prefix(filename_pattern: str, slot: Tensor) -> Tensor:  # the validation prefix into a pinned slot
+    return _load_data_shard(Path(sorted(glob.glob(filename_pattern))[0]), slot, max_tokens=slot.numel())
 
 BOS_ID = 50256
 
@@ -160,7 +164,8 @@ def split_attention_segments(cum_lengths: Tensor, cap: int) -> Tensor:
     return torch.tensor(ends, dtype=cum_lengths.dtype)
 
 def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, staging: PinnedBatchStaging,
-                               align_to_bos: bool = True, shard_slots: list[Tensor] | None = None):
+                               align_to_bos: bool = True, shard_slots: list[Tensor] | None = None, want_shard=None,
+                               first_tokens: Tensor | None = None):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
     # staging: the pinned slots every batch's H2D copies go through (perf/pinned_batches.py)
     # shard_slots: pinned shard buffers, used round-robin instead of a fresh pinned allocation per shard
@@ -175,7 +180,8 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
     file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
     slots = itertools.cycle(shard_slots) if shard_slots else None
     next_slot = lambda: next(slots) if slots else None
-    tokens = _load_data_shard(next(file_iter), next_slot())
+    tokens = _load_data_shard(next(file_iter), next_slot()) if first_tokens is None else first_tokens
+    current = 0  # the current shard; want_shard(j): preload shard j once shard j - 1 is current
     if align_to_bos:
         shard = Shard(tokens, world_size)
         next_shard_getter = Shard.load_async(next(file_iter), world_size, next_slot())
@@ -192,12 +198,14 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
                 start_idxs, end_idxs = torch.tensor(seq_starts[rank]), torch.tensor(seq_ends[rank])
             except StopIteration:
                 # This shard is exhausted, load the next one in the next loop iteration.
-                shard = next_shard_getter()
+                shard = next_shard_getter() if next_shard_getter else Shard(_load_data_shard(next(file_iter), next_slot()), world_size)
                 tokens = shard.tokens
+                current, next_shard_getter = current + 1, None
                 try:
-                    next_shard_getter = Shard.load_async(next(file_iter), world_size, next_slot())
+                    if want_shard is None or want_shard(current + 1):
+                        next_shard_getter = Shard.load_async(next(file_iter), world_size, next_slot())
                 except StopIteration:
-                    next_shard_getter = None  # no more shards to preload
+                    pass  # no more shards to preload
                 continue
 
             buf = torch.cat([tokens[i:j] for i, j in zip(start_idxs, end_idxs)])

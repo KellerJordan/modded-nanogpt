@@ -89,6 +89,7 @@ class CapturedStep:
     forward: torch.cuda.CUDAGraph
     backward: torch.cuda.CUDAGraph
     loss: Tensor                        # forward output (pool memory)
+    tok_loss: Tensor                    # its per-token loss (the chain's fit reads it)
     anvil_grads: list[tuple[nn.Parameter, Tensor]]
     adam_grads: list[tuple[nn.Parameter, Tensor, Tensor]]  # (param, graph output, persistent accumulator)
     ngram_grad: Tensor                  # backward output: the sink's gradient [2T, NGRAM_DIM]
@@ -141,7 +142,7 @@ class StepGraphs:
         the warm iterations and the self-check all run)."""
         s = cs.static
         return self.model(s.inputs, s.targets, s.cum_seqlens, s.ngram_slots, cs.cfg, ngram_sink=cs.ngram_sink,
-                          value_embed_grad=self.value_embeds.grad_accum, ret=s.ret).sum()
+                          value_embed_grad=self.value_embeds.grad_accum, ret=s.ret)
 
     # ---- per step ----
 
@@ -207,7 +208,7 @@ class StepGraphs:
             key=key, static=static,
             cfg=dataclasses.replace(cfg, mtp_weights=static.mtp_weights, prefix_weight=static.prefix_weight),
             ngram_sink=self.ngram_table.grad_sink(key.tokens), attn_scales=self._attn_scales(),
-            forward=torch.cuda.CUDAGraph(), backward=torch.cuda.CUDAGraph(), loss=None,
+            forward=torch.cuda.CUDAGraph(), backward=torch.cuda.CUDAGraph(), loss=None, tok_loss=None,
             anvil_grads=[], adam_grads=[], ngram_grad=None,
         )
         leaves = self.params + [cs.ngram_sink]
@@ -216,12 +217,13 @@ class StepGraphs:
         self.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.stream):
             for _ in range(WARM_ITERATIONS):
-                torch.autograd.grad(self._loss(cs), leaves, allow_unused=True)
+                torch.autograd.grad(self._loss(cs).sum(), leaves, allow_unused=True)
         torch.cuda.current_stream().wait_stream(self.stream)
         torch.cuda.synchronize()
         # thread_local: the loader and prep threads may allocate pinned memory during a capture.
         with torch.cuda.graph(cs.forward, pool=self.pool, stream=self.stream, capture_error_mode="thread_local"):
-            cs.loss = self._loss(cs)
+            cs.tok_loss = self._loss(cs)
+            cs.loss = cs.tok_loss.sum()
         with torch.cuda.graph(cs.backward, pool=self.pool, stream=self.stream, capture_error_mode="thread_local"):
             # retain_graph / create_graph must stay False: AOTAutograd compiles this backward with
             # donated buffers and refuses to run it otherwise (record #360).
@@ -245,7 +247,7 @@ class StepGraphs:
     def _self_check(self, cs: CapturedStep):
         """Replay vs eager forward on the same buffers: catches a graph that baked an input's value or a
         stale address instead of reading the live tensor."""
-        replay, eager = cs.loss.item(), self._loss(cs).item()
+        replay, eager = cs.loss.item(), self._loss(cs).sum().item()
         assert abs(replay - eager) <= max(SELF_CHECK_ABS, abs(eager) * SELF_CHECK_REL), \
             f"step graph {cs.key}: replay loss {replay} != eager {eager}"
 

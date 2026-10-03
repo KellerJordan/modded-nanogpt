@@ -201,7 +201,7 @@ pub struct StreamIndex {
     plan: OnceLock<(Vec<(usize, usize)>, Vec<usize>)>,
     stream: Map<u16>,
     context: Map<u16>,
-    resolved: Map<[i32; 3]>,
+    resolved: Map<[i32; 9]>,
     build: Mutex<Build>,
     pool: rayon::ThreadPool,
     done: Mutex<Result<usize, String>>,
@@ -312,7 +312,12 @@ impl StreamIndex {
         .map_err(PyValueError::new_err)
     }
 
-    /// This rank's rows of `step` (cell, two slots), once resolved. Fails unless the loader's documents for it (every
+    /// The number of leading training shards the plan reads documents from; 0 until planned.
+    fn planned_shards(&self) -> usize {
+        self.plan.get().map_or(0, |(docs, _)| docs.iter().map(|&(s, _)| s / STRIDE + 1).max().unwrap_or(0))
+    }
+
+    /// This rank's rows of `step` (cell, 8 slots), once resolved. Fails unless the loader's documents for it (every
     /// rank's starts and ends within a shard of `size` tokens) are the planned ones.
     fn rows<'py>(
         &self,
@@ -336,7 +341,7 @@ impl StreamIndex {
             return Err(PyValueError::new_err(format!("loader documents at step {step} differ from the plan")));
         }
         let rows = &self.resolved[self.rows[step]..self.rows[step + 1]];
-        Ok(Array2::from_shape_vec((rows.len(), 3), rows.as_flattened().to_vec()).unwrap().into_pyarray(py))
+        Ok(Array2::from_shape_vec((rows.len(), 9), rows.as_flattened().to_vec()).unwrap().into_pyarray(py))
     }
 }
 

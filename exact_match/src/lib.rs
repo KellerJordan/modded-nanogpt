@@ -31,17 +31,26 @@ fn open_shard(path: &str) -> PyResult<(File, usize)> {
 }
 
 /// The row of a match at `length` with next `tokens` (sorted here): its cell (length bucket, bins of the total count
-/// and of the top token's share) and its top two tokens by count (ties: lower token) as token | count << 16, else 0.
-fn row(length: usize, tokens: &mut [i32]) -> [i32; 3] {
+/// and of the top token's share) and its top 8 tokens by count (ties: lower token) as token | count << 16, else 0.
+fn row(length: usize, tokens: &mut [i32]) -> [i32; 9] {
     tokens.sort_unstable();
-    let mut counts: Vec<(i32, i32)> = tokens.chunk_by(|a, b| a == b).map(|run| (run[0], run.len() as i32)).collect();
-    counts.sort_unstable_by_key(|&(token, count)| (std::cmp::Reverse(count), token));
+    let (mut runs, mut n) = ([(0i32, 0i32); 96], 0); // k8: on the stack (at most 2 * 48 candidates), the top 8 sorted
+    for run in tokens.chunk_by(|a, b| a == b) {
+        (runs[n], n) = ((run[0], run.len() as i32), n + 1);
+    }
+    let key = |&(token, count): &(i32, i32)| (std::cmp::Reverse(count), token);
+    if n > 8 {
+        runs[..n].select_nth_unstable_by_key(7, key);
+    }
+    runs[..n.min(8)].sort_unstable_by_key(key);
+    let counts = &runs[..n.min(8)];
     let total = tokens.len();
     let bucket = 1 + LEVELS.iter().filter(|&&l| l <= length).count();
     let count = COUNTS.iter().filter(|&&c| c <= total).count();
     let purity = PURITIES.iter().filter(|&&p| p <= counts[0].1 as f64 / total as f64).count();
     let slot = |i: usize| counts.get(i).map_or(0, |&(token, count)| token | count << 16);
-    [((bucket * (COUNTS.len() + 1) + count) * (PURITIES.len() + 1) + purity) as i32, slot(0), slot(1)]
+    let cell = ((bucket * (COUNTS.len() + 1) + count) * (PURITIES.len() + 1) + purity) as i32;
+    std::array::from_fn(|i| if i == 0 { cell } else { slot(i - 1) })
 }
 
 /// A raw pointer that threads write disjoint parts of.
@@ -118,7 +127,15 @@ impl<T> std::ops::DerefMut for Map<T> {
 
 impl<T> Drop for Map<T> {
     fn drop(&mut self) {
-        unsafe { libc::munmap(self.ptr.cast(), self.bytes) };
+        // In 1 GB pieces with a pause between them: an unmap holds the process's memory-map lock, which the training
+        // threads also take, so a 90 GB arena unmapped at once stalls them for the whole unmap.
+        const PIECE: usize = 1 << 30;
+        for off in (0..self.bytes).step_by(PIECE) {
+            unsafe { libc::munmap(self.ptr.cast::<u8>().add(off).cast(), (self.bytes - off).min(PIECE)) };
+            if off + PIECE < self.bytes {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
     }
 }
 

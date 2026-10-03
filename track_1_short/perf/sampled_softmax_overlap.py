@@ -28,7 +28,7 @@ import torch
 from torch import Tensor
 
 # Deeper than the host's run-ahead of the device, so a slot is rarely still being copied when reused.
-PINNED_SLOTS = 4
+PINNED_SLOTS = 16
 
 
 @dataclass(slots=True)

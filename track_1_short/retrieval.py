@@ -20,7 +20,9 @@ import torch
 import torch.distributed as dist
 from exact_match import CELLS as RET_CELLS, SlotIndex, StreamIndex
 
-VAL_BUILD_THREADS = 16  # rank 0's validation index build, on cores every rank sets aside
+per_gpu = len(os.sched_getaffinity(0)) // int(os.environ.get("LOCAL_WORLD_SIZE", "1"))  # vCPUs per GPU, before any pinning
+VAL_BUILD_THREADS = 64 if per_gpu >= 24 else 32 if per_gpu >= 16 else 16  # rank 0's validation index build, on cores every rank sets aside
+LARGE_HOST = per_gpu >= 24  # >= 24 vCPUs per GPU
 
 @dataclass(frozen=True)
 class CpuPlan:
@@ -50,6 +52,7 @@ def pin_cpus(local_rank: int, world_size: int) -> CpuPlan:
     spare = -(-VAL_BUILD_THREADS // world_size)
     val_build = [min(c) for c in mine[-spare:]] if len(mine) - spare >= 2 else []
     mine = mine[:len(mine) - len(val_build)]
+    val_lookup = sorted(set().union(*mine[1:])) or sorted(mine[0])  # not the build cores
     os.sched_setaffinity(0, set().union(*mine))
     return CpuPlan(main=set(mine[0]), rest=set().union(*mine[1:]) or set(mine[0]), val_build=val_build, val_lookup=val_lookup)
 
@@ -84,20 +87,31 @@ class OnlineCache:
         self.device = device
         self.jobs = {}  # step -> its rows' future, from fetch until the step trains
         self.step0 = None
+        self.hint_from = (round(0.5 * len(schedule)), round(0.85 * len(schedule)))  # 3/2-, 6-token
 
     def start(self):
         self.ready = self.builder.submit(self.index.build)
 
     def submit(self, step, batch):
         """ScheduledBatches' fetch hook: `batch.docs` is the loader's (shard tokens, every rank's document starts, ends)."""
-        self.jobs[step] = self.worker.submit(self._rows, step, *batch.docs)
+        self.jobs[step] = self.worker.submit(self._rows, step, *batch.docs, batch.inputs_cpu)
 
-    def _rows(self, step, tokens, starts, ends):
-        rows = self.index.rows(step, len(tokens), starts, ends)
+    def _rows(self, step, tokens, starts, ends, inputs):
+        x = inputs.astype(np.uint16)  # per position the longest match of the 6-, 3- and 2-token indexes
+        lower = [(source, cache) for source, cache in self.lower if step >= self.hint_from[0] and cache.built.done()]
+        if self.full is not None and step >= self.hint_from[1] and self.full.built.done():
+            rows = np.zeros((len(x), 9), dtype=np.int32)
+            self.full.index.query_into(x, len(x), rows, 0)
+        else:
+            rows = self.index.rows(step, len(tokens), starts, ends)
+        for source, cache in lower:
+            cache.index.query_into(x, len(x), rows, RET_CELLS * source)
+        if self.mix is not None:
+            self.mix.put(step, rows)
         i = step % len(self.ring)
         self.uploaded[i].synchronize()
         slot = self.ring[i, :len(rows)]
-        slot.numpy()[:] = rows
+        slot.numpy()[:] = rows[:, :3]
         return slot
 
     def rows(self, step, n):
@@ -120,9 +134,10 @@ class ValidationCache:
     clock, while training runs, rank 0 builds it on threads pinned to the `build_cpus` every rank sets aside. After
     training each rank reads and looks up just the `chunk`-token validation chunks it evaluates, on its `lookup_cpus`.
     """
-    def __init__(self, train_files, val_files, chunk, total, group, build_cpus, lookup_cpus):
+    def __init__(self, train_files, val_files, chunk, total, group, build_cpus, lookup_cpus, exclude=0, key=6, shards=None):
         files = sorted(glob.glob(train_files))
         assert len(files) == 103, f"the validation index covers all 103 training shards, found {len(files)}"
+        files = files[exclude:][:shards]
         self.val_file, self.chunk, self.group = sorted(glob.glob(val_files))[0], chunk, group
         self.rank, world = dist.get_rank(group), dist.get_world_size(group)
         self.offsets = range(self.rank * chunk, total, world * chunk)
@@ -131,10 +146,10 @@ class ValidationCache:
         cpus = [None] * world
         dist.all_gather_object(cpus, sorted(build_cpus), group=group)
         if self.rank == 0:
-            self.index = SlotIndex.create(path[0], files, VAL_BUILD_THREADS, sum(cpus, [])[:VAL_BUILD_THREADS], lookup_cpus)
+            self.index = SlotIndex.create(path[0], files, VAL_BUILD_THREADS, sum(cpus, [])[:VAL_BUILD_THREADS], lookup_cpus, key)
         dist.barrier(group)
         if self.rank != 0:
-            self.index = SlotIndex.attach(path[0], lookup_cpus)
+            self.index = SlotIndex.attach(path[0], lookup_cpus, key)
         dist.barrier(group)
         if self.rank == 0:
             os.unlink(path[0])
@@ -146,7 +161,8 @@ class ValidationCache:
         self.built = self.worker.submit(self._build, after)
 
     def _build(self, after):
-        after.result()
+        if after is not None:
+            after.result()
         if self.rank == 0:
             t = time.perf_counter()
             self.index.build()
@@ -155,14 +171,49 @@ class ValidationCache:
         if self.rank == 0:
             self.index.release()
 
-    def lookup(self):
+    def lookup(self, lower=()):
         """After training: read this rank's validation chunks and look them up, beside the main thread."""
         def rows():
             tokens = np.concatenate([np.fromfile(self.val_file, "<u2", self.chunk, offset=1024 + 2 * o) for o in self.offsets])
-            return np.split(self.index.query(tokens, self.chunk), len(self.offsets))
+            out = np.zeros((len(tokens), 9), dtype=np.int32)
+            self.index.query_into(tokens, self.chunk, out, 0)
+            for source, cache in lower:  # then the 3- and 2-token indexes, into the rows still empty
+                cache.built.result()
+                cache.index.query_into(tokens, self.chunk, out, RET_CELLS * source)
+            return np.split(out, len(self.offsets))
         self.looked_up = self.worker.submit(rows)
 
     def rows(self):
         """Wait for the build and the lookup: the rows of each of this rank's validation chunks."""
         self.built.result()
         return self.looked_up.result()
+
+
+def mix_q(rows, targets):  # the target's share of the row's candidate counts
+    tok, cnt = rows[:, 1:] & 0xFFFF, (rows[:, 1:] >> 16).float()
+    return (cnt * (tok == targets[:, None]).float()).sum(1) / cnt.sum(1).clamp_min(1.0)
+
+
+def rows_part(cell, q):  # the hint rows' link of the chain: q, weighted by the row's tagged cell
+    return [(q, torch.where(cell % RET_CELLS > 0, cell, torch.full_like(cell, -1)), 4 * RET_CELLS)]
+
+
+class FitRows:  # the kept fit steps' rows (pinned as they are looked up), then their cells and target shares
+    def __init__(self, steps, max_tokens, device):
+        self.steps, self.device, self.n, self.jobs = steps, device, 0, {}
+        self.cell = torch.zeros(len(steps) * max_tokens, dtype=torch.int64, device=device)
+        self.q = torch.zeros(len(steps) * max_tokens, device=device)
+        self.pinned = torch.zeros((len(steps), max_tokens, 9), dtype=torch.int32, pin_memory=True)
+
+    def put(self, step, rows):
+        if step in self.steps:
+            slot = self.pinned[self.steps.index(step), :len(rows)]
+            slot.numpy()[:] = rows
+            self.jobs[step] = slot
+
+    def collect(self, step, targets):
+        rows = self.jobs.pop(step).to(self.device, non_blocking=True)
+        n = len(rows)
+        self.cell[self.n:self.n + n] = rows[:, 0].long()
+        self.q[self.n:self.n + n] = mix_q(rows, targets)
+        self.n += n

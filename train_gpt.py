@@ -21,6 +21,7 @@ import copy
 import gc
 import glob
 import time
+from concurrent.futures import Future
 
 import torch
 
@@ -35,13 +36,16 @@ from torch import nn
 from track_1_short.canonical_mask import BackgroundCanonicalMask
 from track_1_short.config import (
     LR_COOLDOWN_FRAC,
+    MODEL_DIM,
     SPLIT_EMBED_STAGE,
     TRAINING_STAGES,
     WS_POST_YARN_EXT,
     Hyperparameters,
 )
-from track_1_short.data import HEADER_BYTES, ScheduledBatches, cu_seqlens_rows, distributed_data_generator
+from track_1_short.data import HEADER_BYTES, ScheduledBatches, cu_seqlens_rows, distributed_data_generator, read_val_prefix
 from track_1_short.distributed import setup_distributed
+from track_1_short.doc_cache import NBINS as DOC_BINS, ORDERS as DOC_ORDERS, DocChain
+from track_1_short.exact_counts import NBINS, ORDERS, ChainFit, ExactCounts, chain_prob, components, context_counts, gate_L
 from track_1_short.model.gpt import ATTN_BANK_ORDER, FP8_EXACT_SCALE_CALLS, GPT
 from track_1_short.model.prefix_prediction import build_prefix_table_bucket
 from track_1_short.ngram_table import (
@@ -59,9 +63,9 @@ from track_1_short.perf.cuda_graphs.step_graphs import StepGraphs
 from track_1_short.perf.deferred_gathers import DEFERRED_LABELS, DeferredGathers
 from track_1_short.perf.kernels.mlp import prime_stage_cache
 from track_1_short.perf.pinned_batches import PinnedBatchStaging
-from track_1_short.perf.row_prefetch import PREP_SLACK_STEPS, PrefetchStaging, RowPrefetch
+from track_1_short.perf.row_prefetch import PrefetchStaging, RowPrefetch
 from track_1_short.perf.value_embed_pull import ValueEmbedPull
-from track_1_short.retrieval import OnlineCache, ValidationCache, pin_cpus, pin_threads
+from track_1_short.retrieval import LARGE_HOST, RET_CELLS, FitRows, OnlineCache, ValidationCache, mix_q, pin_cpus, pin_threads, rows_part
 from track_1_short.sampled_softmax import SampledSoftmax
 from track_1_short.schedule import TrainingSchedule
 from track_1_short.tail_average import TailAverages
@@ -133,14 +137,15 @@ def main():
     batch_tokens = [s.batch_size // env.world_size for s in TRAINING_STAGES] + [val_tokens_per_rank]
     batch_staging = PinnedBatchStaging(max(batch_tokens), max(map(cu_seqlens_rows, batch_tokens)), env.device)
 
-    def train_loader(shard_slots=None):
+    def train_loader(shard_slots=None, want_shard=None):
         return distributed_data_generator(
             args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, batch_staging,
-            shard_slots=shard_slots,
+            shard_slots=shard_slots, want_shard=want_shard,
         )
 
-    def val_loader():
-        return distributed_data_generator(args.val_files, args.val_batch_size, -1, batch_staging, align_to_bos=False)
+    def val_loader(first_tokens=None):
+        return distributed_data_generator(args.val_files, args.val_batch_size, -1, batch_staging, align_to_bos=False,
+                                          first_tokens=first_tokens)
 
     training_schedule = TrainingSchedule(
         TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, device=env.device,
@@ -157,9 +162,9 @@ def main():
     model: nn.Module = GPT(
         vocab_size=50257,
         num_layers=11,
-        num_heads=6,
+        num_heads=MODEL_DIM // 128,
         head_dim=128,
-        model_dim=768,
+        model_dim=MODEL_DIM,
         max_seq_len=val_tokens_per_rank,
         ngram_dim=NGRAM_DIM,
         world_size=env.world_size,
@@ -223,9 +228,32 @@ def main():
     retrieval_schedule = [(stage.batch_size // env.world_size, stage.train_max_seq_len)
                           for stage, _ in map(training_schedule.lookup, range(training_schedule.total_steps))]
     online_cache = OnlineCache(args.train_files, retrieval_schedule, env.rank, env.world_size, env.device,
-                               lookahead=MAX_CYCLE_STEPS + PREP_SLACK_STEPS)
+                               lookahead=24)  # jobs 16 steps ahead
+    # the 6-token index and the 3- and 2-token ones (20 shards) leave out the shards the loader may train on
+    exclude = -(-int(1.5 * sum(training_schedule.lookup(s)[0].batch_size + env.world_size
+                               for s in range(training_schedule.total_steps))) // 100_000_000)
     val_cache = ValidationCache(args.train_files, args.val_files, val_tokens_per_rank, args.val_tokens,
-                                dist.new_group(backend="gloo"), cpus.val_build, cpus.val_lookup)
+                                dist.new_group(backend="gloo"), cpus.val_build, cpus.val_lookup, exclude=exclude)
+    lower = [ValidationCache(args.train_files, args.val_files, val_tokens_per_rank, args.val_tokens, dist.new_group(backend="gloo"),
+                             cpus.val_build, cpus.val_lookup, exclude=exclude, key=o, shards=20) for o in (3, 2)]
+    online_cache.full, online_cache.lower = (val_cache, [(2, lower[0]), (3, lower[1])])
+    # exact counts at the validation positions and every 4th fit step's (F per rank), and the chain's fit
+    fit_first = training_schedule.boundaries[3][0]  # the fit steps: the taper and the extension
+    fit_steps, exact_fit = range(fit_first, training_schedule.total_steps, 4), []
+    F = sum(training_schedule.lookup(s)[0].batch_size // env.world_size for s in fit_steps)
+    V, S, i = args.val_tokens, F // len(fit_steps), torch.arange(args.val_tokens + env.world_size * F, device=env.device)
+    q_chunk = torch.where(i < V, i // val_cache.chunk * val_cache.chunk, V + (i - V) // S * S)  # query segments: chunks, fit steps
+    exact = ExactCounts(glob.glob(args.train_files), exclude, env.rank, env.world_size, env.device, q_chunk, pinned=LARGE_HOST)
+    K, groups = len(ORDERS), len(ORDERS) * NBINS
+    # the hint rows, one link after the corpus orders
+    K, groups = K + 1, groups + 4 * RET_CELLS
+    # the in-document cache of this rank's validation chunks and kept fit positions
+    doc_chain = DocChain(len(val_cache.offsets) * val_cache.chunk, val_cache.chunk, F, F // len(fit_steps), env.device)
+    K, groups = K + len(DOC_ORDERS), groups + len(DOC_ORDERS) * DOC_BINS
+    chain = ChainFit(F, K, groups, env.device, MODEL_DIM, env.world_size, env.rank)
+    online_cache.mix = fit_rows = FitRows(fit_steps, max_step_tokens, env.device)
+    # the validation prefix's pinned slot (+2: the loader reads one token past the last target) and the all-ranks flag
+    val_slot, post_flag = (torch.empty(args.val_tokens + 2, dtype=torch.uint16, pin_memory=True), torch.ones(1, device=env.device))
 
     ########################################
     #            Warmup kernels            #
@@ -269,6 +297,8 @@ def main():
         # Warmup steps are not consecutive, so no sampled-softmax build is prefetched.
         train_step(training_manager, step_graphs, warmup_prefetch, sampled_softmax, warmup_batches, deferred_gathers,
                    online_cache, step, uncompiled_model.lm_head_f8_col, prefetch_next=False)
+    # and the counts' all-reduce, which NCCL sets up on its first call
+    dist.all_reduce(exact.out)  # the counts are still all zeros
     print0("Resetting Model", console=True)
     deferred_gathers.flush_final()  # the reset below requantizes from the restored weights
     warmup_prefetch.close()
@@ -308,7 +338,9 @@ def main():
     # one loading, and the retired one, a whole shard past its last reader (a fetched batch's docs, the BOS scan).
     shard_tokens = max((os.path.getsize(f) - HEADER_BYTES) // 2 for f in glob.glob(args.train_files))
     shard_slots = [torch.empty(shard_tokens, dtype=torch.uint16, pin_memory=True) for _ in range(3)]
-    batches = ScheduledBatches(train_loader(shard_slots), training_schedule, steps=range(training_schedule.total_steps),
+    # a shard is preloaded only if the loader's plan reads it (until planned: always)
+    want_shard = lambda j: (online_cache.index.planned_shards() or j + 1) > j
+    batches = ScheduledBatches(train_loader(shard_slots, want_shard), training_schedule, steps=range(training_schedule.total_steps),
                                on_fetch=online_cache.submit)
     row_prefetch = RowPrefetch(ngram_table, value_embed_pull, batches, range(training_schedule.total_steps),
                                is_update_step, prefetch_staging)
@@ -336,7 +368,13 @@ def main():
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     online_cache.start()
-    val_cache.start(online_cache.ready)
+    build_gate = Future()  # the first build waits for step 25
+    prev = build_gate  # the 2-, 3- and 6-token index builds one after another
+    for cache in lower[::-1] + [val_cache]:
+        cache.start(prev)
+        prev = cache.built
+    # the corpus share loads once the 6-token index is built (the 3-token one on small hosts)
+    (val_cache if LARGE_HOST else lower[0]).built.add_done_callback(lambda f: exact.load_corpus())
     canon_mask_builder.start()
     # Prefix-token table build, inside the timed region. The tokenizer was loaded at import
     # (get_encoding is cached in tiktoken's registry), so this pays only the table construction,
@@ -351,23 +389,39 @@ def main():
         last_step = (step == training_schedule.total_steps)
         if step == 1:
             pin_threads(cpus, canon_mask_builder.pid)
+        if step == 25:
+            build_gate.set_result(None)
         training_manager.advance_schedule(step)
         # --------------- VALIDATION SECTION -----------------
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             # The deferred gathers land first: validation reads the banks and, at the last step, ships
             # into them.
             if last_step:
+                # the post-training work reordered: the validation rows' lookups and the prefix read first
+                val_cache.lookup(online_cache.lower)
+                read_val_prefix(args.val_files, val_slot)
+                # the queries (validation stream, all ranks' fit steps) counted first, under the rest
+                vt = val_slot[:V + 1].view(torch.int16).to(env.device, non_blocking=True).to(torch.int32) & 0xFFFF
+                f_tok, f_tgt, f_p, *f_h = (torch.cat(e) for e in zip(*exact_fit))
+                doc_chain.launch(vt, val_cache.offsets, f_tok, f_tgt)  # on its own stream, under the counting
+                exact.q_tok[:V], exact.q_tgt[:V] = vt[:V], vt[1:]
+                dist.all_gather_into_tensor(exact.q_tok[V:], f_tok)
+                dist.all_gather_into_tensor(exact.q_tgt[V:], f_tgt)
+                launched = exact.loaded.is_set()  # the host work first while the corpus still loads
+                if launched:
+                    exact.launch()
                 # The final fp8 refresh is skipped, not moved off the clock: its one consumer is a
                 # training forward, and the run ends after this validation.
                 deferred_gathers.flush_final()
                 training_manager.apply_final_ws_ext()
+                val_batches = [batch for _, batch in zip(range(args.val_tokens // args.val_batch_size), val_loader(val_slot))]
+                if not launched:
+                    exact.launch()
                 # Both on the clock: the wait in case the build is somehow not done, and the copy
                 # and broadcast of the result because they are part of the mask's cost.
                 canon_mask_builder.wait()
-                canon_mask_builder.collect(model.canon_mask)
-                # On the clock: evaluate (and keep) the tail-averaged weights, not the final iterate.
-                # The ship also gathers value_embeds whole.
-                tail_averages.ship()
+                with torch.cuda.stream(torch.cuda.Stream(env.device)):
+                    canon_mask_builder.collect(model.canon_mask)  # on its own stream, under the counting
             else:
                 deferred_gathers.flush()
                 # On the clock: only the live cycle's rows of each value_embeds replica are current, and
@@ -379,27 +433,43 @@ def main():
             # below lands each batch's rows again (same routes, no new exchange) right before its forward.
             assert args.val_tokens % args.val_batch_size == 0
             val_steps = args.val_tokens // args.val_batch_size
-            val_loader_iter = val_loader()
-            val_batches = [next(val_loader_iter) for _ in range(val_steps)]
-            del val_loader_iter
-            # Training is over: read this rank's validation chunks and look them up on the CPU, beside the row pull
-            # below.
+            # Training is over: this rank's validation chunks are being looked up on the CPU (started above),
+            # beside the row pull below.
             assert last_step, "the validation index is looked up once, after training"
-            val_cache.lookup()
             val_pulls = ngram_table.eval_pulls([batch.ngram_ids for batch in val_batches])
             for pull in val_pulls:
                 ngram_table.land(pull)
+            # On the clock: evaluate (and keep) the tail-averaged weights, not the final iterate. The ship also gathers
+            # value_embeds whole. It comes after the steps that read the GPU back (the pulls).
+            tail_averages.ship()
+            # training positions only: the counts summed over the ranks, the chain's weights
+            dist.all_reduce(exact.out)
+            f_rows = rows_part(fit_rows.cell[:fit_rows.n], fit_rows.q[:fit_rows.n])
+            fQ, fG, _ = components(*context_counts(exact.out, V + env.rank * F + torch.arange(F, device=env.device)),
+                                   f_rows + doc_chain.part())
+            exact_lam = chain.em(f_p, fQ, fG)
+            gate = chain.gate(f_h[0], f_p, fQ, fG, exact_lam)  # the hidden-state gate
+            exact_val = [context_counts(exact.out, torch.arange(o, o + val_cache.chunk, device=env.device)) for o in val_cache.offsets]
             val_rows = val_cache.rows()
+            # every rank enters this only with its own preparation done
+            dist.all_reduce(post_flag)
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
             model.eval()
             val_loss = 0
             with torch.no_grad():
-                for batch, pull, rows in zip(val_batches, val_pulls, val_rows):
+                for i, (batch, pull, rows) in enumerate(zip(val_batches, val_pulls, val_rows)):
                     ngram_table.land(pull)
-                    val_loss += model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
-                                      training_manager.get_forward_args(), ret=torch.as_tensor(rows, device=env.device)).mean()
+                    loss = model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
+                                 training_manager.get_forward_args(), ret=torch.as_tensor(rows[:, :3], device=env.device))
+                    # the chain: the hint rows' link (q, the target's share of the row's counts), the corpus and document links
+                    r = torch.as_tensor(rows, device=env.device)
+                    link = rows_part(r[:, 0].long(), mix_q(r, batch.targets))
+                    Q, G, _ = components(*exact_val[i], link + doc_chain.part(i))
+                    L = gate_L(uncompiled_model.val_hidden[:len(Q)], G, *gate, groups)
+                    loss = -torch.log(chain_prob(torch.exp(-loss.float()), Q, L).clamp_min(1e-30)).float()
+                    val_loss += loss.mean()
             val_loss /= val_steps
             del val_batches, val_pulls
             dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
@@ -422,9 +492,17 @@ def main():
             break
 
         # --------------- TRAINING SECTION -----------------
+        if step in fit_steps:  # the kept fit step's tokens
+            exact_fit.append((batches.peek(step).inputs.clone(), batches.peek(step).targets.int()))
         train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, batches, deferred_gathers, online_cache,
                    step, uncompiled_model.lm_head_f8_col, prefetch_next=step + 1 < training_schedule.total_steps)
+        if step in fit_steps:  # and its model probabilities
+            exact_fit[-1] += (torch.exp(-step_graphs.current.tok_loss.detach().float()),
+                              uncompiled_model.fit_hidden[:S].clone())
+            fit_rows.collect(step, exact_fit[-1][1])  # its hint rows' cells and target shares
         tail_averages.tick(step)
+        if step + 1 < training_schedule.total_steps:  # the loader 16 batches ahead
+            batches.peek(min(step + 16, training_schedule.total_steps - 1))
 
         # logging, thinned to every PRINT_EVERY steps and the last two
         if (step + 1) % PRINT_EVERY == 0 or step + 1 >= training_schedule.total_steps - 1:

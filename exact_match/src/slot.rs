@@ -1,4 +1,5 @@
 //! SlotIndex: the validation index, approximate and corpus-free, with lookups of at most two bucket reads.
+//! key 3/2: the same index keyed on the last 3 or 2 tokens, 2^12 buckets per partition.
 //!
 //! One u64 entry per training position with a MIN-gram in its shard:
 //!
@@ -18,11 +19,11 @@
 //!      /dev/shm, and this process's mappings of it dropped, so no rank keeps big page tables on the clock.
 //!
 //! Lookup (validation tokens only, after training, every rank its own positions): a position is hashed the same way
-//! and pread reads bucket b1 and, only if b1 is full, b2. Among the entries whose check equals the query's, a
+//! and bucket b1 is read in place (mmap) and, only if b1 is full, b2. Among the entries whose check equals the query's, a
 //! candidate's level is the last of the unbroken ascending run of agreeing fingerprints (levels beyond the query's
 //! segment start never agree), and the row is made of the candidates at the best level.
 use crate::{fence, mmap, open_shard, row, stream, touch, Map, Output, BOS, LEVELS, MIN, STOP};
-use numpy::{ndarray::Array2, IntoPyArray, PyArray2, PyReadonlyArray1};
+use numpy::{PyReadonlyArray1, PyReadwriteArray2};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::arch::x86_64::{_mm512_loadu_si512, _mm512_maskz_loadu_epi64, _mm512_stream_si512, _mm_prefetch, _MM_HINT_T0};
@@ -37,10 +38,7 @@ const SHIFTS: [u32; 2] = [16, 28]; // where each level's fingerprint sits in an 
 const CHECK_SHIFT: u32 = 34;
 const KBITS: u32 = 64 - CHECK_SHIFT; // key check bits
 const PBITS: u32 = 14; // partitions: 2^14
-const NBITS: u32 = 14; // buckets per partition: 2^14
 const SLOTS: usize = 48; // entries per bucket: 6 cache lines
-const SLICE: usize = (1 << NBITS) * SLOTS; // a partition's entries
-const TABLE: usize = (1 << PBITS) * SLICE; // 103 GB
 const BACK: usize = LEVELS[1]; // tokens before a context end that its hash reads
 const STEP: usize = 1 << 12; // positions hashed at once
 const PIECE: usize = 1 << 18; // context ends per piece of the scan (one pread)
@@ -96,14 +94,18 @@ fn check(e: u64) -> u64 {
     (e >> CHECK_SHIFT) & ((1 << KBITS) - 1)
 }
 
-#[inline(always)]
-fn b1(check: u64) -> usize {
-    (check >> (KBITS - NBITS)) as usize
+fn nbits(key: usize) -> u32 { // key: 2^nbits buckets per partition (6: a 103 GB table, 3/2: 26 GB)
+    if key == MIN { 14 } else { 12 }
 }
 
 #[inline(always)]
-fn b2(check: u64) -> usize {
-    (check.wrapping_mul(K0) >> (64 - NBITS)) as usize
+fn b1(check: u64, nbits: u32) -> usize {
+    (check >> (KBITS - nbits)) as usize
+}
+
+#[inline(always)]
+fn b2(check: u64, nbits: u32) -> usize {
+    (check.wrapping_mul(K0) >> (64 - nbits)) as usize
 }
 
 /// pread exactly `buf` at byte `offset` of `file`.
@@ -126,30 +128,39 @@ impl Hashes {
 
     /// The entries (with the next token if `next`) and partitions of the n contexts ending at t[j0..j0 + n]
     /// (exclusive ends): context r ends at t[j0 + r], which is its next token. Needs j0 >= BACK.
-    fn hash(&mut self, t: &[u16], j0: usize, n: usize, next: bool) {
+    fn hash(&mut self, t: &[u16], j0: usize, n: usize, next: bool, key: usize) {
         if *AVX512 {
-            unsafe { self.hash_avx512(t, j0, n, next) }
+            unsafe { self.hash_avx512(t, j0, n, next, key) }
         } else if is_x86_feature_detected!("avx2") {
-            unsafe { self.hash_avx2(t, j0, n, next) }
+            unsafe { self.hash_avx2(t, j0, n, next, key) }
         } else {
-            self.hash_impl(t, j0, n, next)
+            self.hash_impl(t, j0, n, next, key)
         }
     }
 
     #[target_feature(enable = "avx512f,avx512dq,avx512bw,avx512vl")]
-    unsafe fn hash_avx512(&mut self, t: &[u16], j0: usize, n: usize, next: bool) {
-        self.hash_impl(t, j0, n, next)
+    unsafe fn hash_avx512(&mut self, t: &[u16], j0: usize, n: usize, next: bool, key: usize) {
+        self.hash_impl(t, j0, n, next, key)
     }
 
     #[target_feature(enable = "avx2,bmi2")]
-    unsafe fn hash_avx2(&mut self, t: &[u16], j0: usize, n: usize, next: bool) {
-        self.hash_impl(t, j0, n, next)
+    unsafe fn hash_avx2(&mut self, t: &[u16], j0: usize, n: usize, next: bool, key: usize) {
+        self.hash_impl(t, j0, n, next, key)
     }
 
     /// Array passes that vectorise: q[i] holds the 4 tokens before t[j0 - BACK + i] as one word; then per position
     /// the key (from its last 6 tokens, words j and j - 2), its partition and check, and the level fingerprints.
     #[inline(always)]
-    fn hash_impl(&mut self, t: &[u16], j0: usize, n: usize, next: bool) {
+    fn hash_impl(&mut self, t: &[u16], j0: usize, n: usize, next: bool, key: usize) {
+        match key { // key: a vectorised loop per key
+            2 => self.hash_key::<2>(t, j0, n, next),
+            3 => self.hash_key::<3>(t, j0, n, next),
+            _ => self.hash_key::<MIN>(t, j0, n, next),
+        }
+    }
+
+    #[inline(always)]
+    fn hash_key<const KEY: usize>(&mut self, t: &[u16], j0: usize, n: usize, next: bool) {
         let base = j0 - BACK;
         let (q, e, part) = (&mut self.q[..], &mut self.e[..], &mut self.part[..]);
         assert!(t.len() >= base + n + BACK - 1 + next as usize && q.len() >= n + BACK && e.len() >= n && part.len() >= n);
@@ -161,15 +172,20 @@ impl Hashes {
             }
         }
         let qp = q.as_ptr();
+        let short = [(KEY, mul(0, 0)), (6, mul(0, 1))]; // key 3/2: level 10 covers the tokens key + 1 to 10
         for r in 0..n {
             let j = BACK + r;
-            let mut h = nh(unsafe { *qp.add(j) }, K0).wrapping_add(nh(unsafe { *qp.add(j - 2) }, K1));
+            let mut h = match KEY {
+                2 => nh(unsafe { *qp.add(j) } >> 32, K0),
+                3 => nh(unsafe { *qp.add(j) } >> 16, K0),
+                _ => nh(unsafe { *qp.add(j) }, K0).wrapping_add(nh(unsafe { *qp.add(j - 2) }, K1)),
+            };
             h ^= h >> 29;
             h = h.wrapping_mul(K2);
             h ^= h >> 32;
             part[r] = (h >> (64 - PBITS)) as u16;
             e[r] = ((h << PBITS) >> (64 - KBITS)) << CHECK_SHIFT
-                | fingerprint(qp, j, &LEVEL10, FINALS[0], BITS[0], SHIFTS[0])
+                | fingerprint(qp, j, if KEY == MIN { &LEVEL10 } else { &short }, FINALS[0], BITS[0], SHIFTS[0])
                 | fingerprint(qp, j, &LEVEL20, FINALS[1], BITS[1], SHIFTS[1]);
         }
         if next {
@@ -236,7 +252,7 @@ impl Scatter {
     /// the arena) if that is full.
     fn dst(&mut self, p: usize, builder: &Builder) -> std::io::Result<*mut u64> {
         if self.block[p] == NONE || self.fill[p] as usize == BLOCK {
-            let b = self.local.next().unwrap_or_else(|| builder.overflow.fetch_add(1, Relaxed));
+            let b = self.local.next().unwrap_or_else(|| builder.overflow.0.fetch_add(1, Relaxed));
             if b >= builder.arena.len() / BLOCK {
                 return Err(std::io::Error::other("scan arena is full"));
             }
@@ -261,25 +277,36 @@ impl Scatter {
     }
 }
 
+/// The shared-block counter, on cache lines of its own: every scan thread bumps it and every burst flush reads the
+/// builder, so on a line with the builder's fields (by the object's address) it slowed the scan about twofold.
+#[repr(align(128))]
+struct Counter(AtomicUsize);
+
 /// Rank 0's build state.
 struct Builder {
     files: Vec<File>,
     sizes: Vec<usize>,
     pool: rayon::ThreadPool,
     arena: Map<u64>,
-    overflow: AtomicUsize, // the next arena block past the threads' own
+    overflow: Box<Counter>, // the next arena block past the threads' own
     table: Map<u64>,
     scatters: Vec<Mutex<Scatter>>,
     finishes: Vec<Mutex<(Map<u64>, Map<u8>)>>, // a partition's slice of the table and its bucket fill counts
 }
 
 /// The table is one shared-memory file: rank 0 creates and builds it, the other ranks open it read-only. Every rank
-/// looks up its own positions on a pool of its own, reading buckets with pread (mapping nothing).
+/// looks up its own positions on a pool of its own, reading buckets in place from its mapping of the table.
 #[pyclass]
 pub struct SlotIndex {
-    file: File,
+    view: Map<u64>, // mmap: the table, mapped and faulted in before the clock
     lookup: rayon::ThreadPool,
     builder: Option<Builder>,
+    key: usize,
+}
+
+fn view(file: &File, key: usize) -> std::io::Result<Map<u64>> { // mmap: the table of index `key`, faulted in
+    let len = SLOTS << (PBITS + nbits(key));
+    Ok(Map { ptr: mmap(std::ptr::null_mut(), len * 8, libc::MAP_SHARED | libc::MAP_POPULATE, file.as_raw_fd())?.cast(), len, bytes: len * 8 })
 }
 
 #[pymethods]
@@ -288,22 +315,23 @@ impl SlotIndex {
     /// and fault in the build's memory; nothing is read yet. The build runs on `threads` threads pinned round-robin
     /// to `cpus`, lookups one per `lookup_cpus` (either may be empty: unpinned).
     #[staticmethod]
-    fn create(py: Python<'_>, path: String, files: Vec<String>, threads: usize, cpus: Vec<usize>, lookup_cpus: Vec<usize>) -> PyResult<Self> {
+    fn create(py: Python<'_>, path: String, files: Vec<String>, threads: usize, cpus: Vec<usize>, lookup_cpus: Vec<usize>, key: usize) -> PyResult<Self> {
         let (files, sizes): (Vec<File>, Vec<usize>) = files.iter().map(|f| open_shard(f)).collect::<PyResult<Vec<_>>>()?.into_iter().unzip();
         // Full blocks, one partial block per (thread, partition), 2% slack. A thread takes blocks from its own
         // first-touch slice (half its fair share, so a slow thread strands little) and then from the shared rest.
         let full = sizes.iter().map(|&n| n.saturating_sub(MIN)).sum::<usize>().div_ceil(BLOCK);
         let local = full / 2 / threads;
         let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
-        file.set_len((TABLE * 8) as u64)?;
-        let table = mmap(std::ptr::null_mut(), TABLE * 8, libc::MAP_SHARED, file.as_raw_fd())?;
+        let (slice, len) = (SLOTS << nbits(key), SLOTS << (PBITS + nbits(key)));
+        file.set_len((len * 8) as u64)?;
+        let table = mmap(std::ptr::null_mut(), len * 8, libc::MAP_SHARED, file.as_raw_fd())?;
         let builder = Builder {
             files,
             sizes,
             pool: pinned_pool(threads, cpus, "slotindex"),
             arena: Map::new((full * 51 / 50 + threads * (1 << PBITS) + 64) * BLOCK)?,
-            overflow: AtomicUsize::new(threads * local),
-            table: Map { ptr: table.cast(), len: TABLE, bytes: TABLE * 8 },
+            overflow: Box::new(Counter(AtomicUsize::new(threads * local))),
+            table: Map { ptr: table.cast(), len, bytes: len * 8 },
             scatters: (0..threads)
                 .map(|t| {
                     let (buf, used) = (Map::new((1 << PBITS) * BURST)?, Map::new(1 << PBITS)?);
@@ -311,7 +339,7 @@ impl SlotIndex {
                     Ok(Mutex::new(Scatter { buf, used, block, fill, log: Vec::new(), local: t * local..(t + 1) * local }))
                 })
                 .collect::<std::io::Result<_>>()?,
-            finishes: (0..threads).map(|_| Ok(Mutex::new((Map::new(SLICE + 8)?, Map::new(1 << NBITS)?)))).collect::<std::io::Result<_>>()?,
+            finishes: (0..threads).map(|_| Ok(Mutex::new((Map::new(slice + 8)?, Map::new(slice / SLOTS)?)))).collect::<std::io::Result<_>>()?,
         };
         // Fault in the arena (each thread its own slice first), the table and the per-thread buffers, then drop the
         // table's mappings (its pages now exist in the file): each slice is mapped again only while it is written.
@@ -323,29 +351,30 @@ impl SlotIndex {
                 let (own, rest) = (local * BLOCK, b.arena.len() - n * local * BLOCK);
                 touch(part(&b.arena, i * own, (i + 1) * own));
                 touch(part(&b.arena, n * own + rest * i / n, n * own + rest * (i + 1) / n));
-                touch(part(&b.table, TABLE * i / n, TABLE * (i + 1) / n));
+                touch(part(&b.table, len * i / n, len * (i + 1) / n));
                 let (mut scatter, mut finish) = (b.scatters[i].lock().unwrap(), b.finishes[i].lock().unwrap());
                 touch(&mut scatter.buf);
                 touch(&mut scatter.used);
                 touch(&mut finish.0);
                 touch(&mut finish.1);
             });
-            mmap(b.table.ptr.cast(), TABLE * 8, libc::MAP_SHARED | libc::MAP_FIXED, file.as_raw_fd()).map(drop)
+            mmap(b.table.ptr.cast(), len * 8, libc::MAP_SHARED | libc::MAP_FIXED, file.as_raw_fd()).map(drop)
         })?;
         let lookup = pinned_pool(lookup_cpus.len().max(1), lookup_cpus, "slotindex-q");
-        Ok(Self { file, lookup, builder: Some(builder) })
+        Ok(Self { view: py.detach(|| view(&file, key))?, lookup, builder: Some(builder), key })
     }
 
     /// The other ranks, before the clock, once rank 0 has created `path`.
     #[staticmethod]
-    fn attach(path: String, lookup_cpus: Vec<usize>) -> PyResult<Self> {
+    fn attach(path: String, lookup_cpus: Vec<usize>, key: usize) -> PyResult<Self> {
         let lookup = pinned_pool(lookup_cpus.len().max(1), lookup_cpus, "slotindex-q");
-        Ok(Self { file: File::open(&path)?, lookup, builder: None })
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&path)?; // mmap: shared, as the build maps it
+        Ok(Self { view: view(&file, key)?, lookup, builder: None, key })
     }
 
     /// Rank 0, on the clock: build the table.
     fn build(&self, py: Python<'_>) -> PyResult<()> {
-        let b = self.builder.as_ref().unwrap();
+        let (b, nbits) = (self.builder.as_ref().unwrap(), nbits(self.key));
         let pieces: Vec<(usize, usize)> = b.sizes.iter().enumerate().flat_map(|(f, &n)| (MIN..n).step_by(PIECE).map(move |a| (f, a))).collect();
         let next = AtomicUsize::new(0);
         let lens: Vec<AtomicUsize> = (0..b.arena.len() / BLOCK).map(|_| AtomicUsize::new(BLOCK)).collect();
@@ -363,7 +392,7 @@ impl SlotIndex {
                     pread(&b.files[f], &mut tokens[pad..BACK + n], 1024 + lo * 2)?;
                     for r in (0..n).step_by(STEP) {
                         let m = STEP.min(n - r);
-                        hashes.hash(&tokens, BACK + r, m, true);
+                        hashes.hash(&tokens, BACK + r, m, true, self.key);
                         // Raw pointers in locals: through &mut the compiler reloads every field after each store.
                         let (buf, used) = (sc.buf.ptr, sc.used.ptr);
                         for (&e, &p) in hashes.e[..m].iter().zip(&hashes.part[..m]) {
@@ -425,12 +454,12 @@ impl SlotIndex {
                                     _mm_prefetch(src.as_ptr().wrapping_add(i + 512).cast(), _MM_HINT_T0);
                                 }
                                 if let Some(&e) = src.get(i + PF) {
-                                    let h = b1(check(e));
+                                    let h = b1(check(e), nbits);
                                     _mm_prefetch(slice.as_ptr().add(h * SLOTS + (*fill.get_unchecked(h) as usize).min(SLOTS - 1)).cast(), _MM_HINT_T0);
                                 }
                                 let e = *src.get_unchecked(i);
                                 let c = check(e);
-                                if let Some(h) = [b1(c), b2(c)].into_iter().find(|&h| (*fill.get_unchecked(h) as usize) < SLOTS) {
+                                if let Some(h) = [b1(c, nbits), b2(c, nbits)].into_iter().find(|&h| (*fill.get_unchecked(h) as usize) < SLOTS) {
                                     let f = fill.get_unchecked_mut(h);
                                     *slice.get_unchecked_mut(h * SLOTS + *f as usize) = e;
                                     *f += 1;
@@ -439,19 +468,19 @@ impl SlotIndex {
                         }
                     }
                     // Map the slice in one call rather than a write fault per page, write it, and drop the mapping again.
-                    let dst = unsafe { b.table.ptr.add(p * SLICE) };
-                    unsafe { libc::madvise(dst.cast(), SLICE * 8, libc::MADV_POPULATE_WRITE) };
+                    let dst = unsafe { b.table.ptr.add(p * (SLOTS << nbits)) };
+                    unsafe { libc::madvise(dst.cast(), (SLOTS << nbits) * 8, libc::MADV_POPULATE_WRITE) };
                     if *AVX512 {
                         unsafe { out_avx512(slice, fill, dst) };
                     } else {
                         for (j, &f) in fill.iter().enumerate() {
                             slice[j * SLOTS + f as usize..(j + 1) * SLOTS].fill(0);
                         }
-                        unsafe { stream(dst, &slice[..SLICE]) };
+                        unsafe { stream(dst, &slice[..SLOTS << nbits]) };
                     }
                     fill.fill(0);
                     fence();
-                    unsafe { libc::madvise(dst.cast(), SLICE * 8, libc::MADV_DONTNEED) };
+                    unsafe { libc::madvise(dst.cast(), (SLOTS << nbits) * 8, libc::MADV_DONTNEED) };
                 }
                 fence();
             });
@@ -466,33 +495,39 @@ impl SlotIndex {
         py.detach(|| drop(builder));
     }
 
-    /// After the build: the rows (cell, two slots) of every position of `tokens`, split into segments at BOS and
-    /// every `chunk` tokens.
-    fn query<'py>(&self, py: Python<'py>, tokens: PyReadonlyArray1<u16>, chunk: usize) -> PyResult<Bound<'py, PyArray2<i32>>> {
-        let x = tokens.as_slice()?;
+    /// After the build: the rows (cell, 8 slots) of every position of `tokens`, split into segments at BOS and
+    /// every `chunk` tokens, into the rows of `out` still empty (backoff), their cells offset by `tag`.
+    fn query_into(&self, py: Python<'_>, tokens: PyReadonlyArray1<u16>, chunk: usize, mut out: PyReadwriteArray2<i32>, tag: i32) -> PyResult<()> {
+        let (x, nbits) = (tokens.as_slice()?, nbits(self.key));
         let mut starts: Vec<usize> = (0..x.len()).step_by(chunk).chain([x.len()]).collect();
         starts.extend(x.iter().enumerate().filter_map(|(i, &v)| (v == BOS).then_some(i)));
         starts.sort_unstable();
         starts.dedup();
-        let mut rows = Array2::<i32>::zeros((x.len(), 3));
-        let out = Output(rows.as_mut_ptr());
+        let out = out.as_slice_mut()?;
+        assert_eq!(out.len(), x.len() * 9);
+        let out = Output(out.as_mut_ptr());
         py.detach(|| {
             self.lookup.install(|| {
                 starts.par_windows(2).try_for_each_init(
-                    || (Hashes::new(), Vec::new(), Vec::new(), vec![0u64; STEP * SLOTS], vec![0u64; SLOTS]),
-                    |(hashes, tokens, t, buf, buf2), w| -> std::io::Result<()> {
+                    || (Hashes::new(), Vec::with_capacity(2 * SLOTS), Vec::new()),
+                    |(hashes, tokens, t), w| -> std::io::Result<()> {
                         let (start, len) = (w[0], w[1] - w[0]);
                         t.clear();
                         t.resize(BACK, STOP);
                         t.extend_from_slice(&x[start..w[1]]);
-                        for c in (MIN..=len).step_by(STEP) {
+                        for c in (self.key..=len).step_by(STEP) {
                             let m = STEP.min(len + 1 - c);
-                            hashes.hash(t, BACK + c, m, false);
-                            let offset = |r: usize, b: usize| (hashes.part[r] as usize * SLICE + b * SLOTS) * 8;
+                            hashes.hash(t, BACK + c, m, false, self.key);
+                            let bucket = |r: usize, b: usize| &self.view[hashes.part[r] as usize * (SLOTS << nbits) + b * SLOTS..][..SLOTS];
+                            let filled = |r: usize| unsafe { *out.0.add((start + c + r - 1) * 9) } != 0;
                             for r in 0..m {
-                                pread(&self.file, &mut buf[r * SLOTS..(r + 1) * SLOTS], offset(r, b1(check(hashes.e[r]))))?;
-                            }
-                            for r in 0..m {
+                                if r + 1 < m && !filled(r + 1) {
+                                    let next = bucket(r + 1, b1(check(hashes.e[r + 1]), nbits));
+                                    (0..SLOTS).step_by(8).for_each(|l| unsafe { _mm_prefetch(next.as_ptr().add(l).cast(), _MM_HINT_T0) });
+                                }
+                                if filled(r) {
+                                    continue;
+                                }
                                 let e = hashes.e[r];
                                 let levels = LEVELS.iter().filter(|&&l| l <= c + r).count();
                                 let mut best = 0;
@@ -501,7 +536,7 @@ impl SlotIndex {
                                     for &v in bucket.iter().filter(|&&v| v != 0 && check(v) == check(e)) {
                                         let d = v ^ e;
                                         let agree = (0..levels).take_while(|&k| (d >> SHIFTS[k]) & ((1 << BITS[k]) - 1) == 0).count();
-                                        let level = if agree == 0 { MIN } else { LEVELS[agree - 1] };
+                                        let level = if agree == 0 { self.key } else { LEVELS[agree - 1] };
                                         if level > best {
                                             best = level;
                                             tokens.clear();
@@ -511,15 +546,16 @@ impl SlotIndex {
                                         }
                                     }
                                 };
-                                let bucket1 = &buf[r * SLOTS..(r + 1) * SLOTS];
+                                let bucket1 = bucket(r, b1(check(e), nbits));
                                 scan(bucket1);
-                                let (h1, h2) = (b1(check(e)), b2(check(e)));
+                                let (h1, h2) = (b1(check(e), nbits), b2(check(e), nbits));
                                 if h2 != h1 && bucket1[SLOTS - 1] != 0 {
-                                    pread(&self.file, buf2, offset(r, h2))?;
-                                    scan(buf2);
+                                    scan(bucket(r, h2));
                                 }
                                 if best > 0 {
-                                    unsafe { out.write((start + c + r - 1) * 3, &row(best, tokens)) };
+                                    let mut rw = row(best, tokens);
+                                    rw[0] += tag;
+                                    unsafe { out.write((start + c + r - 1) * 9, &rw) };
                                 }
                             }
                         }
@@ -528,6 +564,6 @@ impl SlotIndex {
                 )
             })
         })?;
-        Ok(rows.into_pyarray(py))
+        Ok(())
     }
 }

@@ -19,6 +19,8 @@ VALUE_EMBED_LR_MUL = 70.0
 VALUE_EMBED_BETAS = (0.75, 0.95)
 VALUE_EMBED_WD_MUL = 5.0
 VALUE_EMBED_WD_MUL_PERIOD4 = 10.0
+# lr multipliers by parameter (ANVIL weight decay x1.4 and the n-gram table's lr x0.7 below)
+LR_MULS = {"qk_bank": 1.22, "lm_head": 1.22, "embed": 1.22, "mudd_w1": 2.0, "mudd_gate_w1": 2.0, "copy_qk_bank": 2.0}
 
 
 def value_embed_betas_and_wd_mul(step: int) -> tuple[tuple[float, float], float]:
@@ -81,6 +83,9 @@ class TrainingManager():
         })
         # ---- exact-match retrieval: the scales at 10x lr ----
         ret_labels = [p.label for p in model.parameters() if p.label.startswith("ret_")]
+        cplm_labels = ["copy_qk_bank", "copy_k_sink", "copy_qk_gain"]  # CPLM (PR #379)
+        self.param_table.update({label: {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99],
+                                         **({} if label == "copy_qk_bank" else {"wd_mul": 0.0})} for label in cplm_labels})
         self.param_table.update({label: {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99],
                                          "lr_mul": 10.0 if "scale" in label else 1.0, "wd_mul": 0.0} for label in ret_labels})
 
@@ -94,7 +99,7 @@ class TrainingManager():
             "scalars", "smear_gate", "ve_gate_bank", "post_lambdas", "resid_lambdas",
             "mudd_w1", "mudd_w2", "mudd_w2g", "mudd_b2", "mudd_gate_w1", "mudd_gate_w2", "mudd_gate_b2",
             "_mudd_gate_scale",
-        ] + ret_labels
+        ] + ret_labels + cplm_labels
         # work_order is the compute schedule (record #360):
         # - qk_bank and vo_bank first: their gathers are the first ones the next step's fp8 refresh waits
         #   for (perf/deferred_gathers.py), and Phase 3's lm_head wait queues behind only these two
@@ -106,7 +111,7 @@ class TrainingManager():
         self.work_order = ret_labels + [
             "qk_bank", "vo_bank", "lm_head", "embed", "value_embeds",
             "scalars", "smear_gate", "ve_gate_bank", "mudd_b2", "mudd_gate_b2", "_mudd_gate_scale",
-            "post_lambdas", "resid_lambdas", "mudd_w2", "mudd_w2g", "mudd_gate_w2", "mudd_w1", "mudd_gate_w1",
+            "post_lambdas", "resid_lambdas", *cplm_labels, "mudd_w2", "mudd_w2g", "mudd_gate_w2", "mudd_w1", "mudd_gate_w1",
             "mlp_bank",
         ]
 
@@ -120,7 +125,7 @@ class TrainingManager():
             lr=0.023,
             momentum=0.95,      # Nesterov lookahead; get_rail_beta rewrites it every step
             beta2=0.9,          # lane-energy EMA decay for the equalizer
-            weight_decay=2.25,
+            weight_decay=2.25 * 1.4,
         )
 
         self.optimizer = AnvilAndAdam(
@@ -189,7 +194,7 @@ class TrainingManager():
 
         # Update learning rates and momentum for all params
         for param, p_cfg in self.optimizer.param_cfgs.items():
-            p_cfg.lr = p_cfg.initial_lr * step_lr
+            p_cfg.lr = p_cfg.initial_lr * step_lr * LR_MULS.get(p_cfg.label, 1.0)
             if p_cfg.optim == "anvil":
                 p_cfg.momentum = rail_beta
             elif p_cfg.label == "value_embeds":
@@ -197,7 +202,7 @@ class TrainingManager():
                 # compiles the Adam step for both beta pairs.
                 p_cfg.adam_betas, p_cfg.wd_mul = value_embed_betas_and_wd_mul(step)
 
-        table_event = row_prefetch.optimizer_event(step, lr=self.adam_defaults["lr"] * step_lr,
+        table_event = row_prefetch.optimizer_event(step, lr=self.adam_defaults["lr"] * step_lr * 0.7,
                                                    weight_decay=self.adam_defaults["weight_decay"],
                                                    eps=self.adam_defaults["eps"])
         deferred = self.optimizer.step(do_adam=do_adam, sparse_update=table_event, deferred_labels=deferred_labels)

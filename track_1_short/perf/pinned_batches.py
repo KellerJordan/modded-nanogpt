@@ -23,7 +23,7 @@ from torch import Tensor
 
 # Slots in the ring (record #360's _PINLD_RING): deeper than the loader's lookahead, so a slot's copy has
 # long retired when it comes round again.
-PINNED_BATCH_SLOTS = 16
+PINNED_BATCH_SLOTS = 40  # the host runs further ahead
 
 
 @dataclass(slots=True)
