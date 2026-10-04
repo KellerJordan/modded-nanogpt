@@ -26,7 +26,7 @@ _QKV_BWD_JIT_KW = {_jit_kw: ["grad_scale_ptr"]} if _jit_kw else {}
 def _packed_batched_matrix_amax_partial_kernel(
     first, second, partial_amax, FIRST_ELEMENTS: tl.constexpr, SECOND_ELEMENTS: tl.constexpr,
     FIRST_STRIDE_B: tl.constexpr, SECOND_STRIDE_B: tl.constexpr, NUM_PARTS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr, N: tl.constexpr, FIRST_NARROW: tl.constexpr, SECOND_NARROW: tl.constexpr,
 ):
     """Partial amax of the row-pack per (batch, part); quantize_dual_layout_packed_batched reduces."""
     batch = tl.program_id(0)
@@ -38,9 +38,14 @@ def _packed_batched_matrix_amax_partial_kernel(
         indices = start + offsets
         valid = indices < total_elements
         in_first = indices < FIRST_ELEMENTS
-        first_values = tl.load(first + batch * FIRST_STRIDE_B + indices,
+        first_indices = indices
+        if FIRST_NARROW:
+            first_indices = (128 * ((first_indices // N) // 64) + (first_indices // N) % 64) * N + first_indices % N
+        first_values = tl.load(first + batch * FIRST_STRIDE_B + first_indices,
                                mask=valid & in_first, other=0.0)
         second_indices = tl.maximum(indices - FIRST_ELEMENTS, 0)
+        if SECOND_NARROW:
+            second_indices = (128 * ((second_indices // N) // 64) + (second_indices // N) % 64) * N + second_indices % N
         second_values = tl.load(second + batch * SECOND_STRIDE_B + second_indices,
                                 mask=valid & ~in_first, other=0.0)
         values = first_values.to(tl.float32) + second_values.to(tl.float32)
@@ -52,6 +57,7 @@ def _quantize_dual_layout_packed_batched_kernel(
     first, second, row, transposed, scale_ptr, M, N, FIRST_ROWS: tl.constexpr,
     FIRST_STRIDE_B: tl.constexpr, SECOND_STRIDE_B: tl.constexpr, ROW_STRIDE_B: tl.constexpr,
     TRANSPOSED_STRIDE_B: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    FIRST_NARROW: tl.constexpr, SECOND_NARROW: tl.constexpr,
 ):
     """Quantize that same row-pack in place of a cat: ONE read of each source, TWO fp8 writes (row-major and
     transposed, via a register-tile tl.trans), so the packed QKV GEMM's two operand layouts cost one pass."""
@@ -60,8 +66,13 @@ def _quantize_dual_layout_packed_batched_kernel(
     offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     valid = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     in_first = offs_m[:, None] < FIRST_ROWS
-    first_offsets = offs_m[:, None] * N + offs_n[None, :]
+    first_rows = offs_m
+    if FIRST_NARROW:
+        first_rows = 128 * (first_rows // 64) + first_rows % 64
+    first_offsets = first_rows[:, None] * N + offs_n[None, :]
     second_rows = tl.maximum(offs_m - FIRST_ROWS, 0)
+    if SECOND_NARROW:
+        second_rows = 128 * (second_rows // 64) + second_rows % 64
     second_offsets = second_rows[:, None] * N + offs_n[None, :]
     source_ptrs = tl.where(in_first, first + batch * FIRST_STRIDE_B + first_offsets,
                            second + batch * SECOND_STRIDE_B + second_offsets)
@@ -74,13 +85,21 @@ def _quantize_dual_layout_packed_batched_kernel(
     tl.store(transposed + batch * TRANSPOSED_STRIDE_B + offs_n[:, None] * M + offs_m[None, :],
              tl.trans(quantized), mask=transposed_mask)
 
-def quantize_dual_layout_packed_batched(first, second, scales, partial_amax, row, transposed):
+def quantize_dual_layout_packed_batched(first, second, scales, partial_amax, row, transposed,
+                                        *, first_narrow=False, second_narrow=False):
     """Refresh the packed QKV fp8 weight cache: one launch per batch of layers sharing (B, rows, N), which is
     what the asserts below check.  The scale is EXACT (this step's own amax, not a lagged one) and the +-448
     clamp is explicit, so the fp8 bytes are what a cat + amax + quantize + transpose chain in aten would
     have written."""
     B, first_rows, N = first.shape
     B2, second_rows, N2 = second.shape
+    # Narrow sources keep physical 128-row blocks; only their leading 64 rows are live.
+    if first_narrow:
+        assert first_rows % 128 == 0
+        first_rows //= 2
+    if second_narrow:
+        assert second_rows % 128 == 0
+        second_rows //= 2
     total_rows = first_rows + second_rows
     num_parts = partial_amax.shape[-1]
     assert (B2, N2) == (B, N) and first.device == second.device and first.dtype == second.dtype
@@ -93,7 +112,8 @@ def quantize_dual_layout_packed_batched(first, second, scales, partial_amax, row
     _packed_batched_matrix_amax_partial_kernel[(B, num_parts)](
         first, second, partial_amax, FIRST_ELEMENTS=first_rows * N,
         SECOND_ELEMENTS=second_rows * N, FIRST_STRIDE_B=first.stride(0),
-        SECOND_STRIDE_B=second.stride(0), NUM_PARTS=num_parts, BLOCK_SIZE=2048,
+        SECOND_STRIDE_B=second.stride(0), NUM_PARTS=num_parts, BLOCK_SIZE=2048, N=N,
+        FIRST_NARROW=first_narrow, SECOND_NARROW=second_narrow,
         num_stages=1, num_warps=8)
     # Same exact-scale arithmetic as quantize_mlp_weights_dual in triton_kernels.
     torch.mul(partial_amax.amax(dim=1).clamp_(min=1.0e-12), 1.0 / 448.0, out=scales)
@@ -103,6 +123,7 @@ def quantize_dual_layout_packed_batched(first, second, scales, partial_amax, row
         first, second, row, transposed, scales, total_rows, N, FIRST_ROWS=first_rows,
         FIRST_STRIDE_B=first.stride(0), SECOND_STRIDE_B=second.stride(0),
         ROW_STRIDE_B=row.stride(0), TRANSPOSED_STRIDE_B=transposed.stride(0),
+        FIRST_NARROW=first_narrow, SECOND_NARROW=second_narrow,
         BLOCK_M=block_m, BLOCK_N=block_n, num_stages=2, num_warps=8)
     return row, transposed
 

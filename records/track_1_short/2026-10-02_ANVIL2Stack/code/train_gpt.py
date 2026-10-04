@@ -11,10 +11,10 @@ weight ships are all inside it.
 
 Launch with the stock `./run.sh` -- `torchrun --standalone --nproc_per_node=8 train_gpt.py`, no environment
 prefix. The only variable this file SETS is PYTORCH_ALLOC_CONF; the only ones it READS are torchrun's own
-RANK / LOCAL_RANK / WORLD_SIZE plus DATA_PATH, KX_STEPS and KX_SEED. Everything else is hardcoded.
+RANK / LOCAL_RANK / WORLD_SIZE plus DATA_PATH. Everything else is hardcoded.
 
 The attention kernel is NOT the community FA3 build but a patched FA3 -- `get_kernel('devenpzak/flash-attn3-12864',
-version=1)` -- carrying the (64,128) and (128,64) head-dim pairs upstream does not instantiate; its Python surface
+revision='64c1e6d1f2780e7931839f41426ddcdb564a7cb9', trust_remote_code=True)` -- carrying the (64,128) and (128,64) head-dim pairs upstream does not instantiate; its Python surface
 is byte-identical to `kernels-community/flash-attn3`'s and its patches are published in that repo's `src_patches/`.
 
 Asserts here are load-bearing: several are what makes a CUDA-graph capture safe to replay. Do not run under `python -O`.
@@ -25,7 +25,7 @@ import sys
 # Read this file and every kernel module it ships with, for the run log.
 code = ""
 for _src_file in (sys.argv[0], 'triton_kernels.py', 'anvil_attn_kernels.py',
-                  'bigram_kernels.py', 'fuse_tiny_kernels.py', 'value_embed_op.py'):
+                  'bigram_kernels.py', 'fuse_tiny_kernels.py', 'value_embed_op.py', 'token_norm.py', 'sampled_head.py', 'deferred_sign_scatter.py', 'copy_mixture.py'):
     _p = _src_file if _src_file == sys.argv[0] else os.path.join(os.path.dirname(sys.argv[0]), _src_file)
     with open(_p, 'r') as f:
         if code:
@@ -39,7 +39,7 @@ import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from itertools import accumulate, pairwise
 from itertools import cycle
 from pathlib import Path
@@ -47,6 +47,36 @@ import gc
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
+from checkpoint import save_checkpoint, source_manifest
+from copy_mixture import (COPY_FIT_BATCHES, COPY_NUM_BUCKETS, ConsumedTrainingBatches,
+                          copy_candidates, copy_fit, copy_mix_loss)
+
+run_sources = source_manifest(Path(__file__).resolve().parent)
+
+import hashlib
+import tempfile
+
+
+def _install_tokenizer_assets():
+    root = Path(__file__).resolve().parent / "tokenizer_assets"
+    cache = Path(tempfile.gettempdir()) / "data-gym-cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    for name, expected, cache_name in (
+        ("vocab.bpe", "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5", "6d1cbeee0f20b3d9449abfede4726ed8212e3aee"),
+        ("encoder.json", "196139668be63f3b5d6574427317ae82f612a97c5d1cdaf36ed2256dbf636783", "6c7ea1a7e38e3a7f062df639a5b80947f075ffe6"),
+    ):
+        data = (root / name).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == expected
+        destination = cache / cache_name
+        if destination.is_file() and hashlib.sha256(destination.read_bytes()).hexdigest() == expected:
+            continue
+        with tempfile.NamedTemporaryFile(dir=cache, delete=False) as handle:
+            handle.write(data)
+            temporary = handle.name
+        os.replace(temporary, destination)
+
+
+_install_tokenizer_assets()
 import triton
 import triton.language as tl
 import numpy as np
@@ -60,7 +90,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-from kernels import get_kernel
+from kernels import get_local_kernel
+from huggingface_hub import snapshot_download
+from huggingface_hub.errors import LocalEntryNotFoundError
 from torch import Tensor, nn
 
 # Fused Triton / compiled kernels, in the nanogpt::* custom-op namespace.
@@ -71,6 +103,10 @@ from triton_kernels import (XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction
 import triton_kernels as _fk  # alias for the module-level hooks (_PTP_W_RUNTIME, _SNS_*)
 from triton_kernels import SampledSoftcappedCrossEntropy, sns_init, sns_gather
 import bigram_kernels as _bgk
+from compact_grad import prepare_grad_rows
+from deferred_sign_scatter import signed_scatter_add
+from token_norm import NORM_MAP_SIZE, build_norm_map
+import sampled_head as _hs
 from bigram_kernels import _want_unique, bgcache_land, bgpull_want_build
 import fuse_tiny_kernels as _ft
 from anvil_attn_kernels import (PackedFP8QKVPre, QKNormRoPEPad,
@@ -93,7 +129,7 @@ from value_embed_op import (
 # Distributed training setup
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert 8 % world_size == 0, "world_size must be a divisor of 8"
+assert world_size == 8, "PR360 owner sharding requires exactly eight ranks"
 grad_accum_steps = 8 // world_size
 grad_scale = 1 / grad_accum_steps # consistent grad magnitudes between different num_devices
 assert torch.cuda.is_available()
@@ -431,21 +467,22 @@ def bgsp_share_gradients(compact, lo, hi, send_counts, recv_counts, dtype):
     return sparse_value_a2a(_bgk.bgfuse_send_cast(compact, lo, hi, dtype),
                             send_counts, recv_counts)
 
-@torch.no_grad
+@torch.no_grad()
 def bgsp_merge_gradients(shard, compact, full_idx, lo, hi, recv_idx, recv_vals, rank, world,
-                         compact_ok=False):
-    """The reduce_scatter's output into a persistent dense SHARD [N/world, d], not the full table: own rows from `compact`, peers' on top."""
+                         row_slots):
+    """Aggregate into first-occurrence slots; parameter and moment rows stay global-local."""
     d = shard.shape[1]
-    base = rank * shard.shape[0]
+    base = rank * row_slots.numel()
     own_rows, recv_rows = full_idx[lo:hi] - base, recv_idx - base
-    _BGADAM_CTX["gidx"] = torch.cat([own_rows, recv_rows]) if hi > lo else recv_rows
-    if compact_ok:
-        shard.index_fill_(0, _BGADAM_CTX["gidx"].long(), 0)
-    else:
-        shard.zero_()
+    gidx = torch.cat([own_rows, recv_rows]) if hi > lo else recv_rows
+    n = gidx.numel()
+    assert n <= shard.shape[0], f"[compact-grad] {n} received rows exceed {shard.shape[0]} slots"
+    positions = prepare_grad_rows(gidx, row_slots)
+    shard[:n].zero_()
     if hi > lo:
-        _bgk.bgfuse_scatter_add(compact[lo:hi], own_rows, shard)   # fp16->bf16 cast folded in
-    _bgk.bgfuse_scatter_add(recv_vals.view(-1, d), recv_rows, shard)
+        _bgk.bgfuse_scatter_add(compact[lo:hi], positions[:hi - lo], shard)
+    _bgk.bgfuse_scatter_add(recv_vals.view(-1, d), positions[hi - lo:], shard)
+    _BGADAM_CTX.update(gidx=gidx, gslots=row_slots)
     return shard
 
 # ---- the host-prep pool -------------------------------------------------------
@@ -485,6 +522,15 @@ class _RowPull:
 
     def __init__(self, tag):
         self.tag = tag
+        self.clear_metadata()
+
+    def clear_metadata(self):
+        self._metadata_pending = {}
+        self._metadata_reuse = None
+
+    def remember_request(self, req, rows, cut):
+        self._metadata_pending[id(req)] = (req, rows, cut)
+        return req
 
     def request(self, want_np):
         """sparse_comms_start over a staging slot whose previous H2D has retired."""
@@ -496,21 +542,32 @@ class _RowPull:
         req = sparse_comms_start(want_np, self.n_rows, rank, world_size, buf, cut)
         ev.record()
         self.publish(cut)
-        return req
+        return self.remember_request(req, want_np, cut)
 
     def publish(self, cut):
         """Hook: what this table's request records about the cut."""
 
-    def grad_start(self, rows_np, send_buf, out):
+    def grad_start(self, rows_np, send_buf, out, *, reuse=False):
         """GRADIENT staircase: freeze this cycle's touched-row list and launch its count all_to_all -- sparse_comms_start once more."""
+        cached, self._metadata_reuse = self._metadata_reuse, None
+        if reuse:
+            assert cached is not None and rows_np is cached[0], (
+                'scheduled gradient reuse lost its exact pull receipt')
+            out.update(cached[1])
+            return cached[2]
         return sparse_comms_start(rows_np, self.n_rows, rank, world_size, send_buf, out)
 
     def grad_share(self, counts, param, opt, req):
         """Launch the row-index all_to_all, hand its future to the optimizer, and close this table's pull request."""
-        send_idxes, send_counts, recv_counts, cnt_fut = counts
-        cnt_fut.wait()
-        recv_idxes, state, idxes_fut = sparse_comms_share_indexes(send_idxes, send_counts,
-                                                                  recv_counts)
+        if isinstance(counts, dict):
+            recv_idxes, idxes_fut = counts['peer_idx'], counts['idx_fut']
+            state = dict(send_idxes=counts['my_idx'], send_counts=counts['sc'],
+                         recv_counts=counts['rc'])
+        else:
+            send_idxes, send_counts, recv_counts, cnt_fut = counts
+            cnt_fut.wait()
+            recv_idxes, state, idxes_fut = sparse_comms_share_indexes(send_idxes, send_counts,
+                                                                     recv_counts)
         opt._reduce_futures[param] = [idxes_fut, recv_idxes]
         return state, (None if req is None else self.close(req))
 
@@ -519,7 +576,12 @@ class _RowPull:
         my_idx, req_counts, peer_counts, cnt_fut = req
         cnt_fut.wait()
         peer_idx, rc, sc, idx_fut = bgpull_share_indexes(my_idx, req_counts, peer_counts)
-        return {"peer_idx": peer_idx, "rc": rc, "sc": sc, "my_idx": my_idx, "idx_fut": idx_fut}
+        state = {"peer_idx": peer_idx, "rc": rc, "sc": sc, "my_idx": my_idx, "idx_fut": idx_fut}
+        receipt = self._metadata_pending.pop(id(req), None)
+        if receipt is not None:
+            assert receipt[0] is req, "pull metadata identity mismatch"
+            self._metadata_reuse = (receipt[1], receipt[2], state)
+        return state
 
     @torch.no_grad()
     def serve(self, param, peer_idx, rc, sc):
@@ -591,7 +653,7 @@ def _fp_compare(tag, old, cur):
 def _bits_equal(a, b):
     """Bitwise tensor equality over the raw bytes: NaN-safe, where torch.equal on floats is not."""
     def _u8(t):
-        return (t if t.is_contiguous() else t.contiguous()).view(torch.uint8)
+        return (t if t.is_contiguous() else t.contiguous()).reshape(-1).view(torch.uint8)
     return torch.equal(_u8(a), _u8(b))
 
 def bgpull_share_indexes(my_idx, req_counts, peer_counts):
@@ -1113,6 +1175,11 @@ class AnvilAndAdam:
         # Build id->param mapping
         id_to_param = {id(p): p for p in self.param_cfgs}
 
+        for param_id, saved_cfg in state_dict["param_cfgs"].items():
+            cfg = self.param_cfgs[id_to_param[param_id]]
+            for field in fields(saved_cfg):
+                setattr(cfg, field.name, copy.deepcopy(getattr(saved_cfg, field.name)))
+
         # Load state, preserving dtypes
         for param_id, saved_p_state in state_dict["param_states"].items():
             if param_id in id_to_param:
@@ -1214,10 +1281,7 @@ class AnvilAndAdam:
                 idxes_fut, recv_idxes, recv_fut, recv_vals = self._reduce_futures[param]
                 idxes_fut.wait()
                 recv_fut.wait()
-                # Merge own + received rows into the table's persistent dense SHARD buffer: the
-                # same [chunk_size, d] grad_chunk a reduce_scatter would have produced. compact_ok
-                # is _bgadam_update's dense-fallback predicate: _launch_gather clears _bgpull_state
-                # only AFTER _adam_update returns, so it cannot change in between.
+                # Value embeddings keep their dense shard; n-grams aggregate into compact slots.
                 if label == "value_embeds":
                     st, self._vesp_state = self._vesp_state, None
                     grad_chunk = vesp_merge_gradients(
@@ -1228,7 +1292,7 @@ class AnvilAndAdam:
                     grad_chunk = bgsp_merge_gradients(
                         st["shard"], st["compact"], st["full_idx"], st["lo"], st["hi"],
                         recv_idxes, recv_vals, rank, self.world_size,
-                        compact_ok=(self._bgpull_state is not None and self._bgadam_le is not None))
+                        row_slots=st["slots"])
 
             # Apply update based on optim type
             # The replicated Adam params are independent, so ONE fused pass at the first of them
@@ -1326,15 +1390,7 @@ class AnvilAndAdam:
         return p_slice
 
     def _bgadam_update(self, p_slice, grad_chunk, p_state, p_cfg, beta1, beta2, t, lr):
-        """The n-gram table's Adam event, on the rows that need it. beta1 = 0 throughout, so the
-        moments are ONE fp32 exp_avg_sq per row plus a [1, D] stub and a slept row owes only v's
-        decay, replayed in registers when next loaded. Pass 1 is the gradient rows (`gidx`, which
-        may repeat across ranks), pass 2 this rank's own rows for the next cycle (`own_idx`,
-        duplicate-free) -- bgadam_rows_launch states what each form requires. WARMUP has no row
-        list, so pass 1 runs over EVERY local row: the same kernel, so the event has ONE spelling,
-        and every row comes out stamped current so no later replay straddles this path. Scalars
-        are pushed BEFORE any replay reads them, both row lists are POPPED, and the merge's
-        missing 1/world rides on a1/a2."""
+        """Commit compact gradients, then replay only the rows required by the next read."""
         m, v = p_state["exp_avg"], p_state["exp_avg_sq"]
         eps, le, hist = p_cfg.eps, self._bgadam_le, self._bgadam_hist
         s_t = lr * ((1 - beta2 ** t) ** 0.5 / (1 - beta1 ** t))
@@ -1342,14 +1398,18 @@ class AnvilAndAdam:
         a1, a2 = (1 - beta1) / self.world_size, (1 - beta2) / self.world_size ** 2
         _bgk.bgadam_hist_push(hist, self._bgadam_stage, t, beta1, beta2, s_t, w_t)
         gidx = _BGADAM_CTX.pop("gidx", None)
+        slots = _BGADAM_CTX.pop("gslots", None)
         own = _BGADAM_CTX.pop("own_idx", None)
-        assert le is not None, "[ngram-adam] the row-currency table is allocated before any event"
-        armed = gidx is not None and self._bgpull_state is not None
-        for _g, _rows, _tref in ((grad_chunk, gidx if armed else self._bgadam_all, t - 1),
-                                 (None, own if armed else None, t)):
-            if _rows is not None and _rows.numel():
-                _bgk.bgadam_rows_launch(m, v, p_slice, _g, _rows, le, hist, _tref,
-                                        beta1, beta2, eps, s_t, w_t, a1, a2)
+        assert le is not None and gidx is not None and slots is not None, \
+            "[compact-grad] missing row currency or gradient mapping"
+        armed = self._bgpull_state is not None
+        if gidx.numel():
+            _bgk.bgadam_rows_launch(m, v, p_slice, grad_chunk, gidx, le, hist, t - 1,
+                                    beta1, beta2, eps, s_t, w_t, a1, a2, grad_slots=slots)
+        rows = own if armed else self._bgadam_all
+        if rows is not None and rows.numel():
+            _bgk.bgadam_rows_launch(m, v, p_slice, None, rows, le, hist, t,
+                                    beta1, beta2, eps, s_t, w_t, a1, a2)
         if armed:
             _BGADAM_CTX.update(m=m, v=v, p=p_slice, le=le, hist=hist, eps=eps, t=t)
 
@@ -1786,7 +1846,13 @@ class AttnArgs:
     dv64: bool           # this layer runs the halved-value (d_v=64) attention path
     o_gain: torch.Tensor | None = None   # RF1: extra 0-D gain folded into the O-projection weight
 
-_fa3 = get_kernel('devenpzak/flash-attn3-12864', revision='64c1e6d1f2780e7931839f41426ddcdb564a7cb9')  # immutable commit of the v1 tag
+_fa3_path = Path(__file__).resolve().parent / 'flash_attn3_pkg'
+assert (_fa3_path / 'revision.txt').read_text().splitlines()[:2] == ['devenpzak/flash-attn3-12864', '64c1e6d1f2780e7931839f41426ddcdb564a7cb9']
+try:
+    _fa3_cached = snapshot_download('devenpzak/flash-attn3-12864', repo_type='model', revision='64c1e6d1f2780e7931839f41426ddcdb564a7cb9', local_files_only=True)
+except LocalEntryNotFoundError:
+    _fa3_cached = _fa3_path
+_fa3 = get_local_kernel(Path(_fa3_cached))  # immutable commit of the v1 tag
 flash_attn_interface = _fa3.flash_attn_interface
 # The loaded binary is checked against the sha256 published in that repo's src_patches/: a retagged
 # or swapped artifact fails here instead of changing behaviour silently.
@@ -1861,8 +1927,8 @@ class CausalSelfAttention(nn.Module):
             q, k = QKNormRoPEPad(_qk[0].view(T, 2 * self.num_heads, self.d_qk), yarn.factor1[:T],
                                  yarn.factor2[:T], self.num_heads, self.d_qk, self.paired, key_offset)
             q, k = q[None], k[None]
-        max_len = ((VIRTUAL_SEQ_CAP if train_max_seq_len > VIRTUAL_SEQ_CAP else train_max_seq_len)
-                   if self.training else (args.val_batch_size // (grad_accum_steps * world_size)))
+        max_len = (train_max_seq_len if self.training
+                   else (args.val_batch_size // (grad_accum_steps * world_size)))
 
         if not self.paired:
             if aux_v is not None:
@@ -2065,6 +2131,7 @@ class GPT(nn.Module):
 
         self.attn_gate_layers = [3, 10]
         self.init_mudd_gate(model_dim)
+        self.register_buffer("copy_lambdas", torch.zeros(COPY_NUM_BUCKETS, dtype=torch.float32))
 
         # Auto-label parameters
         for name, param in self.named_parameters():
@@ -2189,6 +2256,9 @@ class GPT(nn.Module):
                              persistent=False)
         bigram_sign_table = torch.randn(args.bigram_sign_table_rows, args.bigram_dim).sign().to(torch.bfloat16)
         self.register_buffer('bigram_sign_table', bigram_sign_table)
+        assert self.vocab_size == NORM_MAP_SIZE
+        self.register_buffer('ngram_norm_map', torch.arange(NORM_MAP_SIZE, dtype=torch.int32, device='cpu'))
+        self.register_load_state_dict_post_hook(_sync_ngram_norm_cpu)
 
         self.post_lambdas = nn.Parameter(torch.ones(num_layers, 2))
 
@@ -2286,16 +2356,16 @@ class GPT(nn.Module):
             _dim = self.qk_bank.shape[-1]
             _qkg = self.qk_bank[:self._num_qk_groups].view(_nlv, _gpl, self.qk_bank.shape[-2], _dim)
             _nqn, _nqd = len(_BANKC2_NARROW_AI), _BANKC2_NQD
-            # Narrow (d_qk=64) rows in `qk_narrow` layout, for both batches: [0:384] Q, [384:768] K.
-            _qkn = (_qkg[:_nqd].view(_nqd, _gpl, 2, self.head_dim, _dim)[:, :, :, :64, :]
-                    .reshape(_nqd, _gpl * 128, _dim))
+            assert self.head_dim == 128
+            # Physical views; the quantizer maps each logical 64-row block to its live half.
+            _qkn = _qkg[:_nqd].flatten(1, 2)
             # V rows: even entries of the per-layer (V, O) pair in vo_bank.
             v = self.vo_bank[:2 * _nlv].view(_nlv, 2, *self.vo_bank.shape[1:])[:, 0]
             qk_n, v_n = _qkn[:_nqn], v[:_nqn]
             if not hasattr(self, "_attn_qkv_f8"):
-                self._attn_qkv_f8, self._attn_qkv_f8_t = self._packed_f8_cache(qk_n, v_n, dev)
+                self._attn_qkv_f8, self._attn_qkv_f8_t = self._packed_f8_cache(qk_n[:, :_gpl * 128], v_n, dev)
             quantize_dual_layout_packed_batched(qk_n, v_n, self._attn_qkv_scales,
-                self._attn_weight_partial_amax, self._attn_qkv_f8, self._attn_qkv_f8_t)
+                self._attn_weight_partial_amax, self._attn_qkv_f8, self._attn_qkv_f8_t, first_narrow=True)
             # Carriers: FULL-width rows straight out of the bank's TRAILING run, already in the (2*num_heads, 128) order PackedFP8QKV reads.
             _nwd = self._num_wide_attn_layers
             qk_w = _qkg[_nlv - _nwd:].flatten(1, 2)
@@ -2304,16 +2374,15 @@ class GPT(nn.Module):
                 self._attn_wide_qkv_f8, self._attn_wide_qkv_f8_t = self._packed_f8_cache(qk_w, v_w, dev)
             quantize_dual_layout_packed_batched(qk_w, v_w, self._attn_wide_qkv_scales,
                 self._attn_wide_weight_partial_amax, self._attn_wide_qkv_f8, self._attn_wide_qkv_f8_t)
-            # The live d_v=64 layers: the narrow copy's tail, and only each V head's live half.
-            _ndv = _nqd - _nqn
+            # The live d_v=64 layers map both QK and V from their physical bank rows.
             qk_d = _qkn[_nqn:]
-            v_src = v[_nqn:_nqd]
-            v_d = (v_src.view(_ndv, self.num_heads, self.head_dim, -1)[:, :, :64, :]
-                   .reshape(_ndv, self.num_heads * 64, -1))
+            v_d = v[_nqn:_nqd]
             if not hasattr(self, "_attn_dv64_qkv_f8"):
-                self._attn_dv64_qkv_f8, self._attn_dv64_qkv_f8_t = self._packed_f8_cache(qk_d, v_d, dev)
+                self._attn_dv64_qkv_f8, self._attn_dv64_qkv_f8_t = self._packed_f8_cache(
+                    qk_d[:, :_gpl * 128], v_d[:, :self.num_heads * 64], dev)
             quantize_dual_layout_packed_batched(qk_d, v_d, self._attn_dv64_qkv_scales,
-                self._attn_dv64_weight_partial_amax, self._attn_dv64_qkv_f8, self._attn_dv64_qkv_f8_t)
+                self._attn_dv64_weight_partial_amax, self._attn_dv64_qkv_f8, self._attn_dv64_qkv_f8_t,
+                first_narrow=True, second_narrow=True)
 
     @staticmethod
     def _refresh_delayed_scale(amax_buf, scale_buf, gain, floor):
@@ -2346,7 +2415,7 @@ class GPT(nn.Module):
                 self._mlp_up_f8_col = torch.zeros_like(self.mlp_bank[:, 0], dtype=torch.float8_e4m3fn).transpose(1, 2).contiguous().transpose(1, 2)
                 self._mlp_dpre_scale = torch.full((12,), FP8_GRAD_SCALE, dtype=torch.float32, device=dev)
                 # atomic_maxed at element 0 only (no CTA offset), so one slot per layer suffices.
-                self._mlp_dpre_amax = torch.zeros(12, 1, dtype=torch.float32, device=dev)
+                self._mlp_dpre_amax = torch.zeros(12, torch.cuda.get_device_properties(dev).multi_processor_count * 8, dtype=torch.float32, device=dev)
                 self._mlp_gs_t = torch.tensor(FP8_GRAD_SCALE, dtype=torch.float32, device=dev)
             # ---- up-projection weight caches (row + col) ----
             boot = self._a2p_calls < 16      # bootstrap: exact scales for the first calls
@@ -2364,7 +2433,7 @@ class GPT(nn.Module):
                 self._mlp_down_scales = torch.ones(12, dtype=torch.float32, device=dev)
                 # Delayed per-layer post-activation scale; the fused kernel epilogue tracks amax.
                 self._mlp_post_scale = torch.ones(12, dtype=torch.float32, device=dev)
-                self._mlp_post_amax = torch.zeros(12, 1, dtype=torch.float32, device=dev)
+                self._mlp_post_amax = torch.zeros(12, torch.cuda.get_device_properties(dev).multi_processor_count * 8, dtype=torch.float32, device=dev)
                 self._mlp_down_f8_row = torch.zeros_like(self.mlp_bank[:, 1], dtype=torch.float8_e4m3fn)
                 self._mlp_dq_bwd = torch.ones(12, dtype=torch.float32, device=dev)
                 # MLPFOLD: per-bank-slot post-lambda and the two DERIVED dequant scales it rides on.
@@ -2460,9 +2529,9 @@ class GPT(nn.Module):
         for the dgrad (dpre <- p * g W2^T). _mlp_post_scale is NOT folded; it rides last so the HOP returns its grad."""
         dn, bw = (self._mlp_down_dq_p, self._mlp_dq_bwd_p) if fold_p is not None else (self._mlp_down_scales, self._mlp_dq_bwd)
         return (fc, proj, up_f8, self._mlp_static_dq[j:j+1], x_f8, self._mlp_down_f8[j], dn[j],
-                self._mlp_post_scale[j], self._mlp_post_amax[j], self._mlp_down_f8_row[j], bw[j], x_f8_t,
+                self._mlp_post_scale[j], self._mlp_post_amax, self._mlp_down_f8_row[j], bw[j], x_f8_t,
                 x_scale, self._mlp_up_f8_col[j], self._mlp_up_proj_scales[j], self._mlp_gs_t,
-                self._mlp_dpre_scale[j], self._mlp_dpre_amax[j]) + ((fold_p,) if fold_p is not None else ())
+                self._mlp_dpre_scale[j], self._mlp_dpre_amax, fold_p, j * self._mlp_post_amax.shape[1])
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig, bg_sink: Tensor | None = None, ve_sink: Tensor | None = None):
         """bg_sink is the zeros leaf harvesting the bigram-channel gradient; ve_sink the persistent V-lite value-gradient buffer."""
@@ -2535,7 +2604,7 @@ class GPT(nn.Module):
         # (details in https://github.com/KellerJordan/modded-nanogpt/pull/299 by @trianxy)
         # The inductor-opaque op's backward writes bg_sink.grad; under eval bg_sink is None.
         x0_bigram = _bgk.bgx_x0_bigram(self.bg_cache, bigram_input_seq, self.bigram_sign_table,
-                                       input_seq, bg_sink)[None]
+                                       self.ngram_norm_map[input_seq], bg_sink)[None]
 
         # Value embeddings - always computed (not precomputed)
         # _VE_PLANES planes, not five; index 3 is layer 10's.
@@ -2775,14 +2844,14 @@ class GPT(nn.Module):
             # The stock lm_head -> softcap -> cross_entropy chain over EVAL_CE_SLAB_ROWS-row slabs.
             # Every statement is row-local, so the per-token losses are the same values in the same
             # order as one full-width pass; only the [rows, vocab] bf16 logit block shrinks. The loop
-            # bound is a traced constant, and the softcap still runs in bf16 with the upcast after it.
+            # bound is constant; softcap arithmetic is FP32 over the full vocabulary.
             _x2 = x.view(-1, x.size(-1))
             _R = _x2.shape[0]
             _parts = []
             for _lo in range(0, _R, EVAL_CE_SLAB_ROWS):
                 _hi = min(_lo + EVAL_CE_SLAB_ROWS, _R)
                 logits = self.lm_head(_x2[_lo:_hi])
-                logits = 23 * torch.sigmoid((logits + 5) / 7.5)
+                logits = 23 * torch.sigmoid((logits.float() + 5) / 7.5)
                 logits_for_loss = logits.float()
                 _parts.append(F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)),
                                               target_seq[_lo:_hi], reduction="none"))
@@ -2790,24 +2859,6 @@ class GPT(nn.Module):
         return loss_per_token
 # -----------------------------------------------------------------------------
 # Distributed data loader
-SHARD_READ_THREADS = 4    # parallel pread threads for the on-clock shard read
-
-def _pread_shard_parallel(fd, arr, nbytes):
-    """seek(1024) + readinto(arr) (the bytes->array copy avoided, @YouJiacheng), split
-    SHARD_READ_THREADS ways over disjoint preadv ranges tiling [0, nbytes) of the one buffer."""
-    mv = memoryview(arr).cast("B")
-    assert len(mv) == nbytes, f"[shard] buffer holds {len(mv)} bytes, shard claims {nbytes}"
-
-    def _work(lo, hi):
-        while lo < hi:
-            n = os.preadv(fd, [mv[lo:hi]], 256 * 4 + lo)
-            assert n > 0, f"[shard] preadv returned {n} at byte {lo}"
-            lo += n
-        return lo   # the offset the preadv returns actually reached, not the tile's claimed end
-
-    edges = [(nbytes * i) // SHARD_READ_THREADS for i in range(SHARD_READ_THREADS + 1)]
-    with ThreadPoolExecutor(SHARD_READ_THREADS) as pool:
-        return max(pool.map(_work, edges, edges[1:]))
 
 def _load_data_shard(file: Path):
     header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
@@ -2816,12 +2867,13 @@ def _load_data_shard(file: Path):
     num_tokens = int(header[2]) # number of tokens (claimed)
     with file.open("rb", buffering=0) as f:
         tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
-        nbytes = _pread_shard_parallel(f.fileno(), tokens.numpy(), 2 * num_tokens)
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
 BOS_ID = 50256
-TRAIN_MAX_NUM_DOCS = {16384: 64, 32768: 96, 40960: 128, 49152: 128}
+TRAIN_MAX_NUM_DOCS = {16384: 64, 32768: 96, 49152: 128}
 
 class Shard:
     def __init__(self, tokens: Tensor, world_size: int = 1):
@@ -2890,71 +2942,21 @@ class Shard:
             return result['shard']
         return get
 
-# ---- pinned staging rings for the loader's per-batch H2Ds -------------------
-
-def _loader_pin_cap():
-    return max(args.val_batch_size, max(s.batch_size for s in TRAINING_STAGES)) // (world_size * grad_accum_steps)
-
-class _PinnedRing:
-    """Round-robin host staging slots: a slot is safe only until the host laps the ring, which the CUDA-graph throttle's bound on host run-ahead prevents."""
-    def __init__(self, slots):
-        self._slots = cycle(slots)
-
-    def next(self):
-        return next(self._slots)
-
-_SGS_PIN_RING = 32
-_sgs_ring = None
-
-def _sgs_pinned_like(x):
-    """Pinned [2 * numel] int32 slot for the two-channel row vector."""
-    global _sgs_ring
-    if _sgs_ring is None:
-        _cap = _loader_pin_cap()
-        _sgs_ring = _PinnedRing([torch.empty(2 * _cap, dtype=torch.int32, pin_memory=True)
-                                 for _ in range(_SGS_PIN_RING)])
-    return _sgs_ring.next()[: 2 * x.numel()]
-
-_TG_ROW_0 = 17351   # x[t]
-_TG_ROW_1 = 60961   # x[t-1]
-_TG_ROW_2 = 45259   # x[t-2]
-
-def get_sgsame_hash(x):
-    """Hash both channels of the int32 row vector `x` into one pinned [2T] int32 vector: out[:T] the bigram (x[t-1], x[t]) in [0, half)."""
+def get_bigram_hash(x):
+    """
+    Computes bigram hash for each position using [prev_token, curr_token].
+    Multiply by arbitary large ints to get even spread over int32 range.
+    Position 0 is mapped to the reserved index (vocab_size - 1).
+    BOS_tokens within the batch will hash based on last token of prior doc. Masking this ran slower and showed no improvement.
+    """
     rand_int_1 = 36313
     rand_int_2 = 27191
-    half = int(args.bigram_vocab_size * 0.5)
-    mod_b, mod_s = half - 1, args.bigram_vocab_size - half - 1
-    assert mod_b > 1 and mod_s > 1, "both hashed channels need rows"
-    n = x.numel()
-    out = _sgs_pinned_like(x)
-    b, s = out[:n], out[n:]
-    b.copy_(x)
-    b[0] = mod_b
-    b[1:] = torch.bitwise_xor(rand_int_1 * b[1:], rand_int_2 * b[:-1]) % mod_b
-    s[0] = s[1] = half + mod_s
-    # int32 products wrap and the xor may be negative; torch's `%` is Python-signed, so the trigram row still lands in [0, mod_s) before the half offset.
-    s[2:] = torch.bitwise_xor(torch.bitwise_xor(_TG_ROW_0 * x[2:], _TG_ROW_1 * x[1:-1]),
-                              _TG_ROW_2 * x[:-2]) % mod_s + half
-    return out
-
-_PINLD_RING = 16
-_pinld_rings: list = []
-
-def _pinld_slot(x, which):
-    """Copy `x` into a rotating pinned slot of ring `which` (0 inputs int32, 1 targets int64, 2 cum_lengths int32)."""
-    if not _pinld_rings:
-        _cap = _loader_pin_cap()
-        # cum_lengths is max_num_docs long (<= 128 for train); sized wide, asserted at each use.
-        _ccap = max(4096, next_multiple_of_n(_cap // 300, n=128) + 128)
-        for _dt, _n in ((torch.int32, _cap), (torch.int64, _cap), (torch.int32, _ccap)):
-            _pinld_rings.append(_PinnedRing([torch.empty(_n, dtype=_dt, pin_memory=True)
-                                             for _ in range(_PINLD_RING)]))
-    buf = _pinld_rings[which].next()
-    n = x.numel()
-    assert n <= buf.numel(), f"[pinld] ring {which} slot holds {buf.numel()} elements, batch needs {n}"
-    out = buf[:n].view(x.shape)
+    mod = args.bigram_vocab_size-1
+    x = x.to(torch.int32)
+    out = torch.empty_like(x, pin_memory=True)
     out.copy_(x)
+    out[0] = mod
+    out[1:] = torch.bitwise_xor(rand_int_1 * out[1:], rand_int_2 * out[:-1]) % mod
     return out
 
 def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
@@ -2999,14 +3001,6 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             _targets = buf[1:]
             end_idxs[-1] -= 1  # last document was too long to account for _targets offset
             cum_lengths = (end_idxs - start_idxs).cumsum(0)
-            if max_seq_len > VIRTUAL_SEQ_CAP:
-                # Attention segments only: the token stream is untouched, the packed seqlens table gains boundaries VIRTUAL_SEQ_CAP apart.
-                _virtual_ends = [0, *(_e for _a, _b in pairwise([0, *cum_lengths.tolist()])
-                                      for _e in (*range(_a + VIRTUAL_SEQ_CAP, _b, VIRTUAL_SEQ_CAP), _b))]
-                assert max(b - a for a, b in zip(_virtual_ends, _virtual_ends[1:])) <= VIRTUAL_SEQ_CAP
-                assert _virtual_ends[-1] == num_tokens_local
-                assert len(_virtual_ends) <= max_num_docs, f"the {VIRTUAL_SEQ_CAP}-token attention cap split this {num_tokens_local}-token batch into {len(_virtual_ends)} segments, past the {max_num_docs}-row packed-seqlens table"
-                cum_lengths = torch.tensor(_virtual_ends[1:], dtype=cum_lengths.dtype)
 
         else:
             if pos + num_tokens + 1 >= len(tokens):  # should not occur for val data
@@ -3026,9 +3020,10 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths
 
         # Cast to int32 on CPU before transfer to avoid dtype conversion during .to()
-        _inputs, _targets, _cum_lengths = (_pinld_slot(_v, _i) for _i, _v in
-                                           enumerate((_inputs, _targets, _cum_lengths)))
-        _bigram_inputs = get_sgsame_hash(_inputs)
+        _inputs = _inputs.to(dtype=torch.int32)
+        _targets = _targets.to(dtype=torch.int64)
+        _cum_lengths = _cum_lengths.to(dtype=torch.int32)
+        _bigram_inputs = get_bigram_hash(_inputs)
 
         new_params = yield (
             _inputs.to(device="cuda", non_blocking=True),
@@ -3036,8 +3031,6 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             _cum_lengths.to(device="cuda", non_blocking=True),
             _bigram_inputs.to(device="cuda", non_blocking=True),
             _bigram_inputs.numpy(),
-            _targets.numpy(),  # the sampled-softmax candidate build reads targets on the host
-            _inputs.numpy(),   # the sparse VE comms read input ids on the host, off the same pinned slot: _PINLD_RING outruns the lookahead FIFO
         )
 
         if new_params is not None:
@@ -3048,6 +3041,101 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             max_seq_len = new_max_seq_len
 
 # -----------------------------------------------------------------------------
+# PR360 input-only metadata adapter
+
+def adapt_ngram_batch(batch, *, training):
+    inputs, targets, cum_seqlens, _old_bigram, _old_metadata = batch
+    input_cpu = inputs.detach().cpu()
+    assert input_cpu.dtype == torch.int32 and input_cpu.ndim == 1
+    ngram_cpu = get_sgsame_hash(input_cpu)
+    target_cpu = targets.detach().cpu().numpy() if training else None
+    expected_docs = TRAIN_MAX_NUM_DOCS.get(inputs.numel(), next_multiple_of_n(inputs.numel() // 300, n=128))
+    assert cum_seqlens.shape == (expected_docs,), "baseline loader / graph seqlen shape mismatch"
+    return (inputs, targets, cum_seqlens,
+            ngram_cpu.to(device=inputs.device, non_blocking=True),
+            ngram_cpu.numpy(), target_cpu, input_cpu.numpy())
+
+
+def ngram_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int,
+                         grad_accum_steps: int = 1, align_to_bos: bool = True, *, training: bool, defer_wait: bool = False):
+    assert training == align_to_bos, "training and validation loader roles must remain separate"
+    assert not defer_wait or training, "deferred readiness is training-only"
+    base = distributed_data_generator(filename_pattern, num_tokens, max_seq_len,
+                                      grad_accum_steps=grad_accum_steps, align_to_bos=align_to_bos)
+    send_args = None
+    loader_stream = torch.cuda.Stream(device=device)
+    try:
+        while True:
+            consumer_stream = torch.cuda.current_stream(device)
+            with torch.cuda.stream(loader_stream):
+                batch = base.send(send_args)
+                adapted = adapt_ngram_batch(batch, training=training)
+            if defer_wait:
+                ready = (loader_stream.record_event(), consumer_stream)
+            else:
+                consumer_stream.wait_stream(loader_stream)
+            for tensor in adapted[:4]:
+                tensor.record_stream(consumer_stream)
+            send_args = yield (adapted, ready) if defer_wait else adapted
+    finally:
+        base.close()
+
+def _loader_pin_cap():
+    return max(args.val_batch_size, max(s.batch_size for s in TRAINING_STAGES)) // (world_size * grad_accum_steps)
+
+class _PinnedRing:
+    """Round-robin host staging slots: a slot is safe only until the host laps the ring, which the CUDA-graph throttle's bound on host run-ahead prevents."""
+    def __init__(self, slots):
+        self._slots = cycle(slots)
+
+    def next(self):
+        return next(self._slots)
+
+_SGS_PIN_RING = 32
+_sgs_ring = None
+
+def _sgs_pinned_like(x):
+    """Pinned [2 * numel] int32 slot for the two-channel row vector."""
+    global _sgs_ring
+    if _sgs_ring is None:
+        _cap = _loader_pin_cap()
+        _sgs_ring = _PinnedRing([torch.empty(2 * _cap, dtype=torch.int32, pin_memory=True)
+                                 for _ in range(_SGS_PIN_RING)])
+    return _sgs_ring.next()[: 2 * x.numel()]
+
+_NGRAM_NORM_MAP = torch.arange(NORM_MAP_SIZE, dtype=torch.int32, device="cpu")
+
+
+def _sync_ngram_norm_cpu(module, incompatible_keys):
+    """Restore the CPU row-hash mirror alongside the checkpointed sign-hash map."""
+    _NGRAM_NORM_MAP.copy_(module.ngram_norm_map.detach().cpu())
+
+
+_TG_ROW_0 = 17351   # x[t]
+_TG_ROW_1 = 60961   # x[t-1]
+_TG_ROW_2 = 45259   # x[t-2]
+
+def get_sgsame_hash(x):
+    """Hash both channels of the int32 row vector `x` into one pinned [2T] int32 vector: out[:T] the bigram (x[t-1], x[t]) in [0, half)."""
+    x = torch.index_select(_NGRAM_NORM_MAP, 0, x)
+    rand_int_1 = 36313
+    rand_int_2 = 27191
+    half = int(args.bigram_vocab_size * 0.5)
+    mod_b, mod_s = half - 1, args.bigram_vocab_size - half - 1
+    assert mod_b > 1 and mod_s > 1, "both hashed channels need rows"
+    n = x.numel()
+    out = _sgs_pinned_like(x)
+    b, s = out[:n], out[n:]
+    b.copy_(x)
+    b[0] = mod_b
+    b[1:] = torch.bitwise_xor(rand_int_1 * b[1:], rand_int_2 * b[:-1]) % mod_b
+    s[0] = s[1] = half + mod_s
+    # int32 products wrap and the xor may be negative; torch's `%` is Python-signed, so the trigram row still lands in [0, mod_s) before the half offset.
+    s[2:] = torch.bitwise_xor(torch.bitwise_xor(_TG_ROW_0 * x[2:], _TG_ROW_1 * x[1:-1]),
+                              _TG_ROW_2 * x[:-2]) % mod_s + half
+    return out
+
+
 # Training Management
 
 PRINT_EVERY = 25          # step-print thinning: print every N steps
@@ -3057,7 +3145,7 @@ PRINT_EVERY = 25          # step-print thinning: print every N steps
 # offsets end to end (every offset is int64 before it meets a base pointer). Row IDS stay int32: V < 2**31 with
 # margin. 224.24x the record's 377,280 rows is affordable because nothing scales with V -- the sparse comms move
 # TOUCHED rows, the shard is 1/world, the row cache is fixed-size, the request/compact caps are per-TOKEN.
-NGRAM_VOCAB_SIZE = 84602880                                # 224.24x it, half bigram half trigram
+NGRAM_VOCAB_SIZE = 105753600                                # 224.24x it, half bigram half trigram
 
 @dataclass(slots=True)
 class Hyperparameters:
@@ -3069,18 +3157,20 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = int(os.environ.get("KX_STEPS", "1122"))  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 20  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 1098  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 34  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 0  # every how many steps to evaluate val loss? 0 for only at the end
-    save_checkpoint: bool = False
+    save_checkpoint: bool = True
+    run_evals: bool = False
     # bigram hash embedding
     bigram_vocab_size: int = NGRAM_VOCAB_SIZE
     bigram_dim: int = 768
     bigram_sign_table_rows: int = 8192  # prefer a power of 2 (values ~500-15000 gave similar results)
 
 args = Hyperparameters()
+assert args.val_tokens == 10485760 and args.save_checkpoint and not args.run_evals
 
 # Checked at import so a bad size dies in seconds; the real bounds are the int32 ROW spaces below.
 _bgv_rpr = args.bigram_vocab_size // world_size
@@ -3105,8 +3195,8 @@ class TrainingStage:
     train_max_seq_len: int
     duration: float = None
 
-LR_FLOOR, VEMB_WD_MUL_PERIOD4 = 0.30, 10.0       # the lr-cooldown floor, as a fraction of the stage lr_mul; the post-period4 value_embeds wd_mul
-STAGE2_BATCH_UNITS, TAPER_BATCH_UNITS = 24, 20   # stage-2 batch units (top rung); terminal taper batch units
+LR_FLOOR, VEMB_WD_MUL_PERIOD4 = 0.30, 10.0       # absolute lr-cooldown floor; post-period4 value_embeds wd_mul
+STAGE2_BATCH_UNITS, TAPER_BATCH_UNITS = 24, 16   # stage-2 batch units (top rung); terminal taper batch units
 
 class TrainingSchedule:
     """
@@ -3115,7 +3205,7 @@ class TrainingSchedule:
         2. Sliding Attention window schedule of [1,3] -> [3,7] -> [5,11] -> [6,13]
         3. YaRN updates to RoPE on window changes
         4. Split embed and lm head at the start of the extension stage
-        5. Batch size schedule of 8 -> 16 -> 24 -> 20 (terminal taper) -> 8 (extension)
+        5. Batch size schedule of 8 -> 16 -> 24 -> 16 (terminal taper) -> 8 (extension)
         6. Post training extension of long windows from 13 to 16
         7. Seq len updates 896 -> 2048 -> 3072 at the first two stage boundaries
     """
@@ -3165,11 +3255,10 @@ class TrainingSchedule:
         return lr
 
 # The extra scheduled steps grow into ONE stage, which keeps its Adam-step parity.
-SCHEDULE_GROWTH_STEPS = 52
+SCHEDULE_GROWTH_STEPS = 36
 SCHEDULE_GROWTH_STAGE = 2
 STAGE_DURATIONS = [0.2854, 0.3209, 0.3931]
 STAGE_DURATIONS = [d / sum(STAGE_DURATIONS) for d in STAGE_DURATIONS]
-VIRTUAL_SEQ_CAP = 2560   # the record trainer caps attention segments at 2048
 EXTENSION_LONG_WINDOW = 13
 # window_sizes are in units of `block_size` tokens (defined in TrainingManager)
 TRAINING_STAGES = [
@@ -3186,9 +3275,6 @@ TRAINING_STAGES = [
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
 
-assert VIRTUAL_SEQ_CAP % 128 == 0, "the virtual attention cap must be a whole block"
-assert any(_s.train_max_seq_len > VIRTUAL_SEQ_CAP for _s in TRAINING_STAGES), \
-    f"no stage's document cap exceeds VIRTUAL_SEQ_CAP={VIRTUAL_SEQ_CAP}: the cap is inert"
 _fk._PTP_W_RUNTIME = PREFIX_CE_WEIGHT  # baseline; advance_schedule overwrites it per stage
 _ptp_table_alloc(device)
 
@@ -3247,8 +3333,8 @@ def _cg_key_at(step: int):
 
 # ---- terminal weight ships --------------------------------------------------
 # Rather than the raw final iterate the run ships a blend of tail accumulators: four ships.
-TAIL_EMA_WINDOW = 298
-TAIL_EMA_BLEND = 0.65
+TAIL_EMA_WINDOW = 154
+TAIL_EMA_BLEND = 0.85
 # TAIL_AVG_LABELS are ANVIL banks and DO move every step, so tavg is lag-matched, not bitwise.
 TAIL_AVG_WINDOW = 250
 TAIL_AVG_PERIOD = 4
@@ -3393,6 +3479,67 @@ def get_rail_beta(step: int, beta_warmup_steps=240, beta_cooldown_steps=50, beta
         beta = beta_max
     return beta
 
+def _cf_planned_steps():
+    """The original warmup SET, independent of manager/graph-runner construction."""
+    transition_steps = {start for start, _ in training_schedule.boundaries[1:]}
+    transition_steps.update(
+        s for s in range(1, training_schedule.total_steps + 1)
+        if _sns_p_at(s) != _sns_p_at(s - 1))
+    steps = {0, 1} | {
+        s + offset for s in transition_steps for offset in (-2, -1, 0, 1)
+        if s + offset >= 2
+    } | {
+        training_schedule.split_step + offset for offset in (1, 2, 3)
+        if 2 <= training_schedule.split_step + offset <= training_schedule.total_steps - 1
+    }
+    key_first = {}
+    for step in range(training_schedule.total_steps):
+        key_first.setdefault(_cg_key_at(step), step)
+    steps.update(
+        step + offset for step in key_first.values() for offset in (0, 1)
+        if step + offset < training_schedule.total_steps)
+    return sorted(steps | set(_CF_PREFIX))
+
+
+def _compact_grad_capacity():
+    """Bound first-occurrence POSITIONS, not the number of distinct local rows."""
+    assert world_size == 8 and grad_accum_steps == 1, (
+        "[compact-grad] capacity requires world_size=8 and grad_accum_steps=1")
+    assert _bgk.BGX_TRI_CH2 and _bgk.BGX_NCH == 2, (
+        "[compact-grad] one hash per token per owner requires the two-channel layout")
+    local_v = args.bigram_vocab_size // world_size
+    assert 2 <= args.bigram_vocab_size < 2 ** 31, (
+        "[compact-grad] global row ids must fit signed int32")
+    assert args.bigram_vocab_size % world_size == 0, (
+        "[compact-grad] channel halves and owner shards must align")
+    assert local_v * (world_size + 1) < 2 ** 31, (
+        "[compact-grad] shard boundary arange must fit signed int32")
+
+    peak = pending = 0
+    for phase, steps in enumerate((
+            _cf_order(_cf_planned_steps()), range(training_schedule.total_steps))):
+        for step in steps:
+            stage, _ = training_schedule.lookup(step)
+            assert stage.batch_size > 0 and stage.batch_size % (world_size * grad_accum_steps) == 0
+            pending += stage.batch_size // (world_size * grad_accum_steps)
+            peak = max(peak, pending)
+            update = (step % 4 == 3 if step >= NGRAM_ADAM_PERIOD4_START
+                      else step % 2 == 1)
+            if update:
+                pending = 0
+        if phase == 0:
+            # _cf_drain forbids carrying a harvested gradient over the reset.
+            assert pending == 0, "[compact-grad] warmup ends with an unconsumed bigram cycle"
+
+    # Channel halves occupy disjoint owner ranks: at most one row/token/owner.
+    # Peer lists may repeat rows, so first-occurrence positions can exceed local_v.
+    capacity = peak * world_size + 64
+    assert 0 < capacity < 2 ** 31, "[compact-grad] slot positions must fit signed int32"
+    assert capacity * args.bigram_dim < 2 ** 63, (
+        "[compact-grad] compact element offsets must fit signed int64")
+    return capacity
+
+
 class TrainingManager():
     """
     Manages the AnvilAndAdam for all parameters with explicit ordering.
@@ -3497,11 +3644,11 @@ class TrainingManager():
         cfg.mtp_weights = mtp_buf
         return cfg
 
-    def bgsp_push(self, bigram_indexes, vals):
+    def bgsp_push(self, bigram_indexes, vals, raw_inputs):
         """Queue one step's harvested bigram sink gradient."""
         _p, _ok = self._bgc_pos_now
         self._bgc_pos_ok.append(_ok)
-        self._bgsp_pending.append((_p if _ok else bigram_indexes, vals))
+        self._bgsp_pending.append((_p if _ok else bigram_indexes, vals, raw_inputs))
 
     def _is_adam_step(self, step: int):
         """Adam params are only updated on odd steps."""
@@ -3761,8 +3908,9 @@ class TrainingManager():
             self._bgsp_sinks = {}
             self._bgsp_buf = torch.zeros(min(args.bigram_vocab_size, 8 * _MAX_LOCAL_TOKENS + 64),
                                          args.bigram_dim, device=device, dtype=torch.float16)
-            self._bgsp_shard = torch.zeros(_bgv_rpr, args.bigram_dim, device=device,
+            self._bgsp_shard = torch.zeros(_compact_grad_capacity(), args.bigram_dim, device=device,
                                            dtype=self.model.bigram_embed.weight.dtype)
+            self._bgsp_slots = torch.zeros(_bgv_rpr, dtype=torch.int32, device=device)
             self.optimizer._bgadam_le = torch.zeros(_bgv_rpr, dtype=torch.int32, device=device)
             self.optimizer._bgadam_hist, self.optimizer._bgadam_stage = _bgk.bgadam_hist_alloc(
                 training_schedule.total_steps + 8, device)
@@ -3805,6 +3953,8 @@ class TrainingManager():
         self._vepull_want = None
         self._vehd_next = None      # next event's row list, stashed one event early
         self._vesp_row_mask.fill(0)
+        _BGPULL.clear_metadata()
+        _VEPULL.clear_metadata()
 
     def get_state(self):
         return copy.deepcopy(self.optimizer.state_dict())
@@ -3816,12 +3966,13 @@ class TrainingManager():
         if self._is_bigram_step(step):
             with torch.no_grad():
                 rows_np, self._bghd_next = self._bghd_next, None
+                reuse = rows_np is not None
                 if rows_np is None:
                     rows_np = np.flatnonzero(self.row_update_mask).astype(np.int32)
                     self.row_update_mask.fill(0)
                 self._bgsp_idx = {}
                 self.sparse_counts_state = _BGPULL.grad_start(
-                    rows_np, self.send_idxes_buffer, self._bgsp_idx)
+                    rows_np, self.send_idxes_buffer, self._bgsp_idx, reuse=reuse)
 
     def sparse_index_share(self, step):
         """After the forward: the bigram table's row-index all_to_all and its pull's close."""
@@ -3888,6 +4039,7 @@ class TrainingManager():
 
     def bgpull_arm(self):
         """Switch the pull on: once, after the post-warmup reset, before the clock."""
+        assert args.val_loss_every == 0, "metadata reuse requires final-only validation"
         self._bgpull_on = True
 
     def bgpull_dense_gather(self):
@@ -4031,14 +4183,15 @@ class TrainingManager():
         assert not any(self._bgc_pos_ok) or full_idx.numel() == _BGC_LIVE["n"], (
             f"[ngram-cache] gradient slot reuse: full_idx has {full_idx.numel()} rows but the "
             f"live cache window has {_BGC_LIVE['n']} -- the index spaces diverged")
-        for _i, (_idx, _vals) in enumerate(self._bgsp_pending):
+        for _i, (_idx, _vals, _raw_inputs) in enumerate(self._bgsp_pending):
             _pos = _idx if _i < len(self._bgc_pos_ok) and self._bgc_pos_ok[_i] \
                 else torch.searchsorted(full_idx, _idx, out_int32=True)
-            _bgk.bgfuse_scatter_add(_vals, _pos, compact)
+            signed_scatter_add(_vals, _pos, compact, self.model.bigram_sign_table,
+                               _raw_inputs, getattr(self.model, "ngram_norm_map", None))
         self._bgsp_pending, self._bgc_pos_ok, self._bgsp_idx = [], [], None
         self.optimizer._bgsp_state = {
             "compact": compact, "full_idx": full_idx, "lo": st["lo"], "hi": st["hi"],
-            "shard": self._bgsp_shard, "dtype": self._bgsp_shard.dtype}
+            "shard": self._bgsp_shard, "slots": self._bgsp_slots, "dtype": self._bgsp_shard.dtype}
 
     # ---- the value-embed table: row-sparse event and pull ----
     def _is_ve_step(self, step: int):
@@ -4055,12 +4208,13 @@ class TrainingManager():
             self._vesp_row_mask[inputs_np] = 1     # cold start only
         if self._is_ve_step(step):
             rows_np, self._vehd_next = self._vehd_next, None
+            reuse = rows_np is not None
             if rows_np is None:
                 rows_np = vesp_rows_from_mask(self._vesp_row_mask, self._vesp_vocab)
                 self._vesp_row_mask.fill(0)
             self._vesp_idx = {}
             self._vesp_counts = _VEPULL.grad_start(
-                rows_np, self._vesp_send_idxes, self._vesp_idx)
+                rows_np, self._vesp_send_idxes, self._vesp_idx, reuse=reuse)
 
     def ve_index_share(self, step):
         if not self._vesp_on or not self._is_ve_step(step):
@@ -4126,9 +4280,9 @@ class _CGraphRunner:
     # Host run-ahead bound.
     _RUNAHEAD = 2
     _STATIC = ("in", "tgt", "cu", "bg", "mtp")   # the per-step tensors a capture bakes, in order
-    _BAKED = ("_sink_flat", "_acc")              # the run-scoped tensors this runner itself owns
+    _BAKED = ("_sink_flat", "_token_flat", "_acc")  # run-scoped graph storage
     # More tensors whose ADDRESS the graphs bake; the other 33 are _TailGraphs2's own published sets.
-    _MODEL_PTR_ATTRS = ("bigram_sign_table", "bg_cache", "_attn_x_scales", "_attn_grad_scales",
+    _MODEL_PTR_ATTRS = ("bigram_sign_table", "bg_cache", "ngram_norm_map", "_attn_x_scales", "_attn_grad_scales",
                         "_attn_wide_x_scales", "_attn_wide_grad_scales")
 
     def __init__(self):
@@ -4146,11 +4300,14 @@ class _CGraphRunner:
             self.key_first.setdefault(_cg_key_at(_s), _s)
         # ONE bg-sink ring shared by every key: slot i belongs to PENDING ENTRY i of the bigram Adam
         # cycle and two live entries always differ in i, so no two can alias. Flat, cut to the
-        # largest key's [2T, dim].
+        # largest key's raw [T, dim], with a matching private raw-token ring.
         self._sink_dtype = model._orig_mod.bigram_embed.weight.dtype
-        self._sink_elems = 2 * max(_k[0] for _k in self.key_first) * args.bigram_dim
+        self._token_elems = max(_k[0] for _k in self.key_first)
+        self._sink_elems = self._token_elems * args.bigram_dim
         self._sink_flat = [torch.empty(self._sink_elems, dtype=self._sink_dtype, device=device)
                            for _ in range(4)]
+        self._token_flat = [torch.empty(self._token_elems, dtype=torch.int32, device=device)
+                            for _ in range(4)]
         print0(f"[graph:step] ON: {len(self.key_first)} keys, runahead_throttle={self._RUNAHEAD}, "
                f"pool=shared, sink_ring={len(self._sink_flat)}", console=True)
 
@@ -4170,6 +4327,7 @@ class _CGraphRunner:
         while len(self._sink_flat) < need:
             self._sink_flat.append(torch.empty(self._sink_elems, dtype=self._sink_dtype,
                                                device=device))
+            self._token_flat.append(torch.empty(self._token_elems, dtype=torch.int32, device=device))
         for _st in self.st_by_key.values():
             _st["sink_ring"] = self._sink_views(_st["sink_grad"])
 
@@ -4200,9 +4358,9 @@ class _CGraphRunner:
         params = list(opt.param_cfgs)
         _sb = tuple(_t.clone() for _t in srcs)   # the graphs bake THESE addresses; fwd() refills them
         st = dict(zip(self._STATIC, _sb), static=_sb)
-        # The bigram row vector carries BOTH hashed channels ([2T]), so bgsp_sink must match it.
+        # Sink holds raw [T, dim]; the two hashed channels are expanded at compact scatter.
         st.update(cfg=training_manager.cg_forward_args(st["mtp"]), ve_sink=training_manager._velite_buf,
-                  bg_sink=training_manager.bgsp_sink(st["bg"].shape[0]))
+                  bg_sink=training_manager.bgsp_sink(st["in"].shape[0]))
         leaves = params + [st["bg_sink"]]
         # 3 eager iterations ON THE CAPTURE STREAM, so its cuBLAS handle, workspace and compile never land inside the capture.
         self.stream.wait_stream(torch.cuda.current_stream())
@@ -4283,11 +4441,13 @@ class _CGraphRunner:
         _pn = len(training_manager._bgsp_pending)
         if _pn >= len(st["sink_ring"]):
             self._sink_grow(_pn + 1)
-        _slot = st["sink_grad"]
+        _slot, _raw = st["sink_grad"], st["in"]
         if not training_manager._is_bigram_step(step):
             _slot = st["sink_ring"][_pn]
             _slot.copy_(st["sink_grad"])
-        training_manager.bgsp_push(bigram_inputs, _slot)
+            _raw = self._token_flat[_pn][:_raw.numel()]
+            _raw.copy_(st["in"])
+        training_manager.bgsp_push(bigram_inputs, _slot, _raw)
         self._ra_evts[self._ra_i % self._RUNAHEAD].record()   # close the throttle window
         self._ra_i += 1
 
@@ -4457,17 +4617,75 @@ class _TailGraphs2:
         """Seal the capture window; _cf_assert_captured() below aborts the run if it is empty or still owes a check."""
         self._sealed = True
 
-def rebuild_fp8_caches_after_reset():
-    """Re-arm the 16-call exact-scale bootstrap and rebuild both fp8 weight caches from the restored weights."""
+def reset_warmup_auxiliary(snapshot):
+    """Restore non-state_dict learning state without rebinding graph-baked storage."""
+    global _la_next, _la_geom, _pref_sns
+    manager, opt = training_manager, training_manager.optimizer
+    _hprep.submit(int).result()
+    assert manager._hprep_bg_cell is None and _pref_sns is None
+    assert not _AGS_PENDING and not _AGS_QPEND and not _SHIP_GATHERS_PENDING
+    assert not opt._reduce_futures and not opt._sparse_async_data
     with torch.no_grad():
-        model._a2p_calls = 0
-        for _b in (model._w_up_pamax, model._w_dn_pamax, model._mlp_post_amax, model._mlp_dpre_amax):
-            _b.zero_()      # IN PLACE: every one of these is a baked _MODEL_PTR_ATTRS pointer
-        model._mlp_dpre_scale.fill_(FP8_GRAD_SCALE)
-        model._mlp_post_scale.fill_(1.0)
-    model.quantize_attn_fp8()
-    model.quantize_mlp_fp8()
+        _TailGraphs2._restore(model._orig_mod, snapshot["fp8"])
+        model._orig_mod._a2p_calls = snapshot["a2p_calls"]
+        model.bg_cache.zero_()
+        for name in ("_velite_buf", "_bgsp_buf", "_bgsp_shard", "_bgsp_slots", "_vesp_buf", "_vesp_shard", "_bgc_slots"):
+            getattr(manager, name).zero_()
+        for value in (*manager._bgsp_sinks.values(), *manager._bgc_ring,
+                      *_CG._sink_flat, *_CG._token_flat, *_CG._acc.values()):
+            value.zero_()
+        for name in ("_bgadam_le", "_bgadam_hist", "_bgadam_stage", "_step_size_t", "_eff_wd_t",
+                     "_tgr_stage_dev", "_tgr_host", "_ft_sc_host", "_ft_sc_dev"):
+            getattr(opt, name).zero_()
+        for value in (*opt._far_flats.values(), *opt._tgr_gbufs.values()):
+            value.zero_()
+        opt._bimax_bf_t.fill_(0.95)
+        opt._bimax_w_t.fill_(1.0)
+        for name, value in _fk._SNS_IDX.items():
+            value.fill_(-1 if name == "PPOS" else 0)
+        for value in (*_fk._SNS_WC.values(), *_fk._SNS_WCT.values()):
+            value.view(torch.uint8).zero_()
+        _fk._SNS_POSD.fill_(-1)
+        _hs.reset()
+        for ship in TAIL_SHIPS:
+            assert not ship.bufs, "warmup must never contribute to terminal averaging"
+            for value in (*ship.free.values(), *ship.scratch.values()):
+                value.zero_()
+    manager._mh_ve_dirty, manager._mh_ve_step = None, -1
+    manager.train_loader_send_args = None
+    manager.mtp_weights = training_schedule.mtp_weights[0]
+    manager._sns_mark.fill(False)
+    manager._sns_pos.fill(-1)
+    for value in (*manager._hprep_bg_masks, *manager._vesp_want_masks):
+        value.fill(False)
+    opt._tgr_ring = opt._ft_sc_ring = 0
+    opt._afe_done = False
+    _CG._ra_i = 0
+    _BGADAM_CTX.clear()
+    _BGC_REQ.clear()
+    _BGC_LIVE.update(want=None, n=0, win=None)
+    _VAL_FILL_PREBUILT.clear()
+    _la_fifo.clear()
+    _la_next, _la_geom, _pref_sns = 0, None, None
+    _fk._PTP_W_RUNTIME = PREFIX_CE_WEIGHT
+    manager._sns_perm = None
+    torch.set_rng_state(snapshot["rng_cpu"])
+    torch.cuda.set_rng_state(snapshot["rng_cuda"], device)
+    np.random.set_state(snapshot["rng_numpy"])
     model.train()
+    # Exact checks are untimed reset checks, not training work or new weight transforms.
+    for key, value in snapshot["model"].items():
+        assert _bits_equal(model.state_dict()[key], value), f"model reset mismatch: {key}"
+    for parameter, state in opt.param_states.items():
+        saved = snapshot["optimizer"]["param_states"][id(parameter)]
+        for key, value in saved.items():
+            assert (_bits_equal(state[key], value) if torch.is_tensor(value) else state[key] == value), \
+                f"optimizer reset mismatch: {opt.param_cfgs[parameter].label}.{key}"
+    for name, value in snapshot["fp8"].items():
+        assert _bits_equal(getattr(model._orig_mod, name), value), f"FP8 reset mismatch: {name}"
+    assert model._orig_mod._a2p_calls == snapshot["a2p_calls"]
+    assert not opt.split_embed and all(p.grad is None for p in model.parameters())
+    torch.cuda.synchronize()
 
 def _w2x_shard_checksum(t, rows=1048576):
     """(max, min, fp64 sum) of the shard, in 1M-row slices: no reduction exceeds 2**31 elements."""
@@ -4491,7 +4709,7 @@ def _w2x_restore_model(sd):
 # ---- the capture protocol inside the single warmup pass ----------------------------------
 # An owner publishes the tensors a captured graph may bake as `_BAKED`: a tuple of attribute NAMES on itself, each resolving at census time.
 _BAKED_FALLBACK = {
-    "mgr": ("_velite_buf", "_bgsp_buf", "_bgsp_shard", "_bgc_slots", "_bgc_val_bounds",
+    "mgr": ("_velite_buf", "_bgsp_buf", "_bgsp_shard", "_bgsp_slots", "_bgc_slots", "_bgc_val_bounds",
             "_vesp_buf", "_vesp_shard", "_bgc_ring"),
 }
 
@@ -4509,7 +4727,8 @@ def _baked_tensors():
                           + _TailGraphs2._OUT_ATTRS),
             # sns_init's index buffers, and the _SNS_WC/_SNS_WCT slab pair it allocates ONCE per
             # sampled-softmax P, by the kernel module's own tables.
-            ("fk", _fk, ("_SNS_IDX", "_SNS_WC", "_SNS_WCT"))):
+            ("fk", _fk, ("_SNS_IDX", "_SNS_WC", "_SNS_WCT")),
+            ("head", _hs, ("COUNTER",))):
         for _n in _names or getattr(_obj, "_BAKED", None) or _BAKED_FALLBACK[_own]:
             _v = getattr(_obj, _n) if _names else getattr(_obj, _n, None)
             for _k, _t in (_v.items() if isinstance(_v, dict) else
@@ -4562,17 +4781,46 @@ def _cf_bgkernel_warm():
                     _le.zero_()
                 _bgk.bgadam_rows_launch(_m, _v, _p, _grad, _ix, _le, _hist, _t,
                                         0.0, 0.0, 1e-8, 0.0, 0.0, 0.0, 0.0, out=_out)
+        # Compile the compact-gradient specialization and row-map kernels on scratch.
+        _slots = torch.zeros(_n, dtype=torch.int32, device=device)
+        prepare_grad_rows(_ix, _slots)
+        for _t in (0, 1, 2):
+            _le.zero_()
+            _bgk.bgadam_rows_launch(_m, _v, _p, _g, _ix, _le, _hist, _t,
+                                    0.0, 0.0, 1e-8, 0.0, 0.0, 0.0, 0.0, grad_slots=_slots)
+        _offset_ix = torch.zeros(_n + 1, dtype=torch.int32, device=device)[1:]
+        for _indices in (_ix, _offset_ix):
+            _bgk.bgfuse_scatter_add(_g, _indices, torch.zeros_like(_g))
         # The two scatter dtype pairs the ARMED path uses and this unarmed pass never reaches.
         _f16 = torch.zeros(_n, _d, dtype=torch.float16, device=device)
         _bgk.bgfuse_scatter_add(_f16, _ix, torch.zeros_like(_f16))
         _bgk.bgfuse_scatter_copy(_p, _ix, torch.zeros_like(_p))
+        # Replay's row-count scalar needs singleton and divisible-by-16 specializations.
+        _rp = torch.zeros(16, _d, dtype=_dt, device=device)
+        _rv = torch.ones(16, 1, dtype=torch.float32, device=device)
+        _rle = torch.zeros(16, dtype=torch.int32, device=device)
+        _rix = torch.arange(16, dtype=torch.int32, device=device)
+        _rhist = torch.zeros_like(_hist)
+        _rhist[1].fill_(0.95)
+        for _rn in (1, 16):
+            for _rt in (0, 1, 2):
+                _rv.fill_(1.0)
+                _rle.zero_()
+                _bgk.bgadam_rows_launch(_m, _rv, _rp, None, _rix[:_rn], _rle, _rhist, _rt,
+                                        0.0, 0.0, 1e-8, 0.0, 0.0, 0.0, 0.0)
+        _ds_src = torch.zeros(16, _d, dtype=torch.bfloat16, device=device)
+        _ds_idx = torch.zeros(32, dtype=torch.int32, device=device)
+        _ds_raw = torch.arange(16, dtype=torch.int32, device=device)
+        _ds_dst = torch.zeros(1, _d, dtype=torch.float16, device=device)
+        signed_scatter_add(_ds_src, _ds_idx, _ds_dst, training_manager.model.bigram_sign_table,
+                           _ds_raw, model.ngram_norm_map)
 
 def _cf_drain():
     """Nothing in flight across the reset, and `_BGADAM_CTX` carrying no event past it: the warmup pass runs UNARMED."""
     torch.cuda.synchronize()
     dist.barrier()
     assert not training_manager._bgsp_pending, "[warmup:capture] harvested bigram values unconsumed"
-    assert _BGADAM_CTX.get("t") is None, "[warmup:capture] the compacted bigram-Adam path ran"
+    assert _BGADAM_CTX.get("t") is None, "[warmup:capture] armed bigram-Adam context was published"
     assert all(_e.query() for _e in _CG._ra_evts), "[warmup:capture] run-ahead event still pending"
     _BGADAM_CTX.clear()
 
@@ -4620,15 +4868,19 @@ def _bgpull_fill():
             _geom = (_ns.batch_size, _ns.train_max_seq_len)
             _args = ((_ns.batch_size, _ns.train_max_seq_len, grad_accum_steps)
                      if _geom != _la_geom else None)
-        _b = train_loader.send(_args)
+        _b, _ready = train_loader.send(_args)
         _la_geom = _geom
         _ic = np.array(_b[4], copy=True)
-        _la_fifo.append((_b[:4] + (_ic,) + _b[5:], _ic))
+        _la_fifo.append((_b[:4] + (_ic,) + _b[5:], _ic, _ready))
         _la_next += 1
 
 def _bgpull_take():
     """The batch for the current step (FIFO front), filling the lookahead on first use."""
     _bgpull_fill()
+    _ready, _consumer = _la_fifo[0][2]
+    _stream = torch.cuda.current_stream(device)
+    assert _stream == _consumer, "loader consumer stream changed"
+    _stream.wait_event(_ready)
     return _la_fifo[0][0]
 
 def _bgpull_advance():
@@ -4653,6 +4905,65 @@ def _clock_stop():
     global training_time_ms
     torch.cuda.synchronize()
     training_time_ms += 1000 * (time.perf_counter() - t0)
+
+
+@torch.no_grad()
+def _copy_fit_retained(batches):
+    """Recompute shipped-model NLL on retained TRAIN examples and fit on the clock."""
+    assert batches and not _VAL_FILL_PREBUILT
+    started = time.perf_counter()
+    model.eval()
+    stats = []
+    bidxs = [batch[3] for batch in batches]
+    try:
+        for inputs, targets, cum_seqlens, bidx in batches:
+            training_manager.bgcache_fill_val(bidx, bidxs)
+            slots = training_manager.bgcache_slots(bidx)
+            loss = model(inputs, targets, cum_seqlens, slots, training_manager.get_forward_args())
+            cand, bucket = copy_candidates(inputs)
+            stats.append((loss, cand == targets, bucket))
+        loss, hit, bucket = (torch.cat(parts) for parts in zip(*stats))
+        fitted = copy_fit(loss, hit, bucket)
+        assert fitted.dtype == model.copy_lambdas.dtype == torch.float32
+        model.copy_lambdas.copy_(fitted)
+        assert not _VAL_FILL_PREBUILT
+        torch.cuda.synchronize()
+        return 1000 * (time.perf_counter() - started)
+    finally:
+        model.train()
+
+
+def _copy_compile_before_reset():
+    """Compile only synthetic calibration geometry; the original full reset follows."""
+    stop = training_schedule.scheduled_iterations
+    assert stop == training_schedule.boundaries[-1][0] and stop >= COPY_FIT_BATCHES
+    geometries = set()
+    for step in range(stop - COPY_FIT_BATCHES, stop):
+        stage, _ = training_schedule.lookup(step)
+        tokens = stage.batch_size // (world_size * grad_accum_steps)
+        docs = TRAIN_MAX_NUM_DOCS.get(tokens, next_multiple_of_n(tokens // 300, n=128))
+        geometries.add((tokens, docs))
+    for module in model.modules():
+        if isinstance(module, Yarn):
+            module.reset()
+    training_manager.ws_short, training_manager.ws_long = training_schedule.stages[0].window_sizes
+    for start, _ in training_schedule.boundaries:
+        training_manager.advance_schedule(start)
+    training_manager.advance_schedule(training_schedule.total_steps)
+    training_manager.apply_final_ws_ext()
+    for module in model.modules():
+        if isinstance(module, Yarn):
+            module.r2_ensure_full()
+    synthetic = []
+    for tokens, docs in sorted(geometries):
+        inputs = torch.zeros(tokens, dtype=torch.int32, device=device)
+        targets = torch.zeros(tokens, dtype=torch.int64, device=device)
+        cu = torch.full((docs,), tokens, dtype=torch.int32, device=device)
+        cu[0] = 0
+        bidx = torch.zeros(2 * tokens, dtype=torch.int32, device=device)
+        synthetic.append((inputs, targets, cu, bidx))
+    _copy_fit_retained(synthetic)
+    del synthetic
 
 
 # -----------------------------------------------------------------------------
@@ -4693,11 +5004,9 @@ print0(f"[schedule] stage ends={training_schedule.ends}")
 print0(nvidia_smi())
 print0("="*100)
 
-# KX_SEED (reproduction runs only): common-random-numbers init, default-off.
-_train_seed = int(os.environ.get("KX_SEED", "0"))
-if _train_seed:
-    torch.manual_seed(_train_seed)
-    torch.cuda.manual_seed_all(_train_seed)
+_train_seed = 0
+torch.manual_seed(_train_seed)
+torch.cuda.manual_seed_all(_train_seed)
 
 model: nn.Module = GPT(
     vocab_size=50257,
@@ -4747,6 +5056,7 @@ prime_stage_cache()
 # Off the clock (this whole block runs before t0), so the identity proof is free.
 _fixk_selftest(model.lm_head.weight.device, model.lm_head.w_s)
 
+_hs.init(device, rank)
 sns_init(device, _SNS_P_ALL, model.vocab_size, _MAX_LOCAL_TOKENS, model_dim=model.lm_head.in_features)
 _ft.sns_war_record()   # arm the SNS copy stream and its events here, off the clock; this first stamp is vacuous
 print0(f"[sampled-softmax] ON P={_SNS_P_ALL} rows<={_MAX_LOCAL_TOKENS} vocab={model.vocab_size} until={_SNS_UNTIL_RESOLVED}", console=True)
@@ -4779,26 +5089,21 @@ assert _w2x_ck0 == (0.0, 0.0, 0.0), (
     f"[warmup:restore] premise failed: the bigram shard is not all-zero at the snapshot "
     f"(max/min/sum = {_w2x_ck0}); the restore-by-zero_ contract does not hold")
 initial_state = dict(model=copy.deepcopy(_w2x_sd),
-                     optimizer=training_manager.get_state()) # save the initial state
+                     optimizer=training_manager.get_state(),
+                     fp8=_TailGraphs2._snapshot(model._orig_mod),
+                     a2p_calls=model._orig_mod._a2p_calls,
+                     rng_cpu=torch.get_rng_state(),
+                     rng_cuda=torch.cuda.get_rng_state(device),
+                     rng_numpy=np.random.get_state())
 del _w2x_sd, _w2x_view
 print0(f"[warmup:restore] ON: bigram shard {tuple(model.bigram_embed.weight.shape)} "
        f"({model.bigram_embed.weight.numel() * 2 / 2**30:.2f} GiB) out of initial_state "
        f"(key {_w2x_key}), restored by zero_() in place; checksum {_w2x_ck0}; initial_state "
        f"pins {_tgr_initial_state_bytes() / 2**30:.2f} GiB of CUDA", console=True)
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader = ngram_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps, training=True)
 
-transition_steps = training_manager.get_transition_steps()
-# first and last pair of steps in each transition
-warmup_steps = sorted({0, 1} | {s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 2}
-                      | {training_schedule.split_step + offset for offset in [1, 2, 3]
-                         if 2 <= training_schedule.split_step + offset <= training_schedule.total_steps - 1})
-# _CGraphRunner built the same map at construction: key -> the step that first shows it.
+warmup_steps = _cf_planned_steps()
 _cg_first = _CG.key_first
-warmup_steps = sorted(set(warmup_steps)
-                      | {_s + _o for _s in _cg_first.values() for _o in (0, 1)
-                         if _s + _o < training_schedule.total_steps})
-# The capture prefix joins the SAME set before the >=2-visits assert, so that assert covers it.
-warmup_steps = sorted(set(warmup_steps) | set(_CF_PREFIX))
 assert len(warmup_steps) <= _CF_MAX, (
     f"[warmup:capture] {len(warmup_steps)} untimed warmup steps exceeds the budget of {_CF_MAX} "
     f"(the last two records shipped 14 and 21): {warmup_steps}")
@@ -4814,6 +5119,7 @@ print0(f"[graph:step] warmup extended for {len(_cg_first)} capture keys; first s
 print0(f"Sampling steps {warmup_steps} for warmup", console=True)
 warmup_steps = _cf_order(warmup_steps)
 for step in warmup_steps:
+    print0(f"WARMUP step:{step}", console=True)
     training_manager.advance_schedule(step)
     training_manager.ve_lite_prepare(step, force=True)
     # warmup runs no eval forwards -- their only purpose was pre-compiling eval variants, the final validation compiles with the clock stopped.
@@ -4840,20 +5146,25 @@ for step in warmup_steps:
 _CG.seal()
 # Drain, then snapshot every address a captured graph bakes, BEFORE the reset.
 _cf_drain()
+_COPY_PTRS = _cf_baked_ptrs()
+_copy_compile_before_reset()
+_cf_check_ptrs(_COPY_PTRS)
+del _COPY_PTRS
 _CF_PTRS = _cf_baked_ptrs()
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 _w2x_restore_model(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
+reset_warmup_auxiliary(initial_state)
 _cf_check_ptrs(_CF_PTRS)
 del _CF_PTRS
+train_loader.close()
 del train_loader, initial_state
-rebuild_fp8_caches_after_reset()
 
 ########################################
 #        Training and validation       #
 ########################################
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader = ngram_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps, training=True, defer_wait=True)
 
 gc.collect()
 # No cyclic GC inside the timed loop: multi-ms gen-2 pauses desynchronise ranks.
@@ -4863,6 +5174,7 @@ gc.disable()
 # Row bound for partial Yarn rebuilds; set only now, so every pre-clock rebuild was full.
 _R2_YARN_ROWS = max(s.batch_size for s in TRAINING_STAGES) // (world_size * grad_accum_steps)
 training_time_ms = 0
+val_history = []
 
 
 # The first .send() on the lazy train_loader is paid INSIDE the timed region at step 0.
@@ -4885,7 +5197,20 @@ assert training_schedule.total_steps - SHIP_VEMB_WINDOW >= VEMB_ADAM_PERIOD4_STA
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
+assert args.val_loss_every == 0 and grad_accum_steps == 1
+_copy_batches = ConsumedTrainingBatches(training_schedule.scheduled_iterations)
+_copy_fit_ms = None
+_norm_ids = torch.from_numpy(build_norm_map())
+_NGRAM_NORM_MAP.copy_(_norm_ids)
+model.ngram_norm_map.copy_(_norm_ids)
+assert torch.equal(model.ngram_norm_map.cpu(), _NGRAM_NORM_MAP)
+del _norm_ids
 _ptp_table_fill()  # prefix-table construction is charged to training time
+_sns_v = training_manager._sns_vocab
+_sns_one = (_SNS_STRIDE * np.arange(_sns_v, dtype=np.int64)) % _sns_v
+training_manager._sns_perm = np.concatenate((_sns_one, _sns_one))
+training_manager._sns_ar[:] = np.arange(training_manager._sns_ar.size, dtype=np.int64)
+del _sns_one
 # begin training
 train_steps = training_schedule.total_steps
 for step in range(train_steps + 1):
@@ -4931,6 +5256,10 @@ for step in range(train_steps + 1):
             _drat = torch.where(_dcur > 0, _dref / _dcur, torch.ones_like(_dcur)).tolist()
             for _lbl, _rt in zip(_SHIP_DECON_LABELS, _drat):
                 _pbl[_lbl].data.mul_(_rt)
+        if last_step:
+            _retained = _copy_batches.take(train_steps)
+            _copy_fit_ms = _copy_fit_retained(_retained)
+            del _retained
         # ---- the validation row pull, ON THE CLOCK -----------------------------------
         # bgcache keeps no bigram replica, so a val batch's rows are pulled into the row cache
         # here -- inside the SAME timed interval the training steps ran in, before the single
@@ -4938,8 +5267,8 @@ for step in range(train_steps + 1):
         # well; the record reads them untimed, so charging them is strictly self-penalising.
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-        _val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1,
-                                                 grad_accum_steps=grad_accum_steps, align_to_bos=False)
+        _val_loader = ngram_data_generator(args.val_files, args.val_batch_size, -1,
+                                           grad_accum_steps=grad_accum_steps, align_to_bos=False, training=False)
         # Read up front and staged as a batch, so the first fill builds every want list and
         # exchanges every count in ONE collective; five batches cannot lap the loader's rings.
         _val_batches = [next(_val_loader)[:4] for _ in range(val_steps)]
@@ -4963,26 +5292,31 @@ for step in range(train_steps + 1):
                 dist.barrier()
                 training_manager.bgcache_fill_val(bigram_inputs)
                 bigram_inputs = training_manager.bgcache_slots(bigram_inputs)
-                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+                _loss_per_token = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+                _copy_cand, _copy_bucket = copy_candidates(inputs)
+                val_loss += copy_mix_loss(_loss_per_token, _copy_cand == targets,
+                                          model.copy_lambdas[_copy_bucket]).mean()
         val_loss /= val_steps
         del _val_batches
         assert not _VAL_FILL_PREBUILT, "prebuilt val fills left unconsumed"
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+        if master_process:
+            val_history.append([int(step), float(val_loss), float(training_time_ms)])
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        if last_step:
+            print0(f"[copy-mixture] train_fit_batches={COPY_FIT_BATCHES} fit_ms={_copy_fit_ms:.3f} "
+                   f"lambda_fp32={model.copy_lambdas.tolist()}", console=True)
         # Clock is stopped here -> both the log flush and the manual GC are untimed.
         if _logf is not None:            # None on non-master ranks
             _logf.flush()
         gc.collect()
         model.train()
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
+        if not last_step:
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
 
     if last_step:
-        if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state())
-            os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+        save_checkpoint(model, step, training_time_ms, val_loss, val_history, run_sources)
         # the last step only has the validation loop, so break to avoid training
         break
 
@@ -5016,6 +5350,7 @@ for step in range(train_steps + 1):
         training_manager.sparse_index_share(step)
         training_manager.ve_index_share(step)
         _CG.bwd(step, bigram_inputs)
+        _copy_batches.after_backward(step, (inputs, targets, cum_seqlens, bigram_inputs))
         # Retire the batch; the next step's SNS build stages under this step's backward.
         _bgpull_advance()
         if step + 1 < train_steps:

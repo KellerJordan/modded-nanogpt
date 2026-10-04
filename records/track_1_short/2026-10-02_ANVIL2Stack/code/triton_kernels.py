@@ -9,6 +9,7 @@ import os
 import torch
 import triton
 import triton.language as tl
+import sampled_head as _hs
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 try:
@@ -431,6 +432,7 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                                  USE_FP8: tl.constexpr,
                                  EMIT_F8: tl.constexpr, EMIT_T: tl.constexpr, STORE_PRE: tl.constexpr,
                                  STORE_POST_BF: tl.constexpr, RECON_SQRT: tl.constexpr, EMIT_DPRE: tl.constexpr,
+                                 AMAX_OFFSET=0,
                                  ):
     dtype = tl.bfloat16
     start_pid = tl.program_id(axis=0)
@@ -505,7 +507,7 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                 # atomic_max, not a loop-carried scalar (tl.range(flatten=True) does not guarantee those); max is
                 # order-free, so one reduce(maximum(c0, c1)) equals maxing the two reductions.
                 tile_max = tl.max(tl.max(tl.maximum(c0_post.to(tl.float32), c1_post.to(tl.float32)), axis=1), axis=0)
-                tl.atomic_max(post_amax_ptr, tile_max)
+                tl.atomic_max(post_amax_ptr + AMAX_OFFSET + start_pid * 8, tile_max, sem='relaxed')
         else:
             # aux holds `post`; relu(pre) = sqrt(post). dpre = 2 * (grad @ W2) * relu(pre).
             if RECON_SQRT:
@@ -539,7 +541,7 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                 c_t_desc.store([offs_bn, offs_am], tl.trans(q0))
                 c_t_desc.store([offs_bn + BLOCK_SIZE_N // 2, offs_am], tl.trans(q1))
                 tile_max = tl.max(tl.max(tl.maximum(tl.abs(c0f), tl.abs(c1f)), axis=1), axis=0)
-                tl.atomic_max(dpre_amax_ptr, tile_max)
+                tl.atomic_max(dpre_amax_ptr + AMAX_OFFSET + start_pid * 8, tile_max, sem='relaxed')
 
 
 # -----------------------------------------------------------------------------
@@ -621,10 +623,31 @@ def quantize_mlp_weights_dual(bank: torch.Tensor, scales: torch.Tensor, partial_
 # and is written ONLY by eager calls, i.e. prime_stage_cache().
 _lrs_stage_cache = {}
 
+def _validate_mutated_amax(amax, offset, grid, active=True):
+    if not active:
+        return
+    if amax is None:
+        raise ValueError("active amax output requires a tensor")
+    if amax.dtype != torch.float32:
+        raise ValueError("amax must be float32")
+    if amax.ndim not in (1, 2):
+        raise ValueError("amax must be a 1D prime buffer or 2D bank")
+    if not amax.is_contiguous():
+        raise ValueError("amax must be contiguous")
+    if not torch.compiler.is_compiling() and amax.storage_offset() != 0:
+        raise ValueError("amax must have zero storage offset")
+    if type(offset) is not int or offset < 0:
+        raise ValueError("amax offset must be a nonnegative int")
+    if type(grid) is not int or grid < 1:
+        raise ValueError("amax grid must be a positive int")
+    if offset + 8 * (grid - 1) + 1 > amax.numel():
+        raise ValueError("amax buffer is too small for the actual launch grid")
+
+
 def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=None,
                        emit_f8=False, post_scale=None, post_amax=None,
                        emit_t=False, store_pre=True, store_post_bf=True,
-                       emit_dpre=False, dpre_scale=None, dpre_amax=None):
+                       emit_dpre=False, dpre_scale=None, dpre_amax=None, amax_offset=0):
     """Fused MLP GEMM with dual-layout fp8 epilogue emission.  Returns (pre, post, post_f8, post_t) forward and
     (dpre, dpre_f8, dpre_t) backward, None where not requested; emit_dpre asks for BOTH fp8 dpre layouts, exactly
     when the bf16 dpre is dead, so the backward emits fp8 or bf16 and never both."""
@@ -677,6 +700,7 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=N
     # memory, hence the asserts.
     assert use_fp8 == (dequant_scale_ptr is not None)
     assert post_scale is not None or not ((FORWARD and emit_f8) or recon_sqrt)
+    assert post_amax is not None or not (FORWARD and emit_f8)
     assert not emit_dpre or (dpre_scale is not None and dpre_amax is not None)
     _unused_ptr = torch.empty(1, dtype=torch.float32, device=a.device)
     dequant_scale_ptr, post_scale, post_amax, dpre_scale, dpre_amax = [
@@ -687,6 +711,8 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=N
            BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, num_warps)
     num_stages = _lrs_stage_cache.get(key, 4 if (FORWARD and not (emit_f8 or emit_t)) else 3)
     _alt_grid = (min(NUM_SMS, triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N)), )
+    _validate_mutated_amax(post_amax, amax_offset, _alt_grid[0], active=FORWARD and emit_f8)
+    _validate_mutated_amax(dpre_amax, amax_offset, _alt_grid[0], active=_dpre8)
 
     def _launch(_ns):
         linear_relu_square_kernel[_alt_grid](
@@ -699,6 +725,7 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=N
             EMIT_F8=aux_f8 is not None, EMIT_T=aux_t is not None,
             STORE_PRE=FORWARD and store_pre, STORE_POST_BF=FORWARD and store_post_bf,
             RECON_SQRT=recon_sqrt, EMIT_DPRE=c_f8 is not None,
+            AMAX_OFFSET=amax_offset,
             num_stages=_ns, num_warps=num_warps,
         )
 
@@ -775,7 +802,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, W1, W2, W1_f8=None, dequant_scale=None, x_f8=None, W2_f8=None, w2_scale=None,
                 post_scale=None, post_amax=None, w2_f8_row=None, dq_bwd=None, x_f8_t=None, x_scale=None,
-                w1_f8_col=None, w1_scale=None, g_scale=None, dpre_scale=None, dpre_amax=None, p_fold=None):
+                w1_f8_col=None, w1_scale=None, g_scale=None, dpre_scale=None, dpre_amax=None, p_fold=None, amax_offset=0):
         # `emit` is ONE decision for the whole fp8 MLP (fp8 down projection, transposed post emit, fp8 dW2); under it
         # both bf16 stores are dead.  The saved-tensor layout and the backward's flags assume all-or-nothing pairs.
         assert (W2_f8 is None) == (w2_f8_row is None)
@@ -787,9 +814,9 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             pre, post, post_f8, post_t = linear_relu_square(
                 x_flat, W1, a_f8=x_f8.view((-1, x_f8.shape[-1])), b_f8=W1_f8, emit_f8=emit, emit_t=emit,
                 dequant_scale_ptr=dequant_scale, post_scale=post_scale, post_amax=post_amax,
-                store_pre=not emit, store_post_bf=not emit)
+                store_pre=not emit, store_post_bf=not emit, amax_offset=amax_offset)
         else:
-            pre, post, post_f8, post_t = linear_relu_square(x_flat, W1, emit_f8=emit, post_scale=post_scale, post_amax=post_amax)
+            pre, post, post_f8, post_t = linear_relu_square(x_flat, W1, emit_f8=emit, post_scale=post_scale, post_amax=post_amax, amax_offset=amax_offset)
         x3 = (torch.ops.nanogpt.dp_f8(post_f8, W2_f8, post_scale, w2_scale) if emit else post @ W2)
         # Graph INTERMEDIATES must go through save_for_backward: ctx-attr stashing inside the compiled HOP pins them
         # past their last use (+3.3 MB).  `p_fold` is the residual site's post-lambda, folded by the caller into the
@@ -802,6 +829,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         ctx.w2_f8_row, ctx.dq_bwd, ctx.x_f8_t, ctx.x_scale = w2_f8_row, dq_bwd, x_f8_t, x_scale
         ctx.w1_f8_col, ctx.w1_scale, ctx.g_scale = w1_f8_col, w1_scale, g_scale
         ctx.dpre_scale, ctx.dpre_amax = dpre_scale, dpre_amax
+        ctx.amax_offset = amax_offset
         return x3.view(x.shape)
 
     @staticmethod
@@ -845,9 +873,9 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             dpre, dpre_f8, dpre_t = linear_relu_square(
                 g_flat, W2, aux=aux_src, a_f8=g_f8, b_f8=ctx.w2_f8_row,
                 dequant_scale_ptr=ctx.dq_bwd, post_scale=ctx.post_scale,
-                emit_dpre=fp8_emit, dpre_scale=ctx.dpre_scale, dpre_amax=ctx.dpre_amax)
+                emit_dpre=fp8_emit, dpre_scale=ctx.dpre_scale, dpre_amax=ctx.dpre_amax, amax_offset=ctx.amax_offset)
         else:
-            dpre, dpre_f8, dpre_t = linear_relu_square(g_flat, W2, aux=aux_src, post_scale=ctx.post_scale)
+            dpre, dpre_f8, dpre_t = linear_relu_square(g_flat, W2, aux=aux_src, post_scale=ctx.post_scale, amax_offset=ctx.amax_offset)
         if fp8_emit:
             dW1 = torch.ops.nanogpt.wg1_f8(dpre_t, ctx.x_f8_t, ctx.dpre_scale, ctx.x_scale)
             dx = torch.ops.nanogpt.dx_f8(dpre_f8, ctx.w1_f8_col, ctx.dpre_scale, ctx.w1_scale)
@@ -855,8 +883,8 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             dW1 = dpre.T @ x  # default eager expressions (unflattened)
             dx = dpre @ W1
 
-        # One return slot per forward input (19, + p_fold).
-        return (dx.view(x.shape), dW1, dW2) + (None,) * 16 + (grad_p,)
+        # One return slot per forward input (19, + p_fold, + amax_offset).
+        return (dx.view(x.shape), dW1, dW2) + (None,) * 16 + (grad_p, None)
 
 
 # -----------------------------------------------------------------------------
@@ -990,9 +1018,8 @@ def transpose_add(src: torch.Tensor, dst: torch.Tensor):
 
 
 # ---- fused softcapped cross-entropy (reuses the lm_head FP8 weight cache) ----
-# ONE CUDA kernel does the forward AND backward in a single pass over the vocabulary, so the [T, 50304] logits are never re-read: the lm_head GEMM writes
-# them as e4m3 CODE BYTES, decoded by a ~4-op hardware conversion (an arithmetic decode costs 0.643 ms/step more at the bandwidth-bound 2.109 TB/s). A
-# row's loss adds a prefix-token CE at prefix_weight to the MTP look-ahead, a no-op at weight 0; its sigmoid cache is fp16 as bf16 rounds 1-sigma to 0.
+# One CUDA pass computes forward and backward from FP16 raw logits produced by the FP8 head GEMM.
+# The prefix-token loss augments MTP; the FP16 sigmoid cache avoids rounding 1-sigma to zero.
 
 CE_KERNEL_BLOCK_SIZE = 256
 CE_KERNEL_VOCAB_SIZE = 50304
@@ -1061,9 +1088,9 @@ __device__ __forceinline__ float ce_e4m3_logit_to_f32(unsigned char b) {
     return f;
 }
 
-#define CE_IN_T unsigned char
-#define CE_IN8_T __nv_uchar8
-#define CE_LOGIT_TO_F32(v) ce_e4m3_logit_to_f32(v)
+#define CE_IN_T __half
+#define CE_IN8_T __half8
+#define CE_LOGIT_TO_F32(v) __half2float(v)
 
 template<typename T> __device__ constexpr T CEIL_DIV(T a, T b) { return (a + b - 1) / b; }
 
@@ -1267,8 +1294,8 @@ __global__ void ce_fwd_bwd_kernel(
 }
 """
 
-# nvrtc needs the CUDA headers; CUDA_HOME is what torch's own extension builder consults.
-CUDA_INCLUDE_DIRS = [os.path.join(os.environ.get("CUDA_HOME") or "/usr/local/cuda", "include")]
+# The pinned Modal CUDA image supplies these headers.
+CUDA_INCLUDE_DIRS = ["/usr/local/cuda/include"]
 
 ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
     CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
@@ -1328,7 +1355,7 @@ def _ce_scalar(ref: torch.Tensor, v: float) -> torch.Tensor:
         _CE_SCALAR_CACHE[key] = t = ref.new_tensor(v, dtype=torch.float32)
     return t
 
-def _ce_backward_gemms(grad_input, w_t, x_f8, x_s, w_s, grad_s):
+def _ce_backward_gemms(grad_input, w_t, x_f8, x_s, w_s, grad_s, n_predict=0):
     """The CE backward tail both CE Functions share: the three scale scalars,
     dx = grad @ W, and the bf16 wgrad via two fp8 transposes (dW = x^T @ grad)."""
     n_rows, n_cols = grad_input.shape
@@ -1343,6 +1370,12 @@ def _ce_backward_gemms(grad_input, w_t, x_f8, x_s, w_s, grad_s):
         scale_b=w_scale,
         use_fast_accum=False,
     )
+
+    if n_predict and n_rows >= _hs.MIN_ROWS:
+        grad_w = torch.ops.nanogpt.sampled_head_wg(
+            grad_input, x_f8, _SNS_IDX["TPOS"][:n_rows], _SNS_IDX["PPOS"][:n_rows],
+            x_scale, grad_scale, _hs.COUNTER, n_predict, _hs.GROUP)
+        return grad_x, grad_w
 
     x_f8_T = torch.empty((x_f8.shape[1], x_f8.shape[0]), dtype=x_f8.dtype, device=x_f8.device)
     transpose_copy(x_f8, x_f8_T)  # (768, n_rows) row-major
@@ -1360,19 +1393,17 @@ def _ce_backward_gemms(grad_input, w_t, x_f8, x_s, w_s, grad_s):
     return grad_x, grad_w
 
 def _ce_logit_gemm(x, x_f8, w_col, x_s, w_s):
-    """The lm_head GEMM, emitting the RAW logit as an e4m3 code byte; w_col must be column-major.
-    torch._scaled_mm IGNORES scale_result for an fp8 out_dtype, so scale_a/scale_b descale the
-    accumulator and the stored byte is the raw e4m3 RNE logit."""
+    """FP8 lm_head operands with FP16 raw logits; w_col must be column-major."""
     return torch._scaled_mm(
         x_f8, w_col,
-        out_dtype=torch.float8_e4m3fn,
+        out_dtype=torch.float16,
         scale_a=_ce_scalar(x, x_s),
         scale_b=_ce_scalar(x, w_s),
         use_fast_accum=True,
     )
 
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
-    """Full-vocabulary softcapped CE: the fp8 lm_head GEMM into e4m3 logit code bytes, the fused fwd+bwd kernel, then the two fp8 gradient GEMMs --
+    """Full-vocabulary softcapped CE: FP8 head GEMM into FP16 logits, fused fwd+bwd, then two FP8 gradient GEMMs --
     the e5m2 grad_input the kernel leaves behind IS the backward's input, and no logit tensor survives the forward. Both GEMM halves are staticmethods
     because SampledSoftcappedCrossEntropy runs the same two. w_f8_in (col-major) and w_f8_row are the trainer's post-step fp8 lm_head copies from the
     comm-overlapped optimizer phase; lm_head_weight only carries the grad. A, B, C are spelled again in train_gpt.py's eval arm and in CE_KERNEL_SOURCE."""
@@ -1509,12 +1540,13 @@ class SampledSoftcappedCrossEntropy(torch.autograd.Function):
                        grad_input, n_rows, mtp_weights.shape[0], A, B, C, grad_s, grad_scale, float(prefix_weight), sns_p)
         ctx.save_for_backward(x_f8, _SNS_WCT[sns_p], grad_input)
         ctx.params = (x_s, w_s, grad_s)
+        ctx.n_predict = mtp_weights.shape[0]
         return losses
 
     @staticmethod
     def backward(ctx, grad_output):
         x_f8, wc_t, grad_input = ctx.saved_tensors
-        grad_x, grad_w_c = _ce_backward_gemms(grad_input, wc_t, x_f8, *ctx.params)
+        grad_x, grad_w_c = _ce_backward_gemms(grad_input, wc_t, x_f8, *ctx.params, n_predict=ctx.n_predict)
         # Dense full-extent grad, sized from _SNS_POSD -- it IS the vocab-length map densify gathers through. The tied
         # transpose_add writes into it in place and the reduce_scatter needs a contiguous payload; freshly allocated every
         # backward (AccumulateGrad may adopt it as .grad) and never zeroed, since the gather writes every element.

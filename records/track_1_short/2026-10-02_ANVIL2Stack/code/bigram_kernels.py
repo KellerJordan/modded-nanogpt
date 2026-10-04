@@ -103,16 +103,15 @@ def _(g, tab, inp):
 class _BGXCombine(torch.autograd.Function):
     """`gather(W, bidx).detach() + bg_sink` routes the whole gradient to `bg_sink` and NOTHING to `W`: that
     detach is what stops a dense [V, 768] embedding grad ever being built.  `sink` is exact zeros the forward
-    never reads, its only purpose being that autograd slot."""
+    never reads. Its raw [T, D] gradient gets signs during the later compact scatter."""
     @staticmethod
     def forward(ctx, weight, bidx, tab, inp, sink):
-        ctx.save_for_backward(tab, inp)
+        assert sink.shape == (inp.shape[0], weight.shape[1])
         return torch.ops.nanogpt.bgx_combine(weight, bidx, tab, inp)
 
     @staticmethod
     def backward(ctx, g):
-        tab, inp = ctx.saved_tensors
-        return None, None, None, None, torch.ops.nanogpt.bgx_sink_grad(g, tab, inp)
+        return None, None, None, None, g.contiguous().reshape(-1, g.shape[-1])
 
 def bgx_x0_bigram(weight, bidx, tab, inp, sink):
     """[T, D] x0_bigram; `sink` is None under eval, where no gradient is wanted."""
@@ -201,7 +200,8 @@ def _want_unique(idx_arrays, cap, vocab):
     # flatnonzeros to nothing), and every consumer already handles a zero-row want.
     if not idx_arrays:
         return np.empty(0, dtype=np.int32)
-    want = np.sort(idx_arrays[0] if len(idx_arrays) == 1 else np.concatenate(idx_arrays))
+    want = idx_arrays[0].copy() if len(idx_arrays) == 1 else np.concatenate(idx_arrays)
+    want.sort()
     if want.size:
         want = want[np.r_[True, want[1:] != want[:-1]]]
     want = want.astype(np.int32, copy=False)
@@ -263,11 +263,11 @@ H_B1, H_B2, H_S, H_W = 0, 1, 2, 3   # per-event scalars, one column per bigram A
 HIST_ROWS = 4
 
 @triton.jit
-def _bgadam_rows_kernel_b0(M, V, P, G, OUT, IDX, LE, HIST,
+def _bgadam_rows_kernel_b0(M, V, P, G, G_SLOTS, OUT, IDX, LE, HIST,
                            t_ref,
                            beta1, beta2, eps, s_t, w_t, a1, a2,
                            D_MODEL: tl.constexpr, HIST_STRIDE: tl.constexpr,
-                           HAS_G: tl.constexpr, COMMIT: tl.constexpr, BLOCK: tl.constexpr):
+                           HAS_G: tl.constexpr, COMPACT_G: tl.constexpr, COMMIT: tl.constexpr, BLOCK: tl.constexpr):
     """One program per row: carry the row's missed second-moment decay, then if HAS_G apply
     this event's real Adam step.  COMMIT writes v/p back and stamps the shared `last_event`
     table LE (idempotent); else the row's parameter goes to OUT.  `M` is never dereferenced."""
@@ -280,30 +280,58 @@ def _bgadam_rows_kernel_b0(M, V, P, G, OUT, IDX, LE, HIST,
     aoff = base + o64                                # int64 tensor
     if COMMIT:
         if HAS_G:
-            # Pass 1, grad rows: IDX concatenates every peer's list, so DUPLICATES ARE A RACE.
-            # atomic_max elects one committer; a loser's loads are predicated off (768 or 0 lanes).
-            t_new = t_ref + 1
-            le = tl.atomic_max(LE + row, t_new)
-            own = le < t_new
-            omask = offs < D_MODEL * own.to(tl.int32)
-            v = tl.load(V + row.to(tl.int64)).to(tl.float32)
-            # the collapsed replay: v's decay product over (le, t_ref], left to right, the same
-            # multiplies a per-event loop performs (n_rep <= 0 for a loser).
-            n_rep = t_ref - le
-            for i in range(n_rep):
-                v = v * tl.load(HIST + 1 * HIST_STRIDE + (le + 1 + i))
-            g = tl.load(G + aoff, mask=omask, other=0.0).to(tl.float32)
-            p = tl.load(P + aoff, mask=omask, other=0.0).to(tl.float32)
-            m = g * a1                               # == m * beta1 + g * a1 at beta1 = 0
-            # The row's MEAN square, so sqrt(v) keeps the scale a per-element sqrt(g*g) had
-            # and neither eps nor s_t needs retuning; masked lanes came in 0 and add nothing.
-            v = v * beta2 + (tl.sum(g * g, axis=0) / D_MODEL) * a2
-            u = (m / (tl.sqrt(v) + eps)) * s_t
-            u = u + tl.where((u * p) > 0, p * w_t, 0.0)
-            p = p - u
-            if own:
-                tl.store(V + row.to(tl.int64), v)
-                tl.store(P + aoff, p.to(P.dtype.element_ty), mask=mask)
+            if COMPACT_G:
+                grow = tl.load(G_SLOTS + row)
+                if pid_r == grow:
+                    t_new = t_ref + 1
+                    le = tl.load(LE + row)
+                    if le < t_new:
+                        v = tl.load(V + row.to(tl.int64)).to(tl.float32)
+                        # the collapsed replay: v's decay product over (le, t_ref], left to right, the same
+                        # multiplies a per-event loop performs (n_rep <= 0 for a loser).
+                        n_rep = t_ref - le
+                        for i in range(n_rep):
+                            v = v * tl.load(HIST + 1 * HIST_STRIDE + (le + 1 + i))
+                        goff = grow.to(tl.int64) * D_MODEL + o64
+                        g = tl.load(G + goff, mask=mask, other=0.0).to(tl.float32)
+                        p = tl.load(P + aoff, mask=mask, other=0.0).to(tl.float32)
+                        m = g * a1                               # == m * beta1 + g * a1 at beta1 = 0
+                        # The row's MEAN square, so sqrt(v) keeps the scale a per-element sqrt(g*g) had
+                        # and neither eps nor s_t needs retuning; masked lanes came in 0 and add nothing.
+                        v = v * beta2 + (tl.sum(g * g, axis=0) / D_MODEL) * a2
+                        u = (m / (tl.sqrt(v) + eps)) * s_t
+                        u = u + tl.where((u * p) > 0, p * w_t, 0.0)
+                        p = p - u
+                        tl.store(V + row.to(tl.int64), v)
+                        tl.store(P + aoff, p.to(P.dtype.element_ty), mask=mask)
+                        tl.store(LE + row, t_new)
+            else:
+                # Pass 1, grad rows: IDX concatenates every peer's list, so DUPLICATES ARE A RACE.
+                # atomic_max elects one committer; a loser's loads are predicated off (768 or 0 lanes).
+                t_new = t_ref + 1
+                le = tl.atomic_max(LE + row, t_new)
+                own = le < t_new
+                omask = offs < D_MODEL * own.to(tl.int32)
+                v = tl.load(V + row.to(tl.int64)).to(tl.float32)
+                # the collapsed replay: v's decay product over (le, t_ref], left to right, the same
+                # multiplies a per-event loop performs (n_rep <= 0 for a loser).
+                n_rep = t_ref - le
+                for i in range(n_rep):
+                    v = v * tl.load(HIST + 1 * HIST_STRIDE + (le + 1 + i))
+                grow = tl.load(G_SLOTS + row) if COMPACT_G else row
+                goff = grow.to(tl.int64) * D_MODEL + o64
+                g = tl.load(G + goff, mask=omask, other=0.0).to(tl.float32)
+                p = tl.load(P + aoff, mask=omask, other=0.0).to(tl.float32)
+                m = g * a1                               # == m * beta1 + g * a1 at beta1 = 0
+                # The row's MEAN square, so sqrt(v) keeps the scale a per-element sqrt(g*g) had
+                # and neither eps nor s_t needs retuning; masked lanes came in 0 and add nothing.
+                v = v * beta2 + (tl.sum(g * g, axis=0) / D_MODEL) * a2
+                u = (m / (tl.sqrt(v) + eps)) * s_t
+                u = u + tl.where((u * p) > 0, p * w_t, 0.0)
+                p = p - u
+                if own:
+                    tl.store(V + row.to(tl.int64), v)
+                    tl.store(P + aoff, p.to(P.dtype.element_ty), mask=mask)
         else:
             # Pass 2, own-read / flush / dense restore: p is replay-invariant, so the row owes
             # only v's decay; IDX is duplicate-free here, nothing to claim.
@@ -321,8 +349,26 @@ def _bgadam_rows_kernel_b0(M, V, P, G, OUT, IDX, LE, HIST,
         ooff = pid_r.to(tl.int64) * D_MODEL + o64
         tl.store(OUT + ooff, p.to(OUT.dtype.element_ty), mask=mask)
 
+@triton.jit
+def _bgadam_replay_rows_kernel(V, LE, IDX, HIST, n, t_ref,
+                HIST_STRIDE: tl.constexpr, BLOCK: tl.constexpr):
+    pos = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = pos < n
+    row = tl.load(IDX + pos, mask=valid, other=0)
+    last = tl.load(LE + row, mask=valid, other=t_ref)
+    value = tl.load(V + row.to(tl.int64), mask=valid, other=0.0)
+    count = t_ref - last
+    longest = tl.maximum(tl.max(count, axis=0), 0)
+    for i in range(longest):
+        active = valid & (i < count)
+        beta = tl.load(HIST + HIST_STRIDE + last + 1 + i,
+                       mask=active, other=1.0)
+        value = tl.where(active, value * beta, value)
+    tl.store(V + row.to(tl.int64), value, mask=valid)
+    tl.store(LE + row, t_ref, mask=valid)
+
 def bgadam_rows_launch(m, v, p, g, idx, le, hist, t_ref,
-                       beta1, beta2, eps, s_t, w_t, a1, a2, out=None):
+                       beta1, beta2, eps, s_t, w_t, a1, a2, out=None, grad_slots=None):
     """Replay over `idx`, an int32 device tensor of LOCAL shard rows.  With a gradient (pass 1) `idx` may
     repeat and the atomic claim picks one committer; without one (g=None) that claim is compiled out and `idx`
     MUST be duplicate-free.  `out` non-None selects the read-only send form; `t_ref` is the anchor -- the grad
@@ -340,12 +386,22 @@ def bgadam_rows_launch(m, v, p, g, idx, le, hist, t_ref,
     assert idx.dtype == torch.int32 and le.dtype == torch.int32 \
         and hist.shape[0] == HIST_ROWS and hist.is_contiguous(), \
         "[ngram-adam] int32 row ids and a contiguous [HIST_ROWS, events] scalar history"
+    if grad_slots is not None:
+        assert g is not None and out is None and g.ndim == 2 and g.shape[1] == d_model
+        assert grad_slots.dtype == torch.int32 and grad_slots.shape == (p.shape[0],) \
+            and grad_slots.is_contiguous() and grad_slots.device == p.device
+    if g is None and out is None:
+        _bgadam_replay_rows_kernel[(triton.cdiv(n, 128),)](
+            v, le, idx, hist, n, int(t_ref),
+            HIST_STRIDE=hist.shape[1], BLOCK=128, num_warps=4)
+        return out
     _bgadam_rows_kernel_b0[(n,)](
-        m, v, p, g if g is not None else p, out if out is not None else p,
+        m, v, p, g if g is not None else p, grad_slots if grad_slots is not None else idx,
+        out if out is not None else p,
         idx, le, hist, int(t_ref),
         float(beta1), float(beta2), float(eps), float(s_t), float(w_t), float(a1), float(a2),
         D_MODEL=d_model, HIST_STRIDE=hist.shape[1],
-        HAS_G=(g is not None), COMMIT=(out is None),
+        HAS_G=(g is not None), COMPACT_G=(grad_slots is not None), COMMIT=(out is None),
         BLOCK=triton.next_power_of_2(d_model), num_warps=4,
     )
     return out
@@ -356,10 +412,7 @@ def bgadam_hist_alloc(max_events, dev):
             torch.zeros(HIST_ROWS, 1, dtype=torch.float32, pin_memory=True))
 
 def bgadam_hist_push(hist, stage, j, beta1, beta2, s_t, w_t):
-    """Event j's scalars: one 16-byte H2D per event, no sync.  Only H_B2 is read back, by the
-    replay; dropping the rest would change the kernel's HIST_STRIDE."""
+    """Write the only consumed history scalar on the current device stream."""
     assert float(beta1) == 0.0, \
         f"the bigram row replay is the beta1 == 0 collapse: event {j} pushed beta1={beta1}"
-    stage[H_B1, 0], stage[H_B2, 0] = beta1, beta2
-    stage[H_S, 0], stage[H_W, 0] = s_t, w_t
-    hist[:, j:j + 1].copy_(stage, non_blocking=True)
+    hist[H_B2, j].fill_(beta2)
