@@ -23,6 +23,8 @@ from exact_match import CELLS as RET_CELLS, SlotIndex, StreamIndex
 per_gpu = len(os.sched_getaffinity(0)) // int(os.environ.get("LOCAL_WORLD_SIZE", "1"))  # vCPUs per GPU, before any pinning
 VAL_BUILD_THREADS = 64 if per_gpu >= 24 else 32 if per_gpu >= 16 else 16  # rank 0's validation index build, on cores every rank sets aside
 LARGE_HOST = per_gpu >= 24  # >= 24 vCPUs per GPU
+# VAL_TOPK: the candidates the model reads per row at validation (default 5; training reads 2)
+VAL_WIDTH = 1 + int(os.environ.get("VAL_TOPK", "5"))
 
 @dataclass(frozen=True)
 class CpuPlan:
@@ -36,7 +38,8 @@ def pin_cpus(local_rank: int, world_size: int) -> CpuPlan:
     """Each rank gets an equal share of the physical cores local to its GPU (within the allowed set: Slurm hands out
     arbitrary CPU ids), and is pinned to it before the process group starts, so every thread inherits it. Its last
     cores run rank 0's validation index build, one thread per core; after training both hyperthreads of every core but
-    the first run this rank's validation lookups. From step 1 the main thread has the first core to itself."""
+    the first run this rank's validation lookups, those of its build cores too (the builds are over by then). From step
+    1 the main thread has the first core to itself."""
     cpulist = lambda path: {c for r in open(path).read().split(",") for a, _, b in [r.partition("-")] for c in range(int(a), int(b or a) + 1)}
     allowed = os.sched_getaffinity(0)
     cores = lambda cpus: sorted({frozenset(cpulist(f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list")) & allowed
@@ -50,9 +53,9 @@ def pin_cpus(local_rank: int, world_size: int) -> CpuPlan:
     mine = near[k * len(near) // n:(k + 1) * len(near) // n]
     val_lookup = sorted(set().union(*mine[1:]))
     spare = -(-VAL_BUILD_THREADS // world_size)
-    val_build = [min(c) for c in mine[-spare:]] if len(mine) - spare >= 2 else []
-    mine = mine[:len(mine) - len(val_build)]
-    val_lookup = sorted(set().union(*mine[1:])) or sorted(mine[0])  # not the build cores
+    build = mine[-spare:] if len(mine) - spare >= 2 else []
+    val_build, mine = [min(c) for c in build], mine[:len(mine) - len(build)]
+    val_lookup = (sorted(set().union(*mine[1:])) or sorted(mine[0])) + sorted(set().union(*build))
     os.sched_setaffinity(0, set().union(*mine))
     return CpuPlan(main=set(mine[0]), rest=set().union(*mine[1:]) or set(mine[0]), val_build=val_build, val_lookup=val_lookup)
 
@@ -171,17 +174,38 @@ class ValidationCache:
         if self.rank == 0:
             self.index.release()
 
-    def lookup(self, lower=()):
-        """After training: read this rank's validation chunks and look them up, beside the main thread."""
+    def lookup(self, lower=(), marks=False, then=None):
+        """After training: read this rank's validation chunks and look them up, beside the main thread.
+        marks (SCAN_HINTS_SKIP; the mark of all the scan's contexts): then self.marks, every validation position's mark
+        for the exact-count scan, and then(self.marks) on this thread (the scan's launch: the main thread does not wait
+        for the marks)."""
         def rows():
             tokens = np.concatenate([np.fromfile(self.val_file, "<u2", self.chunk, offset=1024 + 2 * o) for o in self.offsets])
             out = np.zeros((len(tokens), 9), dtype=np.int32)
             self.index.query_into(tokens, self.chunk, out, 0)
+            empty = out[:, 0] == 0 if marks else None
             for source, cache in lower:  # then the 3- and 2-token indexes, into the rows still empty
                 cache.built.result()
                 cache.index.query_into(tokens, self.chunk, out, RET_CELLS * source)
+            if marks:
+                self.marks = self._marks(out[:, 0], empty, lower[0][0], marks)
+                if then is not None:
+                    then(self.marks)
             return np.split(out, len(self.offsets))
         self.looked_up = self.worker.submit(rows)
+
+    def _marks(self, cell, empty, tag3, every=3):
+        """The contexts whose samples the exact-count scan is to take (exact_counts.py), per validation position: bit 1:
+        its 3-token context, bit 0: its 2-token one. A position the 6-token index left `empty` marks its 3-token context,
+        and its 2-token one if it has no 3-token row (tag3: those rows' tag) -- except the context of a row that already
+        holds a large sample: a match at the key's own length (bucket 1) in the top count bin (at least 33 matches),
+        which the position keeps. The longer contexts in `every` (bit 2: the 4-token one), of which the indexes have no
+        rows, are marked at each `empty` position. This rank's positions here; every rank's, in the validation stream's order, returned."""
+        is3, large = cell // RET_CELLS == tag3, cell % RET_CELLS // 6 == 13  # cell = (7 bucket + count bin) 6 + purity bin
+        mine = torch.from_numpy((empty * ((every & ~3) + 2 * ~(is3 & large) + (~is3 & ~large))).astype(np.int8))
+        parts = [torch.empty_like(mine) for _ in range(dist.get_world_size(self.group))]
+        dist.all_gather(parts, mine, group=self.group)
+        return torch.stack(parts).view(len(parts), -1, self.chunk).transpose(0, 1).reshape(-1)  # chunk c is rank c % world's
 
     def rows(self):
         """Wait for the build and the lookup: the rows of each of this rank's validation chunks."""

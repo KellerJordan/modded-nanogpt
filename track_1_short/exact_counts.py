@@ -18,6 +18,18 @@ HB, FILT, FW, DUMMY = 27, (1 << 2) | (1 << 3) | (1 << 4), 21, 1 << 16  # home bu
 _B = tl.constexpr(0x5851F42D4C957F2D)
 _SALT = tl.constexpr(0x1B873593)
 _SIGN = tl.constexpr(-9223372036854775808)
+# SCAN_HINTS (default on; SCAN_HINTS=0: #380's 20-shard validation rows): the scan also takes the corpus's next token wherever a validation position's 2- or 3-token context occurs
+# (at most SCAN_HINT_CAP per context, an equal part on each rank; the 4-token context too, its row in the 3-token rows' cells), and the validation hint rows of those two lengths are
+# built from these samples of all the scanned shards, in place of the 20-shard indexes' rows
+SCAN_HINTS = os.environ.get("SCAN_HINTS", "1") == "1"
+SCAN_HINT_CAP = 96
+# SCAN_HINTS_SKIP (default on): a context whose 20-shard row already holds a large sample (ValidationCache.lookup's marks) keeps
+# that row: the scan takes no samples of it, and none are sent or tallied
+SCAN_HINTS_SKIP = SCAN_HINTS and os.environ.get("SCAN_HINTS_SKIP", "1") == "1"
+SCAN_HINT_KEYS = (4, 3, 2)  # the sampled context lengths; a position's row is its longest context's with a match
+NK = len(SCAN_HINT_KEYS)  # the sampled context lengths: 2 .. NK + 1 (bit length - 2 of a mark)
+SCAN_HINT_MARKS = (1 << NK) - 1  # every context's mark
+ROW_WIDTHS = (2, 8)  # a context counted at most this often over all the ranks is sent and tallied at this width per rank
 
 
 @triton.jit
@@ -53,6 +65,7 @@ def _insert(tab_ptr, key, live, lane, dummy_base, HB: tl.constexpr):
         old = tl.atomic_cas(tab_ptr + p, tl.where(todo, 0, 1).to(tl.int64), key)
         todo = todo & (old != 0) & (old != key)
         s = tl.where(todo, s + 1, s)
+    return tl.where(k0 == key, 2 * b, tl.where(k1 == key, 2 * b + 1, s))  # the key's slot
 
 
 @triton.jit
@@ -74,14 +87,18 @@ def _lookup(tab_ptr, key, live, HB: tl.constexpr):
     return found, widx
 
 
-@triton.jit(do_not_specialize=["q0", "q1", "dummy_base"])
-def _ins_kernel(tok_ptr, tgt_ptr, start_ptr, q0, q1, tab_ptr, dummy_base, filt_ptr, MAXO: tl.constexpr,
-                HB: tl.constexpr, FILT: tl.constexpr, FW: tl.constexpr, BLOCK: tl.constexpr):
-    offs = q0 + (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
+@triton.jit(do_not_specialize=["q0", "q1", "dummy_base", "nv"])
+def _ins_kernel(tok_ptr, tgt_ptr, start_ptr, q0, q1, tab_ptr, dummy_base, filt_ptr, mark_ptr, nv, MAXO: tl.constexpr,
+                HB: tl.constexpr, FILT: tl.constexpr, FW: tl.constexpr, HINTS: tl.constexpr, NK: tl.constexpr, BLOCK: tl.constexpr):
+    offs = q0 + tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
     live = offs < q1
     lane = tl.arange(0, BLOCK).to(tl.int64)
     start = tl.load(start_ptr + offs, mask=live, other=0).to(tl.int64)
     y = tl.load(tgt_ptr + offs, mask=live, other=0).to(tl.int64)
+    if HINTS:  # SCAN_HINTS: the next query (a validation position: its token is this one's target) and its mark
+        nq = live & (offs + 1 < nv)
+        nstart = tl.load(start_ptr + offs + 1, mask=nq, other=0).to(tl.int64)
+        nmark = tl.load(mark_ptr + offs + 1, mask=nq, other=0).to(tl.int64)
     h = tl.zeros([BLOCK], dtype=tl.int64)
     pw = tl.full([BLOCK], 1, dtype=tl.int64)
     for m in tl.static_range(1, MAXO + 1):
@@ -90,15 +107,21 @@ def _ins_kernel(tok_ptr, tgt_ptr, start_ptr, q0, q1, tab_ptr, dummy_base, filt_p
         h = h + (t + 1) * pw
         pw = pw * _B
         key = _fmix(h * _B + (y + 1) + (m + 1) * _SALT)
-        _insert(tab_ptr, key, ok, lane, dummy_base, HB)
+        slot = _insert(tab_ptr, key, ok, lane, dummy_base, HB)
+        if HINTS and m <= NK:
+            # this gram is the next query's (m + 1)-token context: if that query marks it (bit m - 1), the high half of
+            # the slot's count word takes nv - the first such query (the same on every rank; 0: no query marks it)
+            tl.atomic_max(tab_ptr + 2 * slot, (nv - (offs + 1)) << 32,
+                          mask=ok & nq & (((nmark >> (m - 1)) & 1) != 0) & (offs + 1 - m >= nstart), sem="relaxed")
         if (FILT >> (m + 1)) & 1:
             tl.atomic_or(filt_ptr + ((key >> 20) & ((1 << FW) - 1)), _need(key, BLOCK), mask=ok, sem="relaxed")
 
 
-@triton.jit(do_not_specialize=["n"])
-def _scan_kernel(corpus_ptr, n, tab_ptr, filt_ptr, MAXLEN: tl.constexpr, HB: tl.constexpr,
-                 FILT: tl.constexpr, FW: tl.constexpr, BLOCK: tl.constexpr):
-    offs = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
+@triton.jit(do_not_specialize=["n", "nv"])
+def _scan_kernel(corpus_ptr, n, tab_ptr, filt_ptr, buf_ptr, nv, CAP: tl.constexpr, NK: tl.constexpr, MAXLEN: tl.constexpr,
+                 HB: tl.constexpr, FILT: tl.constexpr, FW: tl.constexpr, BLOCK: tl.constexpr):
+    # int64 positions: a rank's corpus share can be over 2^31 tokens
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
     alive = offs < n
     h = tl.zeros([BLOCK], dtype=tl.int64)
     pw = tl.full([BLOCK], 1, dtype=tl.int64)
@@ -114,14 +137,21 @@ def _scan_kernel(corpus_ptr, n, tab_ptr, filt_ptr, MAXLEN: tl.constexpr, HB: tl.
                 need = _need(key, BLOCK)
                 alive = alive & ((wv & need) == need)
             found, widx = _lookup(tab_ptr, key, alive, HB)
-            tl.atomic_add(tab_ptr + widx, 1, mask=found, sem="relaxed")
+            old = tl.atomic_add(tab_ptr + widx, 1, mask=found, sem="relaxed")
+            if CAP and L <= NK + 1:
+                # a marked context's first CAP occurrences: the count word before the add holds the sample's index (low
+                # half) and the context's sample row (high half: nv - its first query; 0: not marked); the sample, the
+                # corpus's next token, is read only then
+                seen, mine = old & 0xFFFFFFFF, old >> 32
+                put = found & (offs + 1 < n) & (mine > 0) & (seen < CAP)
+                tl.store(buf_ptr + (NK * (nv - mine) + (L - 2)) * CAP + seen, tl.load(corpus_ptr + offs + 1, mask=put, other=0), mask=put)
             alive = found
 
 
-@triton.jit(do_not_specialize=["n"])
-def _find_kernel(tok_ptr, tgt_ptr, start_ptr, n, tab_ptr, out_ptr, MAXO: tl.constexpr, HB: tl.constexpr,
-                 BLOCK: tl.constexpr):
-    offs = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
+@triton.jit(do_not_specialize=["n", "nv"])
+def _find_kernel(tok_ptr, tgt_ptr, start_ptr, n, tab_ptr, out_ptr, ctx_ptr, nv, MAXO: tl.constexpr, HB: tl.constexpr,
+                 HINTS: tl.constexpr, NK: tl.constexpr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
     live = offs < n
     start = tl.load(start_ptr + offs, mask=live, other=0).to(tl.int64)
     y = tl.load(tgt_ptr + offs, mask=live, other=0).to(tl.int64)
@@ -134,9 +164,44 @@ def _find_kernel(tok_ptr, tgt_ptr, start_ptr, n, tab_ptr, out_ptr, MAXO: tl.cons
         pw = pw * _B
         if m >= 2:  # the context's count (column m - 2), then the context and target's (column MAXO + m - 3)
             found, widx = _lookup(tab_ptr, _fmix(h + m * _SALT), ok, HB)
-            tl.store(out_ptr + offs * (2 * MAXO - 2) + (m - 2), tl.load(tab_ptr + widx, mask=found, other=0).to(tl.int32), mask=live)
+            word = tl.load(tab_ptr + widx, mask=found, other=0)  # the count in its low half
+            tl.store(out_ptr + offs * (2 * MAXO - 2) + (m - 2), word.to(tl.int32), mask=live)
+            if HINTS and m <= NK + 1:  # SCAN_HINTS, a validation position: its context's sample row (-1: not marked, or no such context)
+                tl.store(ctx_ptr + offs * NK + (m - 2), tl.where(word >> 32 > 0, NK * (nv - (word >> 32)) + (m - 2), -1).to(tl.int32),
+                         mask=offs < nv)
             found, widx = _lookup(tab_ptr, _fmix(h * _B + (y + 1) + (m + 1) * _SALT), ok, HB)
             tl.store(out_ptr + offs * (2 * MAXO - 2) + (MAXO + m - 3), tl.load(tab_ptr + widx, mask=found, other=0).to(tl.int32), mask=live)
+
+
+@triton.jit(do_not_specialize=["base", "stride"])
+def _row_kernel(s_ptr, base, stride, out_ptr, WORLD: tl.constexpr, W: tl.constexpr, W1: tl.constexpr, W2: tl.constexpr):
+    # one context per program: its samples (0xFFFF: unused), W from each of WORLD ranks (rank r's at base + r * stride +
+    # W * the context) -> its row as the index's row() makes it at the key's own length: the cell, the top 8 tokens by
+    # count (ties: lower token). The WORLD * W samples are tallied in two parts of W1 and (up to) W2, powers of 2 (64 +
+    # 32 at 96, not one block of 128), each against itself and the other
+    c = tl.program_id(0).to(tl.int64)
+    i, j = tl.arange(0, W1), W1 + tl.arange(0, W2)
+    a = tl.load(s_ptr + base + (i // W) * stride + c * W + i % W).to(tl.int32) & 0xFFFF
+    b = tl.load(s_ptr + base + (j // W) * stride + c * W + j % W, mask=j < WORLD * W, other=-1).to(tl.int32) & 0xFFFF
+    ab = (a[:, None] == b[None, :]).to(tl.int32)
+    cnt_a = tl.sum((a[:, None] == a[None, :]).to(tl.int32), axis=1) + tl.sum(ab, axis=1)
+    cnt_b = tl.sum((b[:, None] == b[None, :]).to(tl.int32), axis=1) + tl.sum(ab, axis=0)
+    key_a = tl.where(a != 0xFFFF, cnt_a * 65536 + (65535 - a), -1)  # a token's samples all have its key
+    key_b = tl.where(b != 0xFFFF, cnt_b * 65536 + (65535 - b), -1)
+    total = tl.sum((a != 0xFFFF).to(tl.int32), axis=0) + tl.sum((b != 0xFFFF).to(tl.int32), axis=0)
+    top = tl.maximum(tl.max(key_a, axis=0), tl.max(key_b, axis=0))
+    purity = (top >> 16).to(tl.float64) / tl.maximum(total, 1).to(tl.float64)
+    count_bin = ((total >= 2).to(tl.int32) + (total >= 3).to(tl.int32) + (total >= 5).to(tl.int32) + (total >= 9).to(tl.int32)
+                 + (total >= 17).to(tl.int32) + (total >= 33).to(tl.int32))
+    f64 = tl.zeros([1], dtype=tl.float64)  # the bin edges as float64 (as the index compares them)
+    purity_bin = tl.sum((purity >= f64 + 0.3).to(tl.int32) + (purity >= f64 + 0.5).to(tl.int32) + (purity >= f64 + 0.7).to(tl.int32)
+                        + (purity >= f64 + 0.85).to(tl.int32) + (purity >= f64 + 0.95).to(tl.int32), axis=0)
+    tl.store(out_ptr + c * 9, tl.where(total > 0, (7 + count_bin) * 6 + purity_bin, 0))
+    for i in tl.static_range(8):  # the largest key left; all its copies go at once
+        m = tl.maximum(tl.max(key_a, axis=0), tl.max(key_b, axis=0))
+        tl.store(out_ptr + c * 9 + 1 + i, tl.where(m >= 0, (65535 - (m & 0xFFFF)) | ((m >> 16) << 16), 0))
+        key_a = tl.where(key_a == m, -1, key_a)
+        key_b = tl.where(key_b == m, -1, key_b)
 
 
 def segment_starts(tokens, chunk_starts):  # per position the first index its context may reach (a blocked cummax)
@@ -148,7 +213,7 @@ def segment_starts(tokens, chunk_starts):  # per position the first index its co
 
 
 class ExactCounts:  # one rank's corpus share on its GPU and the query table (buckets of two [count, key] slots)
-    def __init__(self, train_files, exclude, rank, world, device, q_chunk, pinned=False):  # q_chunk: each query's segment start
+    def __init__(self, train_files, exclude, rank, world, device, q_chunk, pinned=False, n_val=0):  # q_chunk: each query's segment start
         self.device, self.files = device, sorted(train_files)[exclude:][rank::world]
         self.n = sum((os.path.getsize(f) - 1024) // 2 for f in self.files)
         self.bufs = [torch.empty(max((os.path.getsize(f) - 1024) // 2 for f in self.files), dtype=torch.int16, pin_memory=True)
@@ -158,8 +223,27 @@ class ExactCounts:  # one rank's corpus share on its GPU and the query table (bu
         self.filt = torch.zeros(1 << FW, dtype=torch.int64, device=device)
         self.q_chunk, (self.q_tok, self.q_tgt) = q_chunk, torch.zeros(2, len(q_chunk), dtype=torch.int32, device=device)
         self.out, self.loaded = torch.zeros(len(q_chunk), 2 * MAX_ORDER - 2, dtype=torch.int32, device=device), threading.Event()
-        tok = torch.randint(0, 50000, (4096,), device=device, dtype=torch.int32)  # compile the kernels
-        self._count(tok, tok, segment_starts(tok, torch.zeros_like(tok)), torch.zeros_like(self.out[:4096]), min(self.n, 4096))
+        self.queries = threading.Event()  # set once q_tok / q_tgt hold the queries (launch_marked waits for it)
+        # SCAN_HINTS (n_val: the first n_val queries are the validation positions). A context's id is the first query
+        # that marks it, kept in the table slot's count word (the high half; the counts are below 2^32). Per context this
+        # rank's cap samples (row NK * id + length - 2); per validation position its NK contexts' sample rows and its mark:
+        # the contexts it has sampled (bit 0: the 2-token one, bit 1: the 3-token one, bit 2: the
+        # 4-token one; all, unless SCAN_HINTS_SKIP sets the marks before the count)
+        self.nv, self.cap, self.rank = n_val, SCAN_HINT_CAP // world if n_val else 0, rank
+        if n_val:
+            self.marks = torch.full((n_val,), SCAN_HINT_MARKS, dtype=torch.int8, device=device)
+            assert NK * n_val <= 1 << 25  # hint_rows packs a sample row and its width's index in an int32
+            self.buf = torch.full((NK * n_val, self.cap), -1, dtype=torch.int16, device=device)
+            self.ctx = torch.zeros(n_val, NK, dtype=torch.int32, device=device)
+        # compile the kernels: the scan as launch() calls it, with the share's own length (an int64 argument above 2^31 tokens,
+        # which is another kernel), over its first blocks only
+        tok = torch.randint(0, 50000, (4096,), device=device, dtype=torch.int32)
+        self._count(tok, tok, segment_starts(tok, torch.zeros_like(tok)), torch.zeros_like(self.out[:4096]), self.n, blocks=16)
+        if n_val:  # as new again: no sample is taken; and the row kernel at each width
+            self.buf.fill_(-1)
+            self.widths = [w for w in ROW_WIDTHS if w < self.cap] + [self.cap]
+            for w in self.widths:
+                self._rows(torch.full((world * w,), -1, dtype=torch.int16, device=device), 0, w, torch.empty(1, 9, dtype=torch.int32, device=device), world, w)
         torch.cuda.synchronize(device)
 
     def load_corpus(self):  # a thread: this rank's corpus share into GPU memory, on a side stream
@@ -184,21 +268,87 @@ class ExactCounts:  # one rank's corpus share on its GPU and the query table (bu
             self.loaded.set()
         threading.Thread(target=run, daemon=True).start()
 
-    def _count(self, tok, tgt, start, out, n_corpus):  # the query table, the scan of the corpus share, the lookups
+    def _count(self, tok, tgt, start, out, n_corpus, blocks=None):  # the query table, the scan of the corpus share, the lookups
         n = tok.numel()
         self.tab.zero_()
         self.filt.zero_()
+        nv, marks, buf, ctx = (min(self.nv, n), self.marks, self.buf, self.ctx) if self.nv else (0, tok, tok, tok)  # not SCAN_HINTS: unused
         for q0, q1 in ((0, -(-n // 2)), (-(-n // 2), n)):
             _ins_kernel[(max(1, triton.cdiv(q1 - q0, 256)),)](tok, tgt, start, q0, q1, self.tab, self.tab.numel() - DUMMY,
-                                                              self.filt, MAXO=MAX_ORDER, HB=HB, FILT=FILT, FW=FW, BLOCK=256)
-        _scan_kernel[(triton.cdiv(n_corpus, 256),)](self.corpus, n_corpus, self.tab, self.filt, MAXLEN=MAX_ORDER + 1, HB=HB,
-                                                    FILT=FILT, FW=FW, BLOCK=256)
-        _find_kernel[(triton.cdiv(n, 256),)](tok, tgt, start, n, self.tab, out, MAXO=MAX_ORDER, HB=HB, BLOCK=256)
+                                                              self.filt, marks, nv, MAXO=MAX_ORDER, HB=HB, FILT=FILT, FW=FW,
+                                                              HINTS=nv > 0, NK=NK, BLOCK=256)
+        grid = (min(blocks or n_corpus, triton.cdiv(n_corpus, 256)),)
+        _scan_kernel[grid](self.corpus, n_corpus, self.tab, self.filt, buf, nv, CAP=self.cap, NK=NK, MAXLEN=MAX_ORDER + 1, HB=HB,
+                           FILT=FILT, FW=FW, BLOCK=256)
+        _find_kernel[(triton.cdiv(n, 256),)](tok, tgt, start, n, self.tab, out, ctx, nv, MAXO=MAX_ORDER, HB=HB, HINTS=nv > 0,
+                                             NK=NK, BLOCK=256)
 
     @torch.no_grad()
     def launch(self):  # after training, the queries in q_tok / q_tgt: this rank's counts into self.out
         self.loaded.wait()
         self._count(self.q_tok, self.q_tgt, segment_starts(self.q_tok, self.q_chunk), self.out, self.n)
+
+    def launch_marked(self, marks):  # SCAN_HINTS_SKIP, on the thread that looked the marks up: the launch, once the queries are in
+        self.queries.wait()
+        torch.cuda.set_device(self.device)
+        self.marks.copy_(marks)
+        self.launch()
+
+    @staticmethod
+    def _rows(samples, base, stride, rows, world, w):  # rows.shape[0] contexts' rows from each rank's w samples of them
+        w1 = 1 << (world * w - 1).bit_length() - 1  # the largest power of 2 below world * w
+        _row_kernel[(rows.shape[0],)](samples, base, stride, rows, WORLD=world, W=w, W1=w1, W2=1 << (world * w - w1 - 1).bit_length())
+
+    @torch.no_grad()
+    def hint_rows(self, own, want, tags):
+        """SCAN_HINTS, after the counts' all-reduce: the hint rows of this rank's validation positions `own` from the
+        contexts they `want` (bits as the marks; a position with a longer match wants none), zeros where there is none:
+        the row of the longest context that is wanted and has a match (3-token, else 2-token; the
+        4-token one first); cells offset by tags = (the 2-token rows' tag, the 3-token rows', which the 4-token rows
+        take too). Each distinct context's row is built once, from
+        every rank's samples of it: the ranks tell each other the sample rows they need, and each sends every other its
+        samples of them -- only its first 2 or 8 where the context's count over all the ranks is no more than that (no
+        rank has more samples of it), and those rows are tallied at that width."""
+        world, dev = dist.get_world_size(), self.device
+        widths = self.widths
+        ctx, cnt = self.ctx[own], self.out[own, :NK]
+        has = ((want[:, None] >> torch.arange(NK, device=dev)) & 1 > 0) & (cnt > 0) & (ctx >= 0)
+        k = torch.where(has[:, 1], 1, torch.where(has[:, 0], 0, -1))  # the row's context: 1: 3-token, 0: 2-token, -1: no row
+        if NK == 3:
+            k = torch.where(has[:, 2], 2, k)  # 2: 4-token
+        row, n_all = (x.gather(1, k.clamp_min(0)[:, None])[:, 0] for x in (ctx, cnt))
+        tier = sum((n_all > w).int() for w in widths[:-1])  # by the context's count: the index of the width its samples fit
+        need, inv = torch.unique(torch.where(k >= 0, row | (tier << 25), 0), return_inverse=True)  # the tiers in turn
+        mine = torch.stack([(need >> 25 == i).sum() for i in range(len(widths))])
+        sizes = torch.zeros(world, len(widths), dtype=torch.int64, device=dev)
+        wanted = torch.zeros(world, len(own), dtype=torch.int32, device=dev)
+        dist.all_gather_into_tensor(sizes.view(-1), mine)
+        dist.all_gather_into_tensor(wanted.view(-1), torch.cat([need, need.new_zeros(len(own) - len(need))]))
+        sizes = sizes.tolist()
+        # the samples travel as bytes (NCCL has no int16): to each rank its tiers in turn, each [contexts, width], the
+        # message padded to whole pages (one whose size is not a multiple of 16 bytes took NCCL 5 times as long)
+        send, cuts, flat = [], [], self.buf.view(-1)
+        for r in range(world):
+            a = 0
+            for n, w in zip(sizes[r], widths):
+                at = (wanted[r, a:a + n] & 0x1FFFFFF).long() * self.buf.shape[1]
+                send.append(flat[at[:, None] + torch.arange(w, device=dev)].view(-1))
+                a += n
+            cuts.append(2 * sum(n * w for n, w in zip(sizes[r], widths)))
+            send.append(flat.new_zeros(-cuts[-1] % 4096 // 2))
+            cuts[-1] += -cuts[-1] % 4096
+        got = torch.empty(world * cuts[self.rank], dtype=torch.uint8, device=dev)
+        dist.all_to_all_single(got, torch.cat(send).view(torch.uint8), [cuts[self.rank]] * world, cuts)
+        torch.cuda.synchronize(dev)
+        rows, a, base = torch.empty(len(need), 9, dtype=torch.int32, device=dev), 0, 0
+        for n, w in zip(sizes[self.rank], widths):  # rank r's samples of this tier at base + r * its whole message
+            if n:
+                self._rows(got.view(torch.int16), base, cuts[self.rank] // 2, rows[a:a + n], world, w)
+            a, base = a + n, base + n * w
+        rows = rows[inv] * (k >= 0)[:, None]
+        rows[:, 0] += torch.tensor(tags, dtype=torch.int32, device=dev)[k.clamp(0, 1)] * (rows[:, 0] > 0)
+        torch.cuda.synchronize(dev)
+        return rows
 
 
 def context_counts(out, offs):  # N, C at query positions offs (the kernel leaves 0 where the context leaves the segment)
@@ -233,7 +383,7 @@ def gate_L(h, G, theta, W, b, n_groups):  # the weights from the hidden state, s
 @triton.jit(do_not_specialize=["n", "K"])
 def _gate_chain_kernel(L_ptr, q_ptr, p_ptr, dL_ptr, n, inv_n, K, BLOCK: tl.constexpr):
     # d(-inv_n * log P) / dL_j per row, each P_{j-1} recomputed from p (a scratch store read back raced on the GPU)
-    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    rows = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
     ok = rows < n
     p0 = tl.load(p_ptr + rows, mask=ok, other=1.0)
     P = p0

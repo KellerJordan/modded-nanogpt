@@ -581,7 +581,7 @@ class GPT(nn.Module):
         ngram_sink (training only) is NgramTable.grad_sink: the table rows' gradient lands on it.
         value_embed_grad (training only) is the persistent fp16 buffer value_embeds' gradient accumulates
         into (perf/value_embed_pull.py); value_embeds itself never gets a .grad.
-        ret: [T, 3] int32 exact-match retrieval rows (track_1_short/retrieval.py), added to the residual
+        ret: [T, 1 + k] int32 (k candidates: 2 in training, VAL_TOPK at validation) exact-match retrieval rows (track_1_short/retrieval.py), added to the residual
         stream at the input, at layer 7 and before the output head; None (hellaswag) adds nothing.
 
         Layer topology (11 layers, 0-indexed):
@@ -638,7 +638,7 @@ class GPT(nn.Module):
             cell, tokens, counts = ret[:, 0].long(), ret[:, 1:] & 0xFFFF, ret[:, 1:] >> 16
             k = (counts > 0).sum(1, keepdim=True)
             weights = (counts * k).float() / counts.sum(1, keepdim=True).clamp_min(1).float()
-            mean = sum(self.embed.weight.detach()[tokens[:, i]].float() * weights[:, i, None] for i in range(2)) / k.clamp_min(1)
+            mean = sum(self.embed.weight.detach()[tokens[:, i]].float() * weights[:, i, None] for i in range(tokens.shape[1])) / k.clamp_min(1)
             ret = ((mean * self.ret_next_scale[cell, None] + self.ret_bucket_embed[cell]) * (cell > 0)[:, None]).bfloat16()
             x = x + self.ret_site_scale_in.type_as(x) * ret
 

@@ -45,7 +45,7 @@ from track_1_short.config import (
 from track_1_short.data import HEADER_BYTES, ScheduledBatches, cu_seqlens_rows, distributed_data_generator, read_val_prefix
 from track_1_short.distributed import setup_distributed
 from track_1_short.doc_cache import NBINS as DOC_BINS, ORDERS as DOC_ORDERS, DocChain
-from track_1_short.exact_counts import NBINS, ORDERS, ChainFit, ExactCounts, chain_prob, components, context_counts, gate_L
+from track_1_short.exact_counts import NBINS, ORDERS, SCAN_HINT_MARKS, SCAN_HINTS, SCAN_HINTS_SKIP, ChainFit, ExactCounts, chain_prob, components, context_counts, gate_L
 from track_1_short.model.gpt import ATTN_BANK_ORDER, FP8_EXACT_SCALE_CALLS, GPT
 from track_1_short.model.prefix_prediction import build_prefix_table_bucket
 from track_1_short.ngram_table import (
@@ -65,7 +65,7 @@ from track_1_short.perf.kernels.mlp import prime_stage_cache
 from track_1_short.perf.pinned_batches import PinnedBatchStaging
 from track_1_short.perf.row_prefetch import PrefetchStaging, RowPrefetch
 from track_1_short.perf.value_embed_pull import ValueEmbedPull
-from track_1_short.retrieval import LARGE_HOST, RET_CELLS, FitRows, OnlineCache, ValidationCache, mix_q, pin_cpus, pin_threads, rows_part
+from track_1_short.retrieval import LARGE_HOST, RET_CELLS, VAL_WIDTH, FitRows, OnlineCache, ValidationCache, mix_q, pin_cpus, pin_threads, rows_part
 from track_1_short.sampled_softmax import SampledSoftmax
 from track_1_short.schedule import TrainingSchedule
 from track_1_short.tail_average import TailAverages
@@ -243,7 +243,11 @@ def main():
     F = sum(training_schedule.lookup(s)[0].batch_size // env.world_size for s in fit_steps)
     V, S, i = args.val_tokens, F // len(fit_steps), torch.arange(args.val_tokens + env.world_size * F, device=env.device)
     q_chunk = torch.where(i < V, i // val_cache.chunk * val_cache.chunk, V + (i - V) // S * S)  # query segments: chunks, fit steps
-    exact = ExactCounts(glob.glob(args.train_files), exclude, env.rank, env.world_size, env.device, q_chunk, pinned=LARGE_HOST)
+    exact = ExactCounts(glob.glob(args.train_files), exclude, env.rank, env.world_size, env.device, q_chunk, pinned=LARGE_HOST,
+                        n_val=V if SCAN_HINTS else 0)
+    if SCAN_HINTS:  # this rank's validation positions and the 2- and 3-token rows' cell tags (as online_cache.lower's)
+        own_val = torch.cat([torch.arange(o, o + val_cache.chunk, device=env.device) for o in val_cache.offsets])
+        hint_tags = (RET_CELLS * 3, RET_CELLS * 2)
     K, groups = len(ORDERS), len(ORDERS) * NBINS
     # the hint rows, one link after the corpus orders
     K, groups = K + 1, groups + 4 * RET_CELLS
@@ -299,6 +303,8 @@ def main():
                    online_cache, step, uncompiled_model.lm_head_f8_col, prefetch_next=False)
     # and the counts' all-reduce, which NCCL sets up on its first call
     dist.all_reduce(exact.out)  # the counts are still all zeros
+    if SCAN_HINTS:  # and the samples' exchange and the row kernel (nothing was counted: one empty row)
+        exact.hint_rows(own_val, exact.marks[own_val], hint_tags)
     print0("Resetting Model", console=True)
     deferred_gathers.flush_final()  # the reset below requantizes from the restored weights
     warmup_prefetch.close()
@@ -398,7 +404,8 @@ def main():
             # into them.
             if last_step:
                 # the post-training work reordered: the validation rows' lookups and the prefix read first
-                val_cache.lookup(online_cache.lower)
+                val_cache.lookup(() if SCAN_HINTS and not SCAN_HINTS_SKIP else online_cache.lower, marks=SCAN_HINTS_SKIP * SCAN_HINT_MARKS,
+                                 then=exact.launch_marked if SCAN_HINTS_SKIP else None)
                 read_val_prefix(args.val_files, val_slot)
                 # the queries (validation stream, all ranks' fit steps) counted first, under the rest
                 vt = val_slot[:V + 1].view(torch.int16).to(env.device, non_blocking=True).to(torch.int32) & 0xFFFF
@@ -407,8 +414,11 @@ def main():
                 exact.q_tok[:V], exact.q_tgt[:V] = vt[:V], vt[1:]
                 dist.all_gather_into_tensor(exact.q_tok[V:], f_tok)
                 dist.all_gather_into_tensor(exact.q_tgt[V:], f_tgt)
-                launched = exact.loaded.is_set()  # the host work first while the corpus still loads
-                if launched:
+                exact.queries.set()
+                # the host work first while the corpus still loads; SCAN_HINTS_SKIP: the lookup thread launches the
+                # count when it has the scan's marks, under the host work
+                launched = SCAN_HINTS_SKIP or exact.loaded.is_set()
+                if launched and not SCAN_HINTS_SKIP:
                     exact.launch()
                 # The final fp8 refresh is skipped, not moved off the clock: its one consumer is a
                 # training forward, and the run ends after this validation.
@@ -443,6 +453,8 @@ def main():
             # value_embeds whole. It comes after the steps that read the GPU back (the pulls).
             tail_averages.ship()
             # training positions only: the counts summed over the ranks, the chain's weights
+            if SCAN_HINTS_SKIP:
+                val_cache.looked_up.result()  # the lookup thread has launched the count
             dist.all_reduce(exact.out)
             f_rows = rows_part(fit_rows.cell[:fit_rows.n], fit_rows.q[:fit_rows.n])
             fQ, fG, _ = components(*context_counts(exact.out, V + env.rank * F + torch.arange(F, device=env.device)),
@@ -451,6 +463,11 @@ def main():
             gate = chain.gate(f_h[0], f_p, fQ, fG, exact_lam)  # the hidden-state gate
             exact_val = [context_counts(exact.out, torch.arange(o, o + val_cache.chunk, device=env.device)) for o in val_cache.offsets]
             val_rows = val_cache.rows()
+            if SCAN_HINTS:  # the scan's (4-/) 3-/2-token rows where the 6-token index left the row empty (SCAN_HINTS_SKIP: marked)
+                looked_up = torch.cat([torch.as_tensor(r, device=env.device) for r in val_rows])
+                scan_want = exact.marks[own_val] if SCAN_HINTS_SKIP else SCAN_HINT_MARKS * (looked_up[:, 0] == 0).to(torch.int8)
+                rows = exact.hint_rows(own_val, scan_want, hint_tags)
+                val_rows = torch.where(rows[:, :1] > 0, rows, looked_up).split(val_cache.chunk)
             # every rank enters this only with its own preparation done
             dist.all_reduce(post_flag)
             # stop the clock
@@ -462,7 +479,7 @@ def main():
                 for i, (batch, pull, rows) in enumerate(zip(val_batches, val_pulls, val_rows)):
                     ngram_table.land(pull)
                     loss = model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
-                                 training_manager.get_forward_args(), ret=torch.as_tensor(rows[:, :3], device=env.device))
+                                 training_manager.get_forward_args(), ret=torch.as_tensor(rows[:, :VAL_WIDTH], device=env.device).contiguous())
                     # the chain: the hint rows' link (q, the target's share of the row's counts), the corpus and document links
                     r = torch.as_tensor(rows, device=env.device)
                     link = rows_part(r[:, 0].long(), mix_q(r, batch.targets))
