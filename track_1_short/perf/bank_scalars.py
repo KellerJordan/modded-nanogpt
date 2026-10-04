@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-BANK_SCALAR_SLOTS = 8
+BANK_SCALAR_SLOTS = 16
 # The 0-D per-bank scalars, in their order in a bank's part of the buffer.
 BANK_SCALAR_FIELDS = ("momentum", "eff_wd", "fast_beta", "fast_weight")
 

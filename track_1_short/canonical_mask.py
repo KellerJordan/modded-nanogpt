@@ -120,13 +120,21 @@ def build_canonical_mask(vocab_size: int, ranks: dict | None = None) -> np.ndarr
             pass  # ends mid-character, so it cannot end in a contraction
 
     mask = np.zeros((vocab_size, vocab_size), dtype=bool)
+    # the same mask with the pieces' intervals as arrays and each block's cells set in one scatter
+    arrays = lambda idx: {k: tuple(np.array(c, dtype=np.int64) for c in zip(*v)) for k, v in idx.items()}
+    last_arr, first_arr, empty = arrays(by_last), arrays(by_first), (np.zeros(0, np.int64),) * 3
+    flat_mask = mask.reshape(-1)
     for rank, (a, b) in rules.items():
-        ps = np.array([p for s, e, p in by_last.get(a, ()) if s <= rank < e], dtype=np.intp)
+        s, e, ps = last_arr.get(a, empty)
+        ps = ps[(s <= rank) & (rank < e)]
         ps = ps[~closed[ps]]
-        xs = np.array([x for s, e, x in by_first.get(b, ()) if s <= rank < e], dtype=np.intp)
-        if len(ps) and len(xs):
-            mask[np.ix_(ps, xs)] |= _SEAM_OK[np.ix_(end_cls[ps], start_cls[xs])]
-
+        if not len(ps):
+            continue
+        s, e, xs = first_arr.get(b, empty)
+        xs = xs[(s <= rank) & (rank < e)]
+        if len(xs):
+            ok = _SEAM_OK[end_cls[ps][:, None], start_cls[xs][None, :]]
+            flat_mask[(ps[:, None] * vocab_size + xs[None, :])[ok]] = True
     return np.packbits(mask, axis=1, bitorder="little")
 
 class BackgroundCanonicalMask:
@@ -181,7 +189,7 @@ class BackgroundCanonicalMask:
                 os.kill(self.pid, signal.SIGKILL)
                 reaped = os.waitpid(self.pid, 0)
                 break
-            time.sleep(0.05)
+            time.sleep(0.001)
         self.pid = None
         if reaped[1]:
             self.print0(f"WARNING: background canonical mask build failed ({reaped[1]}), building it inline", console=True)

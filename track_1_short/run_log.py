@@ -13,12 +13,13 @@ LOG_BUFFER_BYTES = 1 << 20
 
 
 def read_source(entry_script: str) -> str:
-    """Concatenate the entry script and every module of this package, for the run log.
+    """Concatenate the entry script, every module of this package and the exact_match extension's Rust
+    source, for the run log.
 
     Called first thing at startup so the log holds the code as it was at launch.
     """
-    files = [Path(entry_script)] + sorted(PACKAGE_DIR.rglob("*.py"))
     root = Path(entry_script).resolve().parent
+    files = [Path(entry_script)] + sorted(PACKAGE_DIR.rglob("*.py")) + sorted((root / "exact_match" / "src").glob("*.rs"))
     chunks = []
     for path in files:
         text = path.read_text()

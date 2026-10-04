@@ -17,7 +17,7 @@ all_to_all hides under the backward exactly as it does without graphs.
 
 What must stay address-stable (a replay reads and writes the addresses the capture saw):
   - the per-key static inputs this module owns: inputs, targets, cu_seqlens, n-gram cache slots, the
-    MTP and prefix weights; each step copies its batch into them before the forward replay
+    MTP and prefix weights, the retrieval rows; each step copies its batch into them before the forward replay
   - every parameter's .data, every model buffer (fp8 caches and scales, YaRN tables, the n-gram row cache,
     the prefix table), the n-gram gradient sink leaves (NgramTable.grad_sink), value_embeds' gradient
     buffer (ValueEmbedPull.grad_accum), the sampled-softmax candidate buffers (SampledSoftmax.loss_inputs)
@@ -67,14 +67,16 @@ class StaticInputs:
     ngram_slots: Tensor
     mtp_weights: Tensor
     prefix_weight: Tensor
+    ret: Tensor
 
     def buffers(self):
-        return (self.inputs, self.targets, self.cum_seqlens, self.ngram_slots, self.mtp_weights, self.prefix_weight)
+        return (self.inputs, self.targets, self.cum_seqlens, self.ngram_slots, self.mtp_weights, self.prefix_weight,
+                self.ret)
 
 
-def step_inputs(batch: Batch, ngram_slots: Tensor, cfg: ForwardScheduleConfig):
+def step_inputs(batch: Batch, ngram_slots: Tensor, cfg: ForwardScheduleConfig, ret: Tensor):
     """This step's tensors, in StaticInputs order."""
-    return (batch.inputs, batch.targets, batch.cum_seqlens, ngram_slots, cfg.mtp_weights, cfg.prefix_weight)
+    return (batch.inputs, batch.targets, batch.cum_seqlens, ngram_slots, cfg.mtp_weights, cfg.prefix_weight, ret)
 
 
 @dataclass(slots=True)
@@ -87,6 +89,7 @@ class CapturedStep:
     forward: torch.cuda.CUDAGraph
     backward: torch.cuda.CUDAGraph
     loss: Tensor                        # forward output (pool memory)
+    tok_loss: Tensor                    # its per-token loss (the chain's fit reads it)
     anvil_grads: list[tuple[nn.Parameter, Tensor]]
     adam_grads: list[tuple[nn.Parameter, Tensor, Tensor]]  # (param, graph output, persistent accumulator)
     ngram_grad: Tensor                  # backward output: the sink's gradient [2T, NGRAM_DIM]
@@ -139,13 +142,13 @@ class StepGraphs:
         the warm iterations and the self-check all run)."""
         s = cs.static
         return self.model(s.inputs, s.targets, s.cum_seqlens, s.ngram_slots, cs.cfg, ngram_sink=cs.ngram_sink,
-                          value_embed_grad=self.value_embeds.grad_accum).sum()
+                          value_embed_grad=self.value_embeds.grad_accum, ret=s.ret)
 
     # ---- per step ----
 
-    def forward(self, step: int, batch: Batch, ngram_slots: Tensor, cfg: ForwardScheduleConfig):
-        """Copy this step's batch into its key's buffers and replay the forward (capturing it first on
-        the key's first warmup visit)."""
+    def forward(self, step: int, batch: Batch, ngram_slots: Tensor, cfg: ForwardScheduleConfig, ret: Tensor):
+        """Copy this step's batch and retrieval rows into its key's buffers and replay the forward (capturing
+        it first on the key's first warmup visit)."""
         key = live_key(batch, cfg)
         # The replay cannot re-run dynamo's guards: the live shapes and specialized values must be the
         # ones the schedule says, which is what the capture plan made sure warmup captured.
@@ -155,13 +158,13 @@ class StepGraphs:
         if fresh:
             # Captures are warmup-only: after seal() a missing graph is fatal, never a silent eager step.
             assert not self.sealed, f"step {step}: no graph for {key}"
-            cs = self._capture(key, batch, ngram_slots, cfg)
+            cs = self._capture(key, batch, ngram_slots, cfg, ret)
         # The attention scale is a Python float the compiled forward baked; it follows the window
         # schedule, so it must still be the captured one.
         assert self._attn_scales() == cs.attn_scales, f"step {step}: YaRN attention scale moved"
         # The candidate buffers of one P are allocated once, so the same object means the same addresses.
         assert cfg.sampled_loss is cs.cfg.sampled_loss
-        for dst, src in zip(cs.static.buffers(), step_inputs(batch, ngram_slots, cfg)):
+        for dst, src in zip(cs.static.buffers(), step_inputs(batch, ngram_slots, cfg, ret)):
             dst.copy_(src)
         cs.forward.replay()
         if not fresh and key in self.unchecked:
@@ -198,13 +201,14 @@ class StepGraphs:
 
     # ---- capture and checks (warmup only) ----
 
-    def _capture(self, key: StepGraphKey, batch: Batch, ngram_slots: Tensor, cfg: ForwardScheduleConfig) -> CapturedStep:
-        static = StaticInputs(*(t.clone() for t in step_inputs(batch, ngram_slots, cfg)))
+    def _capture(self, key: StepGraphKey, batch: Batch, ngram_slots: Tensor, cfg: ForwardScheduleConfig,
+                 ret: Tensor) -> CapturedStep:
+        static = StaticInputs(*(t.clone() for t in step_inputs(batch, ngram_slots, cfg, ret)))
         cs = CapturedStep(
             key=key, static=static,
             cfg=dataclasses.replace(cfg, mtp_weights=static.mtp_weights, prefix_weight=static.prefix_weight),
             ngram_sink=self.ngram_table.grad_sink(key.tokens), attn_scales=self._attn_scales(),
-            forward=torch.cuda.CUDAGraph(), backward=torch.cuda.CUDAGraph(), loss=None,
+            forward=torch.cuda.CUDAGraph(), backward=torch.cuda.CUDAGraph(), loss=None, tok_loss=None,
             anvil_grads=[], adam_grads=[], ngram_grad=None,
         )
         leaves = self.params + [cs.ngram_sink]
@@ -213,12 +217,13 @@ class StepGraphs:
         self.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.stream):
             for _ in range(WARM_ITERATIONS):
-                torch.autograd.grad(self._loss(cs), leaves, allow_unused=True)
+                torch.autograd.grad(self._loss(cs).sum(), leaves, allow_unused=True)
         torch.cuda.current_stream().wait_stream(self.stream)
         torch.cuda.synchronize()
         # thread_local: the loader and prep threads may allocate pinned memory during a capture.
         with torch.cuda.graph(cs.forward, pool=self.pool, stream=self.stream, capture_error_mode="thread_local"):
-            cs.loss = self._loss(cs)
+            cs.tok_loss = self._loss(cs)
+            cs.loss = cs.tok_loss.sum()
         with torch.cuda.graph(cs.backward, pool=self.pool, stream=self.stream, capture_error_mode="thread_local"):
             # retain_graph / create_graph must stay False: AOTAutograd compiles this backward with
             # donated buffers and refuses to run it otherwise (record #360).
@@ -242,7 +247,7 @@ class StepGraphs:
     def _self_check(self, cs: CapturedStep):
         """Replay vs eager forward on the same buffers: catches a graph that baked an input's value or a
         stale address instead of reading the live tensor."""
-        replay, eager = cs.loss.item(), self._loss(cs).item()
+        replay, eager = cs.loss.item(), self._loss(cs).sum().item()
         assert abs(replay - eager) <= max(SELF_CHECK_ABS, abs(eager) * SELF_CHECK_REL), \
             f"step graph {cs.key}: replay loss {replay} != eager {eager}"
 

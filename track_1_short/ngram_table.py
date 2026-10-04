@@ -44,14 +44,16 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from track_1_short.config import MODEL_DIM, scaled_steps
 from track_1_short.perf.kernels.ngram_adam import adam_rows_, bring_rows_current, claim_rows
 from track_1_short.perf.kernels.row_scatter import scatter_add_rows
 from track_1_short.sharded_rows import RowOwners, RowPull, all_to_all_rows
+from track_1_short.token_norm import NORM_MAP
 
 # 224x the 377,280-row bigram table of earlier records. Rows [0, V/2) are the bigram channel,
 # [V/2, V) the trigram channel. Divisible by 8 (the shard) and < 2**31 (row ids are int32).
 NGRAM_VOCAB_SIZE = 84_602_880
-NGRAM_DIM = 768
+NGRAM_DIM = MODEL_DIM
 # The shared +-1 sign pool. A power of two, so `& (rows - 1)` is the non-negative remainder of the
 # wrapped int32 hash (values ~500-15000 gave similar results in the bigram record).
 NGRAM_SIGN_POOL_ROWS = 8192
@@ -75,7 +77,7 @@ NGRAM_ADAM_BETA2 = 0.95
 # From this step the table updates every 4th step instead of every 2nd (record #360). One event then
 # stands for two: beta2 is squared, so the second moment decays at the same rate per step, and the
 # weight-decay multiplier doubles.
-NGRAM_ADAM_PERIOD4_START = 336
+NGRAM_ADAM_PERIOD4_START = scaled_steps(336, multiple=4)
 NGRAM_WD_MUL_PERIOD4 = 10.0
 # The longest cycle, in steps: the cache holds one cycle's rows (two per token per step).
 MAX_CYCLE_STEPS = 4
@@ -101,7 +103,7 @@ def ngram_row_ids(x: Tensor) -> Tensor:
     t = 1 reads the reserved id, not x[0], as its previous token (it is computed in place after
     out[0] is set, exactly as in record #360).
     """
-    x = x.to(torch.int32)
+    x = torch.index_select(NORM_MAP, 0, x.cpu())  # normalized ids (PR #375)
     half = NGRAM_VOCAB_SIZE // 2
     bigram_mod, trigram_mod = half - 1, NGRAM_VOCAB_SIZE - half - 1
     n = x.numel()

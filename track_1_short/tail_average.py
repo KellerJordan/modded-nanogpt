@@ -24,22 +24,23 @@ from dataclasses import dataclass, field
 import torch
 import torch.distributed as dist
 
+from track_1_short.config import STEP_SCALE, scaled_steps
 from track_1_short.ngram_table import NGRAM_ADAM_PERIOD4_START
 from track_1_short.perf.kernels.lerp import lerp_upcast_
 
-TAIL_EMA_WINDOW = 298
+TAIL_EMA_WINDOW = scaled_steps(298)
 TAIL_EMA_BLEND = 0.65
 
-TAIL_AVG_WINDOW = 250
+TAIL_AVG_WINDOW = scaled_steps(250)
 TAIL_AVG_PERIOD = 4
-TAIL_AVG_RATE = 4.0 / 53.0  # record #360's tuned lerp rate per tick (it is not derived from the window)
+TAIL_AVG_RATE = 4.0 / 53.0 / STEP_SCALE  # record #360's tuned lerp rate per tick (it is not derived from the window)
 
-VALUE_EMBED_AVG_WINDOW = 250
+VALUE_EMBED_AVG_WINDOW = scaled_steps(250)
 # value_embeds updates every 4th step throughout the window (TailAverages asserts it), so this is the
 # tail-avg rate at the same tick spacing (record #360).
 VALUE_EMBED_AVG_RATE = TAIL_AVG_RATE
 
-BANK_BLEND_WINDOW = 298
+BANK_BLEND_WINDOW = scaled_steps(298)
 BANK_BLEND_PERIOD = 4  # ticks every 4th step (record #360)
 # The per-step EMA timescale of the window, at 1/BANK_BLEND_PERIOD of the ticks.
 BANK_BLEND_RATE = 2.0 / (BANK_BLEND_WINDOW // BANK_BLEND_PERIOD + 1)
@@ -47,6 +48,8 @@ BANK_BLEND = 0.55
 RICHARDSON_W = 0.2007
 
 DECONTRACTION_LABELS = ("embed", "lm_head", "mlp_bank", "qk_bank", "vo_bank")
+# one EMA per group (time constant in steps, ticked when it changes), shipped as lerp(final, EMA, 0.5)
+TAIL_GROUPS = {("qk_bank",): 128, ("vo_bank",): 128, ("mlp_bank",): 64, ("lm_head", "embed"): 128}
 
 
 @dataclass
@@ -75,6 +78,10 @@ def tail_ema_rate(step: int, total_steps: int) -> float | None:
     return r if step == total_steps - 1 else -math.expm1(2.0 * math.log1p(-r))
 
 
+def group_ema_rate(tau, period):
+    return lambda s, n: (-math.expm1(-period / tau) if s >= period else 1.0) if s % period == period - 1 else None
+
+
 class TailAverages:
     """All four accumulators, ticked after every optimizer step and shipped before the final eval."""
 
@@ -86,7 +93,8 @@ class TailAverages:
         self.optimizer = optimizer
         self.rank = rank
         self.total_steps = total_steps
-        self.accumulators = [
+        self.accumulators = [TailAccumulator("ema", labels, math.ceil(3 * tau), group_ema_rate(tau, 2 if "embed" in labels else 1),
+                                             dict.fromkeys(labels, 0.5)) for labels, tau in TAIL_GROUPS.items()] or [
             TailAccumulator("tail-ema", ("lm_head", "embed"), TAIL_EMA_WINDOW, tail_ema_rate,
                             {"lm_head": TAIL_EMA_BLEND, "embed": TAIL_EMA_BLEND}),
             TailAccumulator("tail-avg", ("vo_bank", "mlp_bank"), TAIL_AVG_WINDOW,
@@ -155,7 +163,7 @@ class TailAverages:
                 if label not in shipped:
                     shipped.append(label)
         # Each rank wrote only its own shard: one gather per shipped weight reassembles it.
-        for label in shipped:
+        for label in shipped + (["value_embeds"] if TAIL_GROUPS else []):
             p = self._param(label)
             cfg = self.optimizer.param_cfgs[p]
             full = p.data.view(cfg.reshape) if cfg.optim == "anvil" else p.data
@@ -169,4 +177,4 @@ class TailAverages:
     def accumulators_in_ship_order(self):
         """bank-blend last: on vo/mlp it lerps from the already-shipped tail average."""
         by_tag = {acc.tag: acc for acc in self.accumulators}
-        return [by_tag["tail-ema"], by_tag["tail-avg"], by_tag["value-embed-avg"], by_tag["bank-blend"]]
+        return self.accumulators if TAIL_GROUPS else [by_tag["tail-ema"], by_tag["tail-avg"], by_tag["value-embed-avg"], by_tag["bank-blend"]]

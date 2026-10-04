@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor, nn
 
+from track_1_short.config import scaled_steps
 from track_1_short.perf.bank_scalars import BankScalarStaging
 from track_1_short.perf.kernels.polar_express import XTX, XXT, ba_plus_cAA
 from track_1_short.perf.kernels.transpose import transpose_add, transpose_copy
@@ -45,7 +46,7 @@ ANVIL_MAPS = [
 # Twin-rail velocity. Rail 0 is fast (beta scheduled by get_rail_beta until RAIL_ENGAGE_STEP, then
 # RAIL_FAST_BETA); rail 1 is slow (RAIL_SLOW_BETA) and accumulates from step 0. Until the engage
 # step the update reads the fast rail only; after it, RAIL_FAST_WEIGHT * fast + (1 - w) * slow.
-RAIL_FAST_BETA, RAIL_SLOW_BETA, RAIL_FAST_WEIGHT, RAIL_ENGAGE_STEP = 0.85, 0.98, 0.4385, 514
+RAIL_FAST_BETA, RAIL_SLOW_BETA, RAIL_FAST_WEIGHT, RAIL_ENGAGE_STEP = 0.85, 0.98, 0.4385, scaled_steps(514)
 
 # The cascade's input is divided by FROBENIUS_MARGIN * ||X||_F + FROBENIUS_EPS, which puts every
 # singular value safely below 1 where the maps converge (the margin and eps of record #360).
