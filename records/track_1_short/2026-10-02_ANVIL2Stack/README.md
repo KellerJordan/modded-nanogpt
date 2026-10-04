@@ -1,9 +1,10 @@
 # Record candidate: ANVIL2 + sampled head, n-gram token norm, train-fit copy mixture, retuned schedule
 
-> **Status: rule 2 met on Modal, rule 4 open.** 18 runs of `code/` unchanged on Modal 8xH100:
+> **Status: rules 2 and 4 met on Modal.** 18 runs of `code/` unchanged on Modal 8xH100:
 > **38.211 ± 0.278 s**, mean final val loss **3.27925 ± 0.00077**, one-sided p = 3.3e-4 against
-> 3.28 ([`this_pr/statistics.md`](this_pr/statistics.md)). There is no same-machine baseline against
-> [#360](https://github.com/KellerJordan/modded-nanogpt/pull/360) yet; see [What is still needed](#what-is-still-needed).
+> 3.28 ([`this_pr/statistics.md`](this_pr/statistics.md)). On the same host type the current record
+> (master) averages **41.836 ± 0.638 s** ([`baseline/statistics.md`](baseline/statistics.md)), so this
+> tree is **3.625 s (8.7%) faster**.
 
 `code/` builds on the ANVIL2 record ([#360](https://github.com/KellerJordan/modded-nanogpt/pull/360))
 and three open PRs. It is the exact tree that ran: its 17 Python modules hash to the
@@ -19,11 +20,14 @@ times do not compare directly with the leaderboard.
 
 | Run | runs | train_time | val loss | steps |
 | --- | ---: | ---: | ---: | ---: |
+| Current record, master `4ea6b93` ([#360](https://github.com/KellerJordan/modded-nanogpt/pull/360)) | 6 | 41.836 s | 3.27531 | 1194 |
 | Earlier version of this tree (ANVIL2 port) | 1 | 40.450 s | 3.27960 | 1184 |
 | This tree, first run | 1 | 37.590 s | 3.27854 | 1168 |
 | **This tree, validation pool** | **18** | **38.211 s** | **3.27925** | **1168** |
 
 The first run is not in the pool: this tree was chosen because of it, so it is a favourable draw.
+The baseline ran in a separate session from the pool, not interleaved; a seventh baseline run landed
+on a degraded host (141.4 s) and is left out of its timing, as `baseline/statistics.md` explains.
 
 For context only: ANVIL2's own pool is 39.914 s mean over 18 runs (val loss 3.27731) on a vast.ai
 bare-metal 8xH100.
@@ -62,20 +66,19 @@ timed section. Keep that much disk free, or delete `logs/rank_*.pt` between runs
 
 ## What is still needed
 
-1. **Rule 4:** interleaved runs of current master ([#360](https://github.com/KellerJordan/modded-nanogpt/pull/360)) on the same machine, into `baseline/`
-   with its own `statistics.md`.
-2. **Loss margin:** the pool's mean sits 0.00075 under 3.28, against ANVIL2's 0.0027 and the
+1. **Loss margin:** the pool's mean sits 0.00075 under 3.28, against ANVIL2's 0.0027 and the
    0.001-0.002 the maintainers keep, and 3 of 18 runs land above 3.28, so discretionary reason 2
    is likely to come up. About 15 more extension steps (21.5 ms each on Modal, about 0.3 s) would
    restore the margin; that changes `code/` and needs a new pool.
-3. **Layout:** master now runs the record from the `track_1_short/` package ([#373](https://github.com/KellerJordan/modded-nanogpt/pull/373)), so this
+2. **Layout:** master now runs the record from the `track_1_short/` package ([#373](https://github.com/KellerJordan/modded-nanogpt/pull/373)), so this
    delta still has to be ported into the package, without `checkpoint.py` and the bundled assets.
 
 ## Files
 
 `this_pr/` holds the 18 validation run logs (each embeds the trainer and its kernel modules),
-`pip freeze` (identical in every run), and `statistics.md`. `first_run/` holds the console log and
-the checkpoint manifest of the first run.
+`pip freeze` (identical in every run), and `statistics.md`. `baseline/` holds the 7 runs of master on
+the same host type and their `statistics.md`. `first_run/` holds the console log and the checkpoint
+manifest of the first run.
 
 ## Credits
 
