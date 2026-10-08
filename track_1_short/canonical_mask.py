@@ -119,15 +119,44 @@ def build_canonical_mask(vocab_size: int, ranks: dict | None = None) -> np.ndarr
         except UnicodeDecodeError:
             pass  # ends mid-character, so it cannot end in a contraction
 
-    mask = np.zeros((vocab_size, vocab_size), dtype=bool)
+    # Accumulate in the final byte layout. A dense Boolean V-by-V temporary
+    # is eight times larger and needs a separate packing pass.
+    stride = (vocab_size + 7) // 8
+    mask = np.zeros((vocab_size, stride), dtype=np.uint8)
+    # the same mask with the pieces' intervals as arrays and each block's cells set in one scatter
+    arrays = lambda idx: {k: tuple(np.array(c, dtype=np.int64) for c in zip(*v)) for k, v in idx.items()}
+    last_arr, first_arr, empty = arrays(by_last), arrays(by_first), (np.zeros(0, np.int64),) * 3
+    flat_mask = mask.reshape(-1)
     for rank, (a, b) in rules.items():
-        ps = np.array([p for s, e, p in by_last.get(a, ()) if s <= rank < e], dtype=np.intp)
+        s, e, ps = last_arr.get(a, empty)
+        ps = ps[(s <= rank) & (rank < e)]
         ps = ps[~closed[ps]]
-        xs = np.array([x for s, e, x in by_first.get(b, ()) if s <= rank < e], dtype=np.intp)
-        if len(ps) and len(xs):
-            mask[np.ix_(ps, xs)] |= _SEAM_OK[np.ix_(end_cls[ps], start_cls[xs])]
-
-    return np.packbits(mask, axis=1, bitorder="little")
+        if not len(ps):
+            continue
+        s, e, xs = first_arr.get(b, empty)
+        xs = xs[(s <= rank) & (rank < e)]
+        if len(xs):
+            # Small blocks: unbuffered OR preserves multiple bits in the same byte.
+            # Large blocks: coalesce columns first, avoiding a ps-by-xs scatter.
+            if len(ps) * len(xs) <= 4096:
+                ok = _SEAM_OK[end_cls[ps][:, None], start_cls[xs][None, :]]
+                positions = ps[:, None] * stride + (xs[None, :] >> 3)
+                bits = np.broadcast_to((1 << (xs & 7)).astype(np.uint8), ok.shape)
+                np.bitwise_or.at(flat_mask, positions[ok], bits[ok])
+            else:
+                pc = end_cls[ps]
+                xc = start_cls[xs]
+                for c in np.unique(pc):
+                    rows = ps[pc == c]
+                    cols = xs[_SEAM_OK[c, xc]]
+                    if not len(cols):
+                        continue
+                    byte, inv = np.unique(cols >> 3, return_inverse=True)
+                    bits = np.zeros(len(byte), dtype=np.uint8)
+                    np.bitwise_or.at(bits, inv, (1 << (cols & 7)).astype(np.uint8))
+                    # rows and byte are unique, so buffered indexing is safe here.
+                    mask[np.ix_(rows, byte)] |= bits
+    return mask
 
 class BackgroundCanonicalMask:
     """Builds the canonical mask concurrently with training, in a forked child process.
