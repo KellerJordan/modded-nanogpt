@@ -15,6 +15,7 @@ from track_1_short.perf.kernels.cross_entropy import (
     quantize_lm_head_dual,
 )
 from track_1_short.perf.kernels.fp8_attention_quant import PackedQKVFP8Cache
+from track_1_short.perf.kernels.layer_rope import layer_rope_gain_rows
 from track_1_short.perf.kernels.mlp import (
     FusedLinearReLUSquareFunction,
     quantize_dual_layout_fused,
@@ -124,9 +125,47 @@ FP8_DPRE_HEADROOM = 1.25       # delayed dpre scale = last step's amax * this / 
 # weight scales exactly; later calls use the one-step-delayed amax the quantize kernel records.
 FP8_EXACT_SCALE_CALLS = 16
 
+# LayerRoPE: depth-conditioned gains on both stages of both branches. Per layer l, u = log(l + 1),
+# and per site s (0 attn input, 1 mlp input, 2 attn residual, 3 mlp residual):
+#   gamma_eff[s, l] = exp(alpha_s + beta_s * u) * ComplexRot(gamma_s, exp(alpha_rot_s + beta_rot_s * u) * freq_j)
+# rotating channel pairs (2j, 2j + 1), freq_j = base ** (-2j / model_dim). The four gamma vectors (init
+# ones) and 16 gate scalars are shared by every layer. Input gains multiply the normed branch input, the
+# residual gains the branch output (on top of the post-lambdas). Every gain is folded into a weight: the
+# input gains into the columns of Q/K/V and c_fc, the residual gains into the rows of O and the columns
+# of c_proj (the fp8 caches hold the folded weights; see _FoldedColumns and the attention scales below).
+LAYER_ROPE_GATES_INIT = (0.0, 0.0, 0.0, 0.0)  # (alpha, beta, alpha_rot, beta_rot), on every site
+LAYER_ROPE_BASE_FREQ = 100.0
+
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
+
+def _gain_cols(w: Tensor, gain: Tensor | None) -> Tensor:
+    """w [out, dim] with each column scaled by gain [dim] (a LayerRoPE gain), or w as is."""
+    return w if gain is None else w * gain.type_as(w)[None, :]
+
+
+class _FoldedColumns(torch.autograd.Function):
+    """The MLP bank whose fp8 caches hold every matrix with its columns scaled by `gains`.
+
+    Forward: the bank itself (a view, no copy): training reads the fp8 caches, which hold
+    bank * gains (GPT._quantize_mlp_weights_and_scales), and the bf16 slices only carry gradients.
+    Backward: the slices' gradients are with respect to the folded matrices, so
+    dL/dbank = grad * gains and dL/dgains = per-column <grad, bank>, for every slot in one pass over
+    the bank instead of two small passes per slot.
+    bank (S, 2, H, D) bf16, gains (S, 2, D): per slot, the c_fc and the c_proj column gains.
+    """
+    @staticmethod
+    def forward(ctx, bank, gains):
+        ctx.save_for_backward(bank, gains)
+        return bank.view_as(bank)
+
+    @staticmethod
+    def backward(ctx, grad):
+        bank, gains = ctx.saved_tensors
+        grad_gains = (grad.float() * bank.float()).sum(dim=2).to(gains.dtype)
+        return grad * gains[:, :, None, :].to(grad.dtype), grad_gains
+
 
 @dataclass(slots=True)
 class ForwardScheduleConfig:
@@ -189,6 +228,7 @@ class GPT(nn.Module):
         self.init_misc(model_dim, num_layers)
         self.init_mudd(num_layers, model_dim)
         self.init_mudd_gate(model_dim)
+        self.init_layer_rope(num_layers, model_dim)
 
         # Auto-label parameters
         for name, param in self.named_parameters():
@@ -460,6 +500,48 @@ class GPT(nn.Module):
         bs_init[1, post_skip_lane].fill_(skip_gate_bias)
         self.mudd_gate_b2 = nn.Parameter(bs_init)
 
+    def init_layer_rope(self, num_layers: int, model_dim: int):
+        # Rows: 0 attn input, 1 mlp input, 2 attn residual, 3 mlp residual. fp32, Adam, never decayed.
+        self.layer_rope_gammas = nn.Parameter(torch.ones(4, model_dim))
+        # Columns: alpha, beta, alpha_rot, beta_rot; the same init on every row.
+        self.layer_rope_gates = nn.Parameter(torch.tensor(LAYER_ROPE_GATES_INIT).repeat(4, 1))
+        j = torch.arange(model_dim // 2, dtype=torch.float32)
+        self.register_buffer("layer_rope_freqs", LAYER_ROPE_BASE_FREQ ** (-2.0 * j / model_dim), persistent=False)
+        self.register_buffer("layer_rope_u", torch.log(torch.arange(1, num_layers + 1, dtype=torch.float32)),
+                             persistent=False)
+        # The layer each MLP bank slot serves (slot PARALLEL_MLP_SLOT is layer PARALLEL_MLP_LAYER's second MLP).
+        slot_layers = list(range(num_layers)) + [PARALLEL_MLP_LAYER]
+        assert len(slot_layers) == NUM_MLP_SLOTS
+        self.register_buffer("layer_rope_mlp_slot_layers", torch.tensor(slot_layers, dtype=torch.long), persistent=False)
+        # The fp8 refresh's gain rows (perf/kernels/layer_rope.py), (site, layer) per row: the attention
+        # input gains in bank order, then the MLP input and residual gains in slot order.
+        sites = [0] * len(ATTN_BANK_ORDER) + [1] * NUM_MLP_SLOTS + [3] * NUM_MLP_SLOTS
+        layers = list(ATTN_BANK_ORDER) + slot_layers + slot_layers
+        self.register_buffer("_layer_rope_refresh_sites", torch.tensor(sites, dtype=torch.int32), persistent=False)
+        self.register_buffer("_layer_rope_refresh_layers", torch.tensor(layers, dtype=torch.int32), persistent=False)
+        self.register_buffer("_layer_rope_refresh_gains", torch.ones(len(sites), model_dim, dtype=torch.bfloat16),
+                             persistent=False)
+
+    def _layer_rope_refresh_rows(self, rows: slice) -> Tensor:
+        """Compute (into their persistent buffer) and return the refresh's gain rows `rows`."""
+        out = self._layer_rope_refresh_gains[rows]
+        return layer_rope_gain_rows(self.layer_rope_gates, self.layer_rope_gammas, self.layer_rope_freqs,
+                                    self._layer_rope_refresh_sites[rows], self._layer_rope_refresh_layers[rows], out)
+
+    def layer_rope_gamma_eff(self) -> Tensor:
+        """All effective gains in one fp32 precompute per forward (params only, no per-token work):
+        (4, num_layers, model_dim) bf16, rows as in init_layer_rope."""
+        g = self.layer_rope_gates.float()                                                     # (4, 4)
+        u = self.layer_rope_u                                                                 # (L,)
+        mag = g[:, 0:1] + g[:, 1:2] * u                                                       # (4, L)
+        theta = torch.exp(g[:, 2:3] + g[:, 3:4] * u)[..., None] * self.layer_rope_freqs       # (4, L, D/2)
+        cos_t, sin_t = torch.cos(theta), torch.sin(theta)
+        gam = self.layer_rope_gammas.float()
+        gu, gv = gam[:, None, 0::2], gam[:, None, 1::2]                                       # (4, 1, D/2)
+        r = torch.exp(mag)[..., None]                                                         # (4, L, 1)
+        out = torch.stack([r * (gu * cos_t - gv * sin_t), r * (gu * sin_t + gv * cos_t)], dim=-1).flatten(-2)
+        return out.to(torch.bfloat16)
+
     def forward_mudd_gate(self, x, id, num_coef):
         x = F.gelu(F.linear(x, self.mudd_gate_w1[id]))
         return (F.linear(x, self.mudd_gate_w2[id, :num_coef]) + self.mudd_gate_b2[id, :num_coef]) * self._mudd_gate_scale.type_as(x)
@@ -572,7 +654,6 @@ class GPT(nn.Module):
         skip_lambda = self.scalars[2 * self.num_layers + 1]
         resid_lambdas_attn = self.resid_lambdas[:, 0].bfloat16().unbind(0)
         resid_lambdas_mlp  = self.resid_lambdas[:, 1].bfloat16().unbind(0)
-        post_lambdas_attn = self.post_lambdas[:, 0].bfloat16().unbind(0)
         post_lambdas_mlp  = self.post_lambdas[:, 1].bfloat16().unbind(0)
         ve_gates = [None] * self.num_layers
         for layer, gate in zip(VALUE_EMBED_GATE_LAYERS, self.ve_gate_bank.unbind(0)):
@@ -582,7 +663,31 @@ class GPT(nn.Module):
         x0_gates = [None] * self.num_layers
         bigram_gates = [None] * self.num_layers
         attn_weights = self._attn_weights()
-        mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
+        # LayerRoPE: every site's num_layers [dim] gains, from one precompute.
+        lr_eff = self.layer_rope_gamma_eff()
+        lr_in_mlp, lr_res_mlp = lr_eff[1].unbind(0), lr_eff[3].unbind(0)
+        # Every layer's attention scales in one batched op, so each layer's backward runs only the passes
+        # the 0-D scales already cost (per-column / per-row dots instead of full sums): the QKV column
+        # scale sa_lambdas[0] * input gain, and the O row scale sa_lambdas[1] * post-lambda * residual
+        # gain (the last layer's post-lambda is mu[9], per token, so none there).
+        sa = self.scalars[: 2 * self.num_layers].view(-1, 2)
+        post_attn = self.post_lambdas[:, 0].bfloat16().float()
+        o_post = torch.cat([post_attn[:-1], torch.ones_like(post_attn[-1:])])
+        lr_qkv_cols = (sa[:, 0:1] * lr_eff[0].float()).unbind(0)
+        lr_o_rows = ((sa[:, 1] * o_post)[:, None] * lr_eff[2].float()).unbind(0)
+        mlp_bank = self.mlp_bank
+        if use_fp8:
+            # The fp8 MLP caches hold each slot's c_fc times its input gain and c_proj times its
+            # post-lambda and residual gain (columns); the bank-level fold returns those gains'
+            # gradients, the post-lambdas' included. The last layer's slot has no folded post-lambda
+            # (mu[13] is per-token).
+            post = self.post_lambdas[:, 1].bfloat16()
+            slot_post = torch.cat([post[:NUM_LAYERS - 1], torch.ones_like(post[:1]),
+                                   post[PARALLEL_MLP_LAYER:PARALLEL_MLP_LAYER + 1]])
+            slot_gains = torch.stack([lr_eff[1][self.layer_rope_mlp_slot_layers],
+                                      lr_eff[3][self.layer_rope_mlp_slot_layers] * slot_post[:, None]], dim=1)
+            mlp_bank = _FoldedColumns.apply(mlp_bank, slot_gains)
+        mlp_all = mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
 
@@ -709,8 +814,12 @@ class GPT(nn.Module):
                     aux_v=aux_v,
                     xsa_alpha=xsa_alphas[i],
                     train_max_seq_len=train_max_seq_len,
-                    # The post-lambda rides the output projection, except on the MUDD layer (mu[9] is per-token).
-                    o_gain=post_lambdas_attn[i] if mu is None else None,
+                    # LayerRoPE: O's row scale (residual gain, post-lambda and sa_lambdas[1] in one; the
+                    # post-lambda rides the output projection, except on the MUDD layer where mu[9] is
+                    # per-token), and the QKV weight's column scale (input gain and sa_lambdas[0]; the fp8
+                    # cache holds the gain, quantize_attn_fp8, so the shared normed input stays ungated).
+                    o_row_scale=lr_o_rows[i],
+                    qkv_col_scale=lr_qkv_cols[i],
                 )
                 qk_w, v_w, o_w = attn_weights[i]
                 attn_out = self.attn[str(i)](attn_in_normed, attn_args, qk_w, v_w, o_w, qkv_fp8)
@@ -719,7 +828,7 @@ class GPT(nn.Module):
                     x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0]
                     x[..., :self.ngram_dim] = x[..., :self.ngram_dim] + mu[11] * x0_bigram
                 else:
-                    x = scale(resid_lambdas_attn[i], x) + attn_out  # attn_out carries post_lambdas_attn[i]
+                    x = scale(resid_lambdas_attn[i], x) + attn_out  # attn_out carries the post-lambda (O row scale)
                     x = self._inject(i, x, x0, x0_bigram, x0_gates, bigram_gates)
 
             # process mlp
@@ -731,26 +840,31 @@ class GPT(nn.Module):
             mlp_in = norm(x)
             # fp8 only: the post-lambda is folded into the down-projection scale, so the MLP output
             # already carries it. Not on the MUDD layer, whose post-lambda mu[13] is per-token.
-            fold_p = post_lambdas_mlp[i] if use_fp8 and mu is None else None
+            folded = use_fp8 and mu is None
+            # LayerRoPE: the input gain scales c_fc's columns and the residual gain c_proj's. In fp8 the
+            # weight caches hold both (_quantize_mlp_weights_and_scales) and the bank-level fold above
+            # returns their gradients; validation scales the bf16 bank slices.
+            g_in, g_res = lr_in_mlp[i], lr_res_mlp[i]
             if use_fp8:
                 # One quantize of the input, shared with the parallel MLP.
                 x_f8 = quantize_dual_layout_fused(mlp_in.detach().view(-1, mlp_in.size(-1)), self._mlp_x_scale, fmt=torch.float8_e4m3fn)
-                fp8_args = self._mlp_fp8_args(i, mlp_up_f8[i], x_f8, fold_p)
+                mlp_out = self._mlp(mlp_in, c_fc, c_proj, self._mlp_fp8_args(i, mlp_up_f8[i], x_f8, folded))
             else:
-                fp8_args = None
-            mlp_out = self._mlp(mlp_in, c_fc, c_proj, fp8_args)
+                mlp_out = self._mlp(mlp_in, _gain_cols(c_fc, g_in), _gain_cols(c_proj, g_res), None)
             if mu is not None:
                 x = mu[12] * x + mu[13] * mlp_out
-            elif fold_p is not None:
+            elif folded:
                 x = scale(resid_lambdas_mlp[i], x) + mlp_out
             else:
                 x = scale_add(resid_lambdas_mlp[i], x, post_lambdas_mlp[i], mlp_out)
             if i == PARALLEL_MLP_LAYER:
-                # Same input and the same post-lambda as the layer's own MLP.
+                # Same input, the same post-lambda and the same LayerRoPE gains as the layer's own MLP.
                 k = PARALLEL_MLP_SLOT
-                parallel_args = self._mlp_fp8_args(k, mlp_up_f8[k], x_f8, fold_p) if use_fp8 else None
-                parallel_out = self._mlp(mlp_in, mlp_fcs[k], mlp_projs[k], parallel_args)
-                x = x + (parallel_out if fold_p is not None else scale(post_lambdas_mlp[i], parallel_out))
+                if use_fp8:
+                    parallel_out = self._mlp(mlp_in, mlp_fcs[k], mlp_projs[k], self._mlp_fp8_args(k, mlp_up_f8[k], x_f8, folded))
+                else:
+                    parallel_out = self._mlp(mlp_in, _gain_cols(mlp_fcs[k], g_in), _gain_cols(mlp_projs[k], g_res), None)
+                x = x + (parallel_out if folded else scale(post_lambdas_mlp[i], parallel_out))
 
             if i in CACHE_LAYERS:
                 cache[i] = x
@@ -865,6 +979,9 @@ class GPT(nn.Module):
         with torch.no_grad():
             qk_heads = self.qk_bank[:self._num_qk_groups].view(num_slots, 2 * H, head_dim, dim)
             v_heads = self.vo_bank[:2 * num_slots].view(num_slots, 2, H, head_dim, dim)[:, 0]
+            # LayerRoPE: each layer's input gain, in bank order, folded into its Q/K/V weight columns by
+            # the quantize kernels.
+            in_attn = self._layer_rope_refresh_rows(slice(0, num_slots))
             start = 0
             for group, layers in ATTN_WIDTH_GROUPS.items():
                 slots = slice(start, start + len(layers))
@@ -872,7 +989,7 @@ class GPT(nn.Module):
                 qk_dim, v_dim = self.attn_qk_dim(layers[0]), self.attn_v_dim(layers[0])
                 qk = qk_heads[slots, :, :qk_dim].reshape(len(layers), 2 * H * qk_dim, dim)
                 v = v_heads[slots, :, :v_dim].reshape(len(layers), H * v_dim, dim)
-                self.attn_fp8[group].refresh(qk, v)
+                self.attn_fp8[group].refresh(qk, v, col_gain=in_attn[slots])
 
     @staticmethod
     def _refresh_delayed_scale(amax_buf, scale_buf, gain, floor):
@@ -900,17 +1017,25 @@ class GPT(nn.Module):
         e4m3_max = torch.finfo(torch.float8_e4m3fn).max
         e5m2_max = torch.finfo(torch.float8_e5m2).max
         up_weights, down_weights = self.mlp_bank[:, 0], self.mlp_bank[:, 1]
+        # Each slot's LayerRoPE gains, folded into the cached weights' columns by the quantize kernel: the
+        # input gain into c_fc, the residual gain into c_proj (whose post-lambda stays in the down scale below).
+        first = len(ATTN_BANK_ORDER)
+        rows = self._layer_rope_refresh_rows(slice(first, first + 2 * NUM_MLP_SLOTS))
+        up_gain, down_gain = rows[:NUM_MLP_SLOTS], rows[NUM_MLP_SLOTS:]
         exact = self.mlp_quantize_calls < FP8_EXACT_SCALE_CALLS
         self.mlp_quantize_calls += 1
 
         # Weight caches. The exact scale is computed in the weights' bf16, as record #360 does.
         if exact:
-            self._mlp_up_scales[:] = (up_weights.reshape(NUM_MLP_SLOTS, -1).abs().amax(dim=1).clamp(min=1e-12) / e4m3_max).float()
-            self._mlp_down_scales[:] = (down_weights.reshape(NUM_MLP_SLOTS, -1).abs().amax(dim=1).clamp(min=1e-12) / e4m3_max).float()
+            up_src, down_src = up_weights * up_gain[:, None, :], down_weights * down_gain[:, None, :]
+            self._mlp_up_scales[:] = (up_src.reshape(NUM_MLP_SLOTS, -1).abs().amax(dim=1).clamp(min=1e-12) / e4m3_max).float()
+            self._mlp_down_scales[:] = (down_src.reshape(NUM_MLP_SLOTS, -1).abs().amax(dim=1).clamp(min=1e-12) / e4m3_max).float()
         quantize_mlp_weights_dual(up_weights, self._mlp_up_scales, self._mlp_up_partial_amax,
-                                  row=self._mlp_up_f8, col_t=self._mlp_up_f8_col.transpose(1, 2), update_scales=not exact)
+                                  row=self._mlp_up_f8, col_t=self._mlp_up_f8_col.transpose(1, 2), update_scales=not exact,
+                                  col_gain=up_gain)
         quantize_mlp_weights_dual(down_weights, self._mlp_down_scales, self._mlp_down_partial_amax,
-                                  row=self._mlp_down_f8_row, col_t=self._mlp_down_f8.transpose(1, 2), update_scales=not exact)
+                                  row=self._mlp_down_f8_row, col_t=self._mlp_down_f8.transpose(1, 2), update_scales=not exact,
+                                  col_gain=down_gain)
 
         # Scales derived from them. In-place, so every consumer keeps reading the same tensors.
         torch.mul(self._mlp_up_scales, FP8_MLP_X_SCALE, out=self._mlp_up_dequant)
@@ -946,19 +1071,20 @@ class GPT(nn.Module):
                 weights[layer] = (cache.row[j], cache.col[j], cache.scales[j:j+1])
         return weights
 
-    def _mlp_fp8_args(self, slot, up_f8, x_f8, fold_p):
+    def _mlp_fp8_args(self, slot, up_f8, x_f8, folded: bool):
         """The FP8 arguments of FusedLinearReLUSquareFunction for MLP bank `slot`, after (x, c_fc, c_proj).
 
-        `x_f8` is the (row, transposed) e4m3 input. With `fold_p` (the post-lambda folded into the
+        `x_f8` is the (row, transposed) e4m3 input. With `folded` (the post-lambda folded into the
         down-projection scale), the down projection's forward and dgrad dequant scales are the folded
-        ones, and fold_p rides last for its gradient.
+        ones. The post-lambda's gradient comes from the bank-level fold (_FoldedColumns), with the
+        LayerRoPE gains', so nothing rides along for it here.
         """
         x_row, x_t = x_f8
-        if fold_p is not None:
+        if folded:
             down_scales, dq_bwd = self._mlp_down_scales_folded, self._mlp_dq_bwd_folded
         else:
             down_scales, dq_bwd = self._mlp_down_scales, self._mlp_dq_bwd
         return (up_f8, self._mlp_up_dequant[slot:slot+1], x_row, self._mlp_down_f8[slot], down_scales[slot],
                 self._mlp_post_scales[slot], self._mlp_post_amax[slot], self._mlp_down_f8_row[slot], dq_bwd[slot], x_t,
                 self._mlp_x_scale, self._mlp_up_f8_col[slot], self._mlp_up_scales[slot], self._mlp_grad_scale,
-                self._mlp_dpre_scales[slot], self._mlp_dpre_amax[slot]) + ((fold_p,) if fold_p is not None else ())
+                self._mlp_dpre_scales[slot], self._mlp_dpre_amax[slot])

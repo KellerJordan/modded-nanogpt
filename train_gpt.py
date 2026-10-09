@@ -410,6 +410,13 @@ def main():
         hellaswag.evaluate(model=model, schedule_cfg=training_manager.get_forward_args(),
                            seq_len=val_tokens_per_rank, get_bigram_hash=ngram_cache_slots, print0=print0)
 
+    # LayerRoPE's learned gates and each site's gain rms by layer (after the run, off the clock).
+    with torch.no_grad():
+        gates = uncompiled_model.layer_rope_gates.float().tolist()
+        gain_rms = uncompiled_model.layer_rope_gamma_eff().float().square().mean(-1).sqrt().tolist()
+    for site, g, r in zip(("in_attn", "in_mlp", "res_attn", "res_mlp"), gates, gain_rms):
+        print0(f"layer_rope {site}: (alpha, beta, alpha_rot, beta_rot)={[round(v, 4) for v in g]} "
+               f"gain rms by layer {[round(v, 3) for v in r]}", console=True)
     print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
            f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
     dist.destroy_process_group()

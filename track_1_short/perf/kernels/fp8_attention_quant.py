@@ -20,7 +20,10 @@ AMAX_PARTS = 32
 
 @triton.jit
 def _packed_batched_matrix_amax_partial_kernel(
-    first, second, partial_amax,
+    first, second, partial_amax, gain,
+    N: tl.constexpr,
+    GAIN_STRIDE_B: tl.constexpr,
+    HAS_GAIN: tl.constexpr,
     FIRST_ELEMENTS: tl.constexpr,
     SECOND_ELEMENTS: tl.constexpr,
     FIRST_STRIDE_B: tl.constexpr,
@@ -42,14 +45,18 @@ def _packed_batched_matrix_amax_partial_kernel(
         second_indices = tl.maximum(indices - FIRST_ELEMENTS, 0)
         second_values = tl.load(second + batch * SECOND_STRIDE_B + second_indices, mask=valid & ~in_first, other=0.0)
         values = first_values.to(tl.float32) + second_values.to(tl.float32)
+        if HAS_GAIN:  # LayerRoPE: both sources are [rows, N] row-major, so the column is index % N
+            values = values * tl.load(gain + batch * GAIN_STRIDE_B + indices % N, mask=valid, other=0.0).to(tl.float32)
         local_amax = tl.maximum(local_amax, tl.abs(values))
     tl.store(partial_amax + batch * NUM_PARTS + part, tl.max(local_amax, axis=0))
 
 
 @triton.jit
 def _quantize_dual_layout_packed_batched_kernel(
-    first, second, row, transposed, scale_ptr,
+    first, second, row, transposed, scale_ptr, gain,
     M, N,
+    GAIN_STRIDE_B: tl.constexpr,
+    HAS_GAIN: tl.constexpr,
     FIRST_ROWS: tl.constexpr,
     FIRST_STRIDE_B: tl.constexpr,
     SECOND_STRIDE_B: tl.constexpr,
@@ -71,6 +78,8 @@ def _quantize_dual_layout_packed_batched_kernel(
     source_ptrs = tl.where(in_first, first + batch * FIRST_STRIDE_B + first_offsets,
                            second + batch * SECOND_STRIDE_B + second_offsets)
     values = tl.load(source_ptrs, mask=valid, other=0.0).to(tl.float32)
+    if HAS_GAIN:  # LayerRoPE: a per-column (input feature) gain folded into the cached weight
+        values = values * tl.load(gain + batch * GAIN_STRIDE_B + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)[None, :]
     scaled = values / tl.load(scale_ptr + batch)
     quantized = tl.maximum(tl.minimum(scaled, 448.0), -448.0).to(tl.float8e4nv)
     tl.store(row + batch * ROW_STRIDE_B + offs_m[:, None] * N + offs_n[None, :], quantized, mask=valid)
@@ -79,8 +88,9 @@ def _quantize_dual_layout_packed_batched_kernel(
              tl.trans(quantized), mask=transposed_mask)
 
 
-def quantize_dual_layout_packed_batched(first, second, scales, partial_amax, row, transposed):
-    """Exact-scale dual-layout quantization of the row concatenation [first; second], per batch entry."""
+def quantize_dual_layout_packed_batched(first, second, scales, partial_amax, row, transposed, col_gain=None):
+    """Exact-scale dual-layout quantization of the row concatenation [first; second], per batch entry.
+    `col_gain` [B, N] (LayerRoPE), if given, multiplies every row's columns before the amax and quantize."""
     B, first_rows, N = first.shape
     B2, second_rows, N2 = second.shape
     total_rows = first_rows + second_rows
@@ -92,8 +102,12 @@ def quantize_dual_layout_packed_batched(first, second, scales, partial_amax, row
     assert row.shape == (B, total_rows, N) and transposed.shape == (B, N, total_rows)
     assert row.dtype == transposed.dtype == torch.float8_e4m3fn
     assert row.is_contiguous() and transposed.is_contiguous()
+    if col_gain is not None:
+        assert col_gain.shape == (B, N) and col_gain.stride(1) == 1
+    gain_args = dict(GAIN_STRIDE_B=col_gain.stride(0) if col_gain is not None else 0, HAS_GAIN=col_gain is not None)
+    gain = col_gain if col_gain is not None else scales  # unread when HAS_GAIN is off
     _packed_batched_matrix_amax_partial_kernel[(B, num_parts)](
-        first, second, partial_amax,
+        first, second, partial_amax, gain, N=N, **gain_args,
         FIRST_ELEMENTS=first_rows * N, SECOND_ELEMENTS=second_rows * N,
         FIRST_STRIDE_B=first.stride(0), SECOND_STRIDE_B=second.stride(0),
         NUM_PARTS=num_parts, BLOCK_SIZE=2048, num_stages=1, num_warps=8,
@@ -103,8 +117,8 @@ def quantize_dual_layout_packed_batched(first, second, scales, partial_amax, row
     block_m, block_n = 64, 128
     grid = (triton.cdiv(total_rows, block_m), triton.cdiv(N, block_n), B)
     _quantize_dual_layout_packed_batched_kernel[grid](
-        first, second, row, transposed, scales,
-        total_rows, N,
+        first, second, row, transposed, scales, gain,
+        total_rows, N, **gain_args,
         FIRST_ROWS=first_rows,
         FIRST_STRIDE_B=first.stride(0), SECOND_STRIDE_B=second.stride(0),
         ROW_STRIDE_B=row.stride(0), TRANSPOSED_STRIDE_B=transposed.stride(0),
@@ -129,6 +143,7 @@ class PackedQKVFP8Cache(nn.Module):
         self.register_buffer("scales", torch.ones(num_layers, device=device), persistent=False)
         self.register_buffer("partial_amax", torch.zeros(num_layers, AMAX_PARTS, device=device), persistent=False)
 
-    def refresh(self, qk: torch.Tensor, v: torch.Tensor):
-        """Requantize from qk [layers, qk_rows, cols] and v [layers, v_rows, cols]."""
-        quantize_dual_layout_packed_batched(qk, v, self.scales, self.partial_amax, self.row, self.col)
+    def refresh(self, qk: torch.Tensor, v: torch.Tensor, col_gain: torch.Tensor | None = None):
+        """Requantize from qk [layers, qk_rows, cols] and v [layers, v_rows, cols], each layer's columns
+        times col_gain [layers, cols] if given (LayerRoPE)."""
+        quantize_dual_layout_packed_batched(qk, v, self.scales, self.partial_amax, self.row, self.col, col_gain)

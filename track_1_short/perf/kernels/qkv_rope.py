@@ -219,10 +219,14 @@ class PackedFP8QKVFunction(torch.autograd.Function):
 
     The activation arrives already quantized (`x_f8`, `x_f8_t`): layers that read the same attention
     input quantize it once and share it (see GPT.forward). `x` itself only receives the gradient.
+    `col_scale` (LayerRoPE): the [dim] fp32 per-column scale of the effective weight, qkv_scale times
+    the input gain the cached fp8 weight holds folded into its columns; or None. It rides along only for
+    its gradient, which replaces qkv_scale's (the caller passes qkv_scale detached for the dequant).
     """
     @staticmethod
     def forward(ctx, x, qk_weight, v_weight, weight_f8, weight_f8_t, weight_scale, qkv_scale,
-                x_scale, grad_scale, factor1, factor2, num_heads, paired, key_offset, rotary_dim, x_f8, x_f8_t):
+                x_scale, grad_scale, factor1, factor2, num_heads, paired, key_offset, rotary_dim, x_f8, x_f8_t,
+                col_scale=None):
         qk_dim = qk_weight.shape[0] // (2 * num_heads)
         v_dim = v_weight.shape[0] // num_heads
         qk_features = 2 * num_heads * qk_dim
@@ -240,7 +244,9 @@ class PackedFP8QKVFunction(torch.autograd.Function):
         v = v_flat.view(-1, num_heads, v_dim)
         q, k = qk_norm_rope_forward(qk, factor1, factor2, num_heads, rotary_dim, paired, key_offset)
         ctx.save_for_backward(qk_weight, v_weight, x_f8_t, weight_f8_t, scaled_weight_scale,
-                              qkv_scale, x_scale, grad_scale, qk, factor1, factor2)
+                              qkv_scale, x_scale, grad_scale, qk, factor1, factor2,
+                              *((col_scale,) if col_scale is not None else ()))
+        ctx.col_scale = col_scale is not None
         ctx.input_shape = x.shape
         ctx.num_heads, ctx.v_dim = num_heads, v_dim
         ctx.paired, ctx.key_offset, ctx.rotary_dim = paired, key_offset, rotary_dim
@@ -248,8 +254,10 @@ class PackedFP8QKVFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_q, grad_k, grad_v):
-        (qk_weight, v_weight, x_f8_t, weight_f8_t, scaled_weight_scale, qkv_scale,
-         x_scale, grad_scale, qk, factor1, factor2) = ctx.saved_tensors
+        st = ctx.saved_tensors
+        qk_weight, v_weight, x_f8_t, weight_f8_t, scaled_weight_scale = st[0], st[1], st[2], st[3], st[4]
+        qkv_scale, x_scale, grad_scale, qk, factor1, factor2 = st[5], st[6], st[7], st[8], st[9], st[10]
+        col_scale = st[11] if ctx.col_scale else None
         num_heads, v_dim = ctx.num_heads, ctx.v_dim
         grad_v = grad_v.reshape(-1, num_heads, v_dim)
         tokens, heads2, qk_dim = qk.shape
@@ -276,11 +284,22 @@ class PackedFP8QKVFunction(torch.autograd.Function):
         grad_input = _scaled_mm_bf16(grad_f8, weight_f8_t.T, grad_scale, scaled_weight_scale, False)
         # .to(qkv_scale.dtype): qkv_scale is an fp32 scalar while the weights are bf16, and autograd
         # checks the outgoing gradient's dtype.
-        grad_qkv_scale = (grad_weight * torch.cat((qk_weight, v_weight))).sum().to(qkv_scale.dtype)
+        grad_col_scale = None
+        if col_scale is None:
+            grad_qkv_scale = (grad_weight * torch.cat((qk_weight, v_weight))).sum().to(qkv_scale.dtype)
+            weight_grad_scale = qkv_scale
+        else:
+            # The effective weight is W * col_scale (columns): grad_weight is its gradient, so
+            # dL/dW = grad * col_scale and dL/dcol_scale = per-column <grad, W> -- the same two passes
+            # as the scalar case above, with the dot kept per column.
+            grad_qkv_scale = None
+            grad_col_scale = (grad_weight.float() * torch.cat((qk_weight, v_weight)).float()).sum(dim=0)
+            weight_grad_scale = col_scale.to(grad_weight.dtype)
         grad_qk_weight, grad_v_weight = grad_weight.split((2 * num_heads * qk_dim, num_heads * v_dim))
-        # One slot per forward argument; only x, the two weights and qkv_scale carry gradients.
-        return (grad_input.view(ctx.input_shape), grad_qk_weight * qkv_scale, grad_v_weight * qkv_scale,
-                None, None, None, grad_qkv_scale, None, None, None, None, None, None, None, None, None, None)
+        # One slot per forward argument; only x, the two weights and qkv_scale or col_scale carry gradients.
+        return (grad_input.view(ctx.input_shape), grad_qk_weight * weight_grad_scale, grad_v_weight * weight_grad_scale,
+                None, None, None, grad_qkv_scale, None, None, None, None, None, None, None, None, None, None,
+                grad_col_scale)
 
 
 PackedFP8QKV = PackedFP8QKVFunction.apply

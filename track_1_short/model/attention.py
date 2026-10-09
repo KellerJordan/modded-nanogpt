@@ -130,6 +130,13 @@ class AttnArgs:
     # A 0-D gain folded into the output projection with sa_lambdas[1]: the layer's residual post-lambda,
     # so the residual add takes the attention output as is (perf/residual_fusion.py). None = no gain.
     o_gain: torch.Tensor | None = None
+    # LayerRoPE: the [dim] fp32 row scale of O (sa_lambdas[1] times the post-lambda times the residual
+    # gain), replacing sa_lambdas[1] and o_gain. None = no LayerRoPE.
+    o_row_scale: torch.Tensor | None = None
+    # LayerRoPE: the [dim] fp32 column scale of the packed QKV weight (sa_lambdas[0] times the input gain),
+    # replacing sa_lambdas[0]. In fp8 the cache holds the gain (GPT.quantize_attn_fp8) and the scale rides
+    # along for its gradient. None = no LayerRoPE.
+    qkv_col_scale: torch.Tensor | None = None
 
 
 class CausalSelfAttention(nn.Module):
@@ -178,15 +185,19 @@ class CausalSelfAttention(nn.Module):
             weight_f8, weight_f8_t, weight_scale, x_scale, grad_scale, x_f8, x_f8_t = qkv_fp8
             q, k, v = PackedFP8QKV(
                 x, qk_w.type_as(x), v_w.type_as(x),
-                weight_f8, weight_f8_t, weight_scale, sa_lambdas[0],
+                weight_f8, weight_f8_t, weight_scale,
+                sa_lambdas[0] if attn_args.qkv_col_scale is None else sa_lambdas[0].detach(),
                 x_scale, grad_scale,
                 yarn.factor1[:T], yarn.factor2[:T], H,
-                self.paired, key_offset, Yarn.ROTARY_DIM, x_f8, x_f8_t,
+                self.paired, key_offset, Yarn.ROTARY_DIM, x_f8, x_f8_t, attn_args.qkv_col_scale,
             )
             q, k, v = q[None], k[None], v[None]
         else:
             # Validation (no_grad): a bf16 projection and the forward norm/rotary kernel.
-            qkv_weight = sa_lambdas[0] * torch.cat((qk_w, v_w)).type_as(x)
+            if attn_args.qkv_col_scale is None:
+                qkv_weight = sa_lambdas[0] * torch.cat((qk_w, v_w)).type_as(x)
+            else:
+                qkv_weight = (torch.cat((qk_w, v_w)).float() * attn_args.qkv_col_scale[None, :]).type_as(x)
             qkv = F.linear(x, qkv_weight)
             qk, v = qkv.split((2 * H * self.qk_dim, H * self.v_dim), dim=-1)
             qk = qk.view(B, T, 2 * H, self.qk_dim)
@@ -230,5 +241,8 @@ class CausalSelfAttention(nn.Module):
             y = y * attn_gate_w.type_as(y).view(B, T, H, 1)
         y = y.contiguous().view(B, T, H * self.v_dim) # re-assemble all head outputs side by side
         # The output scale rounds to bf16 in the one product with O, with or without o_gain.
+        if attn_args.o_row_scale is not None:
+            # LayerRoPE: still one product with O, by a [dim] row scale instead of a 0-D one.
+            return F.linear(y, (attn_args.o_row_scale[:, None] * o_w.float()).type_as(y))
         o_scale = sa_lambdas[1] if attn_args.o_gain is None else sa_lambdas[1] * attn_args.o_gain
         return F.linear(y, o_scale * o_w.type_as(y))

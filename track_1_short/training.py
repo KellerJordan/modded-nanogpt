@@ -1,5 +1,6 @@
 """Training state that changes per step: schedule application and optimizer stepping."""
 import copy
+import math
 from collections.abc import Callable
 
 import torch
@@ -19,6 +20,19 @@ VALUE_EMBED_LR_MUL = 70.0
 VALUE_EMBED_BETAS = (0.75, 0.95)
 VALUE_EMBED_WD_MUL = 5.0
 VALUE_EMBED_WD_MUL_PERIOD4 = 10.0
+
+
+# LayerRoPE's gates leave the global lr envelope for their own: a linear warmup to LROPE_GATES_PEAK at
+# the end of stage 0, then a cosine decline to LROPE_GATES_FLOOR at the last step ("long_warm").
+LROPE_GATES_PEAK = 1.73
+LROPE_GATES_FLOOR = 0.15
+
+
+def layer_rope_gates_lr(step: int, warm_end: int, total_steps: int) -> float:
+    if step < warm_end:
+        return LROPE_GATES_PEAK * step / warm_end
+    t = (step - warm_end) / max(1, total_steps - warm_end)
+    return LROPE_GATES_FLOOR + (LROPE_GATES_PEAK - LROPE_GATES_FLOOR) * 0.5 * (1.0 + math.cos(math.pi * t))
 
 
 def value_embed_betas_and_wd_mul(step: int) -> tuple[tuple[float, float], float]:
@@ -79,6 +93,12 @@ class TrainingManager():
             "mudd_gate_b2": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
             "_mudd_gate_scale": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
         })
+        # ---- LayerRoPE: never weight-decayed; the gates on their own schedule (layer_rope_gates_lr) ----
+        self.param_table.update({
+            "layer_rope_gammas": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.95], "lr_mul": 1.0, "wd_mul": 0.0},
+            "layer_rope_gates":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.95], "lr_mul": 1.0, "wd_mul": 0.0},
+        })
+        lrope_labels = ["layer_rope_gammas", "layer_rope_gates"]
 
         # NCCL runs one stream in enqueue order and future.wait() is a stream wait, so scatter_order is
         # the comms schedule (record #360). The replicated params are all-reduced as one flat buffer ahead
@@ -89,7 +109,7 @@ class TrainingManager():
             "lm_head", "embed",
             "scalars", "smear_gate", "ve_gate_bank", "post_lambdas", "resid_lambdas",
             "mudd_w1", "mudd_w2", "mudd_w2g", "mudd_b2", "mudd_gate_w1", "mudd_gate_w2", "mudd_gate_b2",
-            "_mudd_gate_scale",
+            "_mudd_gate_scale", *lrope_labels,
         ]
         # work_order is the compute schedule (record #360):
         # - qk_bank and vo_bank first: their gathers are the first ones the next step's fp8 refresh waits
@@ -102,7 +122,7 @@ class TrainingManager():
         self.work_order = [
             "qk_bank", "vo_bank", "lm_head", "embed", "value_embeds",
             "scalars", "smear_gate", "ve_gate_bank", "mudd_b2", "mudd_gate_b2", "_mudd_gate_scale",
-            "post_lambdas", "resid_lambdas", "mudd_w2", "mudd_w2g", "mudd_gate_w2", "mudd_w1", "mudd_gate_w1",
+            "post_lambdas", "resid_lambdas", *lrope_labels, "mudd_w2", "mudd_w2g", "mudd_gate_w2", "mudd_w1", "mudd_gate_w1",
             "mlp_bank",
         ]
 
@@ -192,6 +212,9 @@ class TrainingManager():
                 # By step, not by the run's cadence: warmup (which updates on every Adam step) then
                 # compiles the Adam step for both beta pairs.
                 p_cfg.adam_betas, p_cfg.wd_mul = value_embed_betas_and_wd_mul(step)
+            elif p_cfg.label == "layer_rope_gates":
+                p_cfg.lr = p_cfg.initial_lr * layer_rope_gates_lr(
+                    step, warm_end=self.schedule.boundaries[0][1], total_steps=self.schedule.total_steps)
 
         table_event = row_prefetch.optimizer_event(step, lr=self.adam_defaults["lr"] * step_lr,
                                                    weight_decay=self.adam_defaults["weight_decay"],

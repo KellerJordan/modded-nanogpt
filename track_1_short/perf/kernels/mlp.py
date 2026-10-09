@@ -177,9 +177,10 @@ def quantize_dual_layout_fused(src: torch.Tensor, scale: torch.Tensor, fmt: torc
 # Weight caches: one read of a [L, H, D] bank writes both e4m3 layouts and each tile's amax.
 
 @triton.jit
-def _quantize_weights_dual_kernel(w_ptr, row_ptr, col_ptr, scale_ptr, partial_amax_ptr, w_stride_l, w_stride_h,
-                                  w_stride_d, H: tl.constexpr, D: tl.constexpr, num_tiles_d: tl.constexpr,
-                                  num_tiles: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_D: tl.constexpr):
+def _quantize_weights_dual_kernel(w_ptr, row_ptr, col_ptr, scale_ptr, partial_amax_ptr, gain_ptr, w_stride_l, w_stride_h,
+                                  w_stride_d, gain_stride_l, H: tl.constexpr, D: tl.constexpr, num_tiles_d: tl.constexpr,
+                                  num_tiles: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_D: tl.constexpr,
+                                  HAS_GAIN: tl.constexpr):
     layer = tl.program_id(0)
     tile = tl.program_id(1)
     tile_h = tile // num_tiles_d
@@ -188,6 +189,9 @@ def _quantize_weights_dual_kernel(w_ptr, row_ptr, col_ptr, scale_ptr, partial_am
     offs_d = tile_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask = (offs_h[:, None] < H) & (offs_d[None, :] < D)
     v = tl.load(w_ptr + layer * w_stride_l + offs_h[:, None] * w_stride_h + offs_d[None, :] * w_stride_d, mask=mask, other=0.0).to(tl.float32)
+    if HAS_GAIN:  # LayerRoPE: a per-column gain folded into the cached weight
+        g = tl.load(gain_ptr + layer * gain_stride_l + offs_d, mask=offs_d < D, other=0.0).to(tl.float32)
+        v = v * g[None, :]
     s = tl.load(scale_ptr + layer)
     q = tl.maximum(tl.minimum(v / s, 448.0), -448.0).to(tl.float8e4nv)
     tl.store(row_ptr + layer * H * D + offs_h[:, None] * D + offs_d[None, :], q, mask=mask)
@@ -200,23 +204,30 @@ def quantize_weights_dual_ntiles(H: int, D: int) -> int:
     return triton.cdiv(H, 64) * triton.cdiv(D, 64)
 
 def quantize_mlp_weights_dual(bank: torch.Tensor, scales: torch.Tensor, partial_amax: torch.Tensor,
-                              row: torch.Tensor, col_t: torch.Tensor, update_scales: bool):
+                              row: torch.Tensor, col_t: torch.Tensor, update_scales: bool,
+                              col_gain: torch.Tensor | None = None):
     """Quantize a weight bank [L, H, D] (bf16) into both fp8 caches from one read.
 
     `row` is [L, H, D] e4m3 contiguous; `col_t` is [L, D, H] contiguous, i.e. the transpose(1, 2)
     view of a column-major [L, H, D] cache. With update_scales, `scales` [L] are first refreshed
     from the previous call's per-tile amaxes: the scale lags a step, which takes the reduction off
-    the critical path and is loss-neutral because the weights move <<1% per step."""
+    the critical path and is loss-neutral because the weights move <<1% per step.
+    `col_gain` [L, D] (LayerRoPE), if given, multiplies each layer's columns before quantizing (and
+    before the amax), so the caches hold bank * gain without a temporary."""
     L, H, D = bank.shape
     BLOCK_H = BLOCK_D = 64
     num_tiles_d = triton.cdiv(D, BLOCK_D)
     num_tiles = triton.cdiv(H, BLOCK_H) * num_tiles_d
     assert partial_amax.shape == (L, num_tiles)
+    if col_gain is not None:
+        assert col_gain.shape == (L, D) and col_gain.stride(1) == 1
     if update_scales:
         torch.clamp(partial_amax.amax(dim=1) * (WEIGHT_SCALE_HEADROOM / 448.0), min=1e-12, out=scales)
     _quantize_weights_dual_kernel[(L, num_tiles)](
-        bank, row, col_t, scales, partial_amax, bank.stride(0), bank.stride(1), bank.stride(2), H=H, D=D,
-        num_tiles_d=num_tiles_d, num_tiles=num_tiles, BLOCK_H=BLOCK_H, BLOCK_D=BLOCK_D, num_warps=4, num_stages=2)
+        bank, row, col_t, scales, partial_amax, col_gain if col_gain is not None else scales,
+        bank.stride(0), bank.stride(1), bank.stride(2), col_gain.stride(0) if col_gain is not None else 0, H=H, D=D,
+        num_tiles_d=num_tiles_d, num_tiles=num_tiles, BLOCK_H=BLOCK_H, BLOCK_D=BLOCK_D,
+        HAS_GAIN=col_gain is not None, num_warps=4, num_stages=2)
 
 
 # -----------------------------------------------------------------------------
