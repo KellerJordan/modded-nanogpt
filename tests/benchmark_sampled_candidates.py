@@ -6,7 +6,7 @@ from time import perf_counter
 
 import numpy as np
 
-from tests.test_sampled_candidates import BufferedCandidateBuilder
+from tests.reference_sampled_candidates import BufferedCandidateBuilder
 from track_1_short.perf.sampled_candidates import CandidateBuilder
 
 

@@ -48,10 +48,18 @@ class CandidateBuilder:
     def build(self, P: int, targets: np.ndarray, prefix_table: np.ndarray | None):
         """(candidates, target_pos, prefix_pos) for one microbatch; views into scratch.
 
-        Targets are vocabulary ids; prefix_table holds vocabulary ids or -1 (no prefix).
+        Targets are a one-dimensional integer array of vocabulary ids, no longer than max_rows;
+        prefix_table holds vocabulary ids or -1 (no prefix). P fits both max_candidates and the
+        vocabulary, and may be zero for an empty batch.
         prefix_pos is None when there is no prefix table yet (warmup), leaving the device buffer at -1.
         """
+        if targets.ndim != 1:
+            raise ValueError("targets must be one-dimensional")
         V, mark, pos, T = self.vocab_size, self.mark, self.pos, targets.shape[0]
+        if T > self.target_pos.size:
+            raise ValueError(f"{T} targets exceed scratch capacity {self.target_pos.size}")
+        if P < 0 or P > self.arange.size or P > V:
+            raise ValueError(f"candidate count {P} is outside [0, {min(self.arange.size, V)}]")
         mark.fill(False)
         mark[targets] = True
         num_targets = int(np.count_nonzero(mark[:V]))

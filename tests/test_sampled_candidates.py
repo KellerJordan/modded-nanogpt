@@ -2,30 +2,8 @@ import unittest
 
 import numpy as np
 
+from tests.reference_sampled_candidates import BufferedCandidateBuilder
 from track_1_short.perf.sampled_candidates import CandidateBuilder
-
-
-class BufferedCandidateBuilder(CandidateBuilder):
-    """The original build, retained to verify candidate order and positions across steps."""
-    def build(self, P, targets, prefix_table):
-        V, mark, pos, T = self.vocab_size, self.mark, self.pos, targets.shape[0]
-        mark.fill(False)
-        mark[targets] = True
-        num_targets = int(np.count_nonzero(mark[:V]))
-        assert num_targets <= P
-        if num_targets != P:
-            self.mark_u8[self._negatives(P - num_targets)] = 1
-        candidates = np.flatnonzero(mark[:V])
-        pos[:V].fill(-1)
-        pos[candidates] = self.arange[:P]
-        target_pos = self.target_pos[:T]
-        np.take(pos, targets, out=target_pos)
-        if prefix_table is None:
-            return candidates, target_pos, None
-        prefix_targets, prefix_pos = self.prefix_targets[:T], self.prefix_pos[:T]
-        np.take(prefix_table, targets, out=prefix_targets)
-        np.take(pos, prefix_targets, out=prefix_pos)
-        return candidates, target_pos, prefix_pos
 
 
 class SampledCandidateTests(unittest.TestCase):
