@@ -61,6 +61,6 @@ We left it out of this certification. Its README reports a few collapsed runs, a
 
 ## Environment
 
-- **Hardware:** 8× NVIDIA H100 80GB HBM3 (SXM5, NVLink), driver 595.91.07. It's a rented single node (RunPod Secure Cloud, US). Master ran 40.162 s here vs 39.914 s published, about 0.6 % slower than the official timing.
+- **Hardware:** 8× NVIDIA H100 80GB HBM3 (SXM5, NVLink), one node, driver 595.91.07. Master ran 40.162 s here vs 39.914 s published, about 0.6 % slower than the official timing.
 - **Software:** PyTorch 2.10.0+cu128, Triton 3.6.0, `kernels` 0.16.1 (FlashAttention-3 `devenpzak/flash-attn3-12864`), Python 3.12.
 - **Command:** `torchrun --standalone --nproc_per_node=8 train_gpt.py` (defaults, plus `TRAIN_SEED` per run).
