@@ -20,7 +20,9 @@ class Hyperparameters:
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin") # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    val_batch_size: int = 4 * 64 * 1024 * 8
+    # ALLOW_4_GPUS: half the global val batch so each rank's val forward keeps the 8-GPU size (262k tokens);
+    # val_tokens is fixed, so this only doubles the number of val steps.
+    val_batch_size: int = 4 * 64 * 1024 * (4 if os.environ.get("ALLOW_4_GPUS") == "1" else 8)
     # schedule: the base step count of the main stages (SCHEDULE_GROWTH_STEPS are added on top), then
     # the extension stage. The override is for step-count sweeps (record #360's KX_STEPS).
     num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "1122"))
@@ -30,7 +32,7 @@ class Hyperparameters:
     # Every how many steps to evaluate val loss; 0 = only at the end (record #360: each intermediate
     # validation is on the clock -- the val reads and n-gram pulls, the value_embeds gather, the drained
     # CUDA-graph run-ahead and the cycle re-land after it cost ~0.2-0.5 s over a run at 250).
-    val_loss_every: int = 0
+    val_loss_every: int = int(os.environ.get("VAL_EVERY", 0))
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # reproducibility: unset means a random init; any integer (0 included) seeds it
@@ -65,7 +67,7 @@ BLOCK_SIZE = 128
 VIRTUAL_SEQ_CAP = 2560
 TAPER_BATCH_UNITS = 20
 # The lr decays linearly to its floor over the last LR_COOLDOWN_FRAC of the main stages (record #360).
-LR_COOLDOWN_FRAC = 0.80
+LR_COOLDOWN_FRAC = float(os.environ.get("LR_COOLDOWN_FRAC", "0.80"))  # env override: CPLM schedule ablation
 # embed unties from lm_head at the start of this stage, the extension stage (record #360).
 SPLIT_EMBED_STAGE = 4
 # The final validation extends the long attention window to this many blocks (record #360).
@@ -87,5 +89,24 @@ TRAINING_STAGES = [
     TrainingStage(train_max_seq_len=3072, batch_size=8 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used (lr sits at the floor)
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weights=(0.0,)),
 ]
+# CPLM fix (#61): train on longer documents in the 3072-token stages (CPLM_LATE_SEQ=4096), so the copy head
+# sees the tails of long documents the validation set contains.
+# Window-schedule ablation (WS_SCALE, e.g. 0.75): scale every stage's (short, long) attention window, min 1 block.
+if os.environ.get("WS_SCALE"):
+    import dataclasses as _dc
+    _ws = float(os.environ["WS_SCALE"])
+    TRAINING_STAGES = [_dc.replace(st, window_sizes=tuple(max(1, round(w * _ws)) for w in st.window_sizes))
+                       for st in TRAINING_STAGES]
+# NO_MTP=1: next-token loss only (MTP weights [1.0] in every stage); the prefix loss is kept unless NO_PREFIX=1.
+if os.environ.get("NO_MTP") == "1":
+    import dataclasses as _dc
+    TRAINING_STAGES = [_dc.replace(st, mtp_weights_start=[1.0], mtp_weights_end=[1.0]) for st in TRAINING_STAGES]
+if os.environ.get("NO_PREFIX") == "1":
+    import dataclasses as _dc
+    TRAINING_STAGES = [_dc.replace(st, prefix_weights=(0.0,)) for st in TRAINING_STAGES]
+if os.environ.get("CPLM_LATE_SEQ"):
+    import dataclasses as _dc
+    TRAINING_STAGES = [_dc.replace(st, train_max_seq_len=int(os.environ["CPLM_LATE_SEQ"])) if st.train_max_seq_len == 3072 else st
+                       for st in TRAINING_STAGES]
 assert VIRTUAL_SEQ_CAP % BLOCK_SIZE == 0
 assert any(s.train_max_seq_len > VIRTUAL_SEQ_CAP for s in TRAINING_STAGES), "VIRTUAL_SEQ_CAP would be inert"

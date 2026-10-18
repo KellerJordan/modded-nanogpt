@@ -1,3 +1,4 @@
+import os
 """The GPT model: embeddings, 11 transformer blocks with MUDD skip connections, and the loss."""
 import math
 from dataclasses import dataclass
@@ -114,6 +115,42 @@ FP8_ATTN_GRAD_SCALE = 1.0 / 448.0
 # Validation computes the loss over slabs of this many rows (record #360), so its [rows, vocab] fp32
 # logits (6.6 GB per slab) stay small next to the rank's 16 GB n-gram shard.
 EVAL_CE_SLAB_ROWS = 32768
+if os.environ.get("CPLM") == "1":
+    from track_1_short.cplm_copy import copy_sink_probs_fused
+    from track_1_short.perf.kernels.cplm_cross_entropy import COPY_TOKEN_ID, FusedCPLMCrossEntropy, SampledCPLMCrossEntropy
+    COPY_BLOCK = 2048  # copy lookback band: one to two blocks
+    COPY_TRUE_DOCS = os.environ.get("COPY_TRUE_DOCS") == "1"
+    COPY_PTR_AUX = float(os.environ.get("CPLM_PTR_AUX", "0"))
+    COPY_GATE_OFFSET = float(os.environ.get("CPLM_GATE_OFFSET", "0"))
+    # CPLM_KEY_EMB=1: keys also read the (detached, rms-normed) unembedding row of the source token, through a third
+    # bank slice initialized equal to the query projection, so q_t . k_j ~ the LM logit of x_j from step 0.
+    COPY_KEY_EMB = os.environ.get("CPLM_KEY_EMB") == "1"
+    # CPLM_EXT_GATE=1: alpha = sigmoid(w . h + b), its own head instead of the <copy> column's share of the 50k-way
+    # softmax (b starts at logit(CPLM_GATE_INIT)). In the softmax gate, alpha is pushed by every vocab logit and the
+    # aux CE terms, and in some seeds it collapsed to ~1e-3 early and never recovered.
+    COPY_EXT_GATE = os.environ.get("CPLM_EXT_GATE") == "1"
+    COPY_GATE_INIT = float(os.environ.get("CPLM_GATE_INIT", "0.05"))
+    # CPLM_GATE_MAX: alpha = max * sigmoid(.). Uncapped, the gate overshot to ~0.5 early in some seeds (the copy beats
+    # the young LM), starving the LM of gradient; those runs settled at alpha ~0.25 and a worse loss.
+    COPY_GATE_MAX = float(os.environ.get("CPLM_GATE_MAX", "1"))
+    COPY_GATE_FLOOR = float(os.environ.get("CPLM_GATE_FLOOR", "0"))  # see perf/kernels/cplm_cross_entropy.py
+    COPY_MTP_COPY = os.environ.get("CPLM_MTP_COPY") == "1"  # see perf/kernels/cplm_cross_entropy.py
+    # CPLM_PTR_WINDOW=W (tokens): while the backbone's long attention window is <= W tokens (stage 1 at W = 384), the
+    # pointer only sees sources within that window. Early on the windows are tiny and the pointer, seeing the whole
+    # document, was the model's only long-range route: the gate overshot and the young LM leaned on it.
+    COPY_PTR_WINDOW = int(os.environ.get("CPLM_PTR_WINDOW", "0"))
+    # CPLM_STATS=1: per-step training diagnostics into self.cplm_train_stats (read by train_gpt.py, see STATS_NAMES)
+    COPY_STATS = os.environ.get("CPLM_STATS") == "1"
+    # CPLM_QK_NORM=1: RMS-normalize the pointer's q and k (q times a learnable temperature copy_qk_gain, init 1). Unnormed,
+    # Adam grew q/k fast in the first steps; in some seeds the pointer scores reached std ~75, the pointer softmax
+    # saturated on wrong sources (p_copy underflowed to 0, pointer gradients vanished) and the copy gate then collapsed.
+    COPY_QK_NORM = os.environ.get("CPLM_QK_NORM") == "1"
+    COPY_RAW = os.environ.get("CPLM_RAW_COPY") == "1"  # see perf/kernels/cplm_cross_entropy.py
+    from track_1_short.perf.kernels.cplm_cross_entropy import RAW_C0
+    STATS_NAMES = ("alpha", "log_alpha", "frac_alpha>1e-2", "copy_share", "h_norm", "q_norm", "k_norm", "sink_score",
+                   "score_std", "p_copy", "a_sink", "frac_copyable", "zc_raw", "zc_capped")
+    BOS_TOKEN_ID = 50256
+
 
 # FP8 MLP scales (see perf/kernels/mlp.py), from record #360.
 FP8_MLP_X_SCALE = 2 ** -4      # static: post-RMS-norm rows have max|x| <= sqrt(768) = 27.7 < 448 * 2^-4
@@ -163,7 +200,10 @@ class GPT(nn.Module):
         # The n-gram table rows the current update cycle (or eval batch) reads, pulled from their owning
         # ranks (see track_1_short/ngram_table.py). Sized for the largest forward, two rows per token,
         # which also holds a training cycle (NgramTable asserts it).
-        self.register_buffer("ngram_cache", torch.zeros(2 * max_seq_len, ngram_dim, dtype=torch.bfloat16, device=device),
+        # ALLOW_4_GPUS: a training cycle (2 rows x MAX_CYCLE_STEPS x step tokens) outgrows 2 x the val batch, so
+        # the launcher passes the cycle size in NGRAM_CACHE_MIN_ROWS.
+        cache_rows = max(2 * max_seq_len, int(__import__("os").environ.get("NGRAM_CACHE_MIN_ROWS", "0")))
+        self.register_buffer("ngram_cache", torch.zeros(cache_rows, ngram_dim, dtype=torch.bfloat16, device=device),
                              persistent=False)
 
         # Canonical token mask for the validation softmax, one bit per (prev, cur) pair.
@@ -189,6 +229,55 @@ class GPT(nn.Module):
         self.init_misc(model_dim, num_layers)
         self.init_mudd(num_layers, model_dim)
         self.init_mudd_gate(model_dim)
+
+        # CPLM (env CPLM=1): copy-sink pointer, K=1 head of dim CPLM_DIM over the final hidden state, plus a
+        # learned sink key. <copy> is the first padding row of the vocab, so lm_head needs no new rows.
+        self.cplm = os.environ.get("CPLM") == "1"
+        if self.cplm:
+            copy_dim = int(os.environ.get("CPLM_DIM", "128"))
+            bound = (3 ** 0.5) * model_dim ** -0.5
+            # CPLM_INIT_SEED: draw the copy head's init from its own fixed generator (independent of TRAIN_SEED and
+            # without consuming the global RNG): the copy init draw, not the backbone's, decided the bad seeds.
+            init_seed = os.environ.get("CPLM_INIT_SEED")
+            gen = torch.Generator(device=device).manual_seed(int(init_seed)) if init_seed is not None else None
+            self.copy_qk_bank = nn.Parameter(torch.empty(3 if COPY_KEY_EMB else 2, copy_dim, model_dim, device=device)
+                                             .uniform_(-bound, bound, generator=gen))
+            self.copy_k_sink = nn.Parameter(torch.randn(copy_dim, device=device, generator=gen) * copy_dim ** -0.5)
+            if os.environ.get("CPLM_INIT") == "zerok":
+                # Deterministic, neutral pointer start: zero key projection and sink key -> uniform attention over
+                # the document plus the sink at step 0 (q still gets gradients). Some random q/k draws sent the
+                # pointer, and through it the shared backbone, into a bad mode the run never left.
+                with torch.no_grad():
+                    self.copy_qk_bank[1].zero_()
+                    self.copy_k_sink.zero_()
+            if COPY_KEY_EMB:
+                # structured, seed-robust pointer: hidden-state key term and sink start at zero, embedding key term = W_q
+                with torch.no_grad():
+                    self.copy_qk_bank[2].copy_(self.copy_qk_bank[0])
+                    self.copy_qk_bank[1].zero_()
+                    self.copy_k_sink.zero_()
+            if COPY_EXT_GATE:
+                u = COPY_GATE_INIT / COPY_GATE_MAX
+                init_b = math.log(u / (1 - u))
+                self.copy_gate = nn.Parameter(torch.cat([torch.zeros(model_dim, device=device),
+                                                         torch.full((1,), init_b, device=device)]))
+            if COPY_QK_NORM:
+                self.copy_qk_gain = nn.Parameter(torch.full((1,), float(os.environ.get("CPLM_QK_GAIN_INIT", "1")), device=device))
+            # validation copy band (CPLM_EVAL_BLOCK; the CPLM_EVAL_BLOCKS sweep in train_gpt.py overrides it); None = COPY_BLOCK
+            self.copy_eval_block = int(os.environ["CPLM_EVAL_BLOCK"]) if os.environ.get("CPLM_EVAL_BLOCK") else None
+            self.register_buffer("copy_col_full", torch.full((1,), COPY_TOKEN_ID, dtype=torch.int32, device=device),
+                                 persistent=False)
+            # validation diagnostics, summed over tokens: [count, nll, lm-only nll, alpha, a_sink, copy share of p(y)]
+            self.register_buffer("cplm_diag", torch.zeros(6, dtype=torch.float32, device=device), persistent=False)
+            # copy-gate scale lambda in [0, 1] (alpha -> lambda * alpha); main() ramps it over CPLM_WARMUP steps
+            self.register_buffer("copy_gate_lambda", torch.ones(1, dtype=torch.float32, device=device), persistent=False)
+            # sink-route scale in [0, 1] (a_sink -> lambda * a_sink in the mixture); main() ramps it over CPLM_SINK_WARMUP
+            # steps. At 0 the sink's mass is lost rather than handed back to the LM, so the young pointer cannot park
+            # on the sink (a_sink -> 1 and its gradients vanish), which killed the copy branch in some seeds.
+            # training diagnostics (CPLM_STATS): STATS_NAMES slots, then the batch-mean final hidden state (model_dim)
+            self.register_buffer("cplm_train_stats", torch.zeros(16 + model_dim, dtype=torch.float32, device=device),
+                                 persistent=False)
+            self.register_buffer("copy_sink_lambda", torch.ones(1, dtype=torch.float32, device=device), persistent=False)
 
         # Auto-label parameters
         for name, param in self.named_parameters():
@@ -560,6 +649,8 @@ class GPT(nn.Module):
         # sliding-window sizes and key shift: the long windows get the partial key offset
         bm_sizes = [ws_long if i in LONG_WINDOW_LAYERS else ws_short for i in range(self.num_layers)]
         key_offset = [i in LONG_WINDOW_LAYERS for i in range(self.num_layers)]
+        if os.environ.get("ALL_SHORT") == "1":  # CPLM fix (#61): layers 3, 10 use the short window too, keep key offset
+            bm_sizes = [ws_short] * self.num_layers
 
         # FP8 is training-only; validation runs the bf16 path.
         use_fp8 = self.training
@@ -771,9 +862,10 @@ class GPT(nn.Module):
             mixed = mixed + (mu[k] + deltas[..., k, :]).unsqueeze(-1) * grouped(src)
         x = mixed.flatten(-2)
 
-        return self._loss(norm(x), input_seq, target_seq, mtp_weights, prefix_weight, schedule_cfg.sampled_loss)
+        return self._loss(norm(x), input_seq, target_seq, mtp_weights, prefix_weight, schedule_cfg.sampled_loss, seqlens,
+                          ws_long=schedule_cfg.ws_long)
 
-    def _loss(self, x, input_seq, target_seq, mtp_weights, prefix_weight, sampled_loss):
+    def _loss(self, x, input_seq, target_seq, mtp_weights, prefix_weight, sampled_loss, seqlens=None, ws_long=None):
         """Per-token loss from the final normed hidden state.
 
         Training: fused softcapped CE over next-token + multi-token + prefix-token targets, normalized
@@ -783,6 +875,8 @@ class GPT(nn.Module):
         """
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
+        if self.cplm:
+            return self._cplm_loss(x, input_seq, target_seq, mtp_weights, prefix_weight, sampled_loss, seqlens, ws_long)
         if self.training and sampled_loss is not None:
             # Targets and prefix targets arrive as positions in the candidate set, built on the host.
             n = target_seq.size(0)
@@ -816,6 +910,107 @@ class GPT(nn.Module):
             loss_per_token = torch.cat(slab_losses)
         return loss_per_token
 
+    def _cplm_loss(self, x, input_seq, target_seq, mtp_weights, prefix_weight, sampled_loss, seqlens, ws_long=None):
+        """_loss with the next-token CE replaced by the copy-sink mixture (training: inside the fused CE kernel;
+        validation: on the canonical-masked full-softmax logits, <copy> exempt from the mask)."""
+        xf = x.view(-1, x.size(-1))
+        bank = self.copy_qk_bank.type_as(xf)
+        q, k = F.linear(xf, bank[:2].flatten(0, 1)).chunk(2, dim=-1)
+        if COPY_KEY_EMB:
+            e = self.lm_head.weight.detach().index_select(1, input_seq.view(-1).long()).T
+            k = k + F.linear(F.rms_norm(e.float(), (e.size(-1),)).type_as(xf), bank[2])
+        # COPY_TRUE_DOCS=1: the copy head's documents are the real ones (BOS-delimited) in training as at validation,
+        # not #92's 2560-token attention segments (validation never splits documents).
+        doc_starts = (input_seq == BOS_TOKEN_ID) if COPY_TRUE_DOCS else None
+        if COPY_QK_NORM:
+            q = (F.rms_norm(q.float(), (q.size(-1),)) * self.copy_qk_gain).type_as(xf)
+            k = F.rms_norm(k.float(), (k.size(-1),)).type_as(xf)
+        # CPLM_MTP_COPY=1: in training the MTP terms get their own copy branch (p_copy is [n_predict, N])
+        shifts = mtp_weights.shape[0] if (self.training and COPY_MTP_COPY) else 1
+        block = COPY_BLOCK if (self.training or self.copy_eval_block is None) else self.copy_eval_block
+        p_copy, a_sink = copy_sink_probs_fused(q, k, self.copy_k_sink, input_seq, target_seq, seqlens, block,
+                                               doc_starts=doc_starts, shifts=shifts,
+                                               max_lookback=ws_long if (self.training and ws_long is not None
+                                                                        and ws_long <= COPY_PTR_WINDOW) else None)
+        # (EXT gate: the CPLM_WARMUP lambda ramps the ceiling lambda * GATE_MAX, so the copy cannot take over early)
+        gate = self.copy_gate_lambda * COPY_GATE_MAX * (F.linear(xf, self.copy_gate[None, :-1].type_as(xf)).squeeze(-1).float()
+                                                        + self.copy_gate[-1]).sigmoid() \
+            if COPY_EXT_GATE else self.copy_gate_lambda.expand(xf.size(0))  # (unused by the kernel without EXT_GATE)
+        a_sink_raw, a_sink = a_sink, a_sink * self.copy_sink_lambda
+        if self.training and COPY_STATS:
+            with torch.no_grad():
+                st, d = self.cplm_train_stats, q.size(-1)
+                pc0 = p_copy[0] if p_copy.dim() == 2 else p_copy
+                qf, kf = q.float(), k.float()
+                zc = F.linear(xf, self.lm_head.weight[:, COPY_TOKEN_ID][None].type_as(xf)).float().squeeze(-1)
+                st[4:14].copy_(torch.stack([
+                    xf.float().norm(dim=-1).mean(), qf.norm(dim=-1).mean(), kf.norm(dim=-1).mean(),
+                    (qf @ self.copy_k_sink.float()).mean() * d ** -0.5,
+                    (qf[:4096] @ kf[:4096].T).std() * d ** -0.5,  # spread of raw pointer scores (a slice)
+                    pc0.mean(), a_sink.mean(), (pc0 > 0).float().mean(), zc.mean(),
+                    (23 * torch.sigmoid((zc + 5) / 7.5)).mean()]))
+                st[16:].copy_(xf.float().mean(0))
+        if self.training and COPY_PTR_AUX > 0:
+            assert not COPY_MTP_COPY
+            # Pointer auxiliary loss (cf. fabric_engine's copy-pointer warmup): put the copy mass on the matching
+            # sources when the target occurred earlier in the document, else on the sink. It trains the pointer
+            # whatever the gate alpha is; without it some seeds' gate collapses before the pointer is useful and
+            # never reopens (the pointer's gradient through the mixture is proportional to alpha).
+            copyable = p_copy > 1e-20
+            ptr_aux = -torch.log(torch.where(copyable, p_copy, a_sink_raw) + 1e-9)
+        else:
+            ptr_aux = None
+        if self.training and sampled_loss is not None:
+            n = target_seq.size(0)
+            copy_col = sampled_loss.vocab_pos[COPY_TOKEN_ID:COPY_TOKEN_ID + 1]  # <copy> is forced into C
+            loss = SampledCPLMCrossEntropy.apply(
+                xf, mtp_weights, sampled_loss.target_pos[:n], sampled_loss.prefix_pos[:n], prefix_weight,
+                p_copy, a_sink, copy_col, self.copy_gate_lambda, gate, self.lm_head.weight, sampled_loss.rows, sampled_loss.rows_t,
+                sampled_loss.vocab_pos, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s,
+                self.cplm_train_stats if COPY_STATS else None)
+            return loss if ptr_aux is None else loss + COPY_PTR_AUX * ptr_aux
+        if self.training:
+            loss = FusedCPLMCrossEntropy.apply(
+                xf, target_seq, mtp_weights, self.prefix_table[target_seq], prefix_weight, p_copy, a_sink,
+                self.copy_col_full, self.copy_gate_lambda, gate, self.lm_head.weight, self._lm_head_f8_col, self._lm_head_f8_row,
+                self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, self.cplm_train_stats if COPY_STATS else None)
+            return loss if ptr_aux is None else loss + COPY_PTR_AUX * ptr_aux
+        shifts = torch.arange(8, dtype=torch.uint8, device=xf.device)
+        slab_losses = []
+        for lo in range(0, xf.size(0), EVAL_CE_SLAB_ROWS):
+            hi = min(lo + EVAL_CE_SLAB_ROWS, xf.size(0))
+            raw = self.lm_head(xf[lo:hi])
+            if COPY_GATE_OFFSET != 0.0:  # same raw-logit offset on <copy> as the training kernel
+                raw = raw.index_add(1, self.copy_col_full.long(), torch.full_like(raw[:, :1], COPY_GATE_OFFSET))
+            logits = (23 * torch.sigmoid((raw + 5) / 7.5)).float()
+            if COPY_RAW:  # same linear (uncapped) <copy> gate logit as the training kernel
+                logits[:, COPY_TOKEN_ID] = raw[:, COPY_TOKEN_ID].float() + RAW_C0
+            dropped = (self.canon_mask[input_seq[lo:hi], :, None] >> shifts & 1).view(logits.shape).bool()
+            if not COPY_EXT_GATE:
+                dropped[:, COPY_TOKEN_ID] = False  # the <copy> gate is not a token: never masked
+            logits = logits.masked_fill(dropped, -60.0)
+            # Copy mass on tokens the mask rules out is simply lost (the mixture then sums to <= 1 over the
+            # feasible tokens), so the mask never overstates the copy branch.
+            lse = logits.logsumexp(-1)
+            p_lm = torch.exp(logits.gather(1, target_seq[lo:hi, None])[:, 0] - lse)
+            pc, asink = p_copy[lo:hi], a_sink[lo:hi]
+            if COPY_EXT_GATE:
+                alpha = gate[lo:hi]
+                p = p_lm * (1.0 - alpha + alpha * asink) + alpha * pc
+                lm_nll = -torch.log(p_lm + 1e-30)
+            else:
+                alpha = self.copy_gate_lambda * torch.exp(logits[:, COPY_TOKEN_ID] - lse)
+                p_t = p_lm / (1.0 - alpha).clamp_min(1e-6)  # LM over the real vocab
+                if COPY_GATE_FLOOR > 0:  # same floored gate as the training kernel
+                    alpha = COPY_GATE_FLOOR + (1.0 - COPY_GATE_FLOOR) * alpha
+                p = p_t * (1.0 - alpha * (1.0 - asink)) + alpha * pc
+                lm_nll = -torch.log(p_t + 1e-30)
+            nll = -torch.log(p + 1e-9)
+            self.cplm_diag.add_(torch.stack([torch.ones_like(nll).sum(), nll.sum(), lm_nll.sum(), alpha.sum(),
+                                             a_sink_raw[lo:hi].sum(), (alpha * pc / p.clamp_min(1e-9)).sum()]))
+            slab_losses.append(nll)
+        return torch.cat(slab_losses)
+
     # -------------------------------------------------------------------------
     # Setup and run-level hooks main() calls on the uncompiled model.
 
@@ -829,6 +1024,8 @@ class GPT(nn.Module):
                       self.mudd_w1, self.mudd_w2, self.mudd_w2g, self.mudd_b2,
                       self.mudd_gate_w1, self.mudd_gate_w2, self.mudd_gate_b2):
             param.data = param.data.bfloat16()
+        if self.cplm:
+            self.copy_qk_bank.data = self.copy_qk_bank.data.bfloat16()
 
     @property
     def yarns(self) -> tuple[Yarn, ...]:
