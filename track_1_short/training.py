@@ -80,6 +80,24 @@ class TrainingManager():
             "_mudd_gate_scale": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
         })
 
+        self.cplm = __import__("os").environ.get("CPLM") == "1"
+        if self.cplm:
+            self.param_table.update({
+                # CPLM_COPY_LR_MUL: the pointer must become useful before the gate decides (on #61/#91 its q/k trained
+                # with NorMuon at lr 0.023; here Adam at 0.008 by default).
+                "copy_qk_bank": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99],
+                                 "lr_mul": float(__import__("os").environ.get("CPLM_COPY_LR_MUL", "1"))},
+                "copy_k_sink":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "wd_mul": 0.0,
+                                 "lr_mul": float(__import__("os").environ.get("CPLM_COPY_LR_MUL", "1"))},
+            })
+            if __import__("os").environ.get("CPLM_QK_NORM") == "1":
+                self.param_table["copy_qk_gain"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99],
+                                                    "wd_mul": 0.0}
+            if __import__("os").environ.get("CPLM_EXT_GATE") == "1":
+                self.param_table["copy_gate"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99],
+                                                 "wd_mul": 0.0,
+                                                 "lr_mul": float(__import__("os").environ.get("CPLM_GATE_LR_MUL", "1"))}
+
         # NCCL runs one stream in enqueue order and future.wait() is a stream wait, so scatter_order is
         # the comms schedule (record #360). The replicated params are all-reduced as one flat buffer ahead
         # of all of these (perf/replicated_adam.py); their entries here only name them.
@@ -90,7 +108,9 @@ class TrainingManager():
             "scalars", "smear_gate", "ve_gate_bank", "post_lambdas", "resid_lambdas",
             "mudd_w1", "mudd_w2", "mudd_w2g", "mudd_b2", "mudd_gate_w1", "mudd_gate_w2", "mudd_gate_b2",
             "_mudd_gate_scale",
-        ]
+        ] + (["copy_qk_bank", "copy_k_sink"] if self.cplm else []) \
+          + (["copy_gate"] if self.cplm and __import__("os").environ.get("CPLM_EXT_GATE") == "1" else []) \
+          + (["copy_qk_gain"] if self.cplm and __import__("os").environ.get("CPLM_QK_NORM") == "1" else [])
         # work_order is the compute schedule (record #360):
         # - qk_bank and vo_bank first: their gathers are the first ones the next step's fp8 refresh waits
         #   for (perf/deferred_gathers.py), and Phase 3's lm_head wait queues behind only these two
@@ -105,6 +125,13 @@ class TrainingManager():
             "post_lambdas", "resid_lambdas", "mudd_w2", "mudd_w2g", "mudd_gate_w2", "mudd_w1", "mudd_gate_w1",
             "mlp_bank",
         ]
+        if self.cplm:  # replicated: updated with the other replicated params at their first label
+            self.work_order.insert(self.work_order.index("resid_lambdas") + 1, "copy_qk_bank")
+            self.work_order.insert(self.work_order.index("copy_qk_bank") + 1, "copy_k_sink")
+            if "copy_gate" in self.param_table:
+                self.work_order.insert(self.work_order.index("copy_k_sink") + 1, "copy_gate")
+            if "copy_qk_gain" in self.param_table:
+                self.work_order.insert(self.work_order.index("copy_k_sink") + 1, "copy_qk_gain")
 
         self.adam_defaults = adam_defaults = dict(
             lr=0.008,
@@ -159,7 +186,7 @@ class TrainingManager():
         stage, _ = self.schedule.lookup(step)
         old_ws_short = self.ws_short
         self.ws_short, new_ws_long = stage.window_sizes
-        if new_ws_long != self.ws_long:
+        if new_ws_long != self.ws_long and __import__("os").environ.get("NO_YARN") != "1":  # NO_YARN: CPLM fix (#61)
             # Each rotary table follows the window its layers attend over (record #360; the window
             # sizes only change together, at the ws_long changes).
             self.model.yarn_wide.apply(self.ws_long * BLOCK_SIZE, new_ws_long * BLOCK_SIZE)
@@ -184,8 +211,14 @@ class TrainingManager():
         do_adam = self.is_adam_step(step)
 
         # Update learning rates and momentum for all params
+        # CPLM_PTR_LR_S1: the copy pointer's (q/k/sink) lr multiplier during stage 1 (the gate overshot there when the
+        # pointer became a ready-made induction mechanism before the backbone had one)
+        ptr_lr_s1 = float(__import__("os").environ.get("CPLM_PTR_LR_S1", "1"))
+        in_stage1 = step < self.get_transition_steps()[0]
         for param, p_cfg in self.optimizer.param_cfgs.items():
             p_cfg.lr = p_cfg.initial_lr * step_lr
+            if in_stage1 and ptr_lr_s1 != 1.0 and p_cfg.label in ("copy_qk_bank", "copy_k_sink"):
+                p_cfg.lr *= ptr_lr_s1
             if p_cfg.optim == "anvil":
                 p_cfg.momentum = rail_beta
             elif p_cfg.label == "value_embeds":
