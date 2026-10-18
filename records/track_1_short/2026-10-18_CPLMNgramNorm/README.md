@@ -9,7 +9,7 @@ The modeling ideas are theirs. This PR merges the two (they merge without confli
 
 **A separate timing fix, not included here.** While timing these runs we looked at how the clock starts across ranks.
 - **The problem:** rank 0 starts the timer as soon as *it* has finished its untimed setup. Any rank still busy with its own setup gets charged to the clock at the first collective: up to 0.83 s in one master run on this node, though usually 0.
-- **The fix:** a three-line `dist.barrier()` before `t0`, proposed in its own PR (#<barrier PR>).
+- **The fix:** a three-line `dist.barrier()` before `t0`, proposed in its own PR ([#390](https://github.com/KellerJordan/modded-nanogpt/pull/390)).
 - **Not included here:** this record's numbers don't depend on it. The PR's code runs 34.856 s with or without it; see the notes on the logs below.
 
 ## Result
