@@ -1,11 +1,16 @@
 # #379 + #375 on record #92: 34.856 s (0.581 min)
 
-This record combines two open PRs, with no new modeling idea of its own:
+This record combines two open PRs:
 
 - **[PR #379](https://github.com/KellerJordan/modded-nanogpt/pull/379), CPLM copy-sink pointer LM**, by @NathanGodey.
 - **[PR #375](https://github.com/KellerJordan/modded-nanogpt/pull/375), normalized token ids in the n-gram hashes**, by @daniel-monroe.
 
-All credit for the ideas goes to them. This PR merges the two (they merge without conflicts), re-tunes the step count for the combination, and certifies the result. The README encourages incorporating open PRs, so we hope this helps validate and merge both.
+The modeling ideas are theirs. This PR merges the two (they merge without conflicts), re-tunes the step count for the combination, and certifies the result. The README encourages incorporating open PRs, so we hope this helps validate and merge both.
+
+**A separate timing fix, not included here.** While timing these runs we looked at how the clock starts across ranks.
+- **The problem:** rank 0 starts the timer as soon as *it* has finished its untimed setup. Any rank still busy with its own setup gets charged to the clock at the first collective: up to 0.83 s in one master run on this node, though usually 0.
+- **The fix:** a three-line `dist.barrier()` before `t0`, proposed in its own PR (#<barrier PR>).
+- **Not included here:** this record's numbers don't depend on it. The PR's code runs 34.856 s with or without it; see the notes on the logs below.
 
 ## Result
 
