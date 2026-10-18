@@ -306,7 +306,9 @@ def main():
     uncompiled_model.limit_yarn_rebuild(max_step_tokens)
 
     training_time_ms = 0
-    # start the clock
+    # start the clock on every rank at once: without a barrier, rank 0's timer also pays for any rank that is
+    # still finishing its (untimed) setup when rank 0 starts the clock (same pattern as PRs #367 and #380)
+    dist.barrier()
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     canon_mask_builder.start()
