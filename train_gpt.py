@@ -1,6 +1,7 @@
 """NanoGPT speedrun, track 1: train a GPT-2 small-scale model to 3.28 FineWeb val loss on 8xH100.
 
-Launch: torchrun --standalone --nproc_per_node=8 train_gpt.py
+Launch: torchrun --standalone --nproc_per_node=8 train_gpt.py, after building the exact-match extension once
+(`pip install ./exact_match`, needs a Rust toolchain).
 
 This file is the outline of the whole run. The model, optimizer, data and schedules live in
 the `track_1_short/` package; `track_1_short/perf/` holds the kernels and precision tricks that make it
@@ -18,8 +19,10 @@ code = read_source(sys.argv[0])
 
 import copy
 import gc
+import glob
 import time
 
+import numpy as np
 import torch
 
 torch.empty(
@@ -33,12 +36,13 @@ from torch import nn
 from track_1_short.canonical_mask import BackgroundCanonicalMask
 from track_1_short.config import (
     LR_COOLDOWN_FRAC,
+    MODEL_DIM,
     SPLIT_EMBED_STAGE,
     TRAINING_STAGES,
     WS_POST_YARN_EXT,
     Hyperparameters,
 )
-from track_1_short.data import ScheduledBatches, cu_seqlens_rows, distributed_data_generator
+from track_1_short.data import HEADER_BYTES, ScheduledBatches, cu_seqlens_rows, distributed_data_generator
 from track_1_short.distributed import setup_distributed
 from track_1_short.model.gpt import ATTN_BANK_ORDER, FP8_EXACT_SCALE_CALLS, GPT
 from track_1_short.model.prefix_prediction import build_prefix_table_bucket
@@ -55,10 +59,12 @@ from track_1_short.perf.cuda_graphs.fp8_refresh_graphs import Fp8RefreshGraphs
 from track_1_short.perf.cuda_graphs.optimizer_graphs import AnvilBankGraphs, assert_banks_alias_live_state
 from track_1_short.perf.cuda_graphs.step_graphs import StepGraphs
 from track_1_short.perf.deferred_gathers import DEFERRED_LABELS, DeferredGathers
+from track_1_short.perf.host_heap import keep_freed_memory
 from track_1_short.perf.kernels.mlp import prime_stage_cache
 from track_1_short.perf.pinned_batches import PinnedBatchStaging
-from track_1_short.perf.row_prefetch import PrefetchStaging, RowPrefetch
+from track_1_short.perf.row_prefetch import PREP_SLACK_STEPS, PrefetchStaging, RowPrefetch
 from track_1_short.perf.value_embed_pull import ValueEmbedPull
+from track_1_short.retrieval import OnlineCache, ValidationCache, build_cpus, pin_cpus, pin_threads
 from track_1_short.sampled_softmax import SampledSoftmax
 from track_1_short.schedule import TrainingSchedule
 from track_1_short.tail_average import TailAverages
@@ -72,7 +78,7 @@ dynamo.config.recompile_limit = 64
 PRINT_EVERY = 25
 
 
-def train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, batches, deferred_gathers,
+def train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, batches, deferred_gathers, online_cache,
                step: int, lm_head_f8_col, prefetch_next: bool):
     """One optimizer step on one microbatch: requantize for the previous update, forward/backward, update.
 
@@ -97,7 +103,8 @@ def train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, bat
     # Before the forward, after the lm_head fp8 refresh just above: the candidates' lm_head rows. None on
     # full-softmax steps.
     sampled_loss = sampled_softmax.gather(step, lm_head_f8_col)
-    step_graphs.forward(step, batch, ngram_slots, training_manager.get_forward_args(sampled_loss))
+    step_graphs.forward(step, batch, ngram_slots, training_manager.get_forward_args(sampled_loss),
+                        online_cache.rows(step, batch.inputs.numel()))
     # Eager, between the two replays: the next cycle's row-id exchange hides under the backward.
     row_prefetch.after_forward(step)
     ngram_grad = step_graphs.backward()
@@ -114,7 +121,12 @@ def train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, bat
 
 
 def main():
+    # Freed host memory stays mapped, so the timed loop's helper threads make no mmap calls (perf/host_heap.py).
+    keep_freed_memory()
     args = Hyperparameters()
+    assert args.val_loss_every == 0, "the validation index is looked up once, after training: no intermediate validations"
+    # Before the process group, so that every thread inherits this rank's cores (track_1_short/retrieval.py).
+    cpus = pin_cpus(int(os.environ["LOCAL_RANK"]), int(os.environ["WORLD_SIZE"]))
     env = setup_distributed()
     if args.train_seed is not None:
         torch.manual_seed(args.train_seed)
@@ -127,9 +139,10 @@ def main():
     batch_tokens = [s.batch_size // env.world_size for s in TRAINING_STAGES] + [val_tokens_per_rank]
     batch_staging = PinnedBatchStaging(max(batch_tokens), max(map(cu_seqlens_rows, batch_tokens)), env.device)
 
-    def train_loader():
+    def train_loader(shard_slots=None):
         return distributed_data_generator(
             args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, batch_staging,
+            shard_slots=shard_slots,
         )
 
     def val_loader():
@@ -150,9 +163,9 @@ def main():
     model: nn.Module = GPT(
         vocab_size=50257,
         num_layers=11,
-        num_heads=6,
+        num_heads=MODEL_DIM // 128,
         head_dim=128,
-        model_dim=768,
+        model_dim=MODEL_DIM,
         max_seq_len=val_tokens_per_rank,
         ngram_dim=NGRAM_DIM,
         world_size=env.world_size,
@@ -171,7 +184,7 @@ def main():
     # The hashed n-gram table: 1/world_size of its rows on each rank, with its own sparse Adam. Not a
     # model parameter, so neither the broadcast above nor the state_dict below ever holds it.
     ngram_table = NgramTable(model.ngram_cache, max_step_tokens=max_step_tokens,
-                             max_events=training_schedule.total_steps,
+                             max_events=training_schedule.total_steps, max_eval_ids=2 * args.val_tokens // env.world_size,
                              rank=env.rank, world_size=env.world_size, device=env.device)
     # The row prefetch's pinned upload rings and prep thread, allocated and started off the clock.
     prefetch_staging = PrefetchStaging(max_ngram_rows=2 * MAX_CYCLE_STEPS * max_step_tokens,
@@ -208,6 +221,18 @@ def main():
                              max_step_tokens, env.device)
     fp8_refresh = Fp8RefreshGraphs(uncompiled_model)
     deferred_gathers = DeferredGathers(value_embed_pull, fp8_refresh)
+
+    # Exact-match retrieval (track_1_short/retrieval.py), allocated and prefaulted before the clock. On the clock,
+    # rank 0 plans every step's documents and resolves every rank's rows ahead of training, then builds the validation
+    # index over the first training shards while training runs; the validation rows are looked up only after training,
+    # when the validation tokens are read.
+    retrieval_schedule = [(stage.batch_size // env.world_size, stage.train_max_seq_len)
+                          for stage, _ in map(training_schedule.lookup, range(training_schedule.total_steps))]
+    retrieval_group = dist.new_group(backend="gloo")
+    retrieval_cpus = build_cpus(cpus, retrieval_group)
+    online_cache = OnlineCache(args.train_files, retrieval_schedule, env.rank, env.world_size, env.device,
+                               MAX_CYCLE_STEPS + PREP_SLACK_STEPS, retrieval_group, retrieval_cpus)
+    val_cache = ValidationCache(args.train_files, args.val_index_shards, retrieval_group, retrieval_cpus, cpus.val_lookup, print0)
 
     ########################################
     #            Warmup kernels            #
@@ -250,7 +275,7 @@ def main():
             fp8_refresh.capture()
         # Warmup steps are not consecutive, so no sampled-softmax build is prefetched.
         train_step(training_manager, step_graphs, warmup_prefetch, sampled_softmax, warmup_batches, deferred_gathers,
-                   step, uncompiled_model.lm_head_f8_col, prefetch_next=False)
+                   online_cache, step, uncompiled_model.lm_head_f8_col, prefetch_next=False)
     print0("Resetting Model", console=True)
     deferred_gathers.flush_final()  # the reset below requantizes from the restored weights
     warmup_prefetch.close()
@@ -284,14 +309,22 @@ def main():
     ########################################
     #        Training and validation       #
     ########################################
-    batches = ScheduledBatches(train_loader(), training_schedule, steps=range(training_schedule.total_steps))
+    gc.collect()  # frees the warmup loader's shards first, so the slots below reuse their cached pinned blocks
+    # Pinned shard slots for the timed loader, allocated before the clock: a fresh 256 MB cudaHostAlloc on the clock
+    # holds the driver lock ~144 ms and stalls the main thread's H2Ds. Three, round-robin: the current shard, the next
+    # one loading, and the retired one, a whole shard past its last reader (the BOS scan).
+    shard_tokens = max((os.path.getsize(f) - HEADER_BYTES) // 2 for f in glob.glob(args.train_files))
+    shard_slots = [torch.empty(shard_tokens, dtype=torch.uint16, pin_memory=True) for _ in range(3)]
+    batches = ScheduledBatches(train_loader(shard_slots), training_schedule, steps=range(training_schedule.total_steps),
+                               on_fetch=online_cache.submit)
     row_prefetch = RowPrefetch(ngram_table, value_embed_pull, batches, range(training_schedule.total_steps),
                                is_update_step, prefetch_staging)
 
-    # The canonical mask is only needed by the final validation, so rank 0 builds it in a child
-    # process while we train, and model.canon_mask stays all-zero == no masking until then, which
-    # is what the intermediate validations run with. Only the buffer is allocated here; the build
-    # is started below the clock, so its whole cost -- not just its use -- lands in the timed region.
+    # The canonical mask is only needed by the final validation, so rank 0 builds it in a background
+    # thread while we train, and model.canon_mask stays all-zero == no masking until then, which
+    # is what the intermediate validations run with. Only the buffer and the tokenizer's tables are
+    # made here; the build is started below the clock, so its whole cost -- not just its use -- lands
+    # in the timed region.
     canon_mask_builder = BackgroundCanonicalMask(model.vocab_size, owner=env.master_process, print0=print0)
 
     # No cyclic GC inside the timed loop: a multi-ms generation-2 pause on one rank stalls every rank at
@@ -306,10 +339,13 @@ def main():
     uncompiled_model.limit_yarn_rebuild(max_step_tokens)
 
     training_time_ms = 0
-    # start the clock
+    # start the clock, on every rank at once: ranks finish their pre-clock prefaults at different times
+    dist.barrier()
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    canon_mask_builder.start()
+    online_cache.start()
+    val_cache.start(online_cache.ready)
+    canon_mask_builder.start(cpus.rest)
     # Prefix-token table build, inside the timed region. The tokenizer was loaded at import
     # (get_encoding is cached in tiktoken's registry), so this pays only the table construction,
     # split across ranks: each builds one token bucket and the max over ranks is the whole table.
@@ -321,6 +357,8 @@ def main():
     # begin training
     for step in range(training_schedule.total_steps + 1):
         last_step = (step == training_schedule.total_steps)
+        if step == 1:
+            pin_threads(cpus)
         training_manager.advance_schedule(step)
         # --------------- VALIDATION SECTION -----------------
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
@@ -331,6 +369,22 @@ def main():
                 # training forward, and the run ends after this validation.
                 deferred_gathers.flush_final()
                 training_manager.apply_final_ws_ext()
+            else:
+                deferred_gathers.flush()
+            # On the clock (record #360): the table has no replica, so reading the val batches and pulling
+            # their n-gram rows is part of the run's cost. The cache holds one batch, so the untimed loop
+            # below lands each batch's rows again (same routes, no new exchange) right before its forward.
+            # Both first, while the device runs the last training steps: the read and the want lists are host
+            # work, and the copies, exchanges and lands queue behind training.
+            assert args.val_tokens % args.val_batch_size == 0
+            val_steps = args.val_tokens // args.val_batch_size
+            val_loader_iter = val_loader()
+            val_batches = [next(val_loader_iter) for _ in range(val_steps)]
+            del val_loader_iter
+            val_pulls = ngram_table.eval_pulls([batch.ngram_ids_cpu for batch in val_batches])
+            for pull in val_pulls:
+                ngram_table.land(pull)
+            if last_step:
                 # Both on the clock: the wait in case the build is somehow not done, and the copy
                 # and broadcast of the result because they are part of the mask's cost.
                 canon_mask_builder.wait()
@@ -339,32 +393,26 @@ def main():
                 # The ship also gathers value_embeds whole.
                 tail_averages.ship()
             else:
-                deferred_gathers.flush()
                 # On the clock: only the live cycle's rows of each value_embeds replica are current, and
                 # validation reads every token (perf/value_embed_pull.py).
                 value_embed_pull.gather_replica()
             uncompiled_model.complete_yarn_tables()
-            # On the clock (record #360): the table has no replica, so reading the val batches and pulling
-            # their n-gram rows is part of the run's cost. The cache holds one batch, so the untimed loop
-            # below lands each batch's rows again (same routes, no new exchange) right before its forward.
-            assert args.val_tokens % args.val_batch_size == 0
-            val_steps = args.val_tokens // args.val_batch_size
-            val_loader_iter = val_loader()
-            val_batches = [next(val_loader_iter) for _ in range(val_steps)]
-            del val_loader_iter
-            val_pulls = ngram_table.eval_pulls([batch.ngram_ids for batch in val_batches])
-            for pull in val_pulls:
-                ngram_table.land(pull)
+            # On the clock: the validation index build over the training shards (training-side work).
+            val_cache.wait()
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
+            # Off the clock, like the LM's forward pass below: the validation lookups are the retrieval model's
+            # evaluation forward pass.
+            val_rows = val_cache.rows([batch.inputs_cpu.astype(np.uint16) for batch in val_batches], env.device)
+            canon_mask_builder.release()
             model.eval()
             val_loss = 0
             with torch.no_grad():
-                for batch, pull in zip(val_batches, val_pulls):
+                for batch, pull, rows in zip(val_batches, val_pulls, val_rows):
                     ngram_table.land(pull)
                     val_loss += model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
-                                      training_manager.get_forward_args()).mean()
+                                      training_manager.get_forward_args(), ret=rows).mean()
             val_loss /= val_steps
             del val_batches, val_pulls
             dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
@@ -387,7 +435,7 @@ def main():
             break
 
         # --------------- TRAINING SECTION -----------------
-        train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, batches, deferred_gathers,
+        train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, batches, deferred_gathers, online_cache,
                    step, uncompiled_model.lm_head_f8_col, prefetch_next=step + 1 < training_schedule.total_steps)
         tail_averages.tick(step)
 

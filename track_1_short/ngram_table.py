@@ -1,13 +1,13 @@
 """The hashed n-gram embedding: an 84.6M-row table, sharded across ranks, with its own sparse Adam.
 
-What: every token position t reads two rows of one [NGRAM_VOCAB_SIZE, 768] table -- a bigram row
+What: every token position t reads two rows of one [NGRAM_VOCAB_SIZE, NGRAM_DIM] table -- a bigram row
 (hash of x[t-1], x[t]) from the first half and a trigram row (hash of x[t-2], x[t-1], x[t]) from the
 second half. Each row is multiplied by a +-1 sign row drawn from a small shared pool by an independent
 hash of the same tokens (the sign trick of #299: rows shared by several n-grams separate by sign), and
 the two signed rows are summed into x0_bigram, which the model injects into the residual stream.
 
-Why sharded: the table is 65e9 elements (130 GB in bf16), so no rank can hold a replica. Rank r owns
-rows [r * V/world, (r + 1) * V/world) -- 16.2 GB -- and only a small, data-dependent set of rows is
+Why sharded: the table is 43e9 elements (87 GB in bf16), so no rank can hold a replica. Rank r owns
+rows [r * V/world, (r + 1) * V/world) -- 10.8 GB -- and only a small, data-dependent set of rows is
 live on a step, so every cost below scales with tokens, never with the table.
 
 Update cycles: the table only changes at its Adam events (is_update_step: every odd step, then every
@@ -19,14 +19,14 @@ exchange_ids, then land -- owners serve the asked rows from their (just updated)
 the rows this rank owns itself are read locally and never go on the wire.
 
 The forward reads the cache at `slots` (searchsorted of each token's row ids in want) and adds a
-zeros "sink" leaf, so each step's row gradient lands on the sink ([2T, 768]), never on a table-sized
+zeros "sink" leaf, so each step's row gradient lands on the sink ([2T, NGRAM_DIM]), never on a table-sized
 tensor. accumulate_grad keeps (slots, sink grad) per step; at the event the gradient is summed per
 cache slot (in fp16) and travels back along the pull's routes in reverse (send_grads, bf16 on the wire),
 and each owner sums what every rank sent per row (in bf16) and runs Adam on exactly those rows
 (adam_update).
 
 The optimizer is Adam with beta1 = 0 and ONE fp32 second moment per row (the row's mean squared
-gradient), so its state is 4 bytes per row instead of 2 * 768 * 4, and a row no gradient touched
+gradient), so its state is 4 bytes per row instead of 2 * NGRAM_DIM * 4, and a row no gradient touched
 does not move: with no momentum its update is exactly zero, and the cautious weight decay is gated on
 the update. Its second moment still decays by beta2 every event; that decay is applied lazily, when a
 row is next touched (perf/kernels/ngram_adam.py replays the missed events' beta2 from a history), so
@@ -44,6 +44,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from track_1_short.config import MODEL_DIM
 from track_1_short.perf.kernels.ngram_adam import adam_rows_, bring_rows_current, claim_rows
 from track_1_short.perf.kernels.row_scatter import scatter_add_rows
 from track_1_short.sharded_rows import RowOwners, RowPull, all_to_all_rows
@@ -51,7 +52,7 @@ from track_1_short.sharded_rows import RowOwners, RowPull, all_to_all_rows
 # 224x the 377,280-row bigram table of earlier records. Rows [0, V/2) are the bigram channel,
 # [V/2, V) the trigram channel. Divisible by 8 (the shard) and < 2**31 (row ids are int32).
 NGRAM_VOCAB_SIZE = 84_602_880
-NGRAM_DIM = 768
+NGRAM_DIM = MODEL_DIM
 # The shared +-1 sign pool. A power of two, so `& (rows - 1)` is the non-negative remainder of the
 # wrapped int32 hash (values ~500-15000 gave similar results in the bigram record).
 NGRAM_SIGN_POOL_ROWS = 8192
@@ -69,13 +70,13 @@ TRIGRAM_SIGN_MULS = (58699, 39779, 26801)   # x[t], x[t-1], x[t-2]
 
 # Adam for the table (record #360). lr and weight decay are Adam's scheduled base values times these
 # multipliers; beta1 is 0 for the whole run.
-NGRAM_LR_MUL = 70.0
+NGRAM_LR_MUL = 49.0  # tuned: record #360's 70 x0.7
 NGRAM_WD_MUL = 5.0
 NGRAM_ADAM_BETA2 = 0.95
 # From this step the table updates every 4th step instead of every 2nd (record #360). One event then
 # stands for two: beta2 is squared, so the second moment decays at the same rate per step, and the
-# weight-decay multiplier doubles.
-NGRAM_ADAM_PERIOD4_START = 336
+# weight-decay multiplier doubles. Record #360's step 336, scaled to this run's length (a multiple of 4).
+NGRAM_ADAM_PERIOD4_START = 152
 NGRAM_WD_MUL_PERIOD4 = 10.0
 # The longest cycle, in steps: the cache holds one cycle's rows (two per token per step).
 MAX_CYCLE_STEPS = 4
@@ -156,8 +157,8 @@ class NgramTable:
     is a collective: all ranks call it at the same point.
     """
 
-    def __init__(self, cache: Tensor, max_step_tokens: int, max_events: int, rank: int, world_size: int,
-                 device: torch.device):
+    def __init__(self, cache: Tensor, max_step_tokens: int, max_events: int, max_eval_ids: int, rank: int,
+                 world_size: int, device: torch.device):
         assert NGRAM_VOCAB_SIZE % world_size == 0
         assert cache.shape[1] == NGRAM_DIM and cache.dtype == torch.bfloat16
         # A cycle reads at most two rows per token of MAX_CYCLE_STEPS steps.
@@ -170,7 +171,7 @@ class NgramTable:
         self.owners = RowOwners(NGRAM_VOCAB_SIZE, rank, world_size)
         self.first_row = self.owners.first_row
         rows = self.owners.rows_per_rank
-        # 10.6M x 768 bf16 = 16.2 GB. Zero init, as record #360.
+        # 10.6M x 512 bf16 = 10.8 GB. Zero init, as record #360.
         self.shard = torch.zeros(rows, NGRAM_DIM, dtype=torch.bfloat16, device=device)
         # Adam's second moment, one fp32 scalar per row (beta1 = 0: no first moment), current as of the
         # row's last_event; beta2_history[e] is event e's beta2, for replaying the events a row missed.
@@ -183,10 +184,14 @@ class NgramTable:
         # The live cycle's gradient summed per cache slot, rebuilt at each event.
         self.grad_per_slot = torch.empty(max_cycle_rows, NGRAM_DIM, dtype=GRAD_ACCUM_DTYPE, device=device)
         self.sinks: dict[int, Tensor] = {}  # tokens per step -> the zeros leaf, allocated once
+        # The eval pulls' want lists go up through this (pinned before the clock; `max_eval_ids` row ids: the final
+        # validation's, two per token), its last upload's event guarding the next.
+        self.eval_staging = torch.empty(max_eval_ids, dtype=torch.int32, pin_memory=True)
+        self.eval_uploaded = torch.cuda.Event()
         self.reset()
 
     def reset(self):
-        """Back to the initial state, in place: the post-warmup reset must not copy 16 GB."""
+        """Back to the initial state, in place: the post-warmup reset must not copy 11 GB."""
         self.shard.zero_()
         self.exp_avg_sq.zero_()
         self.last_event.zero_()
@@ -248,12 +253,13 @@ class NgramTable:
         """Cache slots of `row_ids` ([2T] int32, device), all of which `pull` fetched."""
         return torch.searchsorted(pull.want, row_ids, out_int32=True)
 
-    def eval_pulls(self, row_id_batches: list[Tensor]) -> list[RowPull]:
-        """Pulls for eval batches (device row ids): the want lists are built on the device and all
-        batches' counts go in ONE exchange (record #360's batched validation fill). Not yet landed."""
-        wants = [torch.unique(ids) for ids in row_id_batches]  # sorted
-        bounds = torch.from_numpy(self.owners.bounds).to(self.device)
-        cuts = torch.stack([torch.searchsorted(w.to(torch.int64), bounds) for w in wants]).cpu().numpy()
+    def eval_pulls(self, row_id_batches: list[np.ndarray]) -> list[RowPull]:
+        """Pulls for eval batches (host row ids, a Batch's ngram_ids_cpu): all batches' counts go in ONE exchange
+        (record #360's batched validation fill). Not yet landed. The want lists are built on the host (the sorted
+        unique ids torch.unique made on the device) and uploaded through the pinned eval buffer, so nothing here
+        waits for the device: the final validation queues its pulls while the device finishes training."""
+        wants = [sorted_unique_rows([ids]) for ids in row_id_batches]
+        cuts = np.stack([np.searchsorted(w, self.owners.bounds) for w in wants])
         send = cuts[:, 1:] - cuts[:, :-1]              # [batches, world]
         send[:, self.rank] = 0
         send_t = torch.from_numpy(np.ascontiguousarray(send.T))  # row r: what we ask rank r, per batch
@@ -261,18 +267,29 @@ class NgramTable:
         dist.all_to_all_single(recv_t, send_t)
         recv = recv_t.numpy().T
         pulls = []
-        for b, want in enumerate(wants):
+        for b, want in enumerate(self._upload(wants)):
             assert want.shape[0] <= self.cache.shape[0], f"{want.shape[0]} rows overflow ngram_cache"
-            pull = RowPull(want=want.to(torch.int32), lo=int(cuts[b, self.rank]), hi=int(cuts[b, self.rank + 1]),
+            pull = RowPull(want=want, lo=int(cuts[b, self.rank]), hi=int(cuts[b, self.rank + 1]),
                            send_counts=send[b].tolist(), recv_counts=recv[b].tolist())
             pull.peer_want = pull.peer_rows()
             pull.asked = all_to_all_rows(pull.peer_want, pull.send_counts, pull.recv_counts)
             pulls.append(pull)
         return pulls
 
+    def _upload(self, wants: list[np.ndarray]) -> list[Tensor]:
+        """Host int32 want lists on the device, through the pinned eval buffer (a queued copy), or, if they do not
+        fit, a pageable one (a copy the host waits for)."""
+        n = sum(len(w) for w in wants)
+        self.eval_uploaded.synchronize()
+        host = self.eval_staging[:n] if n <= self.eval_staging.numel() else torch.empty(n, dtype=torch.int32)
+        np.concatenate(wants, out=host.numpy())
+        device = host.to(self.device, non_blocking=True)
+        self.eval_uploaded.record()
+        return list(device.split([len(w) for w in wants]))
+
     def load_eval_batch(self, row_ids: Tensor) -> Tensor:
         """Pull one eval batch's rows into the cache; returns its slots."""
-        pull, = self.eval_pulls([row_ids])
+        pull, = self.eval_pulls([row_ids.cpu().numpy()])
         self.land(pull)
         return self.slots(pull, row_ids)
 

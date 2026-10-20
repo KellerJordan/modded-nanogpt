@@ -45,13 +45,13 @@ ANVIL_MAPS = [
 # Twin-rail velocity. Rail 0 is fast (beta scheduled by get_rail_beta until RAIL_ENGAGE_STEP, then
 # RAIL_FAST_BETA); rail 1 is slow (RAIL_SLOW_BETA) and accumulates from step 0. Until the engage
 # step the update reads the fast rail only; after it, RAIL_FAST_WEIGHT * fast + (1 - w) * slow.
-RAIL_FAST_BETA, RAIL_SLOW_BETA, RAIL_FAST_WEIGHT, RAIL_ENGAGE_STEP = 0.85, 0.98, 0.4385, 514
+RAIL_FAST_BETA, RAIL_SLOW_BETA, RAIL_FAST_WEIGHT, RAIL_ENGAGE_STEP = 0.85, 0.98, 0.4385, 232
 
 # The cascade's input is divided by FROBENIUS_MARGIN * ||X||_F + FROBENIUS_EPS, which puts every
 # singular value safely below 1 where the maps converge (the margin and eps of record #360).
 FROBENIUS_MARGIN, FROBENIUS_EPS = 1.05, 1e-6
 # Banks whose matrices have more rows than this run the a*X + X@B step as two kernels instead of one
-# baddbmm (see anvil_cascade): true for mlp_bank (2816 rows), false for qk_bank (256) and vo_bank (768).
+# baddbmm (see anvil_cascade): true for mlp_bank (1792 rows), false for qk_bank (256) and vo_bank (512).
 SPLIT_BADDBMM_MIN_ROWS = 1024
 
 
@@ -500,8 +500,8 @@ class AnvilAndAdam:
         """
         Copy the optimizer state from the lm_head to the embed at the untie point.
         This requires an all-gather + reshard because of different sharding:
-        - lm_head (768, 50304) is sharded to (96, 50304) per rank (along model_dim)
-        - embed (50304, 768) is sharded to (6288, 768) per rank (along vocab_size)
+        - lm_head (512, 50304) is sharded to (64, 50304) per rank (along model_dim)
+        - embed (50304, 512) is sharded to (6288, 512) per rank (along vocab_size)
 
         We all-gather the lm_head momentum, transpose it, then each rank takes their
         embed shard to get the correct momentum state.
@@ -516,9 +516,9 @@ class AnvilAndAdam:
 
         # Copy optimizer state with all-gather + transpose + reshard
         embed_chunk_size = embed_cfg.chunk_size  # 6288
-        # All-gather lm_head momentum to get full (768, 50304) tensor
+        # All-gather lm_head momentum to get full (512, 50304) tensor
         for key in ["exp_avg", "exp_avg_sq"]:
-            lm_chunk = lm_state[key]  # (96, 50304)
+            lm_chunk = lm_state[key]  # (64, 50304)
             full_lm = torch.empty(lm_head.shape[0], lm_head.shape[1], dtype=lm_chunk.dtype, device=lm_chunk.device)
             dist.all_gather_into_tensor(full_lm, lm_chunk.contiguous())
             embed_state[key].copy_(full_lm.T[self.rank * embed_chunk_size:(self.rank + 1) * embed_chunk_size])

@@ -53,7 +53,7 @@ Deviations from record #360 (the rest follows its schedule and kernels):
     it pulled, so the counts and ids exchanged for the pull already say who sends what to whom. #360
     re-ran the count and id exchanges for the gradient (grad_start / grad_share): fewer collectives here.
   - The n-gram owner merges each row's gradient entries through a 42 MB row -> entry claim map into an
-    [entries, 768] buffer (perf/kernels/ngram_adam.py), where #360 scatters into a dense 16.2 GB
+    [entries, NGRAM_DIM] buffer (perf/kernels/ngram_adam.py), where #360 scatters into a dense 16.2 GB
     [V/world, 768] gradient buffer: the same launches and atomics, without the memory this run's
     peak cannot spare. The lazy second-moment replay, its pass over the next cycle's own rows, and the
     fused Triton row update are #360's. The n-gram table is not in the checkpoint, so #360's dense replay

@@ -79,8 +79,10 @@ To run the current record, run the following commands.
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install -r requirements.txt
 pip install torch==2.10 --index-url https://download.pytorch.org/whl/cu128  # the pinned build, not a nightly
-# downloads only the first 900M training tokens to save time
-python data/cached_fineweb10B.py 9
+# build the exact-match retrieval extension (Rust 1.89+: curl https://sh.rustup.rs -sSf | sh)
+pip install ./exact_match
+# download the first 370 training shards (37B tokens, ~74 GB) and the validation shard
+python data/cached_fineweb100B.py 370
 ./run.sh
 ```
 Add torchrun to path if ./run.sh gives error `torchrun: command not found`.
@@ -113,7 +115,7 @@ Note: an NVIDIA driver must already be installed on the system (useful if only t
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 sudo docker build -t modded-nanogpt .
-sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt python data/cached_fineweb10B.py 8
+sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt python data/cached_fineweb100B.py 370
 sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt sh run.sh
 ```
 
