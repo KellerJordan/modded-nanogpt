@@ -76,7 +76,7 @@ NGRAM_ADAM_BETA2 = 0.95
 # From this step the table updates every 4th step instead of every 2nd (record #360). One event then
 # stands for two: beta2 is squared, so the second moment decays at the same rate per step, and the
 # weight-decay multiplier doubles. Record #360's step 336, scaled to this run's length (a multiple of 4).
-NGRAM_ADAM_PERIOD4_START = 160
+NGRAM_ADAM_PERIOD4_START = 152
 NGRAM_WD_MUL_PERIOD4 = 10.0
 # The longest cycle, in steps: the cache holds one cycle's rows (two per token per step).
 MAX_CYCLE_STEPS = 4

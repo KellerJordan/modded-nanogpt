@@ -11,10 +11,12 @@
 //!
 //! Build (on the clock, rank 0 alone, on its own pinned pool, no GIL; AVX-512, with no branch on the data in the
 //! inner loops):
-//!   1. scan: thread t preads the 64K-token pieces t, t + T, ..., hashes 4096 positions at a time, and scatters every
-//!      entry through a per-thread write-combining burst of one cache line per partition into 2048-entry blocks of a
-//!      private huge-page arena, with non-temporal stores (no count pass, no sort). Each thread then lists its blocks
-//!      by partition.
+//!   1. scan: thread t preads the 64K-token pieces t, t + T, ..., hashes 16 positions at a time (one group ahead of
+//!      their inserts), and scatters every entry through a per-thread write-combining burst of one cache line per
+//!      partition into 8192-entry blocks of a private huge-page arena, with non-temporal stores (no count pass, no
+//!      sort). Each thread then lists its blocks by partition. A thread done with its own pieces takes the back half
+//!      of the busiest remaining run of pieces into a spare burst state; the finish places a stolen run right after
+//!      the pieces before it, so the table is the same as without stealing.
 //!   2. finish: per partition (largest first, handed out dynamically), place its entries, thread by thread and each
 //!      thread's blocks in allocation order, into b1 while it has room, else b2, else drop them (a hot key keeps its
 //!      first 2 * slots entries). Only each bucket's filling line is staged; it is streamed to the table (shared
@@ -34,7 +36,7 @@ use std::fs::File;
 use std::hint::select_unpredictable;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::{AcqRel, Acquire, Relaxed, Release}};
 use std::sync::Mutex;
 
 const BITS: [u32; 2] = [12, 6]; // fingerprint bits per level
@@ -46,11 +48,14 @@ const NBITS: u32 = 14; // buckets per partition: 2^14
 const BUCKETS: usize = 1 << (PBITS + NBITS);
 const LOAD: f64 = 0.8; // entries per slot (10.26B tokens: 48 slots, 103 GB; 41.2B: 192, 412 GB)
 const BACK: usize = LEVELS[1]; // tokens before a context end that hash_avx512 reads
-const STEP: usize = 1 << 12; // positions hashed at once
+const STEP: usize = 1 << 12; // positions hashed at once by Hashes (the lookups; the scan hashes 16 at a time)
 const PIECE: usize = 1 << 16; // context ends per piece of the scan (one pread)
 const BURST: usize = 8; // entries per write-combining burst and per staging line: one cache line
-const BLOCK: usize = 2048; // entries per arena block, a multiple of BURST
+const BLOCK: usize = 8192; // entries per arena block, a multiple of BURST
 const CHUNK: usize = 64; // entries between the queued line stores of the scatter and the placement
+const QN: usize = 32; // entries between the placement's queued line streams (u16 lanes of one zmm)
+const PF: usize = 256; // entries the placement prefetches the arena ahead
+const PF_HINT: i32 = _MM_HINT_T0;
 const NONE: u32 = u32::MAX;
 const K0: u64 = 0x9e3779b97f4a7c15; // 2^64 / the golden ratio: b2 is a Fibonacci hash of the check
 
@@ -143,8 +148,37 @@ impl Hashes {
     /// positions' 0, 3, 6.
     #[target_feature(enable = "avx512f,avx512dq,avx512bw,avx512vl,avx512ifma,avx512vbmi")]
     unsafe fn hash_avx512(&mut self, t: &[u16], j0: usize, n: usize, next: bool) {
-        const { assert!(STEP % 16 == 0 && CHECK_SHIFT + KBITS == 64 && KBITS + PBITS == 44 && BITS[0] == 12 && BITS[1] == 6 && SHIFTS[0] == 16 && SHIFTS[1] == 28) };
         assert!(j0 >= BACK && t.len() >= j0 + n - 1 + next as usize && n <= STEP);
+        let h = Hasher::new();
+        let (ep, pp) = (self.e.as_mut_ptr(), self.part.as_mut_ptr());
+        let mut p = h.start(t, j0);
+        for r in (0..n).step_by(16) {
+            let (lo, rlo, q) = h.eight(Hasher::load(t, j0, r), p, next);
+            let (hi, rhi, q) = h.eight(Hasher::load(t, j0, r + 8), q, next);
+            p = q;
+            _mm512_storeu_si512(ep.add(r).cast(), lo);
+            _mm512_storeu_si512(ep.add(r + 8).cast(), hi);
+            _mm512_storeu_si512(pp.add(r).cast(), h.part(rlo, rhi));
+        }
+    }
+}
+
+/// hash_avx512's constants (see there), and its steps: 8 positions at a time, carrying the previous 8 positions'
+/// words 0, 3, 6.
+struct Hasher {
+    idx: [__m512i; 9],
+    keep: __m512i,
+    m10: __m512i,
+    low: __m512i,
+    pmask: __m512i,
+    pidx: __m512i,
+}
+
+impl Hasher {
+    #[target_feature(enable = "avx512f,avx512dq,avx512bw,avx512vl,avx512ifma,avx512vbmi")]
+    #[inline]
+    unsafe fn new() -> Self {
+        const { assert!(STEP % 16 == 0 && CHUNK % 16 == 0 && CHECK_SHIFT + KBITS == 64 && KBITS + PBITS == 44 && BITS[0] == 12 && BITS[1] == 6 && SHIFTS[0] == 16 && SHIFTS[1] == 28) };
         // The offsets o of the permuted words; permute 8 is the next token.
         const OS: [usize; 8] = [0, 3, 6, 7, 17, 8, 11, 14];
         let idx: [__m512i; 9] = std::array::from_fn(|w| {
@@ -157,47 +191,62 @@ impl Hashes {
             }
             _mm512_loadu_si512(b.as_ptr().cast())
         });
-        let (tp, ep, pp) = (t.as_ptr(), self.e.as_mut_ptr(), self.part.as_mut_ptr());
-        let keep = _mm512_set1_epi64(!((1u64 << CHECK_SHIFT) - 1) as i64);
-        let m10 = _mm512_set1_epi64((!((1u64 << CHECK_SHIFT) - 1) | ((1u64 << BITS[0]) - 1) << SHIFTS[0]) as i64);
-        let low = _mm512_set1_epi64(0xffff);
-        let pmask = _mm512_set1_epi32((1 << PBITS) - 1);
-        let pidx = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
+        Self {
+            idx,
+            keep: _mm512_set1_epi64(!((1u64 << CHECK_SHIFT) - 1) as i64),
+            m10: _mm512_set1_epi64((!((1u64 << CHECK_SHIFT) - 1) | ((1u64 << BITS[0]) - 1) << SHIFTS[0]) as i64),
+            low: _mm512_set1_epi64(0xffff),
+            pmask: _mm512_set1_epi32((1 << PBITS) - 1),
+            pidx: _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30),
+        }
+    }
+
+    /// The 32 tokens from BACK before context end j0 + r (zeros past the end of t).
+    #[target_feature(enable = "avx512f,avx512bw")]
+    #[inline]
+    unsafe fn load(t: &[u16], j0: usize, r: usize) -> __m512i {
+        let (start, avail) = (j0 + r - BACK, t.len() - (j0 + r - BACK));
+        if avail >= 32 { _mm512_loadu_si512(t.as_ptr().add(start).cast()) } else { _mm512_maskz_loadu_epi16((1u32 << avail) - 1, t.as_ptr().add(start).cast()) }
+    }
+
+    /// The words 8, 11, 14 of the first 8 positions (the previous 8 positions' 0, 3, 6).
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+    #[inline]
+    unsafe fn start(&self, t: &[u16], j0: usize) -> [__m512i; 3] {
+        let x = Self::load(t, j0, 0);
+        [vpermb(self.idx[5], x), vpermb(self.idx[6], x), vpermb(self.idx[7], x)]
+    }
+
+    /// Entries r..r + 8 (with the next token if `next`) from x = load(t, j0, r) and the previous 8 positions' words
+    /// 0, 3, 6; returns them,
+    /// the key rotated (check at CHECK_SHIFT, partition at 0) and its words 0, 3, 6.
+    #[target_feature(enable = "avx512f,avx512dq,avx512bw,avx512vl,avx512ifma,avx512vbmi")]
+    #[inline]
+    unsafe fn eight(&self, x: __m512i, p: [__m512i; 3], next: bool) -> (__m512i, __m512i, [__m512i; 3]) {
         let madd = |acc: __m512i, w: __m512i, i: u64| _mm512_madd52lo_epu64(acc, w, _mm512_set1_epi64(m52(i) as i64));
         let a = |i: u64| _mm512_set1_epi64(a52(i) as i64);
-        let load = |r: usize| {
-            let (start, avail) = (j0 + r - BACK, t.len() - (j0 + r - BACK));
-            if avail >= 32 { _mm512_loadu_si512(tp.add(start).cast()) } else { _mm512_maskz_loadu_epi16((1u32 << avail) - 1, tp.add(start).cast()) }
-        };
-        // Entries r..r + 8 from the previous 8 positions' words 0, 3, 6; returns the key rotated (check at
-        // CHECK_SHIFT, partition at 0) and its words 0, 3, 6.
-        let eight = |r: usize, p: [__m512i; 3]| -> (__m512i, [__m512i; 3]) {
-            let x = load(r);
-            let w = |i: usize| vpermb(idx[i], x);
-            let (w0, w3, w6) = (w(0), w(1), w(2));
-            // the key: low and high 52 bits of the products, combined (alone, the low sum mod 2^52 of tokens at
-            // 16-bit offsets collides at 2^-20 for contexts differing only in tokens 1 and 4)
-            let hi = |acc: __m512i, w: __m512i, i: u64| _mm512_madd52hi_epu64(acc, w, _mm512_set1_epi64(m52(i) as i64));
-            let key = madd(madd(madd(a(0), w0, 0), w3, 1), hi(hi(_mm512_setzero_si512(), w0, 0), w3, 1), 8);
-            let f10 = madd(madd(a(1), w6, 2), w(3), 3);
-            let f20 = madd(madd(madd(madd(a(2), p[0], 4), p[1], 5), p[2], 6), w(4), 7);
-            let rot = _mm512_rol_epi64::<{ 64 - (52 - PBITS as i32) }>(key);
-            let x10 = _mm512_srli_epi64::<{ 52 - BITS[0] - SHIFTS[0] }>(f10);
-            let x20 = _mm512_srli_epi64::<{ 52 - BITS[1] - SHIFTS[1] }>(f20);
-            let e = _mm512_ternarylogic_epi64::<0xca>(keep, rot, x10); // keep ? rot : x10
-            let e = _mm512_ternarylogic_epi64::<0xca>(m10, e, x20);
-            let e = if next { _mm512_ternarylogic_epi64::<0xca>(low, vpermb(idx[8], x), e) } else { _mm512_andnot_si512(low, e) };
-            _mm512_storeu_si512(ep.add(r).cast(), e);
-            (rot, [w0, w3, w6])
-        };
-        let x = load(0);
-        let mut p = [vpermb(idx[5], x), vpermb(idx[6], x), vpermb(idx[7], x)];
-        for r in (0..n).step_by(16) {
-            let (lo, q) = eight(r, p);
-            let (hi, q) = eight(r + 8, q);
-            p = q;
-            _mm512_storeu_si512(pp.add(r).cast(), _mm512_and_si512(_mm512_permutex2var_epi32(lo, pidx, hi), pmask));
-        }
+        let w = |i: usize| vpermb(self.idx[i], x);
+        let (w0, w3, w6) = (w(0), w(1), w(2));
+        // the key: low and high 52 bits of the products, combined (alone, the low sum mod 2^52 of tokens at
+        // 16-bit offsets collides at 2^-20 for contexts differing only in tokens 1 and 4)
+        let hi = |acc: __m512i, w: __m512i, i: u64| _mm512_madd52hi_epu64(acc, w, _mm512_set1_epi64(m52(i) as i64));
+        let key = madd(madd(madd(a(0), w0, 0), w3, 1), hi(hi(_mm512_setzero_si512(), w0, 0), w3, 1), 8);
+        let f10 = madd(madd(a(1), w6, 2), w(3), 3);
+        let f20 = madd(madd(madd(madd(a(2), p[0], 4), p[1], 5), p[2], 6), w(4), 7);
+        let rot = _mm512_rol_epi64::<{ 64 - (52 - PBITS as i32) }>(key);
+        let x10 = _mm512_srli_epi64::<{ 52 - BITS[0] - SHIFTS[0] }>(f10);
+        let x20 = _mm512_srli_epi64::<{ 52 - BITS[1] - SHIFTS[1] }>(f20);
+        let e = _mm512_ternarylogic_epi64::<0xca>(self.keep, rot, x10); // keep ? rot : x10
+        let e = _mm512_ternarylogic_epi64::<0xca>(self.m10, e, x20);
+        let e = if next { _mm512_ternarylogic_epi64::<0xca>(self.low, vpermb(self.idx[8], x), e) } else { _mm512_andnot_si512(self.low, e) };
+        (e, rot, [w0, w3, w6])
+    }
+
+    /// The partitions (u32) of 16 positions from their two rotated keys.
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    unsafe fn part(&self, lo: __m512i, hi: __m512i) -> __m512i {
+        _mm512_and_si512(_mm512_permutex2var_epi32(lo, self.pidx, hi), self.pmask)
     }
 }
 
@@ -238,53 +287,84 @@ impl Scatter {
         Ok(())
     }
 
-    /// Scatter entries `e` (partitions `part`) without a branch on a burst filling up: each entry is inserted into its
-    /// burst line in a register (a 64 B load and a plain 64 B store, volatile: LLVM would make it a masked store, which
-    /// a later load of the line cannot forward from), the line is also copied to a small queue whose index advances
-    /// (by the lane bit) only when the burst is full, and every CHUNK entries the queued lines are streamed to their
-    /// blocks, in order.
-    #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,bmi2")]
-    unsafe fn scatter(&mut self, b: &Builder, e: &[u64], part: &[u32]) -> std::io::Result<()> {
+    /// The scan's hash and scatter, fused: the entries of the n contexts ending at t[j0..j0 + n] (Hasher, with the
+    /// next token), 16 positions at a time into a small stack buffer, one group ahead of their inserts (so the buffer
+    /// stays in L1, its loads never wait on the store just made, and the out-of-order core overlaps the vector hash
+    /// with the scalar inserts), then scattered without a branch on a burst filling up: each entry is inserted into
+    /// its burst line in a register (a 64 B load and a plain 64 B store, volatile: LLVM would make it a masked store,
+    /// which a later load of the line cannot forward from), the line is also copied to a small queue whose index
+    /// advances (by the lane bit) only when the burst is full, and every CHUNK entries the queued lines are streamed
+    /// to their blocks, in order (the order the bursts filled up, so any chunking gives the same arena).
+    #[target_feature(enable = "avx512f,avx512dq,avx512bw,avx512vl,avx512ifma,avx512vbmi,bmi2")]
+    unsafe fn hash_scatter(&mut self, b: &Builder, t: &[u16], j0: usize, n: usize) -> std::io::Result<()> {
+        assert!(j0 >= BACK && t.len() >= j0 + n + 20);
+        let h = Hasher::new();
         let (buf, used) = (self.buf.ptr, self.used.ptr);
-        let mut q = [_mm512_setzero_si512(); CHUNK];
+        let mut q = [std::mem::MaybeUninit::<__m512i>::uninit(); CHUNK];
         let mut qp = [0u32; CHUNK];
-        let (qv, qpp) = (q.as_mut_ptr(), qp.as_mut_ptr());
-        let m = e.len().min(part.len());
-        let (ep, pp) = (e.as_ptr(), part.as_ptr());
-        let mut i = 0;
-        while i < m {
-            let mut n = 0usize;
-            macro_rules! one {
-                ($j:expr) => {{
-                    let (x, p) = (*ep.add($j), *pp.add($j) as usize);
-                    let u = *used.add(p) as u32;
-                    let line = buf.add(p * BURST);
-                    let bit = 1u32 << u;
-                    let v = _mm512_mask_set1_epi64(_mm512_load_si512(line.cast()), bit as u8, x as i64);
-                    std::ptr::write_volatile(line.cast::<__m512i>(), v);
-                    *used.add(p) = ((u + 1) % BURST as u32) as u8;
-                    *qv.add(n) = v;
-                    *qpp.add(n) = p as u32;
-                    n += (bit >> (BURST - 1)) as usize;
-                }};
-            }
-            if m - i >= CHUNK {
-                for j in 0..CHUNK {
-                    one!(i + j);
+        let (qv, qpp) = (q.as_mut_ptr().cast::<__m512i>(), qp.as_mut_ptr());
+        #[repr(align(64))]
+        struct Group([u64; 16], [u32; 16]);
+        let mut gs = [Group([0; 16], [0; 16]), Group([0; 16], [0; 16])];
+        let gp = gs.as_mut_ptr();
+        // Hash the 16 positions from r into group buffer `g` (inserted one group later). Unmasked loads: t has 20
+        // tokens to spare past the last group (lanes past n read stale tokens, and are never inserted).
+        let mut p = h.start(t, j0);
+        macro_rules! hash16 {
+            ($r:expr, $g:expr) => {{
+                let (ep, pp) = ((*$g).0.as_mut_ptr(), (*$g).1.as_mut_ptr());
+                let (lo, rlo, x) = h.eight(_mm512_loadu_si512(t.as_ptr().add(j0 + $r - BACK).cast()), p, true);
+                let (hi, rhi, x) = h.eight(_mm512_loadu_si512(t.as_ptr().add(j0 + $r + 8 - BACK).cast()), x, true);
+                p = x;
+                _mm512_store_si512(ep.cast(), lo);
+                _mm512_store_si512(ep.add(8).cast(), hi);
+                _mm512_store_si512(pp.cast(), h.part(rlo, rhi));
+            }};
+        }
+        hash16!(0, gp);
+        let (mut i, mut k) = (0, 0usize);
+        while i < n {
+            let c = CHUNK.min(n - i);
+            let mut nq = 0usize;
+            let mut r = 0;
+            while r < c {
+                if i + r + 16 < n {
+                    hash16!(i + r + 16, gp.add((k + 1) & 1));
                 }
-                i += CHUNK;
-            } else {
-                while i < m {
-                    one!(i);
-                    i += 1;
+                let (ep, pp) = ((*gp.add(k & 1)).0.as_ptr(), (*gp.add(k & 1)).1.as_ptr());
+                macro_rules! one {
+                    ($j:expr) => {{
+                        let (x, p) = (*ep.add($j), *pp.add($j) as usize);
+                        let u = *used.add(p) as u32;
+                        let line = buf.add(p * BURST);
+                        let bit = 1u32 << u;
+                        let v = _mm512_mask_set1_epi64(_mm512_load_si512(line.cast()), bit as u8, x as i64);
+                        std::ptr::write_volatile(line.cast::<__m512i>(), v);
+                        *used.add(p) = ((u + 1) % BURST as u32) as u8;
+                        *qv.add(nq) = v;
+                        *qpp.add(nq) = p as u32;
+                        nq += (bit >> (BURST - 1)) as usize;
+                    }};
                 }
+                if c - r >= 16 {
+                    for j in 0..16 {
+                        one!(j);
+                    }
+                } else {
+                    for j in 0..c - r {
+                        one!(j);
+                    }
+                }
+                r += 16;
+                k += 1;
             }
-            for x in 0..n {
+            for x in 0..nq {
                 let p = *qpp.add(x) as usize;
                 let d = self.dst(p, b)?;
                 _mm512_stream_si512(d.cast(), *qv.add(x));
                 *self.fill.get_unchecked_mut(p) += BURST as u32;
             }
+            i += c;
         }
         Ok(())
     }
@@ -320,22 +400,36 @@ impl Scatter {
     }
 }
 
+/// A fresh scan state whose own blocks are `local` (then the shared rest), its block lists presized for `blocks`.
+fn new_scatter(blocks: usize, local: std::ops::Range<usize>) -> std::io::Result<Mutex<Scatter>> {
+    let (buf, used) = (Map::new((1 << PBITS) * BURST)?, Map::new(1 << PBITS)?);
+    let (block, fill) = (vec![NONE; 1 << PBITS], vec![BLOCK as u32; 1 << PBITS]);
+    let blocks = blocks + (1 << PBITS); // ample: presized, not grown on the clock
+    let (log, ks) = (Vec::with_capacity(blocks), Vec::with_capacity(blocks));
+    let off = vec![0; (1 << PBITS) + 1];
+    Ok(Mutex::new(Scatter { buf, used, block, fill, log, local, off, ks }))
+}
+
 /// Place partition p's entries (its arena `blocks`, in order) and stream its buckets to the table at `dst`. Both fill
 /// counts are read and the bucket chosen with selects; a fill stops at `slots`, and an entry that fits neither bucket
-/// goes to b2 with fill `slots`: lane 0 of the staging line of a full bucket, which is never streamed again (slots
-/// is a multiple of 8). The entry is inserted into its bucket's staging line `sp` in a register (as in the scatter),
-/// and the line is also copied to a small queue whose index advances only when the line is complete; every CHUNK
-/// entries the queued lines are streamed to the table, then at the end the partial last lines (zeros past the
-/// fill). Never-written lines stay zero (the table is zero from create).
+/// goes to b2 with fill `slots`: lane 0 of the staging line of a full bucket, whose last line is complete (slots is a
+/// multiple of 8). Each entry is one 8 B store into its bucket's staging line `sp` (no line load, insert and store).
+/// A completed line's bucket is queued in a zmm of u16 lanes (the lane index advancing only when the line is
+/// complete), and every QN entries the queued lines are streamed to the table. A queued bucket's line is its last
+/// complete one (at fill - 8) as long as no entry has reached the bucket since: an entry whose bucket is in the queue
+/// (it would overwrite lane 0 of the queued line, or is dropped into it) first streams the queue (rare, a cold call).
+/// At the end, the partial last lines (zeros past the fill). Never-written lines stay zero (the table is zero from
+/// create).
 #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,bmi2")]
 unsafe fn place(b: &Builder, blocks: &[u32], sp: *mut u64, fp: *mut u8, dst: *mut u64) {
     let slots = b.slots;
-    let mut q = [_mm512_setzero_si512(); CHUNK];
-    let mut qo = [0u32; CHUNK];
-    let (qv, qop) = (q.as_mut_ptr(), qo.as_mut_ptr());
-    for &k in blocks {
+    let none = _mm512_set1_epi16(-1);
+    let mut queue = none;
+    for (i, &k) in blocks.iter().enumerate() {
         let len = b.lens[k as usize].load(Relaxed) as usize;
-        let mut s = b.arena.ptr.add(k as usize * BLOCK) as *const u64;
+        let start = b.arena.ptr.add(k as usize * BLOCK) as *const u64;
+        let nxt = b.arena.ptr.add(*blocks.get(i + 1).unwrap_or(&k) as usize * BLOCK) as *const u64;
+        let mut s = start;
         let end = s.add(len);
         while s < end {
             let mut n = 0usize;
@@ -347,30 +441,38 @@ unsafe fn place(b: &Builder, blocks: &[u32], sp: *mut u64, fp: *mut u8, dst: *mu
                     let in1 = f1 < slots;
                     let h = select_unpredictable(in1, h1, h2);
                     let f = select_unpredictable(in1, f1, f2);
-                    let line = sp.add(h * BURST);
-                    let bit = 1u32 << (f % BURST);
-                    let v = _mm512_mask_set1_epi64(_mm512_load_si512(line.cast()), bit as u8, e as i64);
-                    std::ptr::write_volatile(line.cast::<__m512i>(), v);
+                    let bh = _mm512_set1_epi16(h as i16);
+                    if _mm512_cmpeq_epi16_mask(queue, bh) != 0 {
+                        flush(queue, n, sp, fp, dst, slots);
+                        (n, queue) = (0, none);
+                    }
+                    *sp.add(h * BURST + f % BURST) = e;
                     *fp.add(h) = (f + (f < slots) as usize) as u8;
-                    *qv.add(n) = v;
-                    *qop.add(n) = (h * slots + (f & !(BURST - 1))) as u32; // the line's offset in the slice
-                    n += (bit >> (BURST - 1)) as usize;
+                    let done = (f % BURST == BURST - 1) as u32;
+                    queue = _mm512_mask_mov_epi16(queue, done << n, bh);
+                    n += done as usize;
                 }};
             }
-            if end.offset_from(s) >= CHUNK as isize {
-                for j in 0..CHUNK {
+            if end.offset_from(s) >= QN as isize {
+                // Prefetch the arena PF entries ahead, into the next block past this one's end (the hardware
+                // prefetcher restarts at every 4 KB page and every block).
+                let a = s.offset_from(start) as usize + PF;
+                let pf = if a < len { start.add(a) } else { nxt.add((a - len) & !(BURST - 1)) };
+                for j in 0..QN / BURST {
+                    _mm_prefetch::<PF_HINT>(pf.add(BURST * j).cast());
+                }
+                for j in 0..QN {
                     one!(s.add(j));
                 }
-                s = s.add(CHUNK);
+                s = s.add(QN);
             } else {
                 while s < end {
                     one!(s);
                     s = s.add(1);
                 }
             }
-            for x in 0..n {
-                _mm512_stream_si512(dst.add(*qop.add(x) as usize).cast(), *qv.add(x));
-            }
+            stream_queued(queue, n, sp, fp, dst, slots);
+            queue = none;
         }
     }
     for h in 0..1usize << NBITS {
@@ -381,6 +483,27 @@ unsafe fn place(b: &Builder, blocks: &[u32], sp: *mut u64, fp: *mut u8, dst: *mu
         }
         *fp.add(h) = 0;
     }
+}
+
+/// Stream the last complete line of each of the `n` queued buckets (u16 lanes of `q`) from its staging line.
+#[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,bmi2")]
+#[inline]
+unsafe fn stream_queued(q: __m512i, n: usize, sp: *const u64, fp: *const u8, dst: *mut u64, slots: usize) {
+    let mut hs = [0u16; QN];
+    _mm512_storeu_si512(hs.as_mut_ptr().cast(), q);
+    for &h in &hs[..n] {
+        let h = h as usize;
+        let at = h * slots + *fp.add(h) as usize - BURST;
+        _mm512_stream_si512(dst.add(at).cast(), _mm512_load_si512(sp.add(h * BURST).cast()));
+    }
+}
+
+/// place's conflict path: stream the queue now.
+#[cold]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,bmi2")]
+unsafe fn flush(q: __m512i, n: usize, sp: *const u64, fp: *const u8, dst: *mut u64, slots: usize) {
+    stream_queued(q, n, sp, fp, dst, slots);
 }
 
 /// A value in cache lines of its own (a pair: the adjacent-line prefetcher fetches them together). The arena's shared
@@ -402,6 +525,15 @@ struct Builder {
     overflow: Box<Padded<AtomicUsize>>, // the next arena block past the lanes' own, in lines of its own
     table: Map<u64>,
     scatters: Vec<Mutex<Scatter>>,
+    // Tail stealing of the scan, exact: lane t's pieces are t, t + T, ... (indices 0..n_t of its list); its owner claims
+    // them from the front, a thread done with its own lane claims the back half of the busiest lane's rest into a spare
+    // Scatter. Lane t's entries are then its owner's, followed by its stolen chunks in piece order: the same order as
+    // without stealing, so the same table.
+    claims: Vec<Padded<AtomicU64>>, // per stream (the lanes, then the spares): back << 32 | front
+    lane_of: Vec<AtomicUsize>,      // per stream: its lane (a spare's is set when it steals)
+    spares: Vec<Mutex<Scatter>>,
+    spare_next: AtomicUsize,
+    stolen: Mutex<Vec<(usize, usize, usize)>>, // (lane, first piece index, spare)
     finishes: Vec<Mutex<(Map<u64>, Map<u8>)>>, // a thread's staging line and fill count of every bucket of a slice
     built: AtomicBool, // build ran (the arena and scatter state are single-use)
 }
@@ -437,7 +569,9 @@ impl SlotIndex {
         // them the scan fails ("scan arena is full").
         let full = sizes.iter().map(|&n| n.saturating_sub(MIN)).sum::<usize>().div_ceil(BLOCK);
         let local = full / 2 / threads;
-        let arena = Map::new((full * 51 / 50 + threads * (1 << PBITS) + 64) * BLOCK)?;
+        let npieces = sizes.iter().map(|&n| n.saturating_sub(MIN).div_ceil(PIECE)).sum::<usize>();
+        let spares = threads; // at most this many steals (each spare's partial blocks are slack below)
+        let arena = Map::new((full * 51 / 50 + (threads + spares) * (1 << PBITS) + 64) * BLOCK)?;
         let file = create_empty(&path)?;
         file.set_len((table_len * 8) as u64)?;
         let table = mmap(table_len * 8, libc::MAP_SHARED, file.as_raw_fd())?;
@@ -451,19 +585,16 @@ impl SlotIndex {
             arena,
             overflow: Box::new(Padded(AtomicUsize::new(threads * local))),
             table: Map { ptr: table.cast(), len: table_len, bytes: table_len * 8 },
-            scatters: (0..threads)
-                .map(|t| {
-                    let (buf, used) = (Map::new((1 << PBITS) * BURST)?, Map::new(1 << PBITS)?);
-                    let (block, fill) = (vec![NONE; 1 << PBITS], vec![BLOCK as u32; 1 << PBITS]);
-                    let blocks = 2 * full / threads + (1 << PBITS); // ample: presized, not grown on the clock
-                    let (log, ks) = (Vec::with_capacity(blocks), Vec::with_capacity(blocks));
-                    let off = vec![0; (1 << PBITS) + 1];
-                    Ok(Mutex::new(Scatter { buf, used, block, fill, log, local: t * local..(t + 1) * local, off, ks }))
-                })
-                .collect::<std::io::Result<_>>()?,
+            scatters: (0..threads).map(|t| new_scatter(2 * full / threads, t * local..(t + 1) * local)).collect::<std::io::Result<_>>()?,
+            claims: (0..threads + spares).map(|t| Padded(AtomicU64::new(if t < threads { (((npieces + threads - 1 - t) / threads) as u64) << 32 } else { 0 }))).collect(),
+            lane_of: (0..threads + spares).map(|t| AtomicUsize::new(t.min(threads))).collect(),
+            spares: (0..spares).map(|_| new_scatter(full / threads / 2, 0..0)).collect::<std::io::Result<_>>()?,
+            spare_next: AtomicUsize::new(0),
+            stolen: Mutex::new(Vec::with_capacity(spares)),
             finishes: (0..threads).map(|_| Ok(Mutex::new((Map::new((1 << NBITS) * BURST)?, Map::new(1 << NBITS)?)))).collect::<std::io::Result<_>>()?,
             built: AtomicBool::new(false),
         };
+        assert_eq!(builder.pieces.len(), npieces);
         // Fault in the per-thread buffers first, while 2 MB pages are still easy to get (on a fragmented host, after
         // hundreds of GB of arena and table they fell back to 4 KB pages, and the scan's burst stores then missed the
         // TLB), then the arena (each thread its own slice first) and the table, which stays mapped. Last, the shards
@@ -482,6 +613,13 @@ impl SlotIndex {
                     touch(scatter.ks.spare_capacity_mut());
                     touch(&mut finish.0);
                     touch(&mut finish.1);
+                }
+                for spare in b.spares.iter().skip(i).step_by(n) {
+                    let mut spare = spare.lock().unwrap();
+                    touch(&mut spare.buf);
+                    touch(&mut spare.used);
+                    touch(spare.log.spare_capacity_mut());
+                    touch(spare.ks.spare_capacity_mut());
                 }
                 let part = |m: &Map<u64>, a: usize, b: usize| unsafe { std::slice::from_raw_parts_mut(m.ptr.add(a), b - a) };
                 let (own, rest) = (local * BLOCK, b.arena.len() - n * local * BLOCK);
@@ -528,27 +666,81 @@ impl SlotIndex {
         py.detach(|| {
             // 1. Scan.
             let scanned = b.pool.broadcast(|ctx| -> std::io::Result<()> {
-                let mut guard = b.scatters[ctx.index()].lock().unwrap();
-                let sc = &mut *guard;
-                let (mut hashes, mut tokens) = (Hashes::new(), vec![STOP; PIECE + BACK]);
-                for &(f, a) in b.pieces.iter().skip(ctx.index()).step_by(ctx.num_threads()) {
+                let (t, lanes) = (ctx.index(), ctx.num_threads());
+                let mut tokens = vec![STOP; PIECE + BACK + 20]; // 20 to spare for hash_scatter's last loads
+                // Scan piece index i of lane l into sc.
+                let mut piece = |sc: &mut Scatter, l: usize, i: usize| -> std::io::Result<()> {
+                    let (f, a) = b.pieces[l + i * lanes];
                     // tokens[BACK + r] = shard token a + r; tokens before the shard's start are STOP.
                     let (n, lo) = ((a + PIECE).min(b.sizes[f]) - a, a.saturating_sub(BACK));
                     let pad = BACK - (a - lo);
                     tokens[..pad].fill(STOP);
                     pread(&b.files[f], &mut tokens[pad..BACK + n], HEADER_BYTES + lo * 2)?;
-                    for r in (0..n).step_by(STEP) {
-                        let m = STEP.min(n - r);
-                        hashes.hash(&tokens, BACK + r, m, true);
-                        unsafe { sc.scatter(b, &hashes.e[..m], &hashes.part[..m])? };
+                    unsafe { sc.hash_scatter(b, &tokens, BACK, n)? };
+                    Ok(())
+                };
+                // Claim stream st's pieces from its front and scan them into sc.
+                let mut run = |sc: &mut Scatter, st: usize| -> std::io::Result<()> {
+                    let (claim, l) = (&b.claims[st].0, b.lane_of[st].load(Relaxed));
+                    let mut c = claim.load(Acquire);
+                    while (c as u32) < (c >> 32) as u32 {
+                        match claim.compare_exchange_weak(c, c + 1, AcqRel, Acquire) {
+                            Ok(_) => {
+                                piece(sc, l, c as u32 as usize)?;
+                                c = claim.load(Acquire);
+                            }
+                            Err(now) => c = now,
+                        }
                     }
+                    Ok(())
+                };
+                {
+                    // Own lane.
+                    let mut guard = b.scatters[t].lock().unwrap();
+                    run(&mut guard, t)?;
+                    guard.close(b)?;
                 }
-                sc.close(b)
+                // Then the back half of the busiest stream's rest (a lane's or a stolen chunk's, so a big stolen chunk
+                // is split again), while some stream has STEAL pieces left, as a new stream of the same lane.
+                const STEAL: u64 = 4;
+                loop {
+                    let k = b.spare_next.fetch_add(1, Relaxed);
+                    if k >= b.spares.len() {
+                        break;
+                    }
+                    let claimed = loop {
+                        let (v, c) = (0..b.claims.len()).map(|x| (x, b.claims[x].0.load(Acquire))).max_by_key(|&(_, c)| (c >> 32).saturating_sub(c & 0xffff_ffff)).unwrap();
+                        let (front, back) = (c & 0xffff_ffff, c >> 32);
+                        if back < front + STEAL {
+                            break None;
+                        }
+                        let first = back - (back - front) / 2;
+                        if b.claims[v].0.compare_exchange(c, first << 32 | front, AcqRel, Acquire).is_ok() {
+                            break Some((b.lane_of[v].load(Relaxed), first, back));
+                        }
+                    };
+                    let Some((l, first, back)) = claimed else { break };
+                    let st = lanes + k;
+                    b.lane_of[st].store(l, Relaxed);
+                    b.claims[st].0.store(back << 32 | first, Release);
+                    let mut spare = b.spares[k].lock().unwrap();
+                    run(&mut spare, st)?;
+                    spare.close(b)?;
+                    b.stolen.lock().unwrap().push((l, first as usize, k));
+                }
+                Ok(())
             });
             scanned.into_iter().collect::<std::io::Result<()>>()?;
 
             // 2. Finish: the partitions largest first, each placed into the table.
-            let scatters: Vec<_> = b.scatters.iter().map(|s| s.lock().unwrap()).collect();
+            // Every lane's owner, then its stolen chunks in piece order.
+            let mut stolen = std::mem::take(&mut *b.stolen.lock().unwrap());
+            stolen.sort();
+            let mut scatters = Vec::with_capacity(b.scatters.len() + stolen.len());
+            for (l, s) in b.scatters.iter().enumerate() {
+                scatters.push(s.lock().unwrap());
+                scatters.extend(stolen.iter().filter(|x| x.0 == l).map(|x| b.spares[x.2].lock().unwrap()));
+            }
             let size = |p: usize| -> usize {
                 scatters.iter().flat_map(|s| &s.ks[s.off[p] as usize..s.off[p + 1] as usize]).map(|&k| b.lens[k as usize].load(Relaxed) as usize).sum()
             };

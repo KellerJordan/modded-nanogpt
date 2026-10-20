@@ -19,8 +19,8 @@ and no draw needs an RNG. The gradient for lm_head is dense over the vocabulary 
 
 Schedule (record #360's, per TRAINING_STAGES index): P = 10240 through stages 0 and 1, then stage 2
 ramps 14336 -> 14336 -> 24576 in equal thirds; stage 3 (record #360's batch taper) and the extension run
-the full softmax. For the default 560 + 10 steps: P = 10240 on steps 0-339, 14336 on 340-463, 24576 on
-464-525, and the full softmax from step 526 on.
+the full softmax. For the default 530 + 10 steps: P = 10240 on steps 0-321, 14336 on 322-439, 24576 on
+440-497, and the full softmax from step 498 on.
 
 Requires exactly one microbatch per step: see the race contract in perf/sampled_softmax_overlap.py.
 

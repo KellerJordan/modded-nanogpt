@@ -45,7 +45,7 @@ ANVIL_MAPS = [
 # Twin-rail velocity. Rail 0 is fast (beta scheduled by get_rail_beta until RAIL_ENGAGE_STEP, then
 # RAIL_FAST_BETA); rail 1 is slow (RAIL_SLOW_BETA) and accumulates from step 0. Until the engage
 # step the update reads the fast rail only; after it, RAIL_FAST_WEIGHT * fast + (1 - w) * slow.
-RAIL_FAST_BETA, RAIL_SLOW_BETA, RAIL_FAST_WEIGHT, RAIL_ENGAGE_STEP = 0.85, 0.98, 0.4385, 245
+RAIL_FAST_BETA, RAIL_SLOW_BETA, RAIL_FAST_WEIGHT, RAIL_ENGAGE_STEP = 0.85, 0.98, 0.4385, 232
 
 # The cascade's input is divided by FROBENIUS_MARGIN * ||X||_F + FROBENIUS_EPS, which puts every
 # singular value safely below 1 where the maps converge (the margin and eps of record #360).

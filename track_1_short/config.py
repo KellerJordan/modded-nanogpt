@@ -18,13 +18,13 @@ class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", ".")
     train_files: str = os.path.join(data_path, "data/fineweb100B/fineweb_train_*.bin") # input .bin to train on
     val_files: str = os.path.join(data_path, "data/fineweb100B/fineweb_val_*.bin") # input .bin to eval validation loss on
-    val_index_shards: int = 350 # the validation retrieval index covers the first this many training shards (35B tokens)
+    val_index_shards: int = 370 # the validation retrieval index covers the first this many training shards (37B tokens)
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule: the step count of the main stages, then the extension stage. The override is for
-    # step-count sweeps (record #360's KX_STEPS); the step constants elsewhere are tuned for 560 + 10.
-    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "560"))
+    # step-count sweeps (record #360's KX_STEPS); the step constants elsewhere are tuned for 530 + 10.
+    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "530"))
     num_extension_iterations: int = 10
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"

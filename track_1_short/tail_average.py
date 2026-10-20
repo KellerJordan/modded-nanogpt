@@ -2,17 +2,17 @@
 instead of the raw final iterate.
 
 Four accumulators track the last hundred or so steps (record #360's windows, scaled from its 1194
-steps to this run's 570). Each rank averages only the shard of each
+steps to this run's 540). Each rank averages only the shard of each
 weight it owns in the optimizer (1/8 of the weights), in fp32. At the end of training, before the
 final validation, each accumulator is "shipped": written back into its weights, then every shipped
 weight is all-gathered and rescaled to its pre-ship Frobenius norm ("decontraction": averaging
 shrinks norms, and the model was trained at the un-averaged scale).
 
   accumulator         weights              ticks                          ship
-  tail-ema            lm_head, embed       Adam steps, last 142           lerp(final, ema, 0.65)
-  tail-avg            vo_bank, mlp_bank    every 4th step, last 119       replaced by the average
-  value-embed-avg     value_embeds         its update events, last 119    replaced by the average
-  bank-blend          qk/vo/mlp banks      every 4th step, last 142       lerp(current, ema, B)
+  tail-ema            lm_head, embed       Adam steps, last 134           lerp(final, ema, 0.65)
+  tail-avg            vo_bank, mlp_bank    every 4th step, last 113       replaced by the average
+  value-embed-avg     value_embeds         its update events, last 113    replaced by the average
+  bank-blend          qk/vo/mlp banks      every 4th step, last 134       lerp(current, ema, B)
 
 bank-blend ships last, so on vo/mlp it blends into the tail average. Its B is 0.55, lowered by a
 Richardson correction on vo/mlp: a seeded EMA lags the final iterate, and
@@ -28,20 +28,20 @@ import torch.distributed as dist
 from track_1_short.ngram_table import NGRAM_ADAM_PERIOD4_START
 from track_1_short.perf.kernels.lerp import lerp_upcast_
 
-# The windows and the tail-avg rate are record #360's, scaled from 1194 steps to 570.
-TAIL_EMA_WINDOW = 142
+# The windows and the tail-avg rate are record #360's, scaled from 1194 steps to 540.
+TAIL_EMA_WINDOW = 134
 TAIL_EMA_BLEND = 0.65
 
-TAIL_AVG_WINDOW = 119
+TAIL_AVG_WINDOW = 113
 TAIL_AVG_PERIOD = 4
-TAIL_AVG_RATE = 4.0 / 53.0 * 1194 / 570  # record #360's tuned rate per tick, scaled to 570 steps
+TAIL_AVG_RATE = 4.0 / 53.0 * 1194 / 540  # record #360's tuned rate per tick, scaled to 540 steps
 
-VALUE_EMBED_AVG_WINDOW = 119
+VALUE_EMBED_AVG_WINDOW = 113
 # value_embeds updates every 4th step throughout the window (TailAverages asserts it), so this is the
 # tail-avg rate at the same tick spacing (record #360).
 VALUE_EMBED_AVG_RATE = TAIL_AVG_RATE
 
-BANK_BLEND_WINDOW = 142
+BANK_BLEND_WINDOW = 134
 BANK_BLEND_PERIOD = 4  # ticks every 4th step (record #360)
 # The per-step EMA timescale of the window, at 1/BANK_BLEND_PERIOD of the ticks.
 BANK_BLEND_RATE = 2.0 / (BANK_BLEND_WINDOW // BANK_BLEND_PERIOD + 1)
