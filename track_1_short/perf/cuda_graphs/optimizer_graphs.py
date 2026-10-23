@@ -1,4 +1,4 @@
-"""CUDA graphs of the optimizer tail: one graph per ANVIL bank update (qk_bank, vo_bank, mlp_bank).
+"""CUDA graphs of the optimizer tail: one graph per ANVIL bank update (qk_bank, vo_bank, mlp_bank, moe_bank).
 
 What it replaces: running anvil_bank_update (optim/anvil.py) eagerly for each bank every step -- the
 twin-rail momentum, six rounds of the whitening cascade (Gram, polynomial, update GEMMs per round), the
@@ -39,7 +39,7 @@ class AnvilBankGraphs:
 
     def __init__(self, device: torch.device):
         self.stream = torch.cuda.Stream(device)
-        # The three graphs always replay in capture order (work order), one after another: one pool.
+        # The bank graphs always replay in capture order (work order), one after another: one pool.
         self.pool = torch.cuda.graph_pool_handle()
         self.graphs: dict[str, torch.cuda.CUDAGraph] = {}
         self.unchecked: set[str] = set()

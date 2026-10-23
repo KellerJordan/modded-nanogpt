@@ -15,14 +15,21 @@ Scales, all per-tensor fp32 (the caller in model/gpt.py owns and refreshes them)
   grad   static 2^-6 (e5m2) for the incoming gradient
   dpre   delayed, like post, from the backward epilogue
 
+The two fp8 training rows (forward with the relu^2 / e4m3 epilogue, backward emitting dpre) run on the Gluon
+G3 kernels of mlp_g3.py once prime_stage_cache() has verified, bit for bit, that they reproduce this Triton
+kernel; the Triton kernel below stays the reference, the bf16 (validation) path and the fallback.
+
 Provenance: bf16 kernel by @andrewbriand, @jrauvola; full-fp8 MLP from record #360 (ANVIL2).
 """
+import os
+
 import torch
 import triton
 import triton.language as tl
 from triton.runtime.errors import OutOfResources
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from track_1_short.perf.kernels import mlp_g3 as _g3
 from track_1_short.perf.kernels.transpose import transpose_copy
 
 # Weight scales lag a step (see quantize_mlp_weights_dual), so they keep 12% headroom.
@@ -241,6 +248,17 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=N
     use_fp8 = b_f8 is not None
     FORWARD = aux is None
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    # G3 path (Gluon) for the two fp8 training rows. Every condition is trace-time, and _g3_ok was decided ONCE (eagerly)
+    # by prime_stage_cache, so here it is read-only. Everything else goes through the Triton kernel below.
+    if FORWARD and use_fp8 and emit_f8 and emit_t and not store_pre and not store_post_bf \
+            and _g3._g3_eligible(True, a_f8, b_f8, None, dequant_scale_ptr, post_scale, post_amax):
+        post_f8, post_t = torch.ops.nanogpt.lrs_g3_fwd(a_f8, b_f8, dequant_scale_ptr, post_scale, post_amax)
+        return None, None, post_f8, post_t
+    if (not FORWARD) and use_fp8 and dpre_scale is not None \
+            and _g3._g3_eligible(False, a_f8, b_f8, aux, dequant_scale_ptr, post_scale, dpre_amax):
+        dpre_f8, dpre_t = torch.ops.nanogpt.lrs_g3_bwd(a_f8, b_f8, aux, dequant_scale_ptr, post_scale, dpre_scale,
+                                                       dpre_amax)
+        return dpre_f8, dpre_t
     # One tile shape for both passes: the backward measured 0.3824 ms at 128x256, 0.4102 ms transposed.
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 256
@@ -318,10 +336,91 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=N
         _lrs_stage_cache[key] = num_stages
     return (c, aux_out, aux_f8, aux_t) if FORWARD else (c_f8, c_t)
 
+def _g3_compare_with_triton(dev, nsm):
+    """Compile the two G3 kernels and compare them BIT FOR BIT with the Triton path on a small but non-degenerate
+    problem (forward and backward, row and transposed outputs + amax). True iff everything matches."""
+    _g3._G3_NUM_SMS[0] = nsm
+    g = torch.Generator(device=dev)
+    g.manual_seed(1234)
+    M, N, K = 256, 512, 768
+    e4, e5 = torch.float8_e4m3fn, torch.float8_e5m2
+    x = (torch.randn(M, K, device=dev, generator=g) * 6).clamp(-448, 448).to(e4)
+    w = (torch.randn(N, K, device=dev, generator=g) * 6).clamp(-448, 448).to(e4)
+    w2 = (torch.randn(N, K, device=dev, generator=g) * 6).clamp(-448, 448).to(e4)
+    gr = (torch.randn(M, K, device=dev, generator=g) * 6).clamp(-57344, 57344).to(e5)
+    dq = torch.full((1,), 1.0 / 400.0, device=dev)
+    dqb = torch.full((), 1.0 / 400.0, device=dev)
+    a_bf, b_bf = torch.zeros(M, K, device=dev, dtype=torch.bfloat16), torch.zeros(N, K, device=dev, dtype=torch.bfloat16)
+    ps0 = torch.ones((), device=dev)
+    amax_t = torch.zeros(1, device=dev)
+    _g3._g3_ok[0] = False                   # so that linear_relu_square takes the pure Triton path below
+    linear_relu_square(a_bf, b_bf, a_f8=x, b_f8=w, emit_f8=True, emit_t=True, dequant_scale_ptr=dq, post_scale=ps0,
+                       post_amax=amax_t, store_pre=False, store_post_bf=False)
+    ps = (amax_t[0] * 1.03 / 448.0).clone().reshape(())
+    amax_t.zero_()
+    _, _, pf_t, pt_t = linear_relu_square(a_bf, b_bf, a_f8=x, b_f8=w, emit_f8=True, emit_t=True,
+                                          dequant_scale_ptr=dq, post_scale=ps, post_amax=amax_t, store_pre=False,
+                                          store_post_bf=False)
+    amax_g = torch.zeros(1, device=dev)
+    pf_g, pt_g = torch.ops.nanogpt.lrs_g3_fwd(x, w, dq, ps, amax_g)
+    ok = (torch.equal(pf_t.view(torch.uint8), pf_g.view(torch.uint8))
+          and torch.equal(pt_t.view(torch.uint8), pt_g.view(torch.uint8)) and torch.equal(amax_t, amax_g))
+    dsc0 = torch.full((), 0.015625, device=dev)
+    damax_t = torch.zeros(1, device=dev)
+    linear_relu_square(gr.to(torch.bfloat16), w2.to(torch.bfloat16), aux=pf_t, a_f8=gr, b_f8=w2, dequant_scale_ptr=dqb,
+                       post_scale=ps, dpre_scale=dsc0, dpre_amax=damax_t)
+    dsc = (damax_t[0] * 1.25 / 57344.0).clone().reshape(())
+    damax_t.zero_()
+    df_t, dt_t = linear_relu_square(gr.to(torch.bfloat16), w2.to(torch.bfloat16), aux=pf_t, a_f8=gr, b_f8=w2,
+                                    dequant_scale_ptr=dqb, post_scale=ps, dpre_scale=dsc, dpre_amax=damax_t)
+    damax_g = torch.zeros(1, device=dev)
+    df_g, dt_g = torch.ops.nanogpt.lrs_g3_bwd(gr, w2, pf_t, dqb, ps, dsc, damax_g)
+    ok = ok and (torch.equal(df_t.view(torch.uint8), df_g.view(torch.uint8))
+                 and torch.equal(dt_t.view(torch.uint8), dt_g.view(torch.uint8)) and torch.equal(damax_t, damax_g))
+    torch.cuda.synchronize(dev)
+    return bool(ok)
+
+
+def _g3_prime_base(dev, nsm):
+    """Decide _g3_ok: G3 is on only if Gluon imports, the GPU is Hopper, and the compiled G3 kernels reproduce the
+    Triton path bit for bit. Eager, once: writes only _G3_NUM_SMS / _g3_ok / G3_FALLBACK_REASON (never under compile).
+    Any exception => stay on Triton. Every fallback is printed on rank 0."""
+    _g3._g3_ok[0] = False
+    reason = None
+    if not _g3._HAVE_GLUON:
+        reason = f"Gluon is not importable ({_g3._GLUON_IMPORT_ERROR})"
+    elif torch.cuda.get_device_capability(dev)[0] != 9:
+        reason = "the GPU is not Hopper (sm_90)"
+    else:
+        try:
+            _g3._g3_ok[0] = _g3_compare_with_triton(dev, nsm)
+            if not _g3._g3_ok[0]:
+                reason = "outputs differ from the Triton kernel"
+        except Exception as _e:
+            _g3._g3_ok[0] = False
+            reason = f"{type(_e).__name__}: {str(_e)[:200]}"
+    _g3.G3_FALLBACK_REASON = reason
+    if reason is not None and int(os.environ.get("RANK", "0")) == 0:
+        print(f"[linear_relu_square] G3 (Gluon) disabled, using the Triton kernel: {reason}", flush=True)
+
+
+def _g3_prime(dev, nsm):
+    """Start-up check of the Gluon path (eager, called by prime_stage_cache): G3 against the Triton kernel, then, if G3
+    passed, the ping-pong forward against G3. Sets G3_ACTIVE / G3PP_ACTIVE and the matching *_FALLBACK_REASON."""
+    _g3._G3_PP[0] = 0                       # G3 is compared against the Triton kernel on its own
+    _g3_prime_base(dev, nsm)
+    _g3.G3_ACTIVE = bool(_g3._g3_ok[0])
+    if _g3.G3_ACTIVE:
+        _g3._g3pp_selfcheck(dev)            # sets _G3_PP[0], G3PP_ACTIVE, G3PP_FALLBACK_REASON
+    else:
+        _g3.G3PP_ACTIVE, _g3.G3PP_FALLBACK_REASON = False, "G3 is off"
+
+
 def prime_stage_cache():
     """Resolve num_stages for every linear_relu_square variant training reaches, by launching each
     once on one-tile inputs (shared-memory pressure depends only on the variant, not on M/N/K).
-    Call once, before torch.compile traces the model."""
+    Call once, before torch.compile traces the model. It also runs the Gluon start-up checks
+    (_g3_prime), which set mlp_g3.G3_ACTIVE / G3PP_ACTIVE."""
     dev = torch.device("cuda")
     M, N, K = (128, 256, 128)  # one (BLOCK_M, BLOCK_N) tile, one fp8 K-block
     num_sms = torch.cuda.get_device_properties(dev).multi_processor_count
@@ -341,6 +440,7 @@ def prime_stage_cache():
                     "post_scale": one, "dpre_scale": one, "dpre_amax": amax}):  # fp8 backward
         linear_relu_square(a, b, **kwargs)
     torch.cuda.synchronize(dev)
+    _g3_prime(dev, num_sms)
 
 
 # -----------------------------------------------------------------------------

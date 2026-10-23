@@ -6,14 +6,21 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from track_1_short.config import COPY_TOKEN_ID
 from track_1_short.model.attention import AttnArgs, CausalSelfAttention, Yarn
 from track_1_short.model.layers import CastedLinearT, next_multiple_of_n, norm
-from track_1_short.ngram_table import NGRAM_SIGN_POOL_ROWS
-from track_1_short.perf.kernels.cross_entropy import (
-    FusedSoftcappedCrossEntropy,
-    lm_head_inverse_scale,
-    quantize_lm_head_dual,
+from track_1_short.model.moe import (
+    MOE_AUX,
+    MOE_EXPERTS,
+    MOE_HIDDEN,
+    MOE_INDEX,
+    MOE_LAYERS,
+    MoEMixin,
 )
+from track_1_short.ngram_norm_map import NORM_MAP
+from track_1_short.ngram_table import NGRAM_SIGN_POOL_ROWS
+from track_1_short.perf.kernels.cplm import cplm_loss
+from track_1_short.perf.kernels.cross_entropy import lm_head_inverse_scale, quantize_lm_head_dual
 from track_1_short.perf.kernels.fp8_attention_quant import PackedQKVFP8Cache
 from track_1_short.perf.kernels.mlp import (
     FusedLinearReLUSquareFunction,
@@ -22,17 +29,20 @@ from track_1_short.perf.kernels.mlp import (
     quantize_weights_dual_ntiles,
 )
 from track_1_short.perf.kernels.ngram_embed import ngram_embedding
-from track_1_short.perf.kernels.sampled_cross_entropy import SampledSoftcappedCrossEntropy
 from track_1_short.perf.kernels.value_embed import value_embed_lookup
 from track_1_short.perf.residual_fusion import rms_norm_with_head, scale, scale_add
 from track_1_short.sampled_softmax import SampledLoss
 
-# Layer topology (11 layers). Depth cut from record #360 (ANVIL2): layer 7 is removed whole -- its
-# residual scaling and x0 injection stay, so cache[7] still exists -- and layers 4 and 9 run
-# their MLP only. Layer 6 has had no attention since @YouJiacheng; it adds a gated skip from layer 3.
+# Layer topology (11 layers). Depth cut from record #360 (ANVIL2), one layer deeper: layers 7 and 9 are
+# removed whole -- their residual scaling and x0 / n-gram injections stay, so cache[7] still exists --
+# and layer 4 runs its MLP only. Layer 6 has had no attention since @YouJiacheng; it adds a gated skip
+# from layer 3.
 NUM_LAYERS = 11
 NO_ATTN_LAYERS = (4, 6, 7, 9)
-NO_MLP_LAYERS = (7,)
+NO_MLP_LAYERS = (7, 9)
+assert 9 in NO_MLP_LAYERS and 9 in NO_ATTN_LAYERS, "layer 9 is removed whole"
+assert not set(MOE_LAYERS) & (set(NO_MLP_LAYERS) | {NUM_LAYERS - 1}), \
+    "MoE only on plain MLP layers (not the skipped 7 and 9, not the MUDD layer 10)"
 ATTN_LAYERS = tuple(i for i in range(NUM_LAYERS) if i not in NO_ATTN_LAYERS)  # (0, 1, 2, 3, 5, 8, 10)
 # Long sliding window (with a partial key offset) on these layers, short on the other attention layers.
 LONG_WINDOW_LAYERS = (3, 10)
@@ -60,8 +70,6 @@ ATTN_BANK_ORDER = sum(ATTN_WIDTH_GROUPS.values(), ())  # (0, 2, 5, 1, 8, 3, 10)
 NUM_QK64_SLOTS = len(NARROW_QK_LAYERS) + len(HALF_V_LAYERS)
 assert sorted(ATTN_BANK_ORDER) == list(ATTN_LAYERS), "every attention layer needs exactly one width group"
 assert ATTN_BANK_ORDER[NUM_QK64_SLOTS:] == WIDE_QK_LAYERS
-# Per-head output gates (from the MUDD gates) on these attention layers.
-ATTN_GATE_LAYERS = (3, 10)
 # Gated XSA on these attention layers, its per-head strength from the pre MUDD gate.
 XSA_LAYERS = (1, 3)
 # The residual stream after these layers is kept for later skips: layer 6 re-adds cache[3], and the
@@ -87,22 +95,25 @@ PRE_GATE_X0_LAYERS = tuple(i for i in X0_INJECT_LAYERS if i < POST_GATE_LAYER)  
 PRE_GATE_BIGRAM_LAYERS = tuple(i for i in BIGRAM_INJECT_LAYERS if i < POST_GATE_LAYER)     # (0, 1)
 POST_GATE_X0_LAYERS = tuple(i for i in X0_INJECT_LAYERS if i >= POST_GATE_LAYER)           # (4, 5, 7)
 POST_GATE_BIGRAM_LAYERS = tuple(i for i in BIGRAM_INJECT_LAYERS if i >= POST_GATE_LAYER)   # (4, 5, 9)
-PRE_GATE_ATTN_GATE_LAYERS = tuple(i for i in ATTN_GATE_LAYERS if i < POST_GATE_LAYER)      # (3,)
-POST_GATE_ATTN_GATE_LAYERS = tuple(i for i in ATTN_GATE_LAYERS if i >= POST_GATE_LAYER)    # (10,)
 assert all(i < POST_GATE_LAYER for i in XSA_LAYERS), "the XSA strengths come from the pre gate"
-# Layer 8 runs a second MLP in parallel, from MLP bank slot 11 (the slot that was sharding padding).
-PARALLEL_MLP_LAYER, PARALLEL_MLP_SLOT = 8, 11
 # The post-loop MUDD mix splits model_dim into this many channel groups, each with its own coefficient delta.
 MUDD_GROUPS = 12
 # MUDD coefficients at the start of the last layer (init_mudd lists them).
 LAST_LAYER_MUDD_COEFS = 14
-# MUDD gate lane widths (init_mudd_gate): one lane per head for the XSA strengths and the attention
-# gates, one lane per injection site for x0 / the n-gram embedding, one for the layer-6 skip.
+# MUDD gate lane widths (init_mudd_gate): one lane per head for the XSA strengths, one lane per
+# injection site for x0 / the n-gram embedding, one for the layer-6 skip.
 MUDD_GATE_HEAD_LANES = 6
 MUDD_GATE_SCALE = 0.1  # the gates' output scale at init; biases are stored pre-divided by it
-# MLP bank: 12 slots of (c_fc, c_proj), 24 matrices for even sharding over 8 GPUs. Slot i is layer i's
-# MLP, slot 11 is PARALLEL_MLP_SLOT, slot 7 is dead (NO_MLP_LAYERS) but keeps the bank even.
-NUM_MLP_SLOTS = 12
+# MLP bank: the slots something reads, (c_fc, c_proj) each: the dense layers' (not NO_MLP_LAYERS, not the MoE layers),
+# in layer order, then layer 8's parallel MLP, padded with zero frozen slots to an even shard count (16 matrices
+# over 8 GPUs). The skipped sublayers and the MoE layers own no slot.
+_MLP_LIVE_LAYERS = tuple(layer for layer in range(NUM_LAYERS)
+                         if layer not in NO_MLP_LAYERS and layer not in MOE_INDEX)   # (0, 2, 4, 10)
+MLP_SLOT_OF_LAYER = {layer: slot for slot, layer in enumerate(_MLP_LIVE_LAYERS)}
+# Layer 8 runs a second MLP in parallel, from the slot after the dense layers'.
+PARALLEL_MLP_LAYER, PARALLEL_MLP_SLOT = 8, len(_MLP_LIVE_LAYERS)
+NUM_USED_MLP_SLOTS = PARALLEL_MLP_SLOT + 1
+NUM_MLP_SLOTS = next(n for n in range(NUM_USED_MLP_SLOTS, 64) if 2 * n % 8 == 0)   # 8
 # MLP hidden size, cut from 4 * 768 = 3072 in record #360.
 MLP_HIDDEN_DIM = 2816
 
@@ -111,9 +122,10 @@ MLP_HIDDEN_DIM = 2816
 FP8_ATTN_X_SCALE = 8.0 / 448.0
 FP8_ATTN_GRAD_SCALE = 1.0 / 448.0
 
-# Validation computes the loss over slabs of this many rows (record #360), so its [rows, vocab] fp32
-# logits (6.6 GB per slab) stay small next to the rank's 16 GB n-gram shard.
-EVAL_CE_SLAB_ROWS = 32768
+# Validation computes the loss over slabs of this many rows (record #360 used 32768), so its [rows, vocab]
+# temporaries stay small next to the rank's 16 GB n-gram shard. CPLM's validation (the mixture and the canonical mask
+# keep several [rows, vocab] fp32 temporaries per slab) runs on smaller slabs; untimed.
+CPLM_EVAL_SLAB_ROWS = 8192
 
 # FP8 MLP scales (see perf/kernels/mlp.py), from record #360.
 FP8_MLP_X_SCALE = 2 ** -4      # static: post-RMS-norm rows have max|x| <= sqrt(768) = 27.7 < 448 * 2^-4
@@ -138,11 +150,11 @@ class ForwardScheduleConfig:
     # Training only: the candidate set when this step's loss is a sampled softmax; None = full softmax.
     sampled_loss: SampledLoss | None = None
 
-class GPT(nn.Module):
-    """Training runs every projection in fp8 (the attention QKV, the MLP, the lm_head loss); validation
-    runs the bf16 path under no_grad."""
+class GPT(MoEMixin, nn.Module):
+    """Training runs every projection in fp8 (the attention QKV, the MLP and the MoE experts, the lm_head loss);
+    validation runs the bf16 path under no_grad."""
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int,
-                 *, ngram_dim: int, world_size: int, device: torch.device):
+                 *, ngram_dim: int, world_size: int, rank: int, device: torch.device):
         super().__init__()
         assert num_layers == NUM_LAYERS
         self.world_size = world_size
@@ -185,14 +197,31 @@ class GPT(nn.Module):
             self.embed.weight.copy_(self.lm_head.weight.T)
 
         self.init_attn(model_dim, head_dim, num_heads, max_seq_len)
-        self.init_mlp(model_dim)
+        self.init_mlp(model_dim, rank)
         self.init_misc(model_dim, num_layers)
         self.init_mudd(num_layers, model_dim)
         self.init_mudd_gate(model_dim)
+        self.init_cplm(model_dim)
 
         # Auto-label parameters
         for name, param in self.named_parameters():
             param.label = name.replace('.weight', '')
+
+    def init_cplm(self, model_dim):
+        """CPLM: a K=1 copy-sink pointer of dim 128 over the final hidden state, plus a learned sink key
+        (perf/kernels/cplm.py). <copy> is the first padding row of the vocabulary, so lm_head needs no new row.
+        Created after every other parameter and RNG draw, so the rest of the model initializes as it would without CPLM."""
+        copy_dim = 128
+        bound = (3 ** 0.5) * model_dim ** -0.5
+        self.copy_qk_bank = nn.Parameter(torch.empty(2, copy_dim, model_dim).uniform_(-bound, bound))
+        self.copy_k_sink = nn.Parameter(torch.randn(copy_dim) * copy_dim ** -0.5)
+        # QK-norm: RMS-normed q (times this learnable temperature) and k
+        self.copy_qk_gain = nn.Parameter(torch.full((1,), 1.0))
+        # validation copy band
+        self.copy_eval_block = 8192
+        self.register_buffer("copy_col_full", torch.full((1,), COPY_TOKEN_ID, dtype=torch.int32), persistent=False)
+        # validation diagnostics, summed over tokens: [count, nll, lm-only nll, alpha, a_sink, copy share of p(y)]
+        self.register_buffer("cplm_diag", torch.zeros(6, dtype=torch.float32), persistent=False)
 
     def init_attn(self, model_dim, head_dim, num_heads, max_seq_len):
         # One attention module per attention layer, at the layer's head widths (no learned params --
@@ -279,29 +308,40 @@ class GPT(nn.Module):
     def attn_v_dim(self, layer: int) -> int:
         return NARROW_HEAD_DIM if layer in HALF_V_LAYERS else self.head_dim
 
-    def init_mlp(self, model_dim):
-        # MLP bank: stores c_fc and c_proj for all NUM_MLP_SLOTS slots.
+    def init_mlp(self, model_dim, rank):
+        # MLP bank: c_fc and c_proj of the NUM_USED_MLP_SLOTS live MLPs (MLP_SLOT_OF_LAYER, then PARALLEL_MLP_SLOT),
+        # padded with frozen zero slots to NUM_MLP_SLOTS so its 2 * NUM_MLP_SLOTS matrices shard evenly over 8 GPUs.
         self.mlp_hdim = MLP_HIDDEN_DIM
-        self.mlp_bank = nn.Parameter(torch.empty(NUM_MLP_SLOTS, 2, self.mlp_hdim, model_dim))  # (12, 2, 2816, 768)
-        self.mlp_bank.reshape = (2 * NUM_MLP_SLOTS, self.mlp_hdim, model_dim)  # Shape for sharding: (24, 2816, 768)
-        # The optimizer leaves these matrices untouched: c_fc and c_proj of each NO_MLP_LAYERS slot.
-        self.mlp_bank.frozen_matrices = frozenset(2 * layer + j for layer in NO_MLP_LAYERS for j in (0, 1))
+        assert self.mlp_hdim % 256 == 0, self.mlp_hdim
+        self.mlp_bank = nn.Parameter(torch.empty(NUM_MLP_SLOTS, 2, self.mlp_hdim, model_dim))  # (8, 2, 2816, 768)
+        self.mlp_bank.reshape = (2 * NUM_MLP_SLOTS, self.mlp_hdim, model_dim)  # Shape for sharding: (16, 2816, 768)
+        # The optimizer leaves these matrices untouched: c_fc and c_proj of each padding slot.
+        self.mlp_bank.frozen_matrices = frozenset(
+            2 * slot + j for slot in range(NUM_USED_MLP_SLOTS, NUM_MLP_SLOTS) for j in (0, 1))
 
         # improved init scale by @YouJiacheng and @srashedll
         std = 0.5 * model_dim ** -0.5
         bound = (3 ** 0.5) * std
         with torch.no_grad():
-            self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
+            self.mlp_bank[:NUM_USED_MLP_SLOTS, 0, :, :].uniform_(-bound, bound)  # c_fc
+            self.mlp_bank[NUM_USED_MLP_SLOTS:, 0, :, :].zero_()  # padding slots
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
 
+        # The experts and the router are drawn right after mlp_bank, so every earlier draw is unchanged.
+        self.init_moe(model_dim, rank, FP8_GRAD_SCALE, bound)
         self.init_mlp_fp8(model_dim)
 
     def init_mlp_fp8(self, model_dim):
-        """FP8 MLP state, one entry per bank slot; refreshed by quantize_mlp_fp8 after every optimizer step.
+        """FP8 MLP state, one entry per live bank slot (the padding slots have none); refreshed by quantize_mlp_fp8
+        after every optimizer step.
 
         None of it is in the state_dict: rearm_fp8_bootstrap() restarts it after the post-warmup reset.
         """
-        n, h, d, dev = NUM_MLP_SLOTS, self.mlp_hdim, model_dim, self.device
+        n, h, d, dev = NUM_USED_MLP_SLOTS, self.mlp_hdim, model_dim, self.device
+        # The post-lambda each slot folds, as an index into [post_lambdas_mlp, 1]: its layer's, the parallel slot
+        # layer 8's, and the appended 1 (index NUM_LAYERS) for layer 10's slot, whose post-lambda is the per-token mu[13].
+        fold_src = {slot: (layer if layer < NUM_LAYERS - 1 else NUM_LAYERS) for layer, slot in MLP_SLOT_OF_LAYER.items()}
+        fold_src[PARALLEL_MLP_SLOT] = PARALLEL_MLP_LAYER
         f32, e4m3 = torch.float32, torch.float8_e4m3fn
         col_major = lambda: torch.empty(n, d, h, dtype=e4m3, device=dev).transpose(1, 2)  # (n, h, d), strides (h*d, 1, h)
         num_tiles = quantize_weights_dual_ntiles(h, d)
@@ -331,6 +371,8 @@ class GPT(nn.Module):
             "_mlp_fold_p": torch.ones(n, dtype=f32, device=dev),
             "_mlp_down_scales_folded": torch.ones(n, dtype=f32, device=dev),
             "_mlp_dq_bwd_folded": torch.ones(n, dtype=f32, device=dev),
+            # Which entry of [post_lambdas_mlp, 1] each slot folds (see fold_src above).
+            "_mlp_fold_src": torch.tensor([fold_src[slot] for slot in range(n)], dtype=torch.int64, device=dev),
         }
         for name, buf in buffers.items():
             self.register_buffer(name, buf, persistent=False)
@@ -346,6 +388,9 @@ class GPT(nn.Module):
         # +-1 sign pool (identical on every rank: main() broadcasts it).
         ngram_sign_pool = torch.randn(NGRAM_SIGN_POOL_ROWS, self.ngram_dim).sign().to(torch.bfloat16)
         self.register_buffer('ngram_sign_pool', ngram_sign_pool)
+        # PR #375's token normalization: the sign hashes read the normalized ids (ngram_table.ngram_row_ids
+        # applies the same map to the row hashes on the host).
+        self.register_buffer("ng_norm_map", NORM_MAP.clone(), persistent=False)
 
         self.post_lambdas = nn.Parameter(torch.ones(num_layers, 2))
 
@@ -432,14 +477,12 @@ class GPT(nn.Module):
         H = MUDD_GATE_HEAD_LANES
         assert self.num_heads == H
         # Gate lane layouts, in the order unpack_pre_mudd_gate / unpack_post_mudd_gate read them:
-        # pre:  xsa[1,3] 12 + attn[3] 6 + x0[0,1,2] 3 + bigram[0,1] 2 = 23
-        # post: attn[10] 6 + x0[4,5,7] 3 + bigram[4,5,9] 3 + skip 1 = 13
-        pre_attn_start = H * len(XSA_LAYERS)
-        pre_x0_start = pre_attn_start + H * len(PRE_GATE_ATTN_GATE_LAYERS)
+        # pre:  xsa[1,3] 12 + x0[0,1,2] 3 + bigram[0,1] 2 = 17
+        # post: x0[4,5,7] 3 + bigram[4,5,9] 3 + skip 1 = 7
+        pre_x0_start = H * len(XSA_LAYERS)
         pre_bigram_start = pre_x0_start + len(PRE_GATE_X0_LAYERS)
         self._mudd_gate_pre_num_coef = pre_bigram_start + len(PRE_GATE_BIGRAM_LAYERS)
-        post_x0_start = H * len(POST_GATE_ATTN_GATE_LAYERS)
-        post_bigram_start = post_x0_start + len(POST_GATE_X0_LAYERS)
+        post_bigram_start = len(POST_GATE_X0_LAYERS)
         post_skip_lane = post_bigram_start + len(POST_GATE_BIGRAM_LAYERS)
         self._mudd_gate_post_num_coef = post_skip_lane + 1
         max_num_coef = max(self._mudd_gate_pre_num_coef, self._mudd_gate_post_num_coef)
@@ -450,12 +493,9 @@ class GPT(nn.Module):
 
         # Bias init in the pre-scaled domain (effective = bias * MUDD_GATE_SCALE); XSA and x0 lanes start at 0.
         bs_init = torch.zeros(2, max_num_coef)
-        attn_gate_bias = 0.25 / MUDD_GATE_SCALE
         bigram_gate_bias = 0.05 / MUDD_GATE_SCALE
         skip_gate_bias = 0.5 / MUDD_GATE_SCALE
-        bs_init[0, pre_attn_start:pre_x0_start].fill_(attn_gate_bias)
         bs_init[0, pre_bigram_start:self._mudd_gate_pre_num_coef].fill_(bigram_gate_bias)
-        bs_init[1, 0:post_x0_start].fill_(attn_gate_bias)
         bs_init[1, post_bigram_start:post_skip_lane].fill_(bigram_gate_bias)
         bs_init[1, post_skip_lane].fill_(skip_gate_bias)
         self.mudd_gate_b2 = nn.Parameter(bs_init)
@@ -472,17 +512,15 @@ class GPT(nn.Module):
             gates[layer] = gate[..., lo:lo + width]
         return start + len(layers) * width
 
-    def unpack_pre_mudd_gate(self, gate, xsa_alphas, attn_gates, x0_gates, bigram_gates):
+    def unpack_pre_mudd_gate(self, gate, xsa_alphas, x0_gates, bigram_gates):
         lane = self._unpack_lanes(gate, 0, XSA_LAYERS, xsa_alphas, width=MUDD_GATE_HEAD_LANES)
-        lane = self._unpack_lanes(gate, lane, PRE_GATE_ATTN_GATE_LAYERS, attn_gates, width=MUDD_GATE_HEAD_LANES)
         lane = self._unpack_lanes(gate, lane, PRE_GATE_X0_LAYERS, x0_gates)
         lane = self._unpack_lanes(gate, lane, PRE_GATE_BIGRAM_LAYERS, bigram_gates)
         assert lane == self._mudd_gate_pre_num_coef
 
-    def unpack_post_mudd_gate(self, gate, attn_gates, x0_gates, bigram_gates):
+    def unpack_post_mudd_gate(self, gate, x0_gates, bigram_gates):
         """Unpacks the post gate; returns the layer-6 skip gate."""
-        lane = self._unpack_lanes(gate, 0, POST_GATE_ATTN_GATE_LAYERS, attn_gates, width=MUDD_GATE_HEAD_LANES)
-        lane = self._unpack_lanes(gate, lane, POST_GATE_X0_LAYERS, x0_gates)
+        lane = self._unpack_lanes(gate, 0, POST_GATE_X0_LAYERS, x0_gates)
         lane = self._unpack_lanes(gate, lane, POST_GATE_BIGRAM_LAYERS, bigram_gates)
         assert lane + 1 == self._mudd_gate_post_num_coef
         return gate[..., lane:lane + 1]
@@ -544,10 +582,13 @@ class GPT(nn.Module):
         Layer topology (11 layers, 0-indexed):
           - attention on ATTN_LAYERS (0, 1, 2, 3, 5, 8, 10); short sliding window except layers 3 and 10
             (long window, partial key offset). Layer 6 adds a gated skip from layer 3 instead of attention;
-            layers 4 and 9 run only their MLP; layer 7 only rescales and re-injects x0 / bigram
+            layer 4 runs only its MLP; layers 7 and 9 only rescale and re-inject x0 / bigram
           - head widths: query/key 128 on the long-window layers 3, 10 and 64 elsewhere; value/output
             64 on layers 1, 8 and 128 elsewhere
           - paired-head attention on layers 0, 2, 5; token value embeddings added to V on 1, 2, 8, 10
+          - the MLP is a routed mixture of experts on MOE_LAYERS (1, 3, 5, 6, 8; model/moe.py) and a dense
+            MLP from the mlp_bank slot MLP_SLOT_OF_LAYER[i] on layers 0, 2, 4, 10; layer 8 also runs a second
+            dense MLP in parallel from PARALLEL_MLP_SLOT
           - MUDD gates are computed from x0 (for layers 0-3) and at the start of layer 4 (for layers 4-10);
             the last layer and the post-loop mix use MUDD dense connections over cached layer outputs
         """
@@ -577,14 +618,18 @@ class GPT(nn.Module):
         ve_gates = [None] * self.num_layers
         for layer, gate in zip(VALUE_EMBED_GATE_LAYERS, self.ve_gate_bank.unbind(0)):
             ve_gates[layer] = gate
-        attn_gates = [None] * self.num_layers
         xsa_alphas = [None] * self.num_layers
         x0_gates = [None] * self.num_layers
         bigram_gates = [None] * self.num_layers
         attn_weights = self._attn_weights()
-        mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
+        mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 2 * NUM_MLP_SLOTS tensors of [mlp_hdim, dim]
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
+        # MoE: per MoE layer, (c_fc, c_proj) of all its experts, [E, h, dim] each, and its router in bf16.
+        moe_weights = [(*w.unbind(0), router) for w, router in zip(
+            self.moe_bank.view(len(MOE_LAYERS), 2, MOE_EXPERTS, MOE_HIDDEN, -1).unbind(0),
+            self.moe_router.bfloat16().unbind(0))]
+        moe_aux = 0.0   # the MoE layers' summed load-balancing loss
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
@@ -595,8 +640,8 @@ class GPT(nn.Module):
         #   rows = ngram_cache[slots] + ngram_sink    # the sink is exact zeros: it only catches the gradient
         #   x0_bigram = rows[:T] * sign_pool[bigram_sign] + rows[T:] * sign_pool[trigram_sign]
         # computed by one opaque kernel so x0_bigram is materialised once (perf/kernels/ngram_embed.py).
-        x0_bigram = ngram_embedding(self.ngram_cache, bigram_input_seq, self.ngram_sign_pool, input_seq,
-                                    ngram_sink)[None]                                     # (1, seq, ngram_dim)
+        x0_bigram = ngram_embedding(self.ngram_cache, bigram_input_seq, self.ngram_sign_pool,
+                                    self.ng_norm_map[input_seq], ngram_sink)[None]        # (1, seq, ngram_dim)
 
         # Value embeddings - always computed (not precomputed)
         # Shifted .01 ... 234 structure on token value embeddings by @photomz
@@ -618,7 +663,6 @@ class GPT(nn.Module):
         self.unpack_pre_mudd_gate(
             pre_gate,
             xsa_alphas,
-            attn_gates,
             x0_gates,
             bigram_gates,
         )
@@ -636,13 +680,11 @@ class GPT(nn.Module):
         # so it is normed, and in fp8 quantized, once and shared. The post-loop mix reads it too.
         late_attn_in = None
         for i in range(self.num_layers):
-            c_fc = mlp_fcs[i]
-            c_proj = mlp_projs[i]
             mu = None
 
             if i == POST_GATE_LAYER:
                 post_gate = self.forward_mudd_gate(x, id=1, num_coef=self._mudd_gate_post_num_coef)
-                post_skip_gate = self.unpack_post_mudd_gate(post_gate, attn_gates, x0_gates, bigram_gates)
+                post_skip_gate = self.unpack_post_mudd_gate(post_gate, x0_gates, bigram_gates)
 
             # process attn. skip on layer 6 @YouJiacheng
             if i == 6:
@@ -705,7 +747,6 @@ class GPT(nn.Module):
                     bm_size=bm_sizes[i],
                     yarn=yarn,
                     key_offset=key_offset[i],
-                    attn_gate_w=attn_gates[i] if i in ATTN_GATE_LAYERS else None,
                     aux_v=aux_v,
                     xsa_alpha=xsa_alphas[i],
                     train_max_seq_len=train_max_seq_len,
@@ -732,13 +773,18 @@ class GPT(nn.Module):
             # fp8 only: the post-lambda is folded into the down-projection scale, so the MLP output
             # already carries it. Not on the MUDD layer, whose post-lambda mu[13] is per-token.
             fold_p = post_lambdas_mlp[i] if use_fp8 and mu is None else None
-            if use_fp8:
+            dense = i not in MOE_INDEX   # MoE layers run no dense MLP of their own
+            if use_fp8 and (dense or i == PARALLEL_MLP_LAYER):
                 # One quantize of the input, shared with the parallel MLP.
                 x_f8 = quantize_dual_layout_fused(mlp_in.detach().view(-1, mlp_in.size(-1)), self._mlp_x_scale, fmt=torch.float8_e4m3fn)
-                fp8_args = self._mlp_fp8_args(i, mlp_up_f8[i], x_f8, fold_p)
+            if dense:
+                slot = MLP_SLOT_OF_LAYER[i]
+                fp8_args = self._mlp_fp8_args(slot, mlp_up_f8[slot], x_f8, fold_p) if use_fp8 else None
+                mlp_out = self._mlp(mlp_in, mlp_fcs[slot], mlp_projs[slot], fp8_args)
             else:
-                fp8_args = None
-            mlp_out = self._mlp(mlp_in, c_fc, c_proj, fp8_args)
+                # The routed output carries the folded post-lambda exactly when a dense MLP's would (fp8).
+                mlp_out, aux = self._moe(i, mlp_in, moe_weights, fold_p)
+                moe_aux = moe_aux + aux
             if mu is not None:
                 x = mu[12] * x + mu[13] * mlp_out
             elif fold_p is not None:
@@ -746,7 +792,8 @@ class GPT(nn.Module):
             else:
                 x = scale_add(resid_lambdas_mlp[i], x, post_lambdas_mlp[i], mlp_out)
             if i == PARALLEL_MLP_LAYER:
-                # Same input and the same post-lambda as the layer's own MLP.
+                # Same input and the same post-lambda as the layer's own MLP, from its own bank slot (c_proj
+                # starts exactly zero).
                 k = PARALLEL_MLP_SLOT
                 parallel_args = self._mlp_fp8_args(k, mlp_up_f8[k], x_f8, fold_p) if use_fp8 else None
                 parallel_out = self._mlp(mlp_in, mlp_fcs[k], mlp_projs[k], parallel_args)
@@ -771,50 +818,29 @@ class GPT(nn.Module):
             mixed = mixed + (mu[k] + deltas[..., k, :]).unsqueeze(-1) * grouped(src)
         x = mixed.flatten(-2)
 
-        return self._loss(norm(x), input_seq, target_seq, mtp_weights, prefix_weight, schedule_cfg.sampled_loss)
+        loss_per_token = self._loss(norm(x), input_seq, target_seq, seqlens, mtp_weights, prefix_weight,
+                                    schedule_cfg.sampled_loss)
+        if self.training:
+            # The caller sums the per-token losses, so adding the load-balancing loss to every token weighs it like
+            # MOE_AUX times itself next to the mean cross-entropy. Training only: validation is pure CE.
+            loss_per_token = loss_per_token + MOE_AUX * moe_aux
+        return loss_per_token
 
-    def _loss(self, x, input_seq, target_seq, mtp_weights, prefix_weight, sampled_loss):
-        """Per-token loss from the final normed hidden state.
+    def _loss(self, x, input_seq, target_seq, seqlens, mtp_weights, prefix_weight, sampled_loss):
+        """Per-token loss from the final normed hidden state: the next-token CE replaced by the copy-sink mixture
+        (perf/kernels/cplm.py, PR #379).
 
-        Training: fused softcapped CE over next-token + multi-token + prefix-token targets, normalized
-        over the vocabulary, or over `sampled_loss`'s candidate set early in training (sampled_softmax.py).
-        Validation: plain next-token CE over the full vocabulary, with non-canonical tokens masked out
-        (see canonical_mask.py); `sampled_loss` is ignored.
+        Training: the mixture runs inside the fused softcapped CE kernel, whose other terms are the multi-token and
+        prefix-token targets; it is normalized over the vocabulary, or over `sampled_loss`'s candidate set early in
+        training (sampled_softmax.py). Validation: the mixture over the full-softmax logits, over CPLM_EVAL_SLAB_ROWS-row
+        slabs, with non-canonical tokens masked out (see canonical_mask.py); `sampled_loss` is ignored.
         """
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
-        if self.training and sampled_loss is not None:
-            # Targets and prefix targets arrive as positions in the candidate set, built on the host.
-            n = target_seq.size(0)
-            loss_per_token = SampledSoftcappedCrossEntropy.apply(
-                x.view(-1, x.size(-1)), mtp_weights, sampled_loss.target_pos[:n], sampled_loss.prefix_pos[:n],
-                prefix_weight, self.lm_head.weight, sampled_loss.rows, sampled_loss.rows_t, sampled_loss.vocab_pos,
-                self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s,
-            )
-        elif self.training:
-            prefix_target_seq = self.prefix_table[target_seq]
-            loss_per_token = FusedSoftcappedCrossEntropy.apply(
-                x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight,
-                self.lm_head.weight, self._lm_head_f8_col, self._lm_head_f8_row,
-                self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s,
-            )
-        else:
-            # Every step is row-local, so slabs of EVAL_CE_SLAB_ROWS rows give the same per-token losses
-            # as one pass; only the [rows, vocab] logit block shrinks.
-            x = x.view(-1, x.size(-1))
-            shifts = torch.arange(8, dtype=torch.uint8, device=x.device)
-            slab_losses = []
-            for lo in range(0, x.size(0), EVAL_CE_SLAB_ROWS):
-                hi = min(lo + EVAL_CE_SLAB_ROWS, x.size(0))
-                # The softcap runs in bf16 and upcasts after, as record #360.
-                logits = (23 * torch.sigmoid((self.lm_head(x[lo:hi]) + 5) / 7.5)).float()
-                # Drop the tokens the tokenizer would never emit after input_seq. -60 is well below
-                # the 0..23 the softcap leaves, so a dropped token contributes nothing to the softmax.
-                dropped = (self.canon_mask[input_seq[lo:hi], :, None] >> shifts & 1).view(logits.shape).bool()
-                logits = logits.masked_fill(dropped, -60.0)
-                slab_losses.append(F.cross_entropy(logits, target_seq[lo:hi], reduction="none"))
-            loss_per_token = torch.cat(slab_losses)
-        return loss_per_token
+        # (23, 5, 7.5) is also spelled in perf/kernels/cross_entropy.py's CE kernels (one inside a CUDA source string, so
+        # it cannot be shared): all copies must move together.
+        return cplm_loss(self, x, input_seq, target_seq, seqlens, mtp_weights, prefix_weight, sampled_loss,
+                         CPLM_EVAL_SLAB_ROWS)
 
     # -------------------------------------------------------------------------
     # Setup and run-level hooks main() calls on the uncompiled model.
@@ -825,9 +851,11 @@ class GPT(nn.Module):
         for m in self.modules():
             if isinstance(m, (nn.Embedding, nn.Linear)):
                 m.weight.data = m.weight.data.bfloat16()
-        for param in (self.ve_gate_bank, self.qk_bank, self.vo_bank, self.mlp_bank,
+        # (moe_router stays fp32: it is tiny and read in bf16.)
+        # (copy_k_sink and copy_qk_gain stay fp32 too.)
+        for param in (self.ve_gate_bank, self.qk_bank, self.vo_bank, self.mlp_bank, self.moe_bank,
                       self.mudd_w1, self.mudd_w2, self.mudd_w2g, self.mudd_b2,
-                      self.mudd_gate_w1, self.mudd_gate_w2, self.mudd_gate_b2):
+                      self.mudd_gate_w1, self.mudd_gate_w2, self.mudd_gate_b2, self.copy_qk_bank):
             param.data = param.data.bfloat16()
 
     @property
@@ -899,14 +927,15 @@ class GPT(nn.Module):
     def _quantize_mlp_weights_and_scales(self):
         e4m3_max = torch.finfo(torch.float8_e4m3fn).max
         e5m2_max = torch.finfo(torch.float8_e5m2).max
-        up_weights, down_weights = self.mlp_bank[:, 0], self.mlp_bank[:, 1]
+        n = NUM_USED_MLP_SLOTS   # the padding slots have no cache
+        up_weights, down_weights = self.mlp_bank[:n, 0], self.mlp_bank[:n, 1]
         exact = self.mlp_quantize_calls < FP8_EXACT_SCALE_CALLS
         self.mlp_quantize_calls += 1
 
         # Weight caches. The exact scale is computed in the weights' bf16, as record #360 does.
         if exact:
-            self._mlp_up_scales[:] = (up_weights.reshape(NUM_MLP_SLOTS, -1).abs().amax(dim=1).clamp(min=1e-12) / e4m3_max).float()
-            self._mlp_down_scales[:] = (down_weights.reshape(NUM_MLP_SLOTS, -1).abs().amax(dim=1).clamp(min=1e-12) / e4m3_max).float()
+            self._mlp_up_scales[:] = (up_weights.reshape(n, -1).abs().amax(dim=1).clamp(min=1e-12) / e4m3_max).float()
+            self._mlp_down_scales[:] = (down_weights.reshape(n, -1).abs().amax(dim=1).clamp(min=1e-12) / e4m3_max).float()
         quantize_mlp_weights_dual(up_weights, self._mlp_up_scales, self._mlp_up_partial_amax,
                                   row=self._mlp_up_f8, col_t=self._mlp_up_f8_col.transpose(1, 2), update_scales=not exact)
         quantize_mlp_weights_dual(down_weights, self._mlp_down_scales, self._mlp_down_partial_amax,
@@ -917,25 +946,38 @@ class GPT(nn.Module):
         torch.mul(self._mlp_down_scales, FP8_GRAD_SCALE, out=self._mlp_dq_bwd)
         self._refresh_delayed_scale(self._mlp_post_amax, self._mlp_post_scales, FP8_POST_HEADROOM / e4m3_max, 1e-6)
         self._refresh_delayed_scale(self._mlp_dpre_amax, self._mlp_dpre_scales, FP8_DPRE_HEADROOM / e5m2_max, 1e-12)
+        # MoE: the experts' delayed activation scales (their weight caches are refreshed by their owners,
+        # quantize_moe_local, right after the bank's update).
+        self._refresh_delayed_scale(self._moe_post_amax, self._moe_post_scales, FP8_POST_HEADROOM / e4m3_max, 1e-6)
+        self._refresh_delayed_scale(self._moe_dpre_amax, self._moe_dpre_scales, FP8_DPRE_HEADROOM / e5m2_max, 1e-12)
 
-        # Post-lambda folded into the down-projection scale: slot k folds layer k's post-lambda
-        # (bf16-rounded, as the forward uses it); the
-        # parallel slot folds its layer's. The last layer's slot never folds (its post-lambda is
-        # mu[13]), so its entry stays 1.
+        # Post-lambda folded into the down-projection scale (bf16-rounded, as the forward uses it): a slot folds
+        # its layer's, the parallel slot layer 8's (_mlp_fold_src). The last layer's slot never folds (its
+        # post-lambda is mu[13]): it reads the appended 1.
         post_lambdas = self.post_lambdas[:, 1].bfloat16().float()
-        self._mlp_fold_p[:NUM_LAYERS - 1].copy_(post_lambdas[:NUM_LAYERS - 1])
-        self._mlp_fold_p[PARALLEL_MLP_SLOT].copy_(post_lambdas[PARALLEL_MLP_LAYER])
+        self._mlp_fold_p.copy_(torch.cat([post_lambdas, post_lambdas.new_ones(1)]).index_select(0, self._mlp_fold_src))
         torch.mul(self._mlp_down_scales, self._mlp_fold_p, out=self._mlp_down_scales_folded)
         torch.mul(self._mlp_dq_bwd, self._mlp_fold_p, out=self._mlp_dq_bwd_folded)
 
+    def quantize_moe_local(self):
+        """MoE: this rank's expert matrices, from the shard its optimizer just updated in place. The exact-scale
+        predicate is the MLP's own counter, read before the step's quantize_mlp_fp8 bumps it."""
+        with torch.no_grad():
+            self._quantize_moe(self._moe_lo, self._moe_hi, exact=self.mlp_quantize_calls < FP8_EXACT_SCALE_CALLS)
+
     def rearm_fp8_bootstrap(self):
-        """After the post-warmup weight reset: restart the exact-scale calls and drop the warmup's delayed amaxes."""
+        """After the post-warmup weight reset: restart the exact-scale calls and drop the warmup's delayed amaxes.
+        The caller then requantizes everything, the experts included (quantize_moe_full)."""
         with torch.no_grad():
             self.mlp_quantize_calls = 0
-            for amax in (self._mlp_up_partial_amax, self._mlp_down_partial_amax, self._mlp_post_amax, self._mlp_dpre_amax):
-                amax.zero_()
+            for amax in (self._mlp_up_partial_amax, self._mlp_down_partial_amax, self._mlp_post_amax, self._mlp_dpre_amax,
+                         self._moe_partial_amax, self._moe_post_amax, self._moe_dpre_amax, self._moe_g_amax):
+                amax.zero_()   # in place: every one of these is a baked address
             self._mlp_dpre_scales.fill_(FP8_GRAD_SCALE)
             self._mlp_post_scales.fill_(1.0)
+            self._moe_dpre_scales.fill_(FP8_GRAD_SCALE)
+            self._moe_post_scales.fill_(1.0)
+            self.moe_bank_grad.zero_()
 
     def _attn_fp8_weights(self):
         """Per attention layer: (qkv_f8, qkv_f8_t, qkv_scale) from its width group's cache, for PackedFP8QKV."""

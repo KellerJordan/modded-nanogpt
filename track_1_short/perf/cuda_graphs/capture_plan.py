@@ -8,9 +8,9 @@ code on the same buffers, so the timed run only replays:
   - optimizer tail graphs (optimizer_graphs.py): captured at the top of the second warmup step, self-checked
     in that step's optimizer.
   - fp8 refresh graphs (fp8_refresh_graphs.py): captured once the MLP's exact-scale bootstrap is over (the
-    captured body is the delayed-scale path), after which each of the three graphs (attention; MLP
-    without / with lm_head) self-checks at a later refresh. That needs later warmup steps of both
-    parities: the refresh after an Adam (odd) step includes lm_head, the one after an even step does not.
+    captured body is the delayed-scale path), after which each of the five graphs (attention; MLP
+    without / with lm_head; the experts' local quantize and column-cache build) self-checks at a later
+    refresh. That needs later warmup steps of both parities: the refresh after an Adam (odd) step includes lm_head, the one after an even step does not.
 The two tail captures run at the top of a warmup position, right after DeferredGathers.flush, so no
 collective still reads a buffer their warm iterations touch.
 

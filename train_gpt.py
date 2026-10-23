@@ -5,6 +5,26 @@ Launch: torchrun --standalone --nproc_per_node=8 train_gpt.py
 This file is the outline of the whole run. The model, optimizer, data and schedules live in
 the `track_1_short/` package; `track_1_short/perf/` holds the kernels and precision tricks that make it
 fast, and can be skipped when reading for the algorithm.
+
+Beyond record #360 (the base trainer), this run adds:
+  * a top-1 mixture of experts in place of the MLP on layers 1, 3, 5, 6 and 8: 8 routed relu^2 experts of hidden size
+    1024 (dropless, softmax router, Switch load-balancing loss 0.01), every GEMM one grouped fp8 launch
+    (track_1_short/model/moe.py, perf/kernels/moe_mlp.py). The experts are one ANVIL bank, moe_bank, sharded over the 8
+    ranks and all-gathered as e4m3 rows (the owners quantize right after the update); the bank's cascade runs at
+    Frobenius margin 1.1 against the dense banks' 1.05. mlp_bank keeps only the slots something reads: the dense layers
+    0, 2, 4, 10 and layer 8's parallel MLP, padded to 8 slots. The optimizer's polar cascade has four maps instead of record #360's six;
+  * a copy-sink pointer mixture on the output distribution (CPLM, PR #379; perf/kernels/cplm.py): the next-token
+    distribution mixes the LM softmax with a one-head pointer over the document's previous tokens, inside the fused CE
+    kernels, and the sampled-softmax steps sample the lm_head weight gradient (PR #371/#382; perf/kernels/sampled_head.py).
+    The final validation also drops the tokens the tokenizer never emits after the previous one (canonical mask, PR #350);
+  * n-gram hashes over PR #375's normalized token ids (track_1_short/ngram_norm_map.py), with the table's rows
+    interleaved so every owner shard holds half bigram, half trigram rows. The table's exchange has a communicator of its
+    own: gradients go out as fp16 views with no send copy, the owner merges each row's entries in a fixed order inside the
+    Adam kernel, the pulled rows are received straight into the row cache, and the big dense reduce-scatters (lm_head,
+    moe_bank, mlp_bank) queue behind it on that communicator;
+  * layer 9 skipped whole (layer 7 already was), layer 4 without attention, and no attention output gate on layers 3 and 10;
+  * a run of 981 scheduled + 52 growth + 20 extension = 1053 steps, with all ranks aligned by a barrier right before the
+    clock starts (PRs #390/#391: no rank's clock runs while it waits for another rank's pre-clock work).
 """
 import os
 import sys
@@ -40,26 +60,55 @@ from track_1_short.config import (
 )
 from track_1_short.data import ScheduledBatches, cu_seqlens_rows, distributed_data_generator
 from track_1_short.distributed import setup_distributed
-from track_1_short.model.gpt import ATTN_BANK_ORDER, FP8_EXACT_SCALE_CALLS, GPT
+from track_1_short.model.gpt import (
+    ATTN_BANK_ORDER,
+    FP8_EXACT_SCALE_CALLS,
+    GPT,
+    MLP_SLOT_OF_LAYER,
+    NO_ATTN_LAYERS,
+    NO_MLP_LAYERS,
+    NUM_MLP_SLOTS,
+    NUM_USED_MLP_SLOTS,
+    PARALLEL_MLP_SLOT,
+)
+from track_1_short.model.moe import (
+    MOE_ANVIL_MARGIN,
+    MOE_AUX,
+    MOE_EXPERTS,
+    MOE_HIDDEN,
+    MOE_LAYERS,
+    MOE_TOPK,
+)
 from track_1_short.model.prefix_prediction import build_prefix_table_bucket
 from track_1_short.ngram_table import (
     MAX_CYCLE_STEPS,
     NGRAM_DIM,
+    NGRAM_VOCAB_SIZE,
     NgramTable,
     is_update_step,
     ngram_row_ids,
 )
+from track_1_short.optim.anvil import ANVIL_MAPS, FROBENIUS_MARGIN
 from track_1_short.perf.cuda_graphs.baked_addresses import assert_addresses_unchanged, baked_addresses
 from track_1_short.perf.cuda_graphs.capture_plan import plan_warmup, step_graph_key
 from track_1_short.perf.cuda_graphs.fp8_refresh_graphs import Fp8RefreshGraphs
 from track_1_short.perf.cuda_graphs.optimizer_graphs import AnvilBankGraphs, assert_banks_alias_live_state
 from track_1_short.perf.cuda_graphs.step_graphs import StepGraphs
 from track_1_short.perf.deferred_gathers import DEFERRED_LABELS, DeferredGathers
+from track_1_short.perf.kernels import cplm, mlp_g3, moe_mlp, sampled_head
+from track_1_short.perf.kernels.cross_entropy import (
+    CE_KERNEL_VOCAB_SIZE,
+    ce_fwd_bwd_kernel,
+    ce_fwd_bwd_lut_kernel,
+    check_ce_lut_matches_plain,
+)
 from track_1_short.perf.kernels.mlp import prime_stage_cache
+from track_1_short.perf.kernels.moe_mlp import prime_grouped_stage_cache
+from track_1_short.perf.kernels.sampled_cross_entropy import SAMPLED_CE_KERNELS, SAMPLED_CE_LUT_KERNELS
 from track_1_short.perf.pinned_batches import PinnedBatchStaging
 from track_1_short.perf.row_prefetch import PrefetchStaging, RowPrefetch
 from track_1_short.perf.value_embed_pull import ValueEmbedPull
-from track_1_short.sampled_softmax import SampledSoftmax
+from track_1_short.sampled_softmax import ALL_CANDIDATE_COUNTS, SampledSoftmax
 from track_1_short.schedule import TrainingSchedule
 from track_1_short.tail_average import TailAverages
 from track_1_short.training import TrainingManager
@@ -156,8 +205,11 @@ def main():
         max_seq_len=val_tokens_per_rank,
         ngram_dim=NGRAM_DIM,
         world_size=env.world_size,
+        rank=env.rank,
         device=env.device,
     ).cuda()
+    assert model._moe_f8_col.stride() == (model._moe_f8_col.size(1) * model._moe_f8_col.size(2), 1, model._moe_f8_col.size(1)), \
+        f"[moe] the column-major expert cache lost its layout in .cuda(): stride {model._moe_f8_col.stride()}"
     attn_widths = {layer: (model.attn_qk_dim(layer), model.attn_v_dim(layer)) for layer in ATTN_BANK_ORDER}
     print0(
         f"attention heads={model.num_heads} (qk, v) head widths by layer, in bank order={attn_widths} "
@@ -165,6 +217,19 @@ def main():
         f"steps={training_schedule.total_steps} stage boundaries={training_schedule.boundaries}"
     )
     model.cast_matrix_weights_bf16()
+    # The effective configuration (everything but the step count and the seed is fixed in the code).
+    growth_steps = training_schedule.total_steps - args.num_scheduled_iterations - args.num_extension_iterations
+    print0(f"[config] steps {args.num_scheduled_iterations} scheduled + {growth_steps} growth + "
+           f"{args.num_extension_iterations} extension = {training_schedule.total_steps}; "
+           f"seed {'random' if args.train_seed is None else args.train_seed}; train files {args.train_files}", console=True)
+    print0(f"[config] MoE {MOE_EXPERTS} experts x h{MOE_HIDDEN}, top-{MOE_TOPK}, layers {MOE_LAYERS}, aux {MOE_AUX}; "
+           f"ANVIL {len(ANVIL_MAPS)}-map cascade, expert-bank margin {MOE_ANVIL_MARGIN} (dense banks {FROBENIUS_MARGIN}); "
+           f"skipped layers {sorted(NO_MLP_LAYERS)}, attention-less layers {sorted(NO_ATTN_LAYERS)}, no attention output gate; "
+           f"n-gram table {NGRAM_VOCAB_SIZE} x {NGRAM_DIM} on normalized token ids (PR #375); "
+           f"CPLM copy band {cplm.COPY_BLOCK} train / {model.copy_eval_block} val; canonical mask on", console=True)
+    print0(f"[moe] moe_bank {tuple(model.moe_bank.shape)}; mlp_bank {tuple(model.mlp_bank.shape)}: slot by dense layer "
+           f"{MLP_SLOT_OF_LAYER}, parallel slot {PARALLEL_MLP_SLOT}, "
+           f"{NUM_MLP_SLOTS - NUM_USED_MLP_SLOTS} frozen padding slots", console=True)
     for param in model.parameters():
         dist.broadcast(param.detach(), 0)
     dist.broadcast(model.ngram_sign_pool, 0)  # buffer, not in parameters()
@@ -172,14 +237,27 @@ def main():
     # model parameter, so neither the broadcast above nor the state_dict below ever holds it.
     ngram_table = NgramTable(model.ngram_cache, max_step_tokens=max_step_tokens,
                              max_events=training_schedule.total_steps,
-                             rank=env.rank, world_size=env.world_size, device=env.device)
+                             rank=env.rank, world_size=env.world_size, device=env.device, group=env.ngram_group)
     # The row prefetch's pinned upload rings and prep thread, allocated and started off the clock.
     prefetch_staging = PrefetchStaging(max_ngram_rows=2 * MAX_CYCLE_STEPS * max_step_tokens,
                                        max_value_embed_rows=model.value_embeds.shape[0], device=env.device)
     model.quantize_attn_fp8()
     model.quantize_mlp_fp8(refresh_lm=True)
+    model.quantize_moe_full()  # MoE: every rank holds the whole bank here
     # The fused MLP kernel picks its pipeline depth by trial launch, which cannot run under compile.
     prime_stage_cache()
+    # The grouped fp8 MoE kernels' num_stages, likewise before compile (g3_k: the grouped G3 kernel is compiled for
+    # this K and compared with the Triton one; MOE_G3 stays on only if they agree).
+    prime_grouped_stage_cache(MOE_EXPERTS, MOE_TOPK, g3_k=model.lm_head.in_features)
+    # The kernels the record runs on. Each of them can fall back to a slower Triton path in silence (a missing Gluon, a
+    # priming comparison that failed), so the run refuses to start without them.
+    print0(f"[kernels] dense G3 (Gluon fused linear-relu-square) {mlp_g3._g3_ok[0]}, "
+           f"G3 forward ping-pong {mlp_g3._G3_PP[0]}, grouped MoE G3 {moe_mlp.MOE_G3}, "
+           f"CPLM LUT cross-entropy {cplm.CPLM_LUT}", console=True)
+    assert mlp_g3._g3_ok[0], "[kernels] the dense G3 (Gluon) kernel is not active: priming fell back to Triton"
+    assert mlp_g3._G3_PP[0] == 1, f"[kernels] the G3 forward ping-pong is not active (_G3_PP = {mlp_g3._G3_PP[0]})"
+    assert moe_mlp.MOE_G3, "[kernels] the grouped MoE G3 kernel is not active: moe_g3 is missing or its priming comparison failed"
+    assert cplm.CPLM_LUT, "[kernels] the CPLM LUT cross-entropy kernel is not active"
 
     # Early steps train on a sampled softmax (see track_1_short/sampled_softmax.py).
     sampled_softmax = SampledSoftmax(
@@ -187,12 +265,28 @@ def main():
         rank=env.rank, world_size=env.world_size, device=env.device,
     )
     print0(f"sampled softmax: P by step change {[(s, sampled_softmax.counts[s]) for s in [0, *sampled_softmax.count_change_steps()]]}")
+    sampled_head.init(env.device, env.rank)  # the sampled lm_head dW's counter, one per rank
+    print0(f"[sampled-head] dW of the LM head sampled 1 row in {sampled_head.GROUP} (positive part) at >= "
+           f"{sampled_head.MIN_ROWS} rows; negative part, <copy> and dX exact (PR #371/#382)", console=True)
+    cplm.cplm_init(ALL_CANDIDATE_COUNTS)  # the CPLM CE kernels (full vocabulary + every candidate count): nvrtc, untimed
+    assert set(cplm.CPLM_CE_KERNELS) == set(cplm.CPLM_LUT_KERNELS) == {CE_KERNEL_VOCAB_SIZE, *ALL_CANDIDATE_COUNTS}
+    # Untimed, a few milliseconds: the 256-entry-table CE kernels must reproduce the plain kernels byte for byte (losses
+    # and e5m2 gradients), at the full width and at every sampled-softmax width.
+    assert check_ce_lut_matches_plain(ce_fwd_bwd_lut_kernel, ce_fwd_bwd_kernel, CE_KERNEL_VOCAB_SIZE),         "[kernels] the LUT cross-entropy kernel differs from the plain one at the full vocabulary"
+    for p in ALL_CANDIDATE_COUNTS:
+        assert check_ce_lut_matches_plain(SAMPLED_CE_LUT_KERNELS[p], SAMPLED_CE_KERNELS[p], p),             f"[kernels] the LUT cross-entropy kernel differs from the plain one at width {p}"
+    print0(f"[cplm] copy-sink pointer mixture, d=128 qk-normed, band {cplm.COPY_BLOCK} train / "
+           f"{model.copy_eval_block} val; steps {training_schedule.total_steps}; CE kernels {sorted(cplm.CPLM_CE_KERNELS)}; "
+           f"LUT == plain CE kernels byte for byte", console=True)
 
     uncompiled_model = model  # the CUDA-graph owners read and set attributes on the module itself
     model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
-    # The ANVIL bank updates run through their CUDA graphs once captured (eagerly before).
+    # The ANVIL bank updates run through their CUDA graphs once captured (eagerly before); so does the
+    # experts' fp8 publication that follows moe_bank's update (Fp8RefreshGraphs.publish_moe).
     optimizer_graphs = AnvilBankGraphs(env.device)
-    training_manager = TrainingManager(model, training_schedule, bank_update=optimizer_graphs.update)
+    fp8_refresh = Fp8RefreshGraphs(uncompiled_model)
+    training_manager = TrainingManager(model, training_schedule, bank_update=optimizer_graphs.update,
+                                       moe_publish=fp8_refresh.publish_moe, late_group=env.ngram_group)
     # value_embeds' gradient buffer, row-sparse update and replica pulls, on the n-gram table's cycles.
     value_embed_pull = ValueEmbedPull(model.value_embeds, model.vocab_size, training_manager.optimizer,
                                       rank=env.rank, world_size=env.world_size, device=env.device)
@@ -206,7 +300,6 @@ def main():
                  for s in range(training_schedule.total_steps)]
     step_graphs = StepGraphs(model, training_manager.optimizer, step_keys, ngram_table, value_embed_pull,
                              max_step_tokens, env.device)
-    fp8_refresh = Fp8RefreshGraphs(uncompiled_model)
     deferred_gathers = DeferredGathers(value_embed_pull, fp8_refresh)
 
     ########################################
@@ -273,6 +366,7 @@ def main():
     model.rearm_fp8_bootstrap()
     model.quantize_attn_fp8()
     model.quantize_mlp_fp8(refresh_lm=True)
+    model.quantize_moe_full()  # MoE: the whole bank from the restored weights, exact scales
     model.train()
     # Replay safety: nothing a graph baked moved, and the optimizer banks still alias the live state.
     assert_addresses_unchanged(addresses, baked_addresses(uncompiled_model, training_manager.optimizer, step_graphs))
@@ -306,6 +400,12 @@ def main():
     uncompiled_model.limit_yarn_rebuild(max_step_tokens)
 
     training_time_ms = 0
+    # Start the clock on every rank at once (PRs #390/#391): rank 0 alone runs the canonical-mask setup
+    # above, so without this barrier the ranks reach the clock at different times and a rank's clock
+    # would run while it waits for another rank's pre-clock work.
+    barrier_start = time.perf_counter()
+    dist.barrier()
+    print0(f"[barrier] rank 0 waited {1000 * (time.perf_counter() - barrier_start):.1f} ms before the clock start", console=True)
     # start the clock
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -330,6 +430,9 @@ def main():
                 # The final fp8 refresh is skipped, not moved off the clock: its one consumer is a
                 # training forward, and the run ends after this validation.
                 deferred_gathers.flush_final()
+                # On the clock (MoE): the experts' bf16 replica from the owners' shards, before its first full
+                # reader -- the decontraction norms of the ship below, then the validation.
+                training_manager.optimizer.land_bf16_replicas()
                 training_manager.apply_final_ws_ext()
                 # Both on the clock: the wait in case the build is somehow not done, and the copy
                 # and broadcast of the result because they are part of the mask's cost.
@@ -340,6 +443,7 @@ def main():
                 tail_averages.ship()
             else:
                 deferred_gathers.flush()
+                training_manager.optimizer.land_bf16_replicas()  # MoE: the validation reads the bf16 experts
                 # On the clock: only the live cycle's rows of each value_embeds replica are current, and
                 # validation reads every token (perf/value_embed_pull.py).
                 value_embed_pull.gather_replica()
@@ -360,6 +464,7 @@ def main():
             training_time_ms += 1000 * (time.perf_counter() - t0)
             model.eval()
             val_loss = 0
+            uncompiled_model.cplm_diag.zero_()
             with torch.no_grad():
                 for batch, pull in zip(val_batches, val_pulls):
                     ngram_table.land(pull)
@@ -369,6 +474,12 @@ def main():
             del val_batches, val_pulls
             dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
             print0(f"step:{step}/{training_schedule.total_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            # CPLM diagnostics (token-averaged over all ranks)
+            diag = uncompiled_model.cplm_diag.clone()
+            dist.all_reduce(diag)
+            n_tokens = diag[0].clamp_min(1)
+            print0(f"step:{step} cplm_diag nll:{diag[1]/n_tokens:.4f} lm_nll:{diag[2]/n_tokens:.4f} "
+                   f"alpha:{diag[3]/n_tokens:.4f} a_sink:{diag[4]/n_tokens:.4f} copy_share:{diag[5]/n_tokens:.4f}", console=True)
             # The clock is stopped: flush the log and collect the loop's garbage here.
             flush_log()
             gc.collect()
