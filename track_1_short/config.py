@@ -22,8 +22,9 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule: the base step count of the main stages (SCHEDULE_GROWTH_STEPS are added on top), then
-    # the extension stage. The override is for step-count sweeps (record #360's KX_STEPS).
-    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "1122"))
+    # the extension stage. The override is for step-count sweeps (the sweeps of record #360).
+    # 981 scheduled + SCHEDULE_GROWTH_STEPS (52) + num_extension_iterations (20) = 1053 steps in all.
+    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "981"))
     num_extension_iterations: int = 20
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -58,6 +59,9 @@ TAPER_DURATION = 0.06
 # the batch-24 stage (index 2), which keeps every later boundary's Adam-step (odd/even) parity.
 SCHEDULE_GROWTH_STEPS = 52
 SCHEDULE_GROWTH_STAGE = 2
+# The CPLM <copy> gate (perf/kernels/cplm.py) is the vocabulary's first padding row, so lm_head needs no new row;
+# the sampled softmax always keeps it in its candidate set (sampled_softmax.py).
+COPY_TOKEN_ID = 50257
 # Attention window sizes are counted in blocks of this many tokens (record #360).
 BLOCK_SIZE = 128
 # Documents may run to 3072 tokens in the last stages, but attention segments are cut at this many

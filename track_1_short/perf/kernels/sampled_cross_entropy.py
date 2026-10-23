@@ -17,11 +17,14 @@ import triton.language as tl
 
 from track_1_short.perf.kernels.cross_entropy import (
     CE_KERNEL_BLOCK_SIZE,
+    CE_LUT_ROWS,
+    CE_LUT_SMEM,
     SOFTCAP_A,
     SOFTCAP_B,
     SOFTCAP_C,
     _ce_backward_gemms,
     _ce_logit_gemm,
+    _ce_lut_compile,
     compile_ce_kernel,
 )
 from track_1_short.sampled_softmax import ALL_CANDIDATE_COUNTS
@@ -31,6 +34,9 @@ for _p in ALL_CANDIDATE_COUNTS:
     assert _p % (CE_KERNEL_BLOCK_SIZE * 8) == 0, f"candidate count {_p} is not a legal CE width"
 # P -> the CE kernel compiled at VOCAB_SIZE = P. Built once at import (nvrtc, off the clock), never mutated.
 SAMPLED_CE_KERNELS = {p: compile_ce_kernel(p) for p in ALL_CANDIDATE_COUNTS}
+# The same widths with the 256-entry-table kernel (byte-identical output; the one the step runs when n_rows % 8 == 0,
+# the plain kernel above is the fallback).
+SAMPLED_CE_LUT_KERNELS = {p: _ce_lut_compile(p) for p in ALL_CANDIDATE_COUNTS}
 
 
 @torch.library.custom_op("nanogpt::sampled_ce_fwd_bwd", mutates_args={"losses", "grad_input"})
@@ -51,6 +57,15 @@ def sampled_ce_fwd_bwd(
 ) -> None:
     """ce_fwd_bwd with the kernel of width P = logits.shape[1]."""
     P = logits.shape[1]
+    if n_rows % CE_LUT_ROWS == 0:
+        SAMPLED_CE_LUT_KERNELS[P](
+            (n_rows // CE_LUT_ROWS, 1, 1),
+            (CE_KERNEL_BLOCK_SIZE, 1, 1),
+            (logits, target_pos, mtp_weights, prefix_pos, prefix_weight, losses, grad_input,
+             n_rows, n_predict, A, B, C, grad_s),
+            shared_mem=CE_LUT_SMEM,
+        )
+        return
     SAMPLED_CE_KERNELS[P](
         (n_rows, 1, 1),
         (CE_KERNEL_BLOCK_SIZE, 1, 1),

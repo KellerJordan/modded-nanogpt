@@ -7,21 +7,35 @@ import torch
 import torch.distributed as dist
 from torch import Tensor, nn
 
+from track_1_short.model.moe import MOE_ANVIL_MARGIN
 from track_1_short.perf.bank_scalars import BankScalarStaging
+from track_1_short.perf.kernels import anvil_opt as _ok
 from track_1_short.perf.kernels.polar_express import XTX, XXT, ba_plus_cAA
 from track_1_short.perf.kernels.transpose import transpose_add, transpose_copy
 from track_1_short.perf.replicated_adam import ReplicatedAdam
 
-# The row-sparse updates run at value_embeds' place in scatter_order and work_order (value_embeds is one
-# of them; step() never sees its gradient).
+# The row-sparse updates run at value_embeds' place in work_order (value_embeds is one of them; step()
+# never sees its gradient); their gradient exchanges are launched in the middle of the scatter phase.
 SPARSE_UPDATE_LABEL = "value_embeds"
+
+# The big dense reduce-scatters: mlp_bank, lm_head and the expert bank moe_bank.
+# They are queued on the n-gram table's communicator (`late_group`) behind its gradient exchange, in
+# work_order's order, i.e. the order of their updates (lm_head, moe_bank, mlp_bank): the n-gram exchange
+# is the long chain of the step, and these reduce-scatters are the dense work that can follow it without
+# delaying it. In scatter order the experts' update would wait for the end of the chain, exposed together
+# with the fp8 publication and mlp_bank's update; in update order only mlp_bank's update follows the last
+# reduce-scatter.
+RS_LATE_LABELS = ("mlp_bank", "lm_head", "moe_bank")
 
 
 class SparseUpdate(Protocol):
     """Row-sparse updates outside the dense reduce/gather path (the n-gram table, value_embeds), slotted
     into step()'s comms schedule so their exchanges overlap the dense ones."""
-    def launch(self) -> None:
-        """At SPARSE_UPDATE_LABEL's place in scatter_order: start the gradient exchange."""
+    def launch_ngram(self) -> None:
+        """In the scatter phase, once the dense collectives that do not wait for the sparse payloads are
+        launched: build the n-gram table's gradient payload and start its exchange."""
+    def launch_value_embeds(self) -> None:
+        """After the late reduce-scatters are queued: the same for value_embeds."""
     def update(self) -> None:
         """At SPARSE_UPDATE_LABEL's place in work_order: wait for the exchange, update, and start serving
         the next cycle's rows (queued on the NCCL stream ahead of the gathers launched after it)."""
@@ -31,21 +45,23 @@ class SparseUpdate(Protocol):
 # -----------------------------------------------------------------------------
 # ANVIL: twin-rail momentum + whitening cascade (record #360)
 
-# Six quintic spectral maps applied to the velocity Gram, re-derived for this run rather than
-# taken from the Polar Express reference (https://arxiv.org/pdf/2505.16932).
+# Four quintic spectral maps applied to the velocity Gram, designed with the Polar Express method
+# (https://arxiv.org/pdf/2505.16932; record #38: per-step Remez on [max(l, 0.02407 u), u], re-centring, safety 2e-2,
+# l0 = 1e-3) for this trainer's normalization (trace of the Gram, margin 1.05). Record #360 used six maps. bf16
+# simulation: normalized sigma >= 3e-3 land in [0.77, 1.23] with median 1.00, and the cascade stays bounded up to
+# sigma = 1.022 (the six maps diverge from 0.953), which also lets the expert bank run at a lower margin (model/moe.py).
 ANVIL_MAPS = [
-    (3.923798038567, -6.095026865488, 3.905234618423),
-    (3.278126713798, -3.328923386476, 0.989127286973),
-    (3.505298394150, -5.137358782410, 1.968325560615),
-    (2.815058591845, -3.685181239622, 1.417196497642),
-    (2.245503932403, -2.443826979899, 0.963091710461),
-    (2.256537145403, -2.166840097229, 0.929501253245),
+    (8.057967458384, -22.052383339291, 15.540875280932),
+    (3.929245019706, -2.754491513849, 0.497237282013),
+    (3.477283617853, -2.503541192905, 0.479259394356),
+    (2.507712624527, -1.782373685650, 0.401358534767),
 ]
 
 # Twin-rail velocity. Rail 0 is fast (beta scheduled by get_rail_beta until RAIL_ENGAGE_STEP, then
 # RAIL_FAST_BETA); rail 1 is slow (RAIL_SLOW_BETA) and accumulates from step 0. Until the engage
 # step the update reads the fast rail only; after it, RAIL_FAST_WEIGHT * fast + (1 - w) * slow.
 RAIL_FAST_BETA, RAIL_SLOW_BETA, RAIL_FAST_WEIGHT, RAIL_ENGAGE_STEP = 0.85, 0.98, 0.4385, 514
+assert RAIL_SLOW_BETA == 0.98, "anvil_opt._pre_kernel bakes the slow rail's lerp weight (1 - 0.98) as an fp32 literal"
 
 # The cascade's input is divided by FROBENIUS_MARGIN * ||X||_F + FROBENIUS_EPS, which puts every
 # singular value safely below 1 where the maps converge (the margin and eps of record #360).
@@ -57,13 +73,17 @@ SPLIT_BADDBMM_MIN_ROWS = 1024
 
 @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
 def anvil_cascade(grad_chunk: torch.Tensor, velocity: torch.Tensor, momentum_t: torch.Tensor,
-                  split_baddbmm: bool, fast_beta_t: torch.Tensor, fast_weight_t: torch.Tensor):
+                  split_baddbmm: bool, fast_beta_t: torch.Tensor, fast_weight_t: torch.Tensor,
+                  margin: float = FROBENIUS_MARGIN):
     """Twin-rail Nesterov momentum, then the ANVIL cascade that drives every singular value to ~1.
 
     velocity is one fp32 [2, *chunk] tensor: rail 0 fast, rail 1 slow. Their blend gets a Nesterov
     lookahead (momentum_t), is cast to bf16, normalized by its Frobenius norm, and whitened by
     ANVIL_MAPS. momentum_t, fast_beta_t and fast_weight_t are 0-D device tensors (AnvilBank), so
     per-step changes never recompile and a captured graph reads their current values.
+
+    margin replaces FROBENIUS_MARGIN in the normalization: the expert bank (moe_bank) runs this cascade at its own
+    margin; every other bank runs the fused kernels of anvil_opt at FROBENIUS_MARGIN (see anvil_bank_update).
     """
     grad_chunk = grad_chunk.float()
     momentum = momentum_t.to(grad_chunk.dtype)
@@ -83,7 +103,7 @@ def anvil_cascade(grad_chunk: torch.Tensor, velocity: torch.Tensor, momentum_t: 
         A = torch.empty((*X.shape[:-2], X.size(-1), X.size(-1)), device=X.device, dtype=X.dtype)
         XTX(X, out=A)  # A = X.T @ X
         tr = A.diagonal(dim1=-2, dim2=-1).float().sum(-1)[..., None, None]
-        d = tr.sqrt() * FROBENIUS_MARGIN + FROBENIUS_EPS
+        d = tr.sqrt() * margin + FROBENIUS_EPS
         X = (X.float() / d).bfloat16()
         A = (A.float() / d.square()).bfloat16()
         B = torch.empty_like(A)
@@ -116,7 +136,7 @@ def anvil_cascade(grad_chunk: torch.Tensor, velocity: torch.Tensor, momentum_t: 
         A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
         XXT(X, out=A)  # A = X @ X.mT
         tr = A.diagonal(dim1=-2, dim2=-1).float().sum(-1)[..., None, None]
-        d = tr.sqrt() * FROBENIUS_MARGIN + FROBENIUS_EPS
+        d = tr.sqrt() * margin + FROBENIUS_EPS
         X = (X.float() / d).bfloat16()
         A = (A.float() / d.square()).bfloat16()
         B = torch.empty_like(A)
@@ -190,6 +210,7 @@ class AnvilBank:
     beta2: float          # the equalizer's EMA decay
     split_baddbmm: bool
     red_dim: int
+    margin: float         # the cascade's Frobenius margin (only moe_bank's anvil_cascade reads it)
 
     def mutated(self) -> dict[str, Tensor]:
         """What the update writes."""
@@ -240,10 +261,16 @@ class AnvilAndAdam:
     # @tuttyfrutyee, @vdlad, @ryanyang0, @vagrawal, @varunneal, @chrisjmccormick
     """
     def __init__(self, named_params, param_table: dict, scatter_order: list, work_order: list,
-                 adam_defaults: dict, anvil_defaults: dict, bank_update: Callable[[AnvilBank], None]):
-        """bank_update(bank) runs one bank's ANVIL update: anvil_bank_update, or its captured graph."""
+                 adam_defaults: dict, anvil_defaults: dict, bank_update: Callable[[AnvilBank], None],
+                 moe_publish: Callable[[], list[tuple[str, "torch.futures.Future"]]],
+                 late_group: dist.ProcessGroup | None = None):
+        """bank_update(bank) runs one bank's ANVIL update: anvil_bank_update, or its captured graph.
+        moe_publish() runs right after moe_bank's update and returns the gathers [(label, future)] that replace the
+        bank's own bf16 gather: the owners' fp8 rows and scales (Fp8RefreshGraphs.publish_moe).
+        late_group: the communicator the RS_LATE_LABELS reduce-scatters run on (None: the default one)."""
         self.world_size = dist.get_world_size()
         self.rank = dist.get_rank()
+        self.late_group = late_group
 
         # Store defaults for each optimizer type
         self.adam_defaults = adam_defaults
@@ -251,6 +278,8 @@ class AnvilAndAdam:
         self.param_table = param_table
         self.scatter_order = scatter_order
         self.work_order = work_order
+        # In the order of their updates (see RS_LATE_LABELS).
+        self.late_labels = [label for label in work_order if label in RS_LATE_LABELS]
 
         # Collect params by label and build config
         self.param_cfgs: dict[nn.Parameter, ParamConfig] = {}
@@ -282,6 +311,7 @@ class AnvilAndAdam:
         self.fast_beta, self.fast_weight = 0.0, 1.0
         self._init_banks()
         self.bank_update = bank_update
+        self.moe_publish = moe_publish
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
@@ -328,17 +358,19 @@ class AnvilAndAdam:
             shape_mult = max(1.0, chunk_shape[-2] / chunk_shape[-1]) ** 0.5 if len(chunk_shape) >= 2 else 1.0
             lr_mul = shape_mult * lr_mul
 
-            # Per-matrix LR multipliers for MLP c_proj (2x LR on odd indices). Matrices the model
-            # marks as frozen (`param.frozen_matrices`, e.g. a removed layer's MLP) get LR 0, which
-            # also zeroes their decay term: they do not move at all.
+            # Per-matrix LR multipliers for MLP c_proj (2x LR): the odd indices of mlp_bank, or the matrices a bank
+            # names in `param.c_proj_matrices` (moe_bank's layout is [layer][c_fc, c_proj][expert]). Matrices the
+            # model marks as frozen (`param.frozen_matrices`: mlp_bank's padding slots) get LR 0, which also zeroes
+            # their decay term: they do not move at all.
             per_matrix_lr_mul = None
-            if label == "mlp_bank":
+            if label in ("mlp_bank", "moe_bank"):
                 start_idx = self.rank * chunk_size
                 frozen = getattr(param, "frozen_matrices", frozenset())
+                c_proj = getattr(param, "c_proj_matrices", None)
                 per_matrix_lr_mul = []
                 for i in range(chunk_size):
                     global_idx = start_idx + i
-                    is_c_proj = (global_idx % 2 == 1)
+                    is_c_proj = (global_idx in c_proj) if c_proj is not None else (global_idx % 2 == 1)
                     per_matrix_lr_mul.append(0.0 if global_idx in frozen else 2.0 if is_c_proj else 1.0)
 
             p_cfg = ParamConfig(
@@ -425,6 +457,7 @@ class AnvilAndAdam:
                 beta2=cfg.beta2,
                 split_baddbmm=chunk_shape[-2] > SPLIT_BADDBMM_MIN_ROWS,
                 red_dim=-1 if chunk_shape[-2] >= chunk_shape[-1] else -2,
+                margin=MOE_ANVIL_MARGIN if cfg.label == "moe_bank" else FROBENIUS_MARGIN,
             )
 
     def live_bank_state(self, label: str) -> dict[str, Tensor]:
@@ -454,18 +487,20 @@ class AnvilAndAdam:
         """Launch async reduce for a parameter based on its comms policy."""
         p_cfg = self.param_cfgs[param]
         if p_cfg.comms == "sharded":
+            group = self.late_group if p_cfg.label in RS_LATE_LABELS else None
             if p_cfg.optim == "anvil":
                 # ANVIL: reshape before reduce_scatter, into the bank's persistent gradient buffer
                 grad_chunk = self.banks[p_cfg.label].grad
                 future = dist.reduce_scatter_tensor(
-                    grad_chunk, grad.view(p_cfg.reshape).contiguous(), op=dist.ReduceOp.AVG, async_op=True
+                    grad_chunk, grad.view(p_cfg.reshape).contiguous(), op=dist.ReduceOp.AVG, group=group,
+                    async_op=True
                 ).get_future()
                 self._reduce_futures[param] = (future, grad_chunk)
             else:
                 # Adam: simple reduce_scatter
                 grad_chunk = torch.empty_like(grad[:p_cfg.chunk_size])
                 future = dist.reduce_scatter_tensor(
-                    grad_chunk, grad, op=dist.ReduceOp.AVG, async_op=True
+                    grad_chunk, grad, op=dist.ReduceOp.AVG, group=group, async_op=True
                 ).get_future()
                 self._reduce_futures[param] = (future, grad_chunk)
 
@@ -482,6 +517,17 @@ class AnvilAndAdam:
             return dist.all_gather_into_tensor(
                 param, p_slice.contiguous(), async_op=True
             ).get_future()
+
+    @torch.no_grad()
+    def land_bf16_replicas(self):
+        """MoE: the blocking all-gather of moe_bank's bf16 replica from the owners' shards (current: an update writes
+        its shard in place), the gather step() replaces with the fp8 publication. Before any reader of the full bf16
+        bank: the terminal decontraction norms, the validation."""
+        param = self._param_by_label["moe_bank"]
+        cfg = self.param_cfgs[param]
+        lo = self.rank * cfg.chunk_size
+        full = param.data.view(cfg.reshape)
+        dist.all_gather_into_tensor(full, full[lo:lo + cfg.chunk_size].contiguous())
 
     # -----------------------------------
     # State management
@@ -549,6 +595,28 @@ class AnvilAndAdam:
                     else:
                         p_state[k] = v
 
+    def _launch_label_reduce(self, label: str, do_adam: bool):
+        """Phase 1 for one label: start its reduce, if it has one this step."""
+        param = self._param_by_label[label]
+        p_cfg = self.param_cfgs[param]
+
+        if p_cfg.optim == "adam" and not do_adam:
+            return
+        if param.grad is None or label in self.replicated_labels:
+            return
+
+        # lm_head when tied: aggregate embed.grad.T (tiled Triton transpose-add)
+        if label == "lm_head" and do_adam and not self.split_embed:
+            embed_param = self._embed_param
+            if embed_param is not None and embed_param.grad is not None:
+                transpose_add(embed_param.grad, param.grad)
+
+        # Skip embed when tied (copied from lm_head after gather)
+        if label == "embed" and not self.split_embed:
+            return
+
+        self._launch_reduce(param, param.grad)
+
     # -----------------------------------
     # Unified optimizer step with explicit ordering
 
@@ -570,9 +638,15 @@ class AnvilAndAdam:
         Flow (NCCL runs one stream in enqueue order and future.wait() is a stream wait, so the order
         in which collectives are launched is the comms schedule):
         0. Adam steps: the replicated params' flat all_reduce (perf/replicated_adam.py)
-        1. Scatter phase: Launch reduces in scatter_order (sparse_update.launch at SPARSE_UPDATE_LABEL)
+        1. Scatter phase: Launch reduces in scatter_order, except the RS_LATE_LABELS and the sparse
+           tables' (they depend on the backward alone, so they go out before the sparse payloads are
+           built: a collective waits for everything queued on the compute stream when it is launched).
+           Then sparse_update.launch_ngram (the exchange goes out the moment its payload exists), the
+           RS_LATE_LABELS reduce-scatters in work_order's order (same communicator, so they queue behind
+           it), and sparse_update.launch_value_embeds
         2. Work phase: Process updates in work_order
-           - Wait for reduce, compute update, launch gather
+           - Wait for reduce, compute update, launch gather (moe_bank: launch the owners' fp8 publication
+             instead, moe_publish; its bf16 replica is gathered by land_bf16_replicas before its readers)
            - the first replicated label runs every replicated param's update at once
            - sparse_update.update at SPARSE_UPDATE_LABEL
         3. Finalize phase: wait for the lm_head gather, sparse_update.finish, wait for the gathers
@@ -591,28 +665,16 @@ class AnvilAndAdam:
         if do_adam:
             self.replicated.launch_reduce()
 
-        # ===== Phase 1: Launch reduces in scatter_order =====
+        # ===== Phase 1: Launch reduces =====
         for label in self.scatter_order:
-            if label == SPARSE_UPDATE_LABEL and sparse_update is not None:
-                sparse_update.launch()
-            param = self._param_by_label[label]
-            p_cfg = self.param_cfgs[param]
-
-            if p_cfg.optim == "adam" and not do_adam:
-                continue
-            if param.grad is None or label in self.replicated_labels:
-                continue
-
-            # lm_head when tied: aggregate embed.grad.T (tiled Triton transpose-add)
-            if label == "lm_head" and do_adam and not self.split_embed:
-                if embed_param is not None and embed_param.grad is not None:
-                    transpose_add(embed_param.grad, param.grad)
-
-            # Skip embed when tied (copied from lm_head after gather)
-            if label == "embed" and not self.split_embed:
-                continue
-
-            self._launch_reduce(param, param.grad)
+            if label not in self.late_labels:  # the sparse label has no gradient: nothing to launch here
+                self._launch_label_reduce(label, do_adam)
+        if sparse_update is not None:
+            sparse_update.launch_ngram()
+        for label in self.late_labels:  # queued behind the n-gram exchange, in update order
+            self._launch_label_reduce(label, do_adam)
+        if sparse_update is not None:
+            sparse_update.launch_value_embeds()
 
         # ===== Phase 2: Process updates in work_order =====
         gather_futures = []
@@ -646,6 +708,15 @@ class AnvilAndAdam:
                 p_slice = self._adam_update(param, grad_chunk, p_cfg)
             else:
                 p_slice = self._anvil_update(p_cfg, grad_chunk)
+            # MoE: the expert bank leaves as its owners' fp8 rows and scales (the bf16 replica is gathered only
+            # before its readers, land_bf16_replicas); deferred like a bank gather when `moe_bank` is deferred.
+            if label == "moe_bank":
+                for gather_label, gather_fut in self.moe_publish():
+                    if label in deferred_labels:
+                        deferred_futures[gather_label] = gather_fut
+                    else:
+                        gather_futures.append(gather_fut)
+                continue
             # Launch gather for sharded params
             if p_cfg.comms == "sharded":
                 gather_fut = self._launch_gather(param, p_slice)
@@ -787,11 +858,20 @@ class AnvilAndAdam:
 def anvil_bank_update(bank: AnvilBank):
     """One bank's ANVIL update, from its reduce-scattered gradient (the body the optimizer-tail graphs capture)."""
     # 1. Twin-rail Nesterov momentum + ANVIL whitening cascade
-    v_chunk = anvil_cascade(
-        bank.grad, bank.velocity, bank.momentum,
-        split_baddbmm=bank.split_baddbmm,
-        fast_beta_t=bank.fast_beta, fast_weight_t=bank.fast_weight,
-    )
+    if bank.label != "moe_bank":
+        # The same arithmetic as anvil_cascade, byte for byte (anvil_opt.py): the rails, the Nesterov blend and the
+        # bf16 cast in one pass, then the cascade from the Gram on.
+        x = torch.empty_like(bank.grad)
+        _ok.pre_fused(bank.grad, bank.velocity, x, bank.momentum, bank.fast_beta, bank.fast_weight)
+        v_chunk = _ok.polar(x, bank.split_baddbmm, ANVIL_MAPS)
+    else:
+        # The expert bank runs its own margin; the fused kernels above bake FROBENIUS_MARGIN.
+        v_chunk = anvil_cascade(
+            bank.grad, bank.velocity, bank.momentum,
+            split_baddbmm=bank.split_baddbmm,
+            fast_beta_t=bank.fast_beta, fast_weight_t=bank.fast_weight,
+            margin=bank.margin,
+        )
     # 2. Equalize per-lane update energy
     v_chunk = AnvilAndAdam._rail_equalizer(v_chunk, bank.lane_energy, bank.beta2, bank.red_dim)
     # 3. Update the parameter in place, with weight decay gated on the slow rail's sign. eff_lr is per

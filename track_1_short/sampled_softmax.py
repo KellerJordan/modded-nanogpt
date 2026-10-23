@@ -6,7 +6,9 @@ microbatch ("shared negatives"): every class that is a target somewhere in the m
 negatives to reach P, taken from a fixed stride permutation of the vocabulary. The kernel sees C as a
 P-wide vocabulary: logits are x @ lm_head[C].T, and each target (and prefix target) is replaced by its
 position in C. A prefix target that is not in C is dropped for that token (position -1, the kernel's
-no-op), so prefix targets never force classes into C. Validation always uses the full softmax.
+no-op), so prefix targets never force classes into C. The CPLM <copy> class (config.COPY_TOKEN_ID) is the
+exception that is forced in: it is always a candidate, so the copy gate has a logit on every sampled step.
+Validation always uses the full softmax.
 
 Why: early in training the full vocabulary's logit traffic (the [T, 50304] GEMM, CE pass and two
 gradient GEMMs) buys resolution the model cannot use yet. With P = 10k-25k those three GEMMs and the CE
@@ -19,8 +21,8 @@ and no draw needs an RNG. The gradient for lm_head is dense over the vocabulary 
 
 Schedule (record #360's, per TRAINING_STAGES index): P = 10240 through stages 0 and 1, then stage 2
 ramps 14336 -> 14336 -> 24576 in equal thirds; the batch taper (stage 3) and the extension run the full
-softmax. For the default 1122 + 52 + 20 steps: P = 10240 on steps 0-680, 14336 on 681-964, 24576 on
-965-1106, and the full softmax from step 1107 on.
+softmax. For the default 981 + 52 + 20 steps: P = 10240 on steps 0-594, 14336 on 595-847, 24576 on
+848-973, and the full softmax from step 974 on.
 
 Requires exactly one microbatch per step: see the race contract in perf/sampled_softmax_overlap.py.
 
@@ -33,6 +35,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from track_1_short.config import COPY_TOKEN_ID
 from track_1_short.perf.kernels.transpose import transpose_copy
 from track_1_short.perf.sampled_softmax_overlap import CandidateStaging, StagedCandidates
 from track_1_short.schedule import TrainingSchedule
@@ -122,8 +125,9 @@ class CandidateBuilder:
         V, mark, pos, T = self.vocab_size, self.mark, self.pos, targets.shape[0]
         mark.fill(False)
         mark[targets] = True
+        mark[COPY_TOKEN_ID] = True  # the CPLM <copy> gate is always a candidate
         num_targets = int(np.count_nonzero(mark[:V]))
-        assert num_targets <= P, f"{num_targets} distinct targets > P={P}"
+        assert num_targets <= P, f"{num_targets} always-included classes (targets and <copy>) > P={P}"
         if num_targets != P:
             self.mark_u8[self._negatives(P - num_targets)] = 1
         candidates = np.flatnonzero(mark[:V])  # ascending

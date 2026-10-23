@@ -123,7 +123,6 @@ class AttnArgs:
     bm_size: int
     yarn: Yarn
     key_offset: bool
-    attn_gate_w: torch.Tensor | None
     aux_v: torch.Tensor | None  # added to V; full head width (num_heads * head_dim) on every layer
     xsa_alpha: torch.Tensor | None
     train_max_seq_len: torch.Tensor
@@ -165,7 +164,7 @@ class CausalSelfAttention(nn.Module):
         assert T % 16 == 0
         H = self.num_heads
         # unpack attention args
-        aux_v, attn_gate_w = attn_args.aux_v, attn_args.attn_gate_w
+        aux_v = attn_args.aux_v
         sa_lambdas, key_offset = attn_args.sa_lambdas, attn_args.key_offset
         seqlens, bm_size = attn_args.seqlens, attn_args.bm_size
         train_max_seq_len, yarn = attn_args.train_max_seq_len, attn_args.yarn
@@ -226,8 +225,6 @@ class CausalSelfAttention(nn.Module):
             denom = v.square().sum(-1, keepdim=True).clamp_min(1e-8)
             alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(B, T, H, 1)
             y = y - alpha * (dot / denom) * v
-        if attn_gate_w is not None:
-            y = y * attn_gate_w.type_as(y).view(B, T, H, 1)
         y = y.contiguous().view(B, T, H * self.v_dim) # re-assemble all head outputs side by side
         # The output scale rounds to bf16 in the one product with O, with or without o_gain.
         o_scale = sa_lambdas[1] if attn_args.o_gain is None else sa_lambdas[1] * attn_args.o_gain
