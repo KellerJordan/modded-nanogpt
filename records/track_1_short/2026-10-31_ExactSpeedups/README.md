@@ -1,6 +1,6 @@
-# Track 1: exact speedups on top of #393 (30.67 s, n=12; −0.66 s vs #393 on the same node)
+# Track 1: #393 + #396 (exact speedups), 30.67 s (n=12; −0.66 s vs #393 on the same node)
 
-The code change is in the companion PR: four overheads removed from #393's training step. They are on by default, and `EXACT_LEVERS=none` restores #393. This folder holds the runs.
+The code change is #396: four overheads removed from #393's training step. They are on by default, and `EXACT_LEVERS=none` restores #393. This folder holds the runs.
 
 ## Result
 
@@ -67,11 +67,11 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 ## Disclosures
 - **Hardware:** RunPod, not PrimeIntellect. Stock #393 took 31.32 s on this node (31.285 s reported in #393), so the claim is the same-node difference.
 - **Timed tree:**
-  - The runs used exactly this PR's lever code, switched on with `EXACT_LEVERS=all`.
+  - The runs used exactly #396's lever code, switched on with `EXACT_LEVERS=all`.
   - The tree also carried my launch-kit's off-by-default timing hooks (phase stamps and markers), active in both arms alike, so the code printed at the top of each log includes them.
-  - The PR itself leaves them out, and I did not re-time the stripped tree.
+  - #396 leaves them out, and I did not re-time the stripped tree.
 - **Loss:** unchanged within run-to-run noise. #393's runs are not bit-reproducible either, because FA3's default backward and two atomic adds are non-deterministic. In a deterministic check on 1×H100 with #393's per-rank shapes, losses, all weights and 24 of 25 gradients were bitwise identical. The exception is #393's own atomic scatter-add, which differs the same way between two #393 runs.
 
 ## Taken from other PRs
-Everything except the four levers is #393 by @francesco-prignano.
+Everything except the four levers (#396) is #393 by @francesco-prignano.
 
