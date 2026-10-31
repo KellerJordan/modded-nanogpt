@@ -465,6 +465,31 @@ wg1_f8_op = _f8_mm_op("wg1_f8", transpose_b=True, fast_accum=False)   # dW1 = dp
 dx_f8_op = _f8_mm_op("dx_f8", transpose_b=False, fast_accum=False)    # dx  = dpre_f8 @ w1_f8_col
 
 
+# EXACT_LEVERS=bankinplace: a weight gradient written straight into matrix `index` of the bank's gradient buffer
+# (bank_grad.flatten(0, 1)[index]), the dense twin of moe_mlp.dw_into_bank. wg_f8_into is wg1_f8 / wg2_f8 with out=
+# (the same cuBLASLt call); mul_into is the folded dW2's product, one bf16 rounding as before.
+@torch.library.custom_op("nanogpt::wg_f8_into", mutates_args={"bank_grad"})
+def wg_f8_into(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: torch.Tensor, bank_grad: torch.Tensor,
+               index: int) -> None:
+    torch._scaled_mm(a, b.T, out_dtype=torch.bfloat16, scale_a=a_scale, scale_b=b_scale, use_fast_accum=False,
+                     out=bank_grad.flatten(0, 1)[index])
+
+
+@wg_f8_into.register_fake
+def _(a, b, a_scale, b_scale, bank_grad, index) -> None:
+    return None
+
+
+@torch.library.custom_op("nanogpt::mul_into", mutates_args={"bank_grad"})
+def mul_into(src: torch.Tensor, scale: torch.Tensor, bank_grad: torch.Tensor, index: int) -> None:
+    torch.mul(src, scale, out=bank_grad.flatten(0, 1)[index])
+
+
+@mul_into.register_fake
+def _(src, scale, bank_grad, index) -> None:
+    return None
+
+
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     """relu(x @ W1.T)^2 @ W2 as one autograd op. x is the [T, 768] bf16 normed residual; W1/W2 are
     [H, 768] bf16 bank slices. Called with only (x, W1, W2) it runs the bf16 forward (validation, under
@@ -477,11 +502,15 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
       post_scale/amax, dpre_scale/amax  the delayed activation scales and their amax slots
       p_fold              the residual post-lambda folded into the down-projection scale (w2_scale
                           and dq_bwd), or None. It rides along only so its gradient can be returned.
+      bank_grad, bank_slot  EXACT_LEVERS=bankinplace: the bank's persistent gradient buffer [slots, 2, H, 768] and
+                          this MLP's slot. dW1 / dW2 are written into bank_grad[slot, 0] / [slot, 1] and autograd
+                          gets None for W1 / W2, so nothing stacks the bank's gradient (moe_mlp.dw_into_bank).
     """
     @staticmethod
     def forward(ctx, x, W1, W2, W1_f8=None, dequant_scale=None, x_f8=None, W2_f8=None, w2_scale=None,
                 post_scale=None, post_amax=None, w2_f8_row=None, dq_bwd=None, x_f8_t=None, x_scale=None,
-                w1_f8_col=None, w1_scale=None, g_scale=None, dpre_scale=None, dpre_amax=None, p_fold=None):
+                w1_f8_col=None, w1_scale=None, g_scale=None, dpre_scale=None, dpre_amax=None, p_fold=None,
+                bank_grad=None, bank_slot=None):
         x_flat = x.view((-1, x.shape[-1]))
         if W1_f8 is None:  # validation: nothing saved, the backward below is fp8-only
             _, post, _, _ = linear_relu_square(x_flat, W1)
@@ -495,9 +524,11 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         x3 = torch.ops.nanogpt.dp_f8(post_f8, W2_f8, post_scale, w2_scale)
         # Intermediates go through save_for_backward: stashing them on ctx inside the compiled
         # subgraph pins them past their last use (+3.3 MB). The optional p_fold is trace-time constant.
-        ctx.save_for_backward(*((x, W1, W2) + ((p_fold,) if p_fold is not None else ())))
+        ctx.save_for_backward(*((x, W1, W2) + ((p_fold,) if p_fold is not None else ())
+                                + ((bank_grad,) if bank_grad is not None else ())))
         # Persistent caches and scales are kept by name.
         ctx.fold_p = p_fold is not None
+        ctx.bank_slot = bank_slot if bank_grad is not None else None
         ctx.post_f8, ctx.post_t, ctx.post_scale = post_f8, post_t, post_scale
         ctx.w2_f8_row, ctx.dq_bwd, ctx.x_f8_t, ctx.x_scale = w2_f8_row, dq_bwd, x_f8_t, x_scale
         ctx.w1_f8_col, ctx.w1_scale, ctx.g_scale = w1_f8_col, w1_scale, g_scale
@@ -510,11 +541,17 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         st = ctx.saved_tensors
         x, W2 = st[0], st[2]
         p_fold = st[3] if ctx.fold_p else None
+        slot = ctx.bank_slot   # EXACT_LEVERS=bankinplace: dW1 / dW2 go to bank_grad's matrices 2 * slot, 2 * slot + 1
+        bank_grad = st[-1] if slot is not None else None
         g_flat = grad_output.view((-1, grad_output.shape[-1]))
 
         # 1. Quantize the incoming gradient (one pass, both layouts), then dW2 = post^T @ g.
         g_f8, g_f8_t = quantize_dual_layout_fused(g_flat, ctx.g_scale, fmt=torch.float8_e5m2)
-        dW2 = torch.ops.nanogpt.wg2_f8(ctx.post_t, g_f8_t, ctx.post_scale, ctx.g_scale)
+        if slot is not None and not ctx.fold_p:
+            torch.ops.nanogpt.wg_f8_into(ctx.post_t, g_f8_t, ctx.post_scale, ctx.g_scale, bank_grad, 2 * slot + 1)
+            dW2 = None
+        else:
+            dW2 = torch.ops.nanogpt.wg2_f8(ctx.post_t, g_f8_t, ctx.post_scale, ctx.g_scale)
 
         # 2. Post-lambda folded into the down-projection scale: the forward computed out = post @ (p * W2),
         # so dW2 above is d/d(p*W2). Then dL/dW2 = p * dW2 and dL/dp = <dW2, W2>, an [H, 768] dot that
@@ -522,15 +559,23 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         grad_p = None
         if ctx.fold_p:
             grad_p = (dW2.float() * W2.float()).sum().to(p_fold.dtype)
-            dW2 = dW2 * p_fold
+            if slot is not None:
+                torch.ops.nanogpt.mul_into(dW2, p_fold, bank_grad, 2 * slot + 1)
+                dW2 = None
+            else:
+                dW2 = dW2 * p_fold
 
         # 3. dpre in e5m2 (both layouts, from the kernel epilogue), then dW1 and dx.
         dpre_f8, dpre_t = linear_relu_square(
             g_flat, W2, aux=ctx.post_f8, a_f8=g_f8, b_f8=ctx.w2_f8_row,
             dequant_scale_ptr=ctx.dq_bwd, post_scale=ctx.post_scale,
             dpre_scale=ctx.dpre_scale, dpre_amax=ctx.dpre_amax)
-        dW1 = torch.ops.nanogpt.wg1_f8(dpre_t, ctx.x_f8_t, ctx.dpre_scale, ctx.x_scale)
+        if slot is not None:
+            torch.ops.nanogpt.wg_f8_into(dpre_t, ctx.x_f8_t, ctx.dpre_scale, ctx.x_scale, bank_grad, 2 * slot)
+            dW1 = None
+        else:
+            dW1 = torch.ops.nanogpt.wg1_f8(dpre_t, ctx.x_f8_t, ctx.dpre_scale, ctx.x_scale)
         dx = torch.ops.nanogpt.dx_f8(dpre_f8, ctx.w1_f8_col, ctx.dpre_scale, ctx.w1_scale)
 
-        # One slot per forward input: (x, W1, W2), 16 fp8 args, p_fold.
-        return (dx.view(x.shape), dW1, dW2) + (None,) * 16 + (grad_p,)
+        # One slot per forward input: (x, W1, W2), 16 fp8 args, p_fold (, bank_grad, bank_slot).
+        return (dx.view(x.shape), dW1, dW2) + (None,) * 16 + (grad_p,) + ((None, None) if slot is not None else ())

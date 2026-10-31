@@ -50,6 +50,7 @@ from torch import Tensor
 
 from track_1_short.ngram_norm_map import NORM_MAP
 from track_1_short.perf.kernels.ngram_adam import bring_rows_current, merge_adam_rows_
+from track_1_short.exact_levers import NGRAM_PRESCATTER
 from track_1_short.perf.kernels.row_scatter import scatter_add_rows
 from track_1_short.sharded_rows import RowOwners, RowPull, all_to_all_rows
 
@@ -308,6 +309,16 @@ class NgramTable:
         """Hold one step's (slots, sink gradient) until the cycle's event. `sink_grad` must not be
         rewritten before then (with CUDA graphs: StepGraphs.hold_ngram_grad)."""
         assert self.cached is self.live, "the forward read a cache that holds no training cycle"
+        if NGRAM_PRESCATTER:
+            # EXACT_LEVERS=prescatter: into the cycle's per-slot sum now, while sink_grad is still this step's (the
+            # cycle's first step zeroes the sum: the previous event's exchange, which read it, was waited at that
+            # event). send_grads then sends it as it is; pending only counts the steps.
+            per_slot = self.grad_per_slot[:self.live.num_rows]
+            if not self.pending:
+                per_slot.zero_()
+            scatter_add_rows(sink_grad, slots, per_slot)
+            self.pending.append(None)
+            return
         self.pending.append((slots, sink_grad))
 
     @torch.no_grad()
@@ -317,9 +328,12 @@ class NgramTable:
         pull = self.live
         assert self.pending, "Adam event with no gradient since the last one"
         assert pull.num_rows <= self.grad_per_slot.shape[0], f"{pull.num_rows} cycle rows > gradient buffer"
-        per_slot = self.grad_per_slot[:pull.num_rows].zero_()
-        for slots, grad in self.pending:
-            scatter_add_rows(grad, slots, per_slot)
+        if NGRAM_PRESCATTER:  # EXACT_LEVERS=prescatter: every step of the cycle already added its gradient
+            per_slot = self.grad_per_slot[:pull.num_rows]
+        else:
+            per_slot = self.grad_per_slot[:pull.num_rows].zero_()
+            for slots, grad in self.pending:
+                scatter_add_rows(grad, slots, per_slot)
         self.pending = []
         received, work = self.owners.send_grads(pull, per_slot, self.group)
         self.grads_in_flight = (per_slot[pull.lo:pull.hi], received, work)

@@ -595,10 +595,26 @@ class AnvilAndAdam:
                     else:
                         p_state[k] = v
 
+    def launch_early_reduces(self, do_adam: bool, table_event: bool):
+        """EXACT_LEVERS=rsearly: launch the ANVIL banks' reduce-scatters right after the backward replay, before the host
+        queues the Adam gradient accumulation and the n-gram hold copy (step_graphs.py): a collective waits for whatever
+        the compute stream holds when it is launched. Their gradients are the backward's own buffers, untouched until the
+        next replay, so only the launch moves. step() skips what is already in flight.
+          - qk_bank, vo_bank (default group): every step; they lead its queue as before.
+          - moe_bank (late group): except on table-event steps, whose n-gram exchange leads that queue (record #360).
+          - mlp_bank (late group): only on non-Adam steps. On Adam steps lm_head's reduce-scatter, which needs the
+            accumulated gradient, goes before it, so that lm_head's update (early in work_order) does not wait for it."""
+        late = [] if table_event else [label for label in self.late_labels
+                                       if label in self.banks and (label != "mlp_bank" or not do_adam)]
+        for label in [label for label in self.scatter_order if label in self.banks and label not in self.late_labels] + late:
+            self._launch_label_reduce(label, do_adam)
+
     def _launch_label_reduce(self, label: str, do_adam: bool):
         """Phase 1 for one label: start its reduce, if it has one this step."""
         param = self._param_by_label[label]
         p_cfg = self.param_cfgs[param]
+        if param in self._reduce_futures:  # already launched (launch_early_reduces)
+            return
 
         if p_cfg.optim == "adam" and not do_adam:
             return

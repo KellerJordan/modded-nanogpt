@@ -37,6 +37,7 @@ from track_1_short.run_log import log_environment, read_source, start_run_log
 code = read_source(sys.argv[0])
 
 import copy
+import functools
 import gc
 import time
 
@@ -60,6 +61,7 @@ from track_1_short.config import (
 )
 from track_1_short.data import ScheduledBatches, cu_seqlens_rows, distributed_data_generator
 from track_1_short.distributed import setup_distributed
+from track_1_short.exact_levers import LEVERS as EXACT_LEVERS, RS_EARLY
 from track_1_short.model.gpt import (
     ATTN_BANK_ORDER,
     FP8_EXACT_SCALE_CALLS,
@@ -149,7 +151,11 @@ def train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, bat
     step_graphs.forward(step, batch, ngram_slots, training_manager.get_forward_args(sampled_loss))
     # Eager, between the two replays: the next cycle's row-id exchange hides under the backward.
     row_prefetch.after_forward(step)
-    ngram_grad = step_graphs.backward()
+    # EXACT_LEVERS=rsearly: the bank reduce-scatters go out the moment the backward replay is queued (optim/anvil.py).
+    launch_reduces = functools.partial(training_manager.optimizer.launch_early_reduces,
+                                       do_adam=training_manager.is_adam_step(step),
+                                       table_event=row_prefetch.is_update(step)) if RS_EARLY else None
+    ngram_grad = step_graphs.backward(launch_reduces)
     ngram_table.accumulate_grad(ngram_slots, step_graphs.hold_ngram_grad(
         ngram_grad, pending=len(ngram_table.pending), event_this_step=row_prefetch.is_update(step)))
     sampled_softmax.mark_readers_done()
@@ -249,6 +255,7 @@ def main():
     # The grouped fp8 MoE kernels' num_stages, likewise before compile (g3_k: the grouped G3 kernel is compiled for
     # this K and compared with the Triton one; MOE_G3 stays on only if they agree).
     prime_grouped_stage_cache(MOE_EXPERTS, MOE_TOPK, g3_k=model.lm_head.in_features)
+    print0(f"[exact-levers] EXACT_LEVERS={','.join(sorted(EXACT_LEVERS)) or 'none'}", console=True)
     # The kernels the record runs on. Each of them can fall back to a slower Triton path in silence (a missing Gluon, a
     # priming comparison that failed), so the run refuses to start without them.
     print0(f"[kernels] dense G3 (Gluon fused linear-relu-square) {mlp_g3._g3_ok[0]}, "

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from track_1_short.config import COPY_TOKEN_ID
+from track_1_short.exact_levers import MLP_GRAD_IN_PLACE
 from track_1_short.model.attention import AttnArgs, CausalSelfAttention, Yarn
 from track_1_short.model.layers import CastedLinearT, next_multiple_of_n, norm
 from track_1_short.model.moe import (
@@ -338,6 +339,12 @@ class GPT(MoEMixin, nn.Module):
         None of it is in the state_dict: rearm_fp8_bootstrap() restarts it after the post-warmup reset.
         """
         n, h, d, dev = NUM_USED_MLP_SLOTS, self.mlp_hdim, model_dim, self.device
+        if MLP_GRAD_IN_PLACE:
+            # EXACT_LEVERS=bankinplace: mlp_bank's gradient, written slot by slot by the dense MLPs' backward
+            # (FusedLinearReLUSquareFunction bank_grad); StepGraphs hands it to ANVIL as mlp_bank.grad. The padding
+            # slots are never written: they stay the zeros the stacked gradient filled them with every step.
+            self.register_buffer("mlp_bank_grad", torch.zeros(NUM_MLP_SLOTS, 2, h, d, dtype=torch.bfloat16, device=dev),
+                                 persistent=False)
         # The post-lambda each slot folds, as an index into [post_lambdas_mlp, 1]: its layer's, the parallel slot
         # layer 8's, and the appended 1 (index NUM_LAYERS) for layer 10's slot, whose post-lambda is the per-token mu[13].
         fold_src = {slot: (layer if layer < NUM_LAYERS - 1 else NUM_LAYERS) for layer, slot in MLP_SLOT_OF_LAYER.items()}
@@ -1003,4 +1010,6 @@ class GPT(MoEMixin, nn.Module):
         return (up_f8, self._mlp_up_dequant[slot:slot+1], x_row, self._mlp_down_f8[slot], down_scales[slot],
                 self._mlp_post_scales[slot], self._mlp_post_amax[slot], self._mlp_down_f8_row[slot], dq_bwd[slot], x_t,
                 self._mlp_x_scale, self._mlp_up_f8_col[slot], self._mlp_up_scales[slot], self._mlp_grad_scale,
-                self._mlp_dpre_scales[slot], self._mlp_dpre_amax[slot]) + ((fold_p,) if fold_p is not None else ())
+                self._mlp_dpre_scales[slot], self._mlp_dpre_amax[slot]) + (
+                    (fold_p, self.mlp_bank_grad, slot) if MLP_GRAD_IN_PLACE  # EXACT_LEVERS=bankinplace
+                    else (fold_p,) if fold_p is not None else ())

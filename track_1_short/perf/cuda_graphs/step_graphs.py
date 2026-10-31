@@ -50,6 +50,7 @@ import torch.distributed as dist
 from torch import Tensor, nn
 
 from track_1_short.data import Batch
+from track_1_short.exact_levers import NGRAM_PRESCATTER
 from track_1_short.model.gpt import ForwardScheduleConfig
 from track_1_short.ngram_table import MAX_CYCLE_STEPS, NGRAM_DIM, NgramTable
 from track_1_short.optim.anvil import AnvilAndAdam
@@ -176,12 +177,16 @@ class StepGraphs:
             self._self_check(cs)
         self.current = cs
 
-    def backward(self) -> Tensor:
-        """Replay the backward and set p.grad as loss.backward() would; returns the n-gram sink gradient."""
+    def backward(self, launch_reduces=None) -> Tensor:
+        """Replay the backward and set p.grad as loss.backward() would; returns the n-gram sink gradient.
+        launch_reduces (EXACT_LEVERS=rsearly): called once the ANVIL banks' p.grad are set, before the Adam gradient
+        accumulation below, so the reduce-scatters it launches wait for the backward alone."""
         cs = self.current
         cs.backward.replay()
         for p, grad in cs.anvil_grads:
             p.grad = grad
+        if launch_reduces is not None:
+            launch_reduces()
         first, accumulate = [], []
         for p, grad, acc in cs.adam_grads:
             (first if p.grad is None else accumulate).append((acc, grad))
@@ -194,8 +199,9 @@ class StepGraphs:
 
     def hold_ngram_grad(self, ngram_grad: Tensor, pending: int, event_this_step: bool) -> Tensor:
         """The n-gram gradient the table may keep: the graph's own buffer only if this step's update
-        event consumes it before the next replay, else a copy in ring slot `pending`."""
-        if event_this_step:
+        event consumes it before the next replay, else a copy in ring slot `pending`. EXACT_LEVERS=prescatter: always
+        the graph's buffer (NgramTable.accumulate_grad consumes it within the step)."""
+        if event_this_step or NGRAM_PRESCATTER:
             return ngram_grad
         assert pending < len(self.ngram_grad_ring), f"{pending} held n-gram gradients > ring"
         slot = self.ngram_grad_ring[pending][:ngram_grad.numel()].view_as(ngram_grad)
@@ -231,7 +237,13 @@ class StepGraphs:
             grads = torch.autograd.grad(cs.loss, leaves, allow_unused=True)
         torch.cuda.synchronize()
         moe_bank = self.uncompiled_model.moe_bank
+        # EXACT_LEVERS=bankinplace: the dense MLPs' backward writes mlp_bank's gradient in place, as the experts' do.
+        mlp_bank_grad = getattr(self.uncompiled_model, "mlp_bank_grad", None)
         for p, grad in zip(self.params, grads):
+            if mlp_bank_grad is not None and p is self.uncompiled_model.mlp_bank:
+                assert grad is None, "[mlp] autograd produced an mlp_bank gradient: the dense dW must go to mlp_bank_grad"
+                cs.anvil_grads.append((p, mlp_bank_grad))
+                continue
             if p is moe_bank:
                 # The experts' backward writes moe_bank's gradient in place, into moe_bank_grad (moe_mlp.py
                 # dw_into_bank), so autograd returns None for the bank: that buffer IS its gradient (unconditionally:
