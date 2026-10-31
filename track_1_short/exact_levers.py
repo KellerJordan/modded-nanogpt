@@ -1,8 +1,8 @@
-"""EXACT_LEVERS: bitwise-exact speed levers on top of #393. All four are ON by default; EXACT_LEVERS=none restores
+"""EXACT_LEVERS: exact speed levers on top of #393 (same model, data, schedule and arithmetic). All four are ON by default; EXACT_LEVERS=none restores
 #393's exact code path, and a comma-separated subset switches levers individually (for A/B checks).
 
-Found in 8x H100 profiles of #393 (details in the PR description). None changes a number: the same kernels compute
-the same values; what goes is copies, zero fills and waits. Values: unset or "all" (default), "none", or a subset:
+Found in 8x H100 profiles of #393 (details in the PR description). None changes the arithmetic: the same kernels
+compute the same values; what goes is copies, zero fills and waits. Values: unset or "all" (default), "none", or a subset:
   fa3copy      q, k, v reach FA3 as the [tokens, heads, dim] tensors the QKV kernel made, without the q[None] / q[0]
                round trip, whose select_backward materialized a copy of dq / dk (and dv on three layers) after every
                FA3 backward: 17 copy kernels per step (model/attention.py)
