@@ -16,6 +16,10 @@ import torch
 import triton
 import triton.language as tl
 
+# Fp8 sources with at least this many elements take transpose_copy's big-tile path (the CE grad_input
+# is >= 168 M elements).
+_TC_BIG_NUMEL = 1 << 27
+
 # -----------------------------------------------------------------------------
 # Tiled transpose copy kernel: dst (N, M) = src (M, N).T
 # Uses coalesced reads from src and coalesced writes to dst via tl.trans().
@@ -64,10 +68,18 @@ def transpose_copy(src: torch.Tensor, dst: torch.Tensor):
     assert dst.shape == (N, M), f"Expected dst shape ({N}, {M}), got {dst.shape}"
 
     BLOCK_M, BLOCK_N = 64, 128
+    num_warps = 8
     if src.element_size() == 1 and dst.stride(1) == 1:
         # BLOCK_M is the length in elements of each contiguous destination run, so for fp8 a
         # 64-wide tile would store half a 128-byte L2 line. A pure copy, so still bit-exact.
         BLOCK_M = 128
+        if (src.stride(1) == 1 and src.numel() >= _TC_BIG_NUMEL
+                and src.stride(0) % 16 == 0 and dst.stride(0) % 16 == 0):  # 16 B-aligned rows, else keep the 128x128 tile
+            # The multi-hundred-MB CE grad_input transposes (49152 x 14336 ... 40960 x 50304, 1.4-4.1 GB of traffic
+            # per call) are HBM-bound and cold: a pure D2D copy of the same bytes runs 3.04 TB/s, the 128x128 tile
+            # 2.84. 64x256 with 16 warps (256 B source runs, 64 B destination runs) measured 2.92 / 2.88 TB/s.
+            # Below this size (the [T, 768] glue transposes) every tile shape is within noise.
+            BLOCK_M, BLOCK_N, num_warps = 64, 256, 16
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     _transpose_copy_kernel[grid](
@@ -77,7 +89,7 @@ def transpose_copy(src: torch.Tensor, dst: torch.Tensor):
         dst.stride(0), dst.stride(1),
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        num_warps=8,
+        num_warps=num_warps,
         num_stages=2,
     )
 
