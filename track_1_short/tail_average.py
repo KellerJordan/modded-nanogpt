@@ -9,12 +9,13 @@ shrinks norms, and the model was trained at the un-averaged scale).
 
   accumulator         weights              ticks                          ship
   tail-ema            lm_head, embed       Adam steps, last 298           lerp(final, ema, 0.65)
-  tail-avg            vo_bank, mlp_bank    every 4th step, last 250       replaced by the average
+  tail-avg            vo_bank, mlp_bank,   every 4th step, last 250       replaced by the average
+                      moe_bank
   value-embed-avg     value_embeds         its update events, last 250    replaced by the average
-  bank-blend          qk/vo/mlp banks      every 4th step, last 298       lerp(current, ema, B)
+  bank-blend          qk/vo/mlp/moe banks  every 4th step, last 298       lerp(current, ema, B)
 
-bank-blend ships last, so on vo/mlp it blends into the tail average. Its B is 0.55, lowered by a
-Richardson correction on vo/mlp: a seeded EMA lags the final iterate, and
+bank-blend ships last, so on vo/mlp/moe it blends into the tail average. Its B is 0.55, lowered by a
+Richardson correction on vo/mlp/moe: a seeded EMA lags the final iterate, and
 (1-B)*A + B*X + w*(A - X) == lerp(A, X, B - w).
 """
 import math
@@ -46,7 +47,7 @@ BANK_BLEND_RATE = 2.0 / (BANK_BLEND_WINDOW // BANK_BLEND_PERIOD + 1)
 BANK_BLEND = 0.55
 RICHARDSON_W = 0.2007
 
-DECONTRACTION_LABELS = ("embed", "lm_head", "mlp_bank", "qk_bank", "vo_bank")
+DECONTRACTION_LABELS = ("embed", "lm_head", "mlp_bank", "qk_bank", "vo_bank", "moe_bank")
 
 
 @dataclass
@@ -89,14 +90,14 @@ class TailAverages:
         self.accumulators = [
             TailAccumulator("tail-ema", ("lm_head", "embed"), TAIL_EMA_WINDOW, tail_ema_rate,
                             {"lm_head": TAIL_EMA_BLEND, "embed": TAIL_EMA_BLEND}),
-            TailAccumulator("tail-avg", ("vo_bank", "mlp_bank"), TAIL_AVG_WINDOW,
+            TailAccumulator("tail-avg", ("vo_bank", "mlp_bank", "moe_bank"), TAIL_AVG_WINDOW,
                             lambda s, n: TAIL_AVG_RATE if (n - 1 - s) % TAIL_AVG_PERIOD == 0 else None,
-                            {"vo_bank": None, "mlp_bank": None}),
-            TailAccumulator("bank-blend", ("qk_bank", "vo_bank", "mlp_bank"), BANK_BLEND_WINDOW,
+                            {"vo_bank": None, "mlp_bank": None, "moe_bank": None}),
+            TailAccumulator("bank-blend", ("qk_bank", "vo_bank", "mlp_bank", "moe_bank"), BANK_BLEND_WINDOW,
                             # every BANK_BLEND_PERIOD-th step, plus the final two so the last iterate is always in
                             lambda s, n: BANK_BLEND_RATE if s % BANK_BLEND_PERIOD == 1 or s >= n - 2 else None,
                             {"qk_bank": BANK_BLEND, "vo_bank": BANK_BLEND - RICHARDSON_W,
-                             "mlp_bank": BANK_BLEND - RICHARDSON_W}),
+                             "mlp_bank": BANK_BLEND - RICHARDSON_W, "moe_bank": BANK_BLEND - RICHARDSON_W}),
             TailAccumulator("value-embed-avg", ("value_embeds",), VALUE_EMBED_AVG_WINDOW,
                             lambda s, n: VALUE_EMBED_AVG_RATE if value_embed_updates(s) else None,
                             {"value_embeds": None}),

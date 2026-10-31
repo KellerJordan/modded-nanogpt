@@ -13,6 +13,10 @@ class DistEnv:
     rank: int
     world_size: int
     device: torch.device
+    # A second NCCL communicator (own stream, high priority) for the n-gram table's row exchanges and the
+    # big dense reduce-scatters queued behind them (optim/anvil.py), so they overlap the default group's
+    # collectives instead of sharing its stream.
+    ngram_group: dist.ProcessGroup
 
     @property
     def master_process(self) -> bool:
@@ -31,4 +35,11 @@ def setup_distributed() -> DistEnv:
     torch.cuda.set_device(device)
     dist.init_process_group(backend="cuda:nccl,cpu:gloo", device_id=device)
     dist.barrier()
-    return DistEnv(rank=rank, world_size=world_size, device=device)
+    options = dist.ProcessGroupNCCL.Options()
+    options.is_high_priority_stream = True
+    ngram_group = dist.new_group(backend="nccl", pg_options=options)
+    # NCCL connects a peer pair on its first message: do it for every pair now, off the clock.
+    ones = torch.ones(world_size, dtype=torch.int64, device=device)
+    dist.all_to_all_single(torch.empty_like(ones), ones, group=ngram_group)
+    torch.cuda.synchronize()
+    return DistEnv(rank=rank, world_size=world_size, device=device, ngram_group=ngram_group)

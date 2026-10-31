@@ -20,20 +20,23 @@ What must stay address-stable (a replay reads and writes the addresses the captu
     MTP and prefix weights; each step copies its batch into them before the forward replay
   - every parameter's .data, every model buffer (fp8 caches and scales, YaRN tables, the n-gram row cache,
     the prefix table), the n-gram gradient sink leaves (NgramTable.grad_sink), value_embeds' gradient
-    buffer (ValueEmbedPull.grad_accum), the sampled-softmax candidate buffers (SampledSoftmax.loss_inputs)
+    buffer (ValueEmbedPull.grad_accum), the sampled-softmax candidate buffers (SampledSoftmax.loss_inputs),
+    the sampled lm_head dW's counter (perf/kernels/sampled_head.py)
 baked_addresses.py censuses all of them before and after the post-warmup reset.
 Python values the capture froze: the key, and the YaRN attention scales (re-checked at every replay).
 
 Gradients: the captured backward writes each gradient into its own pool buffer, rewritten by the next
 replay, and no AccumulateGrad runs, so p.grad is set here the way loss.backward() would: ANVIL banks take
-the graph's buffer directly (their reduce-scatter reads it before the next step's backward); Adam
+the graph's buffer directly (their reduce-scatter reads it before the next step's backward), except
+moe_bank, whose experts' backward writes its gradient in place into the model's moe_bank_grad (autograd
+returns None for the bank, and that buffer is its gradient); Adam
 parameters, whose gradient accumulates over two steps, go through one persistent buffer per parameter
 (copy on the first step, add on the second). The n-gram sink gradient is held by the table until its
 update event, up to MAX_CYCLE_STEPS steps, so each non-event step's copy goes to a private ring slot.
 
 Capture protocol (capture_plan.py): the first warmup visit of a key captures (both graphs), then
 replays the forward; the second visit replays and compares the loss with an eager forward on the same
-buffers. seal() then makes a missing capture fatal. Captures run only in the untimed warmup.
+buffers (see _self_check). seal() then makes a missing capture fatal. Captures run only in the untimed warmup.
 
 Provenance: record #360 (ANVIL2): `_CGraphRunner` (fwd/bwd, `_acc`, `_sink_flat` ring, `_selfcheck_now`,
 `seal`). Deviations: no host run-ahead throttle (every pinned ring this run rewrites is event-guarded);
@@ -43,14 +46,17 @@ import dataclasses
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 from torch import Tensor, nn
 
 from track_1_short.data import Batch
+from track_1_short.exact_levers import NGRAM_PRESCATTER
 from track_1_short.model.gpt import ForwardScheduleConfig
 from track_1_short.ngram_table import MAX_CYCLE_STEPS, NGRAM_DIM, NgramTable
 from track_1_short.optim.anvil import AnvilAndAdam
 from track_1_short.perf.cuda_graphs.capture_plan import StepGraphKey
 from track_1_short.perf.cuda_graphs.capture_support import WARM_ITERATIONS
+from track_1_short.perf.kernels import sampled_head
 from track_1_short.perf.value_embed_pull import ValueEmbedPull
 
 # The self-check compares scalar losses of two runs of the same kernels; atomics in the loss kernels
@@ -112,6 +118,7 @@ class StepGraphs:
                  ngram_table: NgramTable, value_embeds: ValueEmbedPull, max_step_tokens: int,
                  device: torch.device):
         self.model = model  # the compiled GPT
+        self.uncompiled_model = getattr(model, "_orig_mod", model)  # owns moe_bank and its gradient buffer
         self.params = list(optimizer.param_cfgs)
         self.anvil_params = {p for p, cfg in optimizer.param_cfgs.items() if cfg.optim == "anvil"}
         self.step_keys = step_keys  # step -> key, for every timed training step
@@ -170,12 +177,16 @@ class StepGraphs:
             self._self_check(cs)
         self.current = cs
 
-    def backward(self) -> Tensor:
-        """Replay the backward and set p.grad as loss.backward() would; returns the n-gram sink gradient."""
+    def backward(self, launch_reduces=None) -> Tensor:
+        """Replay the backward and set p.grad as loss.backward() would; returns the n-gram sink gradient.
+        launch_reduces (EXACT_LEVERS=rsearly): called once the ANVIL banks' p.grad are set, before the Adam gradient
+        accumulation below, so the reduce-scatters it launches wait for the backward alone."""
         cs = self.current
         cs.backward.replay()
         for p, grad in cs.anvil_grads:
             p.grad = grad
+        if launch_reduces is not None:
+            launch_reduces()
         first, accumulate = [], []
         for p, grad, acc in cs.adam_grads:
             (first if p.grad is None else accumulate).append((acc, grad))
@@ -188,8 +199,9 @@ class StepGraphs:
 
     def hold_ngram_grad(self, ngram_grad: Tensor, pending: int, event_this_step: bool) -> Tensor:
         """The n-gram gradient the table may keep: the graph's own buffer only if this step's update
-        event consumes it before the next replay, else a copy in ring slot `pending`."""
-        if event_this_step:
+        event consumes it before the next replay, else a copy in ring slot `pending`. EXACT_LEVERS=prescatter: always
+        the graph's buffer (NgramTable.accumulate_grad consumes it within the step)."""
+        if event_this_step or NGRAM_PRESCATTER:
             return ngram_grad
         assert pending < len(self.ngram_grad_ring), f"{pending} held n-gram gradients > ring"
         slot = self.ngram_grad_ring[pending][:ngram_grad.numel()].view_as(ngram_grad)
@@ -224,7 +236,21 @@ class StepGraphs:
             # donated buffers and refuses to run it otherwise (record #360).
             grads = torch.autograd.grad(cs.loss, leaves, allow_unused=True)
         torch.cuda.synchronize()
+        moe_bank = self.uncompiled_model.moe_bank
+        # EXACT_LEVERS=bankinplace: the dense MLPs' backward writes mlp_bank's gradient in place, as the experts' do.
+        mlp_bank_grad = getattr(self.uncompiled_model, "mlp_bank_grad", None)
         for p, grad in zip(self.params, grads):
+            if mlp_bank_grad is not None and p is self.uncompiled_model.mlp_bank:
+                assert grad is None, "[mlp] autograd produced an mlp_bank gradient: the dense dW must go to mlp_bank_grad"
+                cs.anvil_grads.append((p, mlp_bank_grad))
+                continue
+            if p is moe_bank:
+                # The experts' backward writes moe_bank's gradient in place, into moe_bank_grad (moe_mlp.py
+                # dw_into_bank), so autograd returns None for the bank: that buffer IS its gradient (unconditionally:
+                # anything autograd returned for the bank would not be it).
+                assert grad is None, "[moe] autograd produced a moe_bank gradient: the experts' dW must go to moe_bank_grad"
+                cs.anvil_grads.append((p, self.uncompiled_model.moe_bank_grad))
+                continue
             if grad is None:  # value_embeds: its gradient goes to ValueEmbedPull.grad_accum instead
                 continue
             if p in self.anvil_params:
@@ -238,13 +264,26 @@ class StepGraphs:
         self.unchecked.add(key)
         return cs
 
-    @torch.no_grad()
     def _self_check(self, cs: CapturedStep):
         """Replay vs eager forward on the same buffers: catches a graph that baked an input's value or a
-        stale address instead of reading the live tensor."""
-        replay, eager = cs.loss.item(), self._loss(cs).item()
+        stale address instead of reading the live tensor.
+
+        The replay's loss is asserted against an eager forward through the SAME compiled graph the capture recorded
+        (grad enabled, the result discarded), so only the loss kernels' atomics separate the two. A second
+        reference under torch.no_grad() runs a different compiled graph and is only printed: the normed input's
+        bf16 rounding can differ by an ulp between the two graphs, and early in training the router is near
+        uniform, so such an ulp flips some tokens' top-1 expert, a discrete jump the dense model never makes. The
+        experts' own fp8 graphs keep their bitwise checks (fp8_refresh_graphs.py)."""
+        replay = cs.loss.item()
+        with torch.no_grad():
+            eager_no_grad = self._loss(cs).item()
+        eager = self._loss(cs).item()
+        rel_no_grad = abs(replay - eager_no_grad) / max(abs(eager_no_grad), 1e-30)
+        rel = abs(replay - eager) / max(abs(eager), 1e-30)
+        print(f"[graph:step] rank {dist.get_rank()} self-check rel: no_grad eager {rel_no_grad:.2e} "
+              f"(sign {'+' if eager_no_grad > replay else '-'}), grad eager {rel:.2e}", flush=True)
         assert abs(replay - eager) <= max(SELF_CHECK_ABS, abs(eager) * SELF_CHECK_REL), \
-            f"step graph {cs.key}: replay loss {replay} != eager {eager}"
+            f"[graph:step] self-check FAILED: replay {replay!r} vs grad-enabled eager {eager!r} on the same buffers (step graph {cs.key})"
 
     def seal(self):
         """After warmup: every key the timed run reaches owns a self-checked capture."""
@@ -257,6 +296,8 @@ class StepGraphs:
         """(role, tensor) for every tensor the step graphs bake that the model's parameters and buffers do
         not cover. Tensors other objects own are read from their owners, live, so a rebind shows up."""
         yield "value_embeds.grad_accum", self.value_embeds.grad_accum
+        # the sampled lm_head dW's sample counter: a module global the captured backward advances in place
+        yield "sampled_head.COUNTER", sampled_head.COUNTER
         for tokens, sink in self.ngram_table.sinks.items():
             yield f"ngram_table.sinks[{tokens}]", sink
         for i, slot in enumerate(self.ngram_grad_ring):
