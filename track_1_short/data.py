@@ -16,7 +16,7 @@ from torch import Tensor
 
 from track_1_short.config import VIRTUAL_SEQ_CAP
 from track_1_short.model.layers import next_multiple_of_n
-from track_1_short.ngram_table import ngram_row_ids
+from track_1_short.ngram_hash import ngram_row_ids
 from track_1_short.perf.pinned_batches import PinnedBatchStaging
 from track_1_short.schedule import TrainingSchedule
 
@@ -85,6 +85,9 @@ class Shard:
         self.size = tokens.numel()
         self.world_size = world_size
         self.i = 0
+        self._batch_bos = None
+        self._batch_cap = None
+        self._batch_prefix = None
 
         # Partial index now, full index async
         self.bos_idx = (tokens[:6_000_000] == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
@@ -105,26 +108,32 @@ class Shard:
 
     def next_batch(self, num_tokens_local: int, max_seq_len: int):
         self._maybe_switch()
-        n = len(self.bos_idx)
-        starts = [[] for _ in range(self.world_size)]
-        ends = [[] for _ in range(self.world_size)]
-
+        if num_tokens_local < 0 or max_seq_len <= 0:
+            raise ValueError("batch tokens must be nonnegative and sequence length positive")
+        bos = self.bos_idx
+        # A capped document contributes the same length until either the cap or the async BOS
+        # index changes. Its cumulative lengths replace the per-document walk on every rank.
+        if self._batch_bos is not bos or self._batch_cap != max_seq_len:
+            lengths = np.minimum(np.diff(bos, append=self.size), max_seq_len)
+            prefix = np.empty(len(bos) + 1, dtype=np.int64)
+            prefix[0] = 0
+            np.cumsum(lengths, out=prefix[1:])
+            self._batch_bos, self._batch_cap, self._batch_prefix = bos, max_seq_len, prefix
+        prefix = self._batch_prefix
+        starts, ends = [], []
         idx = self.i
-        for r in range(self.world_size):
-            cur_len = 0
-            while cur_len <= num_tokens_local:
-                if idx >= n:
-                    raise StopIteration("Insufficient BOS ahead; hit tail of shard.")
-                cur = self.bos_idx[idx]
-                starts[r].append(cur)
-                idx += 1
-                end = min(self.bos_idx[idx] if idx < n else self.size,
-                          cur + max_seq_len,
-                          cur + num_tokens_local - cur_len + 1)
-                ends[r].append(end)
-                cur_len += end - cur
-
-            assert cur_len == num_tokens_local + 1
+        for _ in range(self.world_size):
+            goal = prefix[idx] + num_tokens_local + 1
+            stop = int(np.searchsorted(prefix, goal, side="left"))
+            if stop > len(bos):
+                raise StopIteration("Insufficient BOS ahead; hit tail of shard.")
+            start = bos[idx:stop].copy()
+            end = start + np.diff(prefix[idx:stop + 1])
+            end[-1] -= prefix[stop] - goal  # truncate only the final document to the exact budget
+            starts.append(start)
+            ends.append(end)
+            idx = stop
+        # A failure on any rank consumes no documents, as in the scalar planner.
         self.i = idx
         return starts, ends
 
