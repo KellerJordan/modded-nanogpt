@@ -124,3 +124,50 @@ No GPU runs have been performed for this PR. Real pinned H2D/event ordering,
 ring reuse under asynchronous execution, CUDA graph capture/replay, numerical
 parity, and matched 8×H100 timing remain unverified. CPU component speedups do
 not establish the end-to-end training gain.
+
+Attention layout validation
+---------------------------
+
+The FA3 layout change adapts #396's copy removal to this baseline, including its
+attention gate. Internal Q/K/V stay `[tokens, heads, width]` on both projection
+paths; the public attention output remains `[1, tokens, model_dim]`.
+
+```bash
+python -m pytest tests/test_attention_layout.py -q
+```
+
+The harness executes the actual `Yarn`, `AttnArgs` and `CausalSelfAttention`
+definitions. `reference_attention.py` freezes the old forward at `42c9714`.
+The GPU-only QKV/RoPE and FA3 boundaries use explicit CPU mathematical references;
+the production shape/control code is not rewritten by the test harness.
+
+Checks include exact output/every-input-gradient parity over 160 combinations
+of 64/128 QK and V widths, paired heads, auxiliary V, attention gates, partial key
+offset, BF16/FP64 and both projection paths. Additional cases cover strided
+inputs, zero values/XSA's denominator clamp, missing output gain, 16-token inputs,
+padded document boundaries and actual no-grad evaluation. A reduced attention
+fixture compares gradients, weights and complete Adam state over 32 updates.
+It is separate from the coupled language-model fixture above.
+
+A CPU profiler test observes three 3-D `select_backward` materializations in the
+frozen path and zero in the new path. That test failed before the production
+change and passed after it. It describes eager CPU autograd behavior, not a
+measured compiled GPU speedup. The CPU boundaries do not emulate FP8 rounding,
+actual FA3 numerics, GPU memory scheduling or CUDA graph capture.
+
+On an existing H100 with the record's Torch 2.10/FA3 environment, run real-kernel
+parity separately in eager and compiled modes, then run the full-record A/B:
+
+```bash
+python -m tests.validate_attention_cuda --output work/attention-eager.json
+python -m tests.validate_attention_cuda --compile --tokens 16384 \
+  --output work/attention-compiled.json
+```
+
+This gate uses real FP8 caches and the pinned FA3 build, enables deterministic
+FA3 backward in both comparison arms, and requires bitwise output/gradient
+equality. Each mode compares old versus new; it does not compare eager versus
+compiled. The only compilation flags/limit are those already used by the
+trainer. It makes no timing claim and does not capture CUDA graphs. It fails
+explicitly without an H100. Only that preflight was exercised locally; CUDA
+execution of this gate and the full-record runner remains outstanding.
