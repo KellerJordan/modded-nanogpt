@@ -42,6 +42,7 @@ from track_1_short.data import ScheduledBatches, cu_seqlens_rows, distributed_da
 from track_1_short.distributed import setup_distributed
 from track_1_short.model.gpt import ATTN_BANK_ORDER, FP8_EXACT_SCALE_CALLS, GPT
 from track_1_short.model.prefix_prediction import build_prefix_table_bucket
+from track_1_short.ngram_hash import prime_ngram_hash
 from track_1_short.ngram_table import (
     MAX_CYCLE_STEPS,
     NGRAM_DIM,
@@ -213,6 +214,7 @@ def main():
     #            Warmup kernels            #
     ########################################
     print0("Compiling model, warming up kernels and capturing CUDA graphs (~7 minutes on first execution)", console=True)
+    prime_ngram_hash(batch_tokens)  # includes validation: no CPU hash compilation on the clock
     # Warmup the training kernels, then re-initialize the state so we aren't cheating. The n-gram
     # table (16 GB per rank) is not copied: it starts at zero, so ngram_table.reset() restores it.
     initial_state = dict(model=copy.deepcopy(model.state_dict()),

@@ -96,6 +96,8 @@ HF_HUB_OFFLINE=1 ./run.sh
 ```
 
 **Note: torch.compile will add around 7 minutes of latency the first time you run the code.**
+The CPU n-gram hash also uses Inductor and needs a working C++ compiler (included in the Docker image).
+All configured train and validation hash shapes are compiled during warmup, before timing starts.
 
 The track-1 trainer is `train_gpt.py` plus the `track_1_short/` package. `train_gpt.py` is the outline of a run
 (setup, model, warmup and CUDA-graph capture, the timed loop, the final validation); `track_1_short/` holds the model,

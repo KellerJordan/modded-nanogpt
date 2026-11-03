@@ -173,6 +173,8 @@ class CausalSelfAttention(nn.Module):
         # The partial key offset shifts a key's non-rotating dims, so only a head with some can carry it.
         assert not key_offset or self.qk_dim > Yarn.ROTARY_DIM
 
+        # Keep Q/K/V in FA3's native [tokens, heads, width] layout. Adding a leading axis and
+        # selecting it away at the call makes select_backward materialize dq/dk/dv (#396, @atveit).
         # QK norm @Grad62304977 and rotary run in the projection's epilogue on both paths.
         if qkv_fp8 is not None:
             weight_f8, weight_f8_t, weight_scale, x_scale, grad_scale, x_f8, x_f8_t = qkv_fp8
@@ -183,24 +185,22 @@ class CausalSelfAttention(nn.Module):
                 yarn.factor1[:T], yarn.factor2[:T], H,
                 self.paired, key_offset, Yarn.ROTARY_DIM, x_f8, x_f8_t,
             )
-            q, k, v = q[None], k[None], v[None]
         else:
             # Validation (no_grad): a bf16 projection and the forward norm/rotary kernel.
             qkv_weight = sa_lambdas[0] * torch.cat((qk_w, v_w)).type_as(x)
             qkv = F.linear(x, qkv_weight)
             qk, v = qkv.split((2 * H * self.qk_dim, H * self.v_dim), dim=-1)
-            qk = qk.view(B, T, 2 * H, self.qk_dim)
-            v = v.view(B, T, H, self.v_dim)
+            qk = qk.view(T, 2 * H, self.qk_dim)
+            v = v.view(T, H, self.v_dim)
             q, k = qk_norm_rope_forward(
-                qk[0], yarn.factor1[:T], yarn.factor2[:T], H, Yarn.ROTARY_DIM, self.paired, key_offset,
+                qk, yarn.factor1[:T], yarn.factor2[:T], H, Yarn.ROTARY_DIM, self.paired, key_offset,
             )
-            q, k = q[None], k[None]
         max_len = train_max_seq_len if self.training else self.val_max_seq_len
 
         # A narrower V takes the leading v_dim dims of each head of aux_v: the same as adding at full
         # width and dropping the rest.
         if aux_v is not None:
-            aux_v = aux_v.view(B, T, H, self.head_dim)[..., :self.v_dim]
+            aux_v = aux_v.view(T, H, self.head_dim)[..., :self.v_dim]
         if not self.paired:
             if aux_v is not None:
                 v = v + aux_v
@@ -208,26 +208,26 @@ class CausalSelfAttention(nn.Module):
             # Paired heads: adjacent heads' queries attend to each other's keys. Two copies of the
             # input stream are interleaved (q, k already are, by the norm/rotary kernel), which
             # doubles each sequence's length and halves the effective window.
-            v = v.reshape(B, T * 2, H // 2, self.v_dim)
+            v = v.reshape(T * 2, H // 2, self.v_dim)
             if aux_v is not None:
                 v = v + aux_v.reshape(v.shape)
             seqlens = 2 * seqlens
             max_len = 2 * max_len
 
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+        y = flash_attn_interface.flash_attn_varlen_func(q, k, v, cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
-        y = y.view(B, T, H, self.v_dim)
+        y = y.view(T, H, self.v_dim)
         # Gated XSA (arXiv:2603.09078) with learnable strength: subtract per-head fraction tanh(α)
         # of y aligned with v̂. Non-paired only (v shape doesn't line up for paired layers).
         if attn_args.xsa_alpha is not None and not self.paired:
             dot = (y * v).sum(-1, keepdim=True)
             denom = v.square().sum(-1, keepdim=True).clamp_min(1e-8)
-            alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(B, T, H, 1)
+            alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(T, H, 1)
             y = y - alpha * (dot / denom) * v
         if attn_gate_w is not None:
-            y = y * attn_gate_w.type_as(y).view(B, T, H, 1)
+            y = y * attn_gate_w.type_as(y).view(T, H, 1)
         y = y.contiguous().view(B, T, H * self.v_dim) # re-assemble all head outputs side by side
         # The output scale rounds to bf16 in the one product with O, with or without o_gain.
         o_scale = sa_lambdas[1] if attn_args.o_gain is None else sa_lambdas[1] * attn_args.o_gain

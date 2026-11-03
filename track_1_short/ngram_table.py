@@ -44,22 +44,17 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from track_1_short.ngram_hash import BIGRAM_ROW_MULS, TRIGRAM_ROW_MULS, NGRAM_VOCAB_SIZE, ngram_row_ids
+
 from track_1_short.perf.kernels.ngram_adam import adam_rows_, bring_rows_current, claim_rows
 from track_1_short.perf.kernels.row_scatter import scatter_add_rows
 from track_1_short.sharded_rows import RowOwners, RowPull, all_to_all_rows
 
-# 224x the 377,280-row bigram table of earlier records. Rows [0, V/2) are the bigram channel,
-# [V/2, V) the trigram channel. Divisible by 8 (the shard) and < 2**31 (row ids are int32).
-NGRAM_VOCAB_SIZE = 84_602_880
 NGRAM_DIM = 768
 # The shared +-1 sign pool. A power of two, so `& (rows - 1)` is the non-negative remainder of the
 # wrapped int32 hash (values ~500-15000 gave similar results in the bigram record).
 NGRAM_SIGN_POOL_ROWS = 8192
 
-# Row hashes (record #360): multiply each token by a large odd constant, xor, reduce mod the channel
-# size. int32 products wrap; torch's `%` is Python-signed, so the result is non-negative.
-BIGRAM_ROW_MULS = (36313, 27191)            # x[t], x[t-1]
-TRIGRAM_ROW_MULS = (17351, 60961, 45259)    # x[t], x[t-1], x[t-2]
 # Sign-pool hashes (record #360), independent of the row hashes; computed in the embedding kernel
 # (perf/kernels/ngram_embed.py). Position t reads pool row
 #   bigram:  (m[1] * x[t-1] ^ m[0] * x[t]) & (pool_rows - 1), row 0 at t < 1
@@ -93,30 +88,6 @@ assert NGRAM_ADAM_PERIOD4_START % 4 == 0
 
 # -----------------------------------------------------------------------------
 # Hashing
-
-def ngram_row_ids(x: Tensor) -> Tensor:
-    """Token ids [T] (host) -> table row ids [2T] int32: out[:T] bigram rows, out[T:] trigram rows.
-
-    Positions without enough history get the channel's reserved last row. Note the bigram hash at
-    t = 1 reads the reserved id, not x[0], as its previous token (it is computed in place after
-    out[0] is set, exactly as in record #360).
-    """
-    x = x.to(torch.int32)
-    half = NGRAM_VOCAB_SIZE // 2
-    bigram_mod, trigram_mod = half - 1, NGRAM_VOCAB_SIZE - half - 1
-    n = x.numel()
-    out = torch.empty(2 * n, dtype=torch.int32)
-    bigram, trigram = out[:n], out[n:]
-    bigram.copy_(x)
-    bigram[0] = bigram_mod
-    bigram[1:] = torch.bitwise_xor(BIGRAM_ROW_MULS[0] * bigram[1:], BIGRAM_ROW_MULS[1] * bigram[:-1]) % bigram_mod
-    trigram[0] = trigram[1] = half + trigram_mod
-    trigram[2:] = torch.bitwise_xor(
-        torch.bitwise_xor(TRIGRAM_ROW_MULS[0] * x[2:], TRIGRAM_ROW_MULS[1] * x[1:-1]),
-        TRIGRAM_ROW_MULS[2] * x[:-2],
-    ) % trigram_mod + half
-    return out
-
 
 def sorted_unique_rows(row_id_arrays: list[np.ndarray]) -> np.ndarray:
     """The sorted-unique row ids of several steps' [2T] arrays (a cycle's want list), int32.

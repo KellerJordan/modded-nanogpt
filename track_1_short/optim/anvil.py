@@ -7,6 +7,8 @@ import torch
 import torch.distributed as dist
 from torch import Tensor, nn
 
+from track_1_short.optim.spectral_maps import ANVIL_MAPS
+
 from track_1_short.perf.bank_scalars import BankScalarStaging
 from track_1_short.perf.kernels.polar_express import XTX, XXT, ba_plus_cAA
 from track_1_short.perf.kernels.transpose import transpose_add, transpose_copy
@@ -30,18 +32,6 @@ class SparseUpdate(Protocol):
 
 # -----------------------------------------------------------------------------
 # ANVIL: twin-rail momentum + whitening cascade (record #360)
-
-# Six quintic spectral maps applied to the velocity Gram, re-derived for this run rather than
-# taken from the Polar Express reference (https://arxiv.org/pdf/2505.16932).
-ANVIL_MAPS = [
-    (3.923798038567, -6.095026865488, 3.905234618423),
-    (3.278126713798, -3.328923386476, 0.989127286973),
-    (3.505298394150, -5.137358782410, 1.968325560615),
-    (2.815058591845, -3.685181239622, 1.417196497642),
-    (2.245503932403, -2.443826979899, 0.963091710461),
-    (2.256537145403, -2.166840097229, 0.929501253245),
-]
-
 # Twin-rail velocity. Rail 0 is fast (beta scheduled by get_rail_beta until RAIL_ENGAGE_STEP, then
 # RAIL_FAST_BETA); rail 1 is slow (RAIL_SLOW_BETA) and accumulates from step 0. Until the engage
 # step the update reads the fast rail only; after it, RAIL_FAST_WEIGHT * fast + (1 - w) * slow.
