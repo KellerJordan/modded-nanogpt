@@ -122,7 +122,7 @@ The script reads `data/fineweb10B/fineweb_{train,val}_*.bin` relative to the wor
 ## Credits
 
 **Row gains:**
-- Muown: Hübler et al., [arXiv 2605.10797](https://arxiv.org/abs/2605.10797); record #23, [PR #288](https://github.com/KellerJordan/modded-nanogpt/pull/288)
+- Muown: Lion, Hübler, Li, Orvieto & He, "Muown: Row-Norm Control for Muon Optimization", [arXiv 2605.10797](https://arxiv.org/abs/2605.10797); record #23, [PR #288](https://github.com/KellerJordan/modded-nanogpt/pull/288)
 - Weight Normalization: Salimans & Kingma 2016, [arXiv 1602.07868](https://arxiv.org/abs/1602.07868)
 - AdamP: Heo et al., ICLR 2021, [arXiv 2006.08217](https://arxiv.org/abs/2006.08217)
 - Rotational Equilibrium: Kosson, Messmer & Jaggi, ICML 2024, [arXiv 2305.17212](https://arxiv.org/abs/2305.17212)
