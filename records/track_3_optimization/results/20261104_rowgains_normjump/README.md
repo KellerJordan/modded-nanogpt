@@ -12,6 +12,8 @@ The architecture, dataset, batch size and evaluation are unchanged, and no param
 
 **Result:** <!-- FILL from pr_summarize.py --> on **n = 16** fresh seeds (0–15), the Tail-EMA readout reaches mean `val_ema = 3.27xxx` at **step 2640**, so (3.28 − mean)·√16 = 0.00xxx ≥ 0.004. This is −50 steps against #46 (2690).
 
+The mechanisms behind each change, with the full experiment history (path-efficiency measurements, the row-gain anatomy, and the rejected variants), are in the [experiment log](https://app.notion.com/p/yanghaocheng/Modded-Nano-GPT-Speed-run-Track-3-407e76e151bb8074b2eef29f813d75da?source=copy_link).
+
 ## Changes in detail
 
 Notation: W_i is row i of a hidden matrix, g_i the same row of its gradient, and η_t/η₀ the PowerCool LR ratio of the Muon group.
@@ -84,3 +86,7 @@ torchrun --standalone --nproc_per_node=8 records/track_3_optimization/results/20
 ```
 
 The script reads `data/fineweb10B/fineweb_{train,val}_*.bin` relative to the working directory and writes `logs/<uuid>.txt`.
+
+## Acknowledgements
+
+This work was done at [Cerulean Labs](https://cerulean.works/). Compute was sponsored by the [National Center for High-performance Computing (NCHC)](https://www.nchc.org.tw/), Taiwan.
