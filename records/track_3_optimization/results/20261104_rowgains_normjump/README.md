@@ -1,4 +1,4 @@
-# Record: Track 3 Optimization -- #46 + row gains (per-row length Adam) + 2.5× norm-gain EMA-Nesterov jump -- 2640 steps (n=16)
+# Record: Track 3 Optimization -- #46 + row gains (per-row length Adam) + 2.5× norm-gain EMA-Nesterov jump -- 2635 steps (n=16)
 
 ## TL;DR
 
@@ -10,7 +10,7 @@ Setup from record #46 ([PR #328](https://github.com/KellerJordan/modded-nanogpt/
 
 The architecture, dataset, batch size and evaluation are unchanged, and no parameters are added: a row's length is part of the existing weight matrix. There is one forward-backward pass per step.
 
-**Result:** <!-- FILL from pr_summarize.py --> on **n = 16** fresh seeds (0–15), the Tail-EMA readout reaches mean `val_ema = 3.27xxx` at **step 2640**, so (3.28 − mean)·√16 = 0.00xxx ≥ 0.004. This is −50 steps against #46 (2690).
+**Result:** on **n = 16** seeds (0–15, all runs made), the Tail-EMA readout reaches mean `val_ema = 3.27888` at **step 2635**, so (3.28 − mean)·√16 = 0.00448 ≥ 0.004. This is −55 steps against #46 (2690). An earlier, independent 16-seed batch of the same settings (logs without embedded code, not submitted) also passed first at 2635 (0.0053).
 
 The mechanisms behind each change, with the full experiment history (path-efficiency measurements, the row-gain anatomy, and the rejected variants), are in the [experiment log](https://app.notion.com/p/yanghaocheng/Modded-Nano-GPT-Speed-run-Track-3-407e76e151bb8074b2eef29f813d75da?source=copy_link).
 
@@ -65,19 +65,40 @@ Ablations that shaped the choices:
 
 ## Validation runs
 
-<!-- FILL: table of the 16 logs (seed, val_ema at 2635 / 2640 / 2650) and the rule per step, from pr_summarize.py -->
-
-- 16 runs, seeds 0–15, all of them (none excluded). Each was run with this exact `train_gpt.py`; its source is at the top of each log.
-- Each run stops at step 2650 and validates every 5 steps from 2600, the same in every run. The claimed step is the earliest step where the 16-run mean passes the rule.
-- Hardware: 8× NVIDIA H200 per run. The global batch is the same as the benchmark's.
-
 | step | mean val_ema (n = 16) | (3.28 − mean)·√16 |
 |---|---|---|
-| 2630 | | |
-| 2635 | | |
-| **2640** | | |
-| 2645 | | |
-| 2650 | | |
+| 2620 | 3.27988 | 0.00048 |
+| 2625 | 3.27956 | 0.00176 |
+| 2630 | 3.27922 | 0.00313 |
+| **2635** | **3.27888** | **0.00448** pass |
+| 2640 | 3.27854 | 0.00584 pass |
+| 2645 | 3.27821 | 0.00716 pass |
+| 2650 | 3.27795 | 0.00819 pass |
+
+- 16 runs, seeds 0–15. These are all the runs made with this file; none were excluded.
+- Each was run with this exact `train_gpt.py`; its source is at the top of each log.
+- Every run stops at step 2650 and validates every 5 steps from 2600, the same in every run. The claimed step is the earliest step where the 16-run mean passes the rule.
+- Hardware: 8× NVIDIA H200 per run (PyTorch 2.11, CUDA 13.0), about 284 ms per step. Peak memory is 30.0 GiB allocated and 34.8 GiB reserved, under the 80 GB of an H100. The global batch is the same as the benchmark's.
+- The seed standard deviation at 2635 is 0.00134.
+
+| seed | log | val_ema @2630 | val_ema @2635 | val_ema @2640 | val_ema @2650 |
+|---|---|---|---|---|---|
+| 0 | [log](H200_seed0_682805f2-2e8a-483e-a09e-94e3940162b2.txt) | 3.27871 | 3.27837 | 3.27802 | 3.27745 |
+| 1 | [log](H200_seed1_a4682099-b95d-4766-b77a-910a35269acf.txt) | 3.27851 | 3.27815 | 3.27781 | 3.27723 |
+| 2 | [log](H200_seed2_69f00619-3bcb-4a7d-86b5-5631f7e41f1d.txt) | 3.27920 | 3.27890 | 3.27856 | 3.27797 |
+| 3 | [log](H200_seed3_39597760-471f-4dbd-8837-e466c1c69823.txt) | 3.27719 | 3.27685 | 3.27652 | 3.27591 |
+| 4 | [log](H200_seed4_56adf4f4-dc60-4aa2-9336-4d1ebc83bc38.txt) | 3.28149 | 3.28115 | 3.28083 | 3.28024 |
+| 5 | [log](H200_seed5_b418d3f9-2bd8-43f7-9f39-eeab9de98227.txt) | 3.27662 | 3.27625 | 3.27592 | 3.27533 |
+| 6 | [log](H200_seed6_94b8c6af-413c-4eee-a681-be3fc75bd5b7.txt) | 3.28135 | 3.28104 | 3.28069 | 3.28008 |
+| 7 | [log](H200_seed7_7a7c5b4f-31ae-4478-bf67-94fe1c23f992.txt) | 3.27914 | 3.27884 | 3.27847 | 3.27791 |
+| 8 | [log](H200_seed8_51af7a9a-6d89-400a-9f69-14a569e593d9.txt) | 3.27923 | 3.27888 | 3.27856 | 3.27798 |
+| 9 | [log](H200_seed9_c61555f8-7860-4a53-bba6-5e4f6bc57d25.txt) | 3.28024 | 3.27989 | 3.27955 | 3.27900 |
+| 10 | [log](H200_seed10_df8d861a-b4c4-4812-8a0e-e7edc648c28c.txt) | 3.28039 | 3.28006 | 3.27973 | 3.27914 |
+| 11 | [log](H200_seed11_c3a3fadf-3a74-4438-b32f-92e22b5e3955.txt) | 3.27837 | 3.27801 | 3.27768 | 3.27708 |
+| 12 | [log](H200_seed12_d4d27a86-95a1-405f-b942-82445cc11b6a.txt) | 3.28050 | 3.28016 | 3.27979 | 3.27919 |
+| 13 | [log](H200_seed13_6016ecd1-18fa-449d-8b1e-a14ccfecf703.txt) | 3.27903 | 3.27871 | 3.27836 | 3.27777 |
+| 14 | [log](H200_seed14_0f394249-7333-4ca8-9c2c-3ead881f7e7f.txt) | 3.27856 | 3.27819 | 3.27786 | 3.27727 |
+| 15 | [log](H200_seed15_cfd37550-ae62-4106-83c0-588cc84c0db3.txt) | 3.27896 | 3.27861 | 3.27830 | 3.27770 |
 
 ## Reproduce
 
