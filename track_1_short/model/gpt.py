@@ -6,6 +6,9 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from exact_match import CELLS as RET_CELLS
+
+from track_1_short.config import MODEL_DIM
 from track_1_short.model.attention import AttnArgs, CausalSelfAttention, Yarn
 from track_1_short.model.layers import CastedLinearT, next_multiple_of_n, norm
 from track_1_short.ngram_table import NGRAM_SIGN_POOL_ROWS
@@ -93,18 +96,18 @@ assert all(i < POST_GATE_LAYER for i in XSA_LAYERS), "the XSA strengths come fro
 # Layer 8 runs a second MLP in parallel, from MLP bank slot 11 (the slot that was sharding padding).
 PARALLEL_MLP_LAYER, PARALLEL_MLP_SLOT = 8, 11
 # The post-loop MUDD mix splits model_dim into this many channel groups, each with its own coefficient delta.
-MUDD_GROUPS = 12
+MUDD_GROUPS = MODEL_DIM // 64
 # MUDD coefficients at the start of the last layer (init_mudd lists them).
 LAST_LAYER_MUDD_COEFS = 14
 # MUDD gate lane widths (init_mudd_gate): one lane per head for the XSA strengths and the attention
 # gates, one lane per injection site for x0 / the n-gram embedding, one for the layer-6 skip.
-MUDD_GATE_HEAD_LANES = 6
+MUDD_GATE_HEAD_LANES = MODEL_DIM // 128
 MUDD_GATE_SCALE = 0.1  # the gates' output scale at init; biases are stored pre-divided by it
 # MLP bank: 12 slots of (c_fc, c_proj), 24 matrices for even sharding over 8 GPUs. Slot i is layer i's
 # MLP, slot 11 is PARALLEL_MLP_SLOT, slot 7 is dead (NO_MLP_LAYERS) but keeps the bank even.
 NUM_MLP_SLOTS = 12
-# MLP hidden size, cut from 4 * 768 = 3072 in record #360.
-MLP_HIDDEN_DIM = 2816
+# MLP hidden size: 3.5 * MODEL_DIM (record #360 used 2816 at width 768).
+MLP_HIDDEN_DIM = 1792
 
 # Static FP8 scales of the attention projection's input (e4m3, saturates entries beyond |8|) and of
 # its incoming gradient, both from record #360.
@@ -112,11 +115,11 @@ FP8_ATTN_X_SCALE = 8.0 / 448.0
 FP8_ATTN_GRAD_SCALE = 1.0 / 448.0
 
 # Validation computes the loss over slabs of this many rows (record #360), so its [rows, vocab] fp32
-# logits (6.6 GB per slab) stay small next to the rank's 16 GB n-gram shard.
+# logits (6.6 GB per slab) stay small next to the rank's 11 GB n-gram shard.
 EVAL_CE_SLAB_ROWS = 32768
 
 # FP8 MLP scales (see perf/kernels/mlp.py), from record #360.
-FP8_MLP_X_SCALE = 2 ** -4      # static: post-RMS-norm rows have max|x| <= sqrt(768) = 27.7 < 448 * 2^-4
+FP8_MLP_X_SCALE = 2 ** -4      # static: post-RMS-norm rows have max|x| <= sqrt(512) = 22.6 < 448 * 2^-4
 FP8_GRAD_SCALE = 2 ** -6       # static e5m2 scale of the MLP's incoming gradient
 FP8_POST_HEADROOM = 1.03       # delayed relu(pre)^2 scale = last step's amax * this / 448
 FP8_DPRE_HEADROOM = 1.25       # delayed dpre scale = last step's amax * this / 57344
@@ -189,6 +192,14 @@ class GPT(nn.Module):
         self.init_misc(model_dim, num_layers)
         self.init_mudd(num_layers, model_dim)
         self.init_mudd_gate(model_dim)
+        # Exact-match retrieval (track_1_short/retrieval.py): per cell a scale of the candidates' mean embedding and an
+        # embedding of its own, and a scale per injection site. Warm inits, tuned with the scales' 10x lr (training.py):
+        # from small inits the scales were still climbing at the end of training, held back by Adam's step size.
+        self.ret_next_scale = nn.Parameter(torch.full((RET_CELLS,), 4.0))
+        self.ret_bucket_embed = nn.Parameter(torch.zeros(RET_CELLS, model_dim))
+        self.ret_site_scale_in = nn.Parameter(torch.tensor(0.1))
+        self.ret_site_scale_mid = nn.Parameter(torch.tensor(8.0))
+        self.ret_site_scale_out = nn.Parameter(torch.tensor(8.0))
 
         # Auto-label parameters
         for name, param in self.named_parameters():
@@ -236,9 +247,9 @@ class GPT(nn.Module):
         # own independent whitening: a slot's 2 * num_heads heads (Q heads, then K heads) are
         # num_heads groups of two full-width heads.
         qk_groups_per_slot = num_heads
-        num_qk_groups = num_slots * qk_groups_per_slot  # 42
+        num_qk_groups = num_slots * qk_groups_per_slot  # 28
         self._num_qk_groups = num_qk_groups
-        num_qk_padded = next_multiple_of_n(num_qk_groups, n=self.world_size)  # 48
+        num_qk_padded = next_multiple_of_n(num_qk_groups, n=self.world_size)  # 32
         self.qk_bank = nn.Parameter(torch.empty(num_qk_padded, 2 * head_dim, model_dim))
         self.qk_bank.reshape = (num_qk_padded, 2 * head_dim, model_dim)
 
@@ -282,8 +293,8 @@ class GPT(nn.Module):
     def init_mlp(self, model_dim):
         # MLP bank: stores c_fc and c_proj for all NUM_MLP_SLOTS slots.
         self.mlp_hdim = MLP_HIDDEN_DIM
-        self.mlp_bank = nn.Parameter(torch.empty(NUM_MLP_SLOTS, 2, self.mlp_hdim, model_dim))  # (12, 2, 2816, 768)
-        self.mlp_bank.reshape = (2 * NUM_MLP_SLOTS, self.mlp_hdim, model_dim)  # Shape for sharding: (24, 2816, 768)
+        self.mlp_bank = nn.Parameter(torch.empty(NUM_MLP_SLOTS, 2, self.mlp_hdim, model_dim))  # (12, 2, 1792, 512)
+        self.mlp_bank.reshape = (2 * NUM_MLP_SLOTS, self.mlp_hdim, model_dim)  # Shape for sharding: (24, 1792, 512)
         # The optimizer leaves these matrices untouched: c_fc and c_proj of each NO_MLP_LAYERS slot.
         self.mlp_bank.frozen_matrices = frozenset(2 * layer + j for layer in NO_MLP_LAYERS for j in (0, 1))
 
@@ -531,7 +542,7 @@ class GPT(nn.Module):
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor,
                 schedule_cfg: ForwardScheduleConfig, ngram_sink: Tensor | None = None,
-                value_embed_grad: Tensor | None = None):
+                value_embed_grad: Tensor | None = None, ret: Tensor | None = None):
         """Per-token loss for one packed varlen batch (B=1, documents separated by `seqlens`).
 
         bigram_input_seq: [2T] int32 slots in `ngram_cache` of each token's bigram (first T) and
@@ -540,6 +551,8 @@ class GPT(nn.Module):
         ngram_sink (training only) is NgramTable.grad_sink: the table rows' gradient lands on it.
         value_embed_grad (training only) is the persistent fp16 buffer value_embeds' gradient accumulates
         into (perf/value_embed_pull.py); value_embeds itself never gets a .grad.
+        ret: int32 exact-match retrieval rows of the T positions (track_1_short/retrieval.py), their hint added to the
+        residual stream at the input, at layer 7 and before the output head; None (hellaswag) adds nothing.
 
         Layer topology (11 layers, 0-indexed):
           - attention on ATTN_LAYERS (0, 1, 2, 3, 5, 8, 10); short sliding window except layers 3 and 10
@@ -588,6 +601,20 @@ class GPT(nn.Module):
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
+        hint = None
+        if ret is not None:
+            # Exact-match retrieval: ret is each position's cell, then its candidates as (position, token | count << 16)
+            # pairs, padded with count 0. A position's hint is the mean embedding of its candidates weighted by their
+            # counts and read without a gradient, times its cell's scale, plus its cell's embedding; zero where
+            # nothing matched.
+            T = input_seq.numel()
+            cell, entries = ret[:T].long(), ret[T:].view(-1, 2)
+            at, tokens, counts = entries[:, 0].long(), (entries[:, 1] & 0xFFFF).long(), (entries[:, 1] >> 16).float()
+            total = counts.new_zeros(T).index_add(0, at, counts).clamp_min(1)
+            terms = self.embed.weight.detach()[tokens].float() * (counts / total[at])[:, None]
+            mean = terms.new_zeros(T, terms.shape[1]).index_add(0, at, terms)
+            hint = ((mean * self.ret_next_scale[cell, None] + self.ret_bucket_embed[cell]) * (cell > 0)[:, None]).bfloat16()
+            x = x + self.ret_site_scale_in.type_as(x) * hint
 
         # Hashed n-gram embedding: each token's bigram row and trigram row, each times its own +-1 sign
         # row, summed. The sign trick compresses several n-grams into a shared row (details in
@@ -643,6 +670,9 @@ class GPT(nn.Module):
             if i == POST_GATE_LAYER:
                 post_gate = self.forward_mudd_gate(x, id=1, num_coef=self._mudd_gate_post_num_coef)
                 post_skip_gate = self.unpack_post_mudd_gate(post_gate, attn_gates, x0_gates, bigram_gates)
+
+            if i == 7 and hint is not None:
+                x = x + self.ret_site_scale_mid.type_as(x) * hint[None]
 
             # process attn. skip on layer 6 @YouJiacheng
             if i == 6:
@@ -770,6 +800,8 @@ class GPT(nn.Module):
         for k, src in enumerate(sources):
             mixed = mixed + (mu[k] + deltas[..., k, :]).unsqueeze(-1) * grouped(src)
         x = mixed.flatten(-2)
+        if hint is not None:
+            x = x + self.ret_site_scale_out.type_as(x) * hint[None]
 
         return self._loss(norm(x), input_seq, target_seq, mtp_weights, prefix_weight, schedule_cfg.sampled_loss)
 

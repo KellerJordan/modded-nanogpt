@@ -3,7 +3,7 @@ from itertools import accumulate, pairwise
 
 import torch
 
-from track_1_short.config import SCHEDULE_GROWTH_STAGE, SCHEDULE_GROWTH_STEPS, TrainingStage
+from track_1_short.config import TrainingStage
 
 # The lr cooldown decays linearly to this absolute multiplier (record #360's code; its README says 0.20).
 LR_FLOOR = 0.30
@@ -24,18 +24,15 @@ class TrainingSchedule:
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
                  device: torch.device, cooldown_frac: float, split_embed_stage: int, ws_post_yarn_ext: int):
         self.stages = stages
-        # The main stages run the base count plus the growth steps; the lr cooldown spans all of it.
-        self.scheduled_iterations = scheduled_iterations + SCHEDULE_GROWTH_STEPS
+        self.scheduled_iterations = scheduled_iterations
         self.cooldown_frac = cooldown_frac
         # increase final validation ws, used for YaRN extension and short window size @classiclarryd
         self.ws_post_yarn_ext = ws_post_yarn_ext
 
         self.total_steps = self.scheduled_iterations + extension_iterations
 
-        # Stage ends from the durations over the base count, then every end after the growth stage
-        # shifts by the growth steps (the last is extension stage, ending at total_steps).
+        # Stage ends from the durations (the last is the extension stage, ending at total_steps).
         ends = [0, *[round(c * scheduled_iterations) for c in accumulate(s.duration for s in stages[:-1])], self.total_steps]
-        ends[SCHEDULE_GROWTH_STAGE + 1:-1] = [e + SCHEDULE_GROWTH_STEPS for e in ends[SCHEDULE_GROWTH_STAGE + 1:-1]]
         assert self.scheduled_iterations == ends[-2]
         self.boundaries = list(pairwise(ends))
 
@@ -75,7 +72,7 @@ class TrainingSchedule:
         return lr
 
 
-def get_rail_beta(step: int, total_steps: int, beta_warmup_steps=240, beta_cooldown_steps=50, beta_min=0.85, beta_max=0.93):
+def get_rail_beta(step: int, total_steps: int, beta_warmup_steps=110, beta_cooldown_steps=23, beta_min=0.85, beta_max=0.93):
     """ANVIL's fast-rail beta, also its Nesterov lookahead: linear warmup from beta_min to beta_max,
     flat for the bulk of the run, linear cooldown back over the last beta_cooldown_steps."""
     beta_cd_start = total_steps - beta_cooldown_steps

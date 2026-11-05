@@ -22,7 +22,7 @@ Invariants:
     forward reads only its cycle's rows, and the replica is gathered whole (gather_replica) before
     every validation; the tail-average ship gathers it too.
   - This rank's own shard of the replica is the parameter Adam updates in place; it never lands from
-    the wire, so the tail average, which reads the own shard, never races a land.
+    the wire, so the tail ship's gather, which reads the own shard, never races a land.
   - The land is split (start_land in the event's optimizer step, complete_land right before the next
     forward, perf/deferred_gathers.py): every reader of the peers' rows -- the forward, gather_replica,
     the tail ship's gather -- runs after complete_land.
