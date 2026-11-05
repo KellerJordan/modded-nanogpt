@@ -64,7 +64,7 @@ from track_1_short.perf.kernels.mlp import prime_stage_cache
 from track_1_short.perf.pinned_batches import PinnedBatchStaging
 from track_1_short.perf.row_prefetch import PREP_SLACK_STEPS, PrefetchStaging, RowPrefetch
 from track_1_short.perf.value_embed_pull import ValueEmbedPull
-from track_1_short.retrieval import OnlineCache, ValidationCache, build_cpus, pin_cpus, pin_threads
+from track_1_short.retrieval import OnlineCache, ValidationCache, build_cpus, pin_cpus, pin_threads, table_vote
 from track_1_short.sampled_softmax import SampledSoftmax
 from track_1_short.schedule import TrainingSchedule
 from track_1_short.tail_average import TailAverages
@@ -408,14 +408,20 @@ def main():
             canon_mask_builder.release()
             model.eval()
             val_loss = 0
+            network_loss = 0
             with torch.no_grad():
                 for batch, pull, rows in zip(val_batches, val_pulls, val_rows):
                     ngram_table.land(pull)
-                    val_loss += model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
-                                      training_manager.get_forward_args(), ret=rows).mean()
+                    losses = model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
+                                   training_manager.get_forward_args(), ret=rows)
+                    network_loss += losses.mean()
+                    val_loss += table_vote(losses, val_cache, batch.inputs_cpu.astype(np.uint16), batch.targets_cpu.numpy().astype(np.uint16)).mean()
             val_loss /= val_steps
+            network_loss /= val_steps
             del val_batches, val_pulls
             dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+            dist.reduce(network_loss, 0, op=dist.ReduceOp.AVG)
+            print0(f"network alone: {network_loss:.4f}", console=True)
             print0(f"step:{step}/{training_schedule.total_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
             # The clock is stopped: flush the log and collect the loop's garbage here.
             flush_log()

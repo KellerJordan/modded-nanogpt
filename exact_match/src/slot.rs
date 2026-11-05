@@ -843,4 +843,71 @@ impl SlotIndex {
         })?;
         Ok(compact(py, &cells, &mut entries, capacity))
     }
+    /// All three empirical distributions. Targets only select a component of each distribution.
+    fn query_counts<'py>(&self, py: Python<'py>, tokens: PyReadonlyArray1<u16>, targets: PyReadonlyArray1<u16>) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        let x = tokens.as_slice()?;
+        let y = targets.as_slice()?;
+        if y.len() != x.len() { return Err(PyValueError::new_err("target length differs")); }
+        let slots = self.slots;
+        let mut starts: Vec<usize> = [0].into_iter().chain(x.iter().enumerate().filter_map(|(i, &v)| (v == BOS).then_some(i))).chain([x.len()]).collect();
+        starts.dedup();
+
+        let out = py.detach(|| {
+            self.lookup.install(|| -> std::io::Result<Vec<u32>> {
+                // Hash every position with MIN tokens of its segment before it, as (home bucket, entry, row, levels in
+                // its reach), and sort them by home bucket: the reads go through the table in order.
+                let mut queries: Vec<(usize, u64, usize, usize)> = starts
+                    .par_windows(2)
+                    .flat_map_iter(|w| {
+                        let (start, len) = (w[0], w[1] - w[0]);
+                        let t = [vec![STOP; BACK], x[start..w[1]].to_vec()].concat();
+                        let (mut hashes, mut out) = (Hashes::new(), Vec::new());
+                        for c in (MIN..=len).step_by(STEP) {
+                            let m = STEP.min(len + 1 - c);
+                            hashes.hash(&t, BACK + c, m, false);
+                            out.extend((0..m).map(|r| {
+                                let (e, levels) = (hashes.e[r], LEVELS.iter().filter(|&&l| l <= c + r).count());
+                                ((hashes.part[r] as usize) << NBITS | b1(check(e)), e, start + c + r - 1, levels)
+                            }));
+                        }
+                        out
+                    })
+                    .collect();
+                queries.par_sort_unstable_by_key(|q| q.0);
+
+                let rows: Vec<Vec<(usize, [u32; 6])>> = queries.par_chunks(1024).map_init(
+                    || (vec![0u64; slots], vec![0u64; slots]),
+                    |(buf, buf2), qs| -> std::io::Result<_> {
+                        let mut rows = Vec::new();
+                        for &(home, e, r, levels) in qs {
+                            let mut counts = [0u32; 6];
+                            let mut scan = |bucket: &[u64]| {
+                                for &v in bucket.iter().filter(|&&v| v != 0 && check(v) == check(e)) {
+                                    let depth = agree(levels, v ^ e);
+                                    for k in 0..=depth {
+                                        counts[k] += 1;
+                                        counts[3+k] += ((v & 0xffff) as u16 == y[r]) as u32;
+                                    }
+                                }
+                            };
+                            pread(&self.file, buf, home * slots * 8)?;
+                            scan(buf);
+                            let second = (home >> NBITS << NBITS) | b2(check(e));
+                            if second != home && buf[slots-1] != 0 {
+                                pread(&self.file, buf2, second * slots * 8)?;
+                                scan(buf2);
+                            }
+                            rows.push((r,counts));
+                        }
+                        Ok(rows)
+                    }).collect::<std::io::Result<_>>()?;
+                let mut out = vec![0u32; x.len()*6];
+                for chunk in rows {
+                    for (r, counts) in chunk { out[r*6..r*6+6].copy_from_slice(&counts); }
+                }
+                Ok(out)
+            })
+        })?;
+        Ok(PyArray1::from_vec(py, out))
+    }
 }

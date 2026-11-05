@@ -157,6 +157,23 @@ class OnlineCache:
         return rows
 
 
+# Pseudo-counts of the table vote, per match length 6, 10, 20: how many occurrences the table needs before it outweighs
+# the network. Set once on training shard 900, which no index covers, and fixed, like any other hyperparameter.
+VOTE_K = (706.6, 43.39, 2.694)
+
+
+def table_vote(losses, cache, inputs, targets):
+    """The table votes on the final answer: per-token loss of (hits + k * p) / (total + k), applied to the network's
+    probability p of the target for each match length, shortest first. A context with no match leaves p unchanged. No
+    gradient and no fitting; targets only choose which count is read, as they choose which probability is scored."""
+    counts = cache.counts(inputs, targets).reshape(-1, 6)
+    counts = torch.from_numpy(counts.astype("float64")).to(losses.device)
+    p = torch.exp(-losses.double())
+    for level, k in enumerate(VOTE_K):
+        p = (counts[:, 3 + level] + k * p) / (counts[:, level] + k)
+    return -torch.log(p).float()
+
+
 class ValidationCache:
     """Validation rows from one SlotIndex over the first `shards` training shards, one table in shared memory
     for all ranks.
@@ -219,3 +236,7 @@ class ValidationCache:
             if lost:
                 raise RuntimeError(f"rank {self.rank}: a validation batch has {lost} hint entries past its capacity")
             yield torch.from_numpy(rows).to(device)
+
+    def counts(self, inputs, targets):
+        """The table's counts for a batch, for the vote. On the worker: rank 0's release holds the index exclusively."""
+        return self.worker.submit(self.index.query_counts, inputs, targets).result()
