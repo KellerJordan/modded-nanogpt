@@ -22,10 +22,13 @@ from track_1_short.perf.kernels.mlp import (
     quantize_weights_dual_ntiles,
 )
 from track_1_short.perf.kernels.ngram_embed import ngram_embedding
-from track_1_short.perf.kernels.sampled_cross_entropy import SampledSoftcappedCrossEntropy
+from track_1_short.perf.kernels.sampled_cross_entropy import (
+    SampledSoftcappedCrossEntropy,
+    StratifiedSoftcappedCrossEntropy,
+)
 from track_1_short.perf.kernels.value_embed import value_embed_lookup
 from track_1_short.perf.residual_fusion import rms_norm_with_head, scale, scale_add
-from track_1_short.sampled_softmax import SampledLoss
+from track_1_short.sampled_softmax import ChunkedSampledLoss, SampledLoss
 
 # Layer topology (11 layers). Depth cut from record #360 (ANVIL2): layer 7 is removed whole -- its
 # residual scaling and x0 injection stay, so cache[7] still exists -- and layers 4 and 9 run
@@ -136,7 +139,8 @@ class ForwardScheduleConfig:
     ws_long: int
     train_max_seq_len: int  # longest attention segment in a training batch
     # Training only: the candidate set when this step's loss is a sampled softmax; None = full softmax.
-    sampled_loss: SampledLoss | None = None
+    # A ChunkedSampledLoss on the stratified steps (stratified_softmax.py).
+    sampled_loss: SampledLoss | ChunkedSampledLoss | None = None
 
 class GPT(nn.Module):
     """Training runs every projection in fp8 (the attention QKV, the MLP, the lm_head loss); validation
@@ -783,7 +787,15 @@ class GPT(nn.Module):
         """
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
-        if self.training and sampled_loss is not None:
+        if self.training and isinstance(sampled_loss, ChunkedSampledLoss):
+            # Stratified steps: one candidate set per chunk of rows, with a log weight per column.
+            n = target_seq.size(0)
+            loss_per_token = StratifiedSoftcappedCrossEntropy.apply(
+                x.view(-1, x.size(-1)), mtp_weights, sampled_loss.target_pos[:n], sampled_loss.prefix_pos[:n],
+                prefix_weight, self.lm_head.weight, sampled_loss.col_logw,
+                self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, *sampled_loss.slabs,
+            )
+        elif self.training and sampled_loss is not None:
             # Targets and prefix targets arrive as positions in the candidate set, built on the host.
             n = target_seq.size(0)
             loss_per_token = SampledSoftcappedCrossEntropy.apply(

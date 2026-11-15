@@ -9,6 +9,10 @@ Invariants: the GEMMs read the (P, D) / (D, P) row slabs SampledSoftmax gathered
 cache for this step, and the Function saves the (D, P) slab without copying it -- legal only under the
 one-microbatch-per-step race contract in perf/sampled_softmax_overlap.py.
 
+The stratified steps (stratified_softmax.py) run StratifiedSoftcappedCrossEntropy instead: the same
+GEMMs and densify per 16384-row chunk, each chunk on its own candidate set, through a variant of the CE
+kernel that adds one log weight per column inside every exp().
+
 Provenance: record #360 (ANVIL2).
 """
 import torch
@@ -17,6 +21,7 @@ import triton.language as tl
 
 from track_1_short.perf.kernels.cross_entropy import (
     CE_KERNEL_BLOCK_SIZE,
+    CE_KERNEL_SOURCE,
     SOFTCAP_A,
     SOFTCAP_B,
     SOFTCAP_C,
@@ -25,12 +30,19 @@ from track_1_short.perf.kernels.cross_entropy import (
     compile_ce_kernel,
 )
 from track_1_short.sampled_softmax import ALL_CANDIDATE_COUNTS
+from track_1_short.stratified_softmax import ENABLED as STRATIFIED_ENABLED
+from track_1_short.stratified_softmax import WIDTH as STRATIFIED_WIDTH
+from track_1_short.stratified_softmax import weighted_kernel_source
 
 # The kernel's 8-wide shared-memory and grad stores need P % (BLOCK_SIZE * 8) == 0.
 for _p in ALL_CANDIDATE_COUNTS:
     assert _p % (CE_KERNEL_BLOCK_SIZE * 8) == 0, f"candidate count {_p} is not a legal CE width"
 # P -> the CE kernel compiled at VOCAB_SIZE = P. Built once at import (nvrtc, off the clock), never mutated.
 SAMPLED_CE_KERNELS = {p: compile_ce_kernel(p) for p in ALL_CANDIDATE_COUNTS}
+assert STRATIFIED_WIDTH % (CE_KERNEL_BLOCK_SIZE * 8) == 0
+# The column-weighted CE kernel of the stratified steps, at their one width (nvrtc, off the clock).
+STRATIFIED_CE_KERNEL = (compile_ce_kernel(STRATIFIED_WIDTH, weighted_kernel_source(CE_KERNEL_SOURCE))
+                        if STRATIFIED_ENABLED else None)
 
 
 @torch.library.custom_op("nanogpt::sampled_ce_fwd_bwd", mutates_args={"losses", "grad_input"})
@@ -118,3 +130,84 @@ class SampledSoftcappedCrossEntropy(torch.autograd.Function):
         sampled_densify(grad_w_c.contiguous(), vocab_pos, grad_w)
         # One slot per forward input; grad_w lands on lm_head_weight.
         return grad_x, None, None, None, None, grad_w, None, None, None, None, None, None
+
+
+@torch.library.custom_op("nanogpt::stratified_ce_fwd_bwd", mutates_args={"losses", "grad_input"})
+def stratified_ce_fwd_bwd(
+    logits: torch.Tensor,
+    target_pos: torch.Tensor,
+    mtp_weights: torch.Tensor,
+    prefix_pos: torch.Tensor,
+    prefix_weight: torch.Tensor,
+    col_logw: torch.Tensor,
+    losses: torch.Tensor,
+    grad_input: torch.Tensor,
+    n_rows: int,
+    n_predict: int,
+    A: float,
+    B: float,
+    C: float,
+    grad_s: float,
+) -> None:
+    """sampled_ce_fwd_bwd with the column-weighted kernel: column c counts as exp(col_logw[c]) classes."""
+    STRATIFIED_CE_KERNEL(
+        (n_rows, 1, 1),
+        (CE_KERNEL_BLOCK_SIZE, 1, 1),
+        (logits, target_pos, mtp_weights, prefix_pos, prefix_weight, col_logw, losses, grad_input,
+         n_rows, n_predict, A, B, C, grad_s),
+        shared_mem=STRATIFIED_WIDTH * 2,
+    )
+
+
+class StratifiedSoftcappedCrossEntropy(torch.autograd.Function):
+    """SampledSoftcappedCrossEntropy on chunks of the microbatch, one candidate set per chunk.
+
+    `slabs` holds, per chunk, the set's (P, D) rows, (D, P) rows_t and (V,) vocab_pos. target_pos /
+    prefix_pos are positions in the row's own chunk's set; col_logw is the (chunks * P,) log weight of
+    every column, chunk after chunk (0 for exact ids, log(rest / tail) for the random tail ids).
+    The hidden state is quantized once; each chunk runs its own logit GEMM, CE kernel and gradient
+    GEMMs. The lm_head gradient is the sum of the chunks' densified gradients.
+    """
+    @staticmethod
+    def forward(ctx, x, mtp_weights, target_pos, prefix_pos, prefix_weight, lm_head_weight, col_logw,
+                x_s, w_s, grad_s, *slabs):
+        chunks = len(slabs) // 3
+        chunk_rows = x.shape[0] // chunks
+        P = slabs[0].shape[0]
+        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+        mtp_weights = mtp_weights.contiguous()
+        prefix_weight = prefix_weight.reshape(1).to(torch.float32).contiguous()
+        losses, grad_inputs = [], []
+        for k in range(chunks):
+            rows = slice(k * chunk_rows, (k + 1) * chunk_rows)
+            logits = _ce_logit_gemm(x_f8[rows], slabs[3 * k].T, x_s, w_s)  # rows.T is column-major
+            chunk_losses = torch.empty(chunk_rows, dtype=torch.float32, device=logits.device)
+            grad_input = torch.empty((chunk_rows, P), dtype=torch.float8_e5m2, device=logits.device)
+            stratified_ce_fwd_bwd(logits.contiguous(), target_pos[rows], mtp_weights, prefix_pos[rows],
+                                  prefix_weight, col_logw[k * P:(k + 1) * P], chunk_losses, grad_input,
+                                  chunk_rows, mtp_weights.shape[0], SOFTCAP_A, SOFTCAP_B, SOFTCAP_C, grad_s)
+            losses.append(chunk_losses)
+            grad_inputs.append(grad_input)
+        ctx.save_for_backward(x_f8, *grad_inputs, *slabs[1::3], *slabs[2::3])
+        ctx.scales = (x_s, w_s, grad_s)
+        ctx.chunks = chunks
+        return torch.cat(losses)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        chunks = ctx.chunks
+        x_f8, *saved = ctx.saved_tensors
+        grad_inputs, rows_t, vocab_pos = saved[:chunks], saved[chunks:2 * chunks], saved[2 * chunks:]
+        chunk_rows = x_f8.shape[0] // chunks
+        grad_x, grad_w = [], None
+        for k in range(chunks):
+            chunk_grad_x, grad_w_c = _ce_backward_gemms(
+                grad_inputs[k], rows_t[k], x_f8[k * chunk_rows:(k + 1) * chunk_rows], *ctx.scales)
+            grad_x.append(chunk_grad_x)
+            # As SampledSoftcappedCrossEntropy: freshly allocated and never zeroed, densify writes every element.
+            dense = torch.empty((x_f8.shape[1], vocab_pos[k].numel()), dtype=grad_w_c.dtype, device=grad_w_c.device)
+            sampled_densify(grad_w_c.contiguous(), vocab_pos[k], dense)
+            grad_w = dense if grad_w is None else grad_w + dense
+        # One slot per forward input; grad_w lands on lm_head_weight.
+        return (torch.cat(grad_x), None, None, None, None, grad_w, None, None, None, None,
+                *([None] * (3 * chunks)))

@@ -24,6 +24,10 @@ softmax. For the default 1122 + 52 + 20 steps: P = 10240 on steps 0-680, 14336 o
 
 Requires exactly one microbatch per step: see the race contract in perf/sampled_softmax_overlap.py.
 
+Stratified sets (stratified_softmax.py): the steps the schedule above gives P = 24576 run at 8192
+instead, on three 16384-row chunks of the microbatch, each with its own set of exact ids plus a
+weighted random tail. Those steps hand the loss a ChunkedSampledLoss instead of a SampledLoss.
+
 Provenance: record #360 (ANVIL2).
 """
 import math
@@ -36,6 +40,7 @@ from torch import Tensor
 from track_1_short.perf.kernels.transpose import transpose_copy
 from track_1_short.perf.sampled_softmax_overlap import CandidateStaging, StagedCandidates
 from track_1_short.schedule import TrainingSchedule
+from track_1_short.stratified_softmax import CHUNK_ROWS, WIDTH, StratifiedBuilder, stratified_counts
 
 # Candidate counts per stage index (TRAINING_STAGES order). A stage with several counts splits its steps
 # into equal parts, one count each. Stages not listed run the full softmax. Every count must be a
@@ -74,6 +79,38 @@ class SampledLoss:
     target_pos: Tensor  # (T_max,) int64: position in C of each token's target (first T rows are live)
     prefix_pos: Tensor  # (T_max,) int64: position in C of each token's prefix target, -1 if absent
     vocab_pos: Tensor   # (V,) int32: position in C of each class, -1 if not a candidate
+
+    @property
+    def width(self) -> int:
+        return self.rows.shape[0]
+
+    def named_tensors(self):
+        """(name, tensor) of every buffer the loss reads (the step graphs bake their addresses)."""
+        return [(name, getattr(self, name)) for name in ("rows", "rows_t", "target_pos", "prefix_pos", "vocab_pos")]
+
+
+@dataclass(slots=True)
+class ChunkedSampledLoss:
+    """What the stratified loss reads (stratified_softmax.py): one candidate set per chunk of
+    `chunk_rows` rows. One object, reused every stratified step."""
+    slabs: tuple[Tensor, ...]  # per chunk: rows (P, D) e4m3, rows_t (D, P) e4m3, vocab_pos (V,) int32
+    target_pos: Tensor         # (T_max,) int64: position of each token's target in its chunk's set
+    prefix_pos: Tensor         # (T_max,) int64: same for the prefix target, -1 if absent or not exact
+    col_logw: Tensor           # (chunks * P,) fp32: log weight of each column, chunk after chunk
+    chunk_rows: int
+
+    @property
+    def width(self) -> int:
+        return self.slabs[0].shape[0]
+
+    @property
+    def chunks(self) -> int:
+        return len(self.slabs) // 3
+
+    def named_tensors(self):
+        slab_names = [f"{name}[{k}]" for k in range(self.chunks) for name in ("rows", "rows_t", "vocab_pos")]
+        return [*zip(slab_names, self.slabs), ("target_pos", self.target_pos), ("prefix_pos", self.prefix_pos),
+                ("col_logw", self.col_logw)]
 
 
 class CandidateBuilder:
@@ -152,38 +189,68 @@ class SampledSoftmax:
         # (distributed.py requires the 8-GPU world that guarantees it).
         self.schedule = schedule
         self.rank, self.world_size = rank, world_size
-        self.counts = [candidate_count_at(schedule, s) for s in range(schedule.total_steps + 1)]
+        record_counts = [candidate_count_at(schedule, s) for s in range(schedule.total_steps + 1)]
+        self.counts = stratified_counts(record_counts)
+        # Steps whose sets are stratified (stratified_softmax.py): one set per CHUNK_ROWS rows.
+        self.stratified_steps = frozenset(s for s in range(schedule.total_steps) if self.counts[s] != record_counts[s])
+        step_rows = {schedule.lookup(s)[0].batch_size // world_size for s in self.stratified_steps}
+        assert len(step_rows) <= 1 and all(rows % CHUNK_ROWS == 0 for rows in step_rows), \
+            f"stratified steps need one microbatch size, a multiple of {CHUNK_ROWS} rows: {step_rows}"
+        self.chunks = step_rows.pop() // CHUNK_ROWS if step_rows else 0
         p_values = sorted(set(self.counts) - {0})
         assert p_values
         max_p = max(p_values)
+        max_candidates = max(max_p, self.chunks * WIDTH)  # a stratified step uploads its chunks' sets back to back
         self.builder = CandidateBuilder(vocab_size, max_p, max_rows)
-        self.staging = CandidateStaging(max_candidates=max_p, max_rows=max_rows, device=device)
+        self.stratified = StratifiedBuilder(vocab_size, max_rows, rank) if self.stratified_steps else None
+        self.staging = CandidateStaging(max_candidates=max_candidates, max_rows=max_rows, device=device)
         self.prefix_table = None  # host copy of model.prefix_table, set once it is built
 
         # Device buffers, one identity for the process's life (the compiled graph reads them).
         # prefix_pos starts at -1, the kernel's no-op, for steps that upload no prefix positions.
-        self.candidates = torch.zeros(max_p, dtype=torch.int64, device=device)
+        self.candidates = torch.zeros(max_candidates, dtype=torch.int64, device=device)
         target_pos = torch.zeros(max_rows, dtype=torch.int64, device=device)
         prefix_pos = torch.full((max_rows,), -1, dtype=torch.int64, device=device)
         vocab_pos = torch.empty(vocab_size, dtype=torch.int32, device=device)
         self.arange = torch.arange(max_p, dtype=torch.int32, device=device)
         # A (D, P) slice of a wider slab is not a valid _scaled_mm operand, so each P has its own pair.
         e4m3 = torch.float8_e4m3fn
-        self.loss_inputs = {
+        self.loss_inputs: dict[int, SampledLoss | ChunkedSampledLoss] = {
             p: SampledLoss(rows=torch.zeros(p, model_dim, dtype=e4m3, device=device),
                            rows_t=torch.zeros(model_dim, p, dtype=e4m3, device=device),
                            target_pos=target_pos, prefix_pos=prefix_pos, vocab_pos=vocab_pos)
-            for p in p_values
+            for p in p_values if not (self.stratified_steps and p == WIDTH)
         }
+        if self.stratified_steps:
+            slabs = [slab for _ in range(self.chunks)
+                     for slab in (torch.zeros(WIDTH, model_dim, dtype=e4m3, device=device),
+                                  torch.zeros(model_dim, WIDTH, dtype=e4m3, device=device),
+                                  torch.empty(vocab_size, dtype=torch.int32, device=device))]
+            self.loss_inputs[WIDTH] = ChunkedSampledLoss(
+                slabs=tuple(slabs), target_pos=target_pos, prefix_pos=prefix_pos,
+                col_logw=torch.zeros(self.chunks * WIDTH, dtype=torch.float32, device=device), chunk_rows=CHUNK_ROWS)
         self.reset()
 
     def reset(self):
         self.builder.reset(self.rank, self.world_size)
+        if self.stratified is not None:
+            self.stratified.reset()
         self.staging.reset()
         self.uploaded: tuple[int, StagedCandidates] | None = None  # (step, slot) between upload and gather
 
     def set_prefix_table(self, prefix_table: np.ndarray):
         self.prefix_table = prefix_table
+
+    def describe(self) -> str:
+        """The stratified steps, one log line."""
+        if not self.stratified_steps:
+            return "stratified softmax: off (every sampled step runs the record's sets)"
+        return (f"stratified softmax: steps {min(self.stratified_steps)}-{max(self.stratified_steps)} run "
+                f"{self.chunks} chunks of {CHUNK_ROWS} rows at P={WIDTH} (exact ids + weighted tail)")
+
+    def stratified_summary(self) -> str:
+        """End-of-run counter of this rank's builder (host only; call off the clock)."""
+        return f"stratified chunks with a grown exact part: {self.stratified.grown_chunks if self.stratified else 0}"
 
     def count_change_steps(self) -> list[int]:
         """Steps whose P differs from the previous step's: each P is its own compiled graph."""
@@ -196,10 +263,15 @@ class SampledSoftmax:
         assert not missing, f"warmup never compiles (P, stage) {sorted(missing)}"
 
     def _stage(self, step: int, targets: np.ndarray) -> StagedCandidates:
-        """Build step `step`'s candidate set on the host and copy it into a pinned slot."""
-        P = self.counts[step]
-        candidates, target_pos, prefix_pos = self.builder.build(P, targets, self.prefix_table)
-        return self.staging.fill_slot(candidates, target_pos, prefix_pos)
+        """Build step `step`'s candidate set(s) on the host and copy them into a pinned slot."""
+        if step in self.stratified_steps:
+            staged = self.staging.fill_slot(*self.stratified.build(targets, self.prefix_table))
+        else:
+            candidates, target_pos, prefix_pos = self.builder.build(self.counts[step], targets, self.prefix_table)
+            staged = self.staging.fill_slot(candidates, target_pos, prefix_pos)
+        if self.stratified is not None:
+            self.stratified.observe(targets)  # after the build: a step's ranking is the targets before it
+        return staged
 
     def prefetch(self, step: int, targets_cpu: Tensor):
         """Start step `step`'s host build on the prep thread (joined by upload(step))."""
@@ -217,11 +289,12 @@ class SampledSoftmax:
         if staged is None:
             staged = self._stage(step, targets_cpu.numpy())
         inputs = self.loss_inputs[P]
-        self.staging.upload(staged, self.candidates, inputs.target_pos, inputs.prefix_pos)
+        self.staging.upload(staged, self.candidates, inputs.target_pos, inputs.prefix_pos,
+                            inputs.col_logw if isinstance(inputs, ChunkedSampledLoss) else None)
         self.uploaded = (step, staged)
 
-    def gather(self, step: int, lm_head_f8_col: Tensor) -> SampledLoss | None:
-        """Step `step`'s candidate set with its lm_head rows gathered; None on full-softmax steps.
+    def gather(self, step: int, lm_head_f8_col: Tensor) -> SampledLoss | ChunkedSampledLoss | None:
+        """Step `step`'s candidate set(s) with their lm_head rows gathered; None on full-softmax steps.
 
         Must run after the last lm_head fp8 refresh, so the gathered rows are the current weights.
         """
@@ -233,18 +306,22 @@ class SampledSoftmax:
         assert uploaded_step == step, f"uploaded step {uploaded_step}, gathering step {step}"
         inputs = self.loss_inputs[P]
         self.staging.wait_uploaded(staged)
-        self._gather_rows(lm_head_f8_col, P, inputs)
+        if isinstance(inputs, ChunkedSampledLoss):
+            for k in range(inputs.chunks):
+                rows, rows_t, vocab_pos = inputs.slabs[3 * k:3 * k + 3]
+                self._gather_rows(lm_head_f8_col, self.candidates[k * P:(k + 1) * P], rows, rows_t, vocab_pos)
+        else:
+            self._gather_rows(lm_head_f8_col, self.candidates[:P], inputs.rows, inputs.rows_t, inputs.vocab_pos)
         return inputs
 
     def mark_readers_done(self):
         self.staging.mark_readers_done()
 
-    def _gather_rows(self, lm_head_f8_col: Tensor, P: int, inputs: SampledLoss):
-        """Copy the candidates' rows out of the fp8 lm_head cache and rebuild C's inverse map."""
-        cand = self.candidates[:P]
+    def _gather_rows(self, lm_head_f8_col: Tensor, cand: Tensor, rows: Tensor, rows_t: Tensor, vocab_pos: Tensor):
+        """Copy one candidate set's rows out of the fp8 lm_head cache and rebuild its inverse map."""
         # The cache is (D, V) with strides (1, D), so its transpose is a contiguous (V, D) row table;
         # the uint8 views move identical bytes.
-        torch.index_select(lm_head_f8_col.T.view(torch.uint8), 0, cand, out=inputs.rows.view(torch.uint8))
-        transpose_copy(inputs.rows.view(torch.uint8), inputs.rows_t.view(torch.uint8))
-        inputs.vocab_pos.fill_(-1)
-        inputs.vocab_pos.index_copy_(0, cand, self.arange[:P])
+        torch.index_select(lm_head_f8_col.T.view(torch.uint8), 0, cand, out=rows.view(torch.uint8))
+        transpose_copy(rows.view(torch.uint8), rows_t.view(torch.uint8))
+        vocab_pos.fill_(-1)
+        vocab_pos.index_copy_(0, cand, self.arange[:cand.numel()])

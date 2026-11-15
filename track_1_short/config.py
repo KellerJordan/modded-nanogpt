@@ -3,7 +3,8 @@
 The run's own environment variables (DATA_PATH, NUM_SCHEDULED_ITERATIONS, TRAIN_SEED) are read here.
 The others: torchrun's RANK / LOCAL_RANK / WORLD_SIZE (distributed.py; train_gpt.py also reads
 LOCAL_RANK), PYTORCH_ALLOC_CONF (set by train_gpt.py), and CUDA_HOME (perf/kernels/cross_entropy.py,
-for the CE kernel's CUDA headers).
+for the CE kernel's CUDA headers), and STRATIFIED_SOFTMAX (stratified_softmax.py; 0 = the record's
+own candidate sets on every step, for same-node baselines).
 
 Provenance: the five-stage table (batch taper, batch-8 extension, seq 3072 under a 2560 attention
 cap, 52 growth steps) is record #360's.
