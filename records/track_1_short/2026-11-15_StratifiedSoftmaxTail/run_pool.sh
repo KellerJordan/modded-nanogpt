@@ -18,6 +18,7 @@ here=$root/records/track_1_short/2026-11-15_StratifiedSoftmaxTail
 record=$root/../modded-nanogpt-record
 [[ -f train_gpt.py && -d track_1_short ]] || { echo "run from the repository root" >&2; exit 1; }
 [[ -z "$(git status --porcelain --untracked-files=no)" ]] || { echo "commit or drop local changes first" >&2; exit 1; }
+git worktree prune  # a checkout made in an earlier container is gone; forget it
 [[ -d $record ]] || git worktree add --detach "$record" "$record_commit"
 [[ "$(git -C "$record" rev-parse HEAD)" == "$record_commit" ]] || { echo "$record is not the record commit" >&2; exit 1; }
 export DATA_PATH=${DATA_PATH:-$root}
