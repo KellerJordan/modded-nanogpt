@@ -136,4 +136,4 @@ Suggested: the smoke run, then 10 + 5. If both rules pass, top up to 18 + 9 with
 | 3. No extra compile flags | Yes. None added. |
 | 4. Faster than the prior record on the same hardware | Yes: 39.702 s against 40.235 s for the record on the same node (and 39.914 s published). |
 | Readability | One new 150-line module, about 200 net lines added to 8 existing files, plus tests. |
-| Loss buffer (must beat a simple step decrease) | On the port, 4-5x less loss than cutting steps for the same time. The record's write-up prices a millinat at 120-250 ms; a 0.8 s saving for one millinat would clear that, if the 8xH100 numbers hold. |
+| Loss buffer (must beat a simple step decrease) | 0.533 s for +0.62 millinats (standard error about 0.5; +0.95 on the first 10 + 5 runs, +1.0 on the one-GPU port). At one millinat that is about 530 ms per millinat; the record's write-up prices a millinat at 120-250 ms. On the port, cutting steps cost 4-5x more loss for the same time. |
