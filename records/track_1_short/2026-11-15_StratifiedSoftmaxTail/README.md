@@ -36,6 +36,7 @@ most about 5,300.
 | `track_1_short/perf/kernels/cross_entropy.py` | `compile_ce_kernel` takes the kernel source. |
 | `track_1_short/model/gpt.py`, `perf/cuda_graphs/step_graphs.py`, `train_gpt.py`, `config.py` | Wiring: the loss branch, the graph key and address census, two log lines, the switch's docstring. |
 | `tests/test_stratified_softmax.py` | CPU tests (no GPU, no triton). |
+| This folder: `node.sh`, `gpu_check.py`, `run_pool.sh`, `statistics.py` | The node procedure, the GPU kernel self-check, the interleaved pool, the pool statistics. |
 
 `STRATIFIED_SOFTMAX=0` turns the change off (the record's sets on every step). The pool script does not
 use it: its baseline legs run the record's own commit from a second checkout.
@@ -69,35 +70,32 @@ counts its own targets (an eighth of the data). The sets are built on the host h
 
 ## Running it on an 8xH100 node
 
-Environment: exactly the record's (the repository README and `records/track_1_short/2026-08-30_ANVIL2`):
-the root `Dockerfile` (torch 2.10.0+cu128 on a CUDA 13 runtime), NVIDIA driver >= 580, 8x H100-80GB on
-one node. From the repository root, inside that environment:
+The node needs an NVIDIA driver >= 580 and Docker with the NVIDIA container toolkit; the root
+`Dockerfile` builds the rest (the record's stack: torch 2.10.0+cu128 on a CUDA 13 runtime).
+`node.sh` does everything inside the container: it checks the stack and the driver, downloads the data,
+pre-seeds the attention kernel and goes offline (anonymous `get_kernel` can return 401, see the
+record's README), then runs the mode asked for. Run inside tmux, from the directory holding the clone.
+
+1. Build, then the smoke mode: `gpu_check.py` (the weighted CE kernel against the record's kernel and
+   an fp64 reference, about a minute on one GPU) and one candidate run (about 7 minutes of compiling,
+   then about 40 seconds of training):
 
 ```bash
-python data/cached_fineweb10B.py 9
+git clone -b experiment/vocab-prune-h100 https://github.com/x4ahmed/modded-nanogpt.git && cd modded-nanogpt && sudo docker build -t modded-nanogpt . && sudo docker run --rm --name run --gpus all --ipc=host --ulimit memlock=-1:-1 -v $(pwd)/..:/work -w /work/modded-nanogpt modded-nanogpt bash records/track_1_short/2026-11-15_StratifiedSoftmaxTail/node.sh smoke 2>&1 | tee smoke.log
 ```
 
-1. One candidate run first. It compiles for about 7 minutes, then trains for about 40 seconds:
+`--ipc=host` is required: the run shares a 316 MB buffer with a child process, more than Docker's
+default 64 MB `/dev/shm`. The parent directory is mounted so the pool's second checkout and the kernel
+cache outlive the container. Healthy output, in order: `stack ok`, `driver ... ok`, `GPU CHECK PASSED`,
+`stratified softmax: steps 965-1106 run 3 chunks of 16384 rows at P=8192`, `CUDA graphs sealed`, and a
+final `step:1194/1194 val_loss:... train_time:...`. Anything else: stop and fix before buying more time.
+`sudo docker kill run` stops a run.
+
+2. The pool, interleaved with the record's own commit on the same node, then the statistics (every log
+   in `candidate/` and `baseline/` counts; the smoke run is a functional check and is not in the pool):
 
 ```bash
-bash run.sh 2>&1 | tee smoke.log
-```
-
-Check three things in `smoke.log`: the line `stratified softmax: steps 965-1106 run 3 chunks of 16384
-rows at P=8192`; the line `CUDA graphs sealed`; and a final `step:1194/1194 val_loss:... train_time:...`.
-Any assertion or traceback before that is a bug in this change: stop and fix it before buying more time.
-
-2. The pool, interleaved with the record on the same node (candidate runs, then baseline runs):
-
-```bash
-bash records/track_1_short/2026-11-15_StratifiedSoftmaxTail/run_pool.sh 10 5 2>&1 | tee pool.log
-```
-
-3. The numbers (every log in `candidate/` and `baseline/` counts):
-
-```bash
-pip install scipy
-python records/track_1_short/2026-11-15_StratifiedSoftmaxTail/statistics.py
+sudo docker run --rm --name run --gpus all --ipc=host --ulimit memlock=-1:-1 -v $(pwd)/..:/work -w /work/modded-nanogpt modded-nanogpt bash records/track_1_short/2026-11-15_StratifiedSoftmaxTail/node.sh pool 10 5 2>&1 | tee pool.log
 ```
 
 ## How many runs

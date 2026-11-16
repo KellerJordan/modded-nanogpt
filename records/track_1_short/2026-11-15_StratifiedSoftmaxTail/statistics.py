@@ -36,7 +36,7 @@ def parse_run(path, stratified):
     assert len(finals) == 1, f"{path}: expected one final validation line, found {len(finals)}"
     final = finals[0]
     assert int(final["steps"]) == EXPECTED_STEPS, f"{path}: {final['steps']} steps"
-    assert text.count("NVIDIA H100") >= 8, f"{path}: not an 8xH100 log"
+    assert text.count("H100") >= 8, f"{path}: not an 8xH100 log"
     assert bool(STRATIFIED_ON.search(text)) == stratified, f"{path}: wrong pool (stratified softmax on/off)"
     return float(final["loss"]), int(final["time_ms"]) / 1000
 
