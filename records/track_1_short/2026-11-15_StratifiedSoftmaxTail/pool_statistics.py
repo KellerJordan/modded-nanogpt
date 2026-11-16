@@ -1,7 +1,7 @@
 """Statistics of a run pool: this PR's logs in candidate/, the record's same-node logs in baseline/.
 
     pip install scipy
-    python records/track_1_short/2026-11-15_StratifiedSoftmaxTail/statistics.py
+    python records/track_1_short/2026-11-15_StratifiedSoftmaxTail/pool_statistics.py
 
 Every log in the two folders counts; none is dropped. Prints, per pool, the mean and sample std of the
 final validation loss and of the training time; for the candidate the one-sided p-value that its mean

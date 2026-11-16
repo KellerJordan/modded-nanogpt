@@ -44,7 +44,7 @@ case $mode in
     pool)
         bash "$here/run_pool.sh" "${2:?candidate runs}" "${3:?baseline runs}"
         pip install -q scipy
-        python "$here/statistics.py"
+        python "$here/pool_statistics.py"
         ;;
     *)
         echo "unknown mode $mode" >&2; exit 1 ;;

@@ -36,7 +36,7 @@ most about 5,300.
 | `track_1_short/perf/kernels/cross_entropy.py` | `compile_ce_kernel` takes the kernel source. |
 | `track_1_short/model/gpt.py`, `perf/cuda_graphs/step_graphs.py`, `train_gpt.py`, `config.py` | Wiring: the loss branch, the graph key and address census, two log lines, the switch's docstring. |
 | `tests/test_stratified_softmax.py` | CPU tests (no GPU, no triton). |
-| This folder: `node.sh`, `gpu_check.py`, `run_pool.sh`, `statistics.py` | The node procedure, the GPU kernel self-check, the interleaved pool, the pool statistics. |
+| This folder: `node.sh`, `gpu_check.py`, `run_pool.sh`, `pool_statistics.py` | The node procedure, the GPU kernel self-check, the interleaved pool, the pool statistics. |
 
 `STRATIFIED_SOFTMAX=0` turns the change off (the record's sets on every step). The pool script does not
 use it: its baseline legs run the record's own commit from a second checkout.

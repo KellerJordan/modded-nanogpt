@@ -10,7 +10,7 @@ Exits non-zero on a mismatch: do not start a run then.
 import os
 import sys
 
-sys.path.insert(0, os.getcwd())
+sys.path[0] = os.getcwd()  # the repository root, not this folder (its files must not shadow the stdlib)
 import torch
 
 from track_1_short.perf.kernels import sampled_cross_entropy as sce
