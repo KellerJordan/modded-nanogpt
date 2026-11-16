@@ -109,7 +109,11 @@ record's own commit from a second checkout.
 **Compile caches were not wiped between legs.** The pool ran in three containers (1 + 1, 9 + 4 and
 8 + 4 legs). The first leg of each kind in a container compiled from scratch; later legs reused the
 on-disk compile cache. Record #92's pool wiped the caches for every leg. The timed section starts
-after compilation, warmup and graph capture in both cases.
+after compilation, warmup and graph capture in both cases, but the first leg in a container is
+measurably slower for this tree: its three cold legs took 39.809, 39.776 and 39.764 s (mean 39.783 s),
+the 15 later ones 39.686 s on average. The baseline shows no such gap (first legs 40.231 s, later
+legs 40.237 s), but its first legs came after a leg of this tree and were not fully cold. Counting
+only this tree's cold legs against the whole baseline pool, the win is 0.45 s instead of 0.53 s.
 
 **One run is not in the pool.** The first execution of this tree on the node was declared a
 functional check before it ran (3.2757, 39.748 s). Every run after it is counted.
