@@ -298,12 +298,13 @@ __global__ void ce_fwd_bwd_kernel(
 # nvrtc needs the CUDA headers; CUDA_HOME is what torch's own extension builder consults.
 CUDA_INCLUDE_DIRS = [os.path.join(os.environ.get("CUDA_HOME") or "/usr/local/cuda", "include")]
 
-def compile_ce_kernel(vocab_size: int):
+def compile_ce_kernel(vocab_size: int, source: str = CE_KERNEL_SOURCE):
     """ce_fwd_bwd_kernel for rows of `vocab_size` logits: VOCAB_SIZE is a compile-time constant of the
-    source, and the fp16 sigmoid row lives in vocab_size * 2 bytes of shared memory."""
+    source, and the fp16 sigmoid row lives in vocab_size * 2 bytes of shared memory. `source` is the
+    kernel text (the stratified loss compiles a column-weighted variant of it)."""
     decls = f"\nconstexpr int VOCAB_SIZE = {vocab_size};\nconstexpr int BLOCK_SIZE = {CE_KERNEL_BLOCK_SIZE};\n"
     kernel = torch.cuda._compile_kernel(
-        decls + CE_KERNEL_SOURCE,
+        decls + source,
         "ce_fwd_bwd_kernel",
         compute_capability="90",
         cuda_include_dirs=CUDA_INCLUDE_DIRS,

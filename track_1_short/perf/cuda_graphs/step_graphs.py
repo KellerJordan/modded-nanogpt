@@ -97,7 +97,7 @@ def live_key(batch: Batch, cfg: ForwardScheduleConfig) -> StepGraphKey:
         tokens=batch.inputs.numel(),
         cu_seqlens_rows=batch.cum_seqlens.numel(),
         mtp_targets=cfg.mtp_weights.numel(),
-        candidates=0 if cfg.sampled_loss is None else cfg.sampled_loss.rows.shape[0],
+        candidates=0 if cfg.sampled_loss is None else cfg.sampled_loss.width,
         ws_short=cfg.ws_short,
         ws_long=cfg.ws_long,
         max_seq_len=cfg.train_max_seq_len,
@@ -266,5 +266,5 @@ class StepGraphs:
             for field in dataclasses.fields(cs.static):
                 yield f"{tag}.{field.name}", getattr(cs.static, field.name)
             if cs.cfg.sampled_loss is not None:
-                for field in dataclasses.fields(cs.cfg.sampled_loss):
-                    yield f"{tag}.sampled_loss.{field.name}", getattr(cs.cfg.sampled_loss, field.name)
+                for name, tensor in cs.cfg.sampled_loss.named_tensors():
+                    yield f"{tag}.sampled_loss.{name}", tensor

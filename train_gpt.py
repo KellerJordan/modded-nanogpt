@@ -187,6 +187,7 @@ def main():
         rank=env.rank, world_size=env.world_size, device=env.device,
     )
     print0(f"sampled softmax: P by step change {[(s, sampled_softmax.counts[s]) for s in [0, *sampled_softmax.count_change_steps()]]}")
+    print0(sampled_softmax.describe(), console=True)
 
     uncompiled_model = model  # the CUDA-graph owners read and set attributes on the module itself
     model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
@@ -410,6 +411,7 @@ def main():
         hellaswag.evaluate(model=model, schedule_cfg=training_manager.get_forward_args(),
                            seq_len=val_tokens_per_rank, get_bigram_hash=ngram_cache_slots, print0=print0)
 
+    print0(sampled_softmax.stratified_summary())
     print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
            f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
     dist.destroy_process_group()

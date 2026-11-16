@@ -36,22 +36,25 @@ class PinnedSlot:
     candidates: Tensor
     target_pos: Tensor
     prefix_pos: Tensor
+    col_logw: Tensor            # fp32 column log weights (stratified sets only, see stratified_softmax.py)
     uploaded: torch.cuda.Event  # recorded on the copy stream after this slot's H2Ds
 
 
 @dataclass(slots=True)
 class StagedCandidates:
-    """A pinned slot plus how many entries of each vector are live (prefix count 0: skip that upload)."""
+    """A pinned slot plus how many entries of each vector are live (prefix or weight count 0: skip that upload)."""
     slot: PinnedSlot
     num_candidates: int
     num_rows: int
     num_prefix_rows: int
+    num_weights: int = 0
 
 
 class CandidateStaging:
     def __init__(self, max_candidates: int, max_rows: int, device: torch.device):
         pinned = lambda n: torch.empty(n, dtype=torch.int64, pin_memory=True)
-        self.slots = [PinnedSlot(pinned(max_candidates), pinned(max_rows), pinned(max_rows), torch.cuda.Event())
+        self.slots = [PinnedSlot(pinned(max_candidates), pinned(max_rows), pinned(max_rows),
+                                 torch.empty(max_candidates, dtype=torch.float32, pin_memory=True), torch.cuda.Event())
                       for _ in range(PINNED_SLOTS)]
         self.next_slot = 0
         # One worker; the no-op submit starts its thread here, off the clock.
@@ -65,7 +68,8 @@ class CandidateStaging:
     def reset(self):
         assert self.pending is None
 
-    def fill_slot(self, candidates: np.ndarray, target_pos: np.ndarray, prefix_pos: np.ndarray | None) -> StagedCandidates:
+    def fill_slot(self, candidates: np.ndarray, target_pos: np.ndarray, prefix_pos: np.ndarray | None,
+                  col_logw: np.ndarray | None = None) -> StagedCandidates:
         """Copy host arrays into the next pinned slot (may run on the prep thread)."""
         slot = self.slots[self.next_slot]
         self.next_slot = (self.next_slot + 1) % PINNED_SLOTS
@@ -76,7 +80,11 @@ class CandidateStaging:
         if prefix_pos is not None:
             num_prefix_rows = prefix_pos.shape[0]
             slot.prefix_pos[:num_prefix_rows].copy_(torch.from_numpy(prefix_pos))
-        return StagedCandidates(slot, candidates.shape[0], target_pos.shape[0], num_prefix_rows)
+        num_weights = 0
+        if col_logw is not None:
+            num_weights = col_logw.shape[0]
+            slot.col_logw[:num_weights].copy_(torch.from_numpy(col_logw))
+        return StagedCandidates(slot, candidates.shape[0], target_pos.shape[0], num_prefix_rows, num_weights)
 
     def submit(self, step: int, build, *args):
         """Run `build(*args)` on the prep thread; take(step) joins it."""
@@ -92,7 +100,8 @@ class CandidateStaging:
         assert pending_step == step, f"prefetched step {pending_step}, loading step {step}"
         return future.result()
 
-    def upload(self, staged: StagedCandidates, candidates: Tensor, target_pos: Tensor, prefix_pos: Tensor):
+    def upload(self, staged: StagedCandidates, candidates: Tensor, target_pos: Tensor, prefix_pos: Tensor,
+               col_logw: Tensor | None = None):
         """Async H2Ds on the copy stream, behind the previous step's last reader."""
         slot = staged.slot
         self.copy_stream.wait_event(self.readers_done)
@@ -101,6 +110,8 @@ class CandidateStaging:
             target_pos[:staged.num_rows].copy_(slot.target_pos[:staged.num_rows], non_blocking=True)
             if staged.num_prefix_rows:
                 prefix_pos[:staged.num_prefix_rows].copy_(slot.prefix_pos[:staged.num_prefix_rows], non_blocking=True)
+            if staged.num_weights:
+                col_logw[:staged.num_weights].copy_(slot.col_logw[:staged.num_weights], non_blocking=True)
         slot.uploaded.record(self.copy_stream)
 
     def wait_uploaded(self, staged: StagedCandidates):
