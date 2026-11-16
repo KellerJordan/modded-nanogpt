@@ -30,7 +30,7 @@ all runs count. Based on record #92 (ANVIL2, PR #360, commit `4ea6b93`). One cha
   40.235 s (n = 9). This PR is below both.
 - Peak memory is unchanged: 48,411 MiB allocated in both pools.
 - `python records/track_1_short/2026-11-15_StratifiedSoftmaxTail/pool_statistics.py` recomputes all of
-  the above from the logs (needs scipy).
+  the above from the logs (needs scipy); `this_pr/statistics.md` and `baseline/statistics.md` list every run.
 
 Machine: Nebius `gpu-h100-sxm`, 8x H100 80GB HBM3, driver 580.173.02, the root `Dockerfile` unchanged
 (torch 2.10.0+cu128, CUDA 13.1 runtime), 2026-11-16.
@@ -132,6 +132,16 @@ configurations and 12 captured step graphs as record #92 on this node (both logs
 **Different from the one-GPU port:** there the sets were built on the GPU and one frequency count was
 shared by all microbatches; here they are built on the host prep thread, as the record builds its own
 sets, and each GPU ranks by its own counts.
+
+## Related PRs
+
+- #371 (open) samples token rows for the lm_head's weight gradient on steps 320-1106. This PR samples
+  columns of the loss on steps 965-1106. The two touch different axes of the same GEMMs; they have not
+  been tested together.
+- #372 (closed by its author in favour of the record's sampled softmax) used an adaptive softmax with
+  frequency clusters counted inside the timed run. The frequency ranking here is also counted inside
+  the timed run.
+- This PR is based on master (record #92) alone and does not include any open PR.
 
 ## Reproducing
 
