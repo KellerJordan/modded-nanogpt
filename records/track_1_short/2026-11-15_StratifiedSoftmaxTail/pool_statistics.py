@@ -1,4 +1,4 @@
-"""Statistics of a run pool: this PR's logs in candidate/, the record's same-node logs in baseline/.
+"""Statistics of a run pool: this PR's logs in this_pr/, the record's same-node logs in baseline/.
 
     pip install scipy
     python records/track_1_short/2026-11-15_StratifiedSoftmaxTail/pool_statistics.py
@@ -53,7 +53,7 @@ def pool(name, stratified):
     return losses, times
 
 
-candidate_losses, candidate_times = pool("candidate", stratified=True)
+candidate_losses, candidate_times = pool("this_pr", stratified=True)
 baseline_losses, baseline_times = pool("baseline", stratified=False)
 
 gate = ttest_1samp(candidate_losses, GATE, alternative="less")

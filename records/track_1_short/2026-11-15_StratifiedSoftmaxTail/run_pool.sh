@@ -6,7 +6,7 @@
 # Run from the repository root, inside the environment whose torchrun launches the run. The baseline
 # legs run the record's own commit from a second checkout (../modded-nanogpt-record), so they are the
 # record's code byte for byte; both checkouts read the same data. Legs alternate, the candidate first,
-# so both pools see the same machine state. Each finished log is copied into this folder's candidate/
+# so both pools see the same machine state. Each finished log is copied into this folder's this_pr/
 # or baseline/ directory. A failed leg stops the pool; logs already copied stay.
 set -euo pipefail
 
@@ -22,30 +22,30 @@ git worktree prune  # a checkout made in an earlier container is gone; forget it
 [[ -d $record ]] || git worktree add --detach "$record" "$record_commit"
 [[ "$(git -C "$record" rev-parse HEAD)" == "$record_commit" ]] || { echo "$record is not the record commit" >&2; exit 1; }
 export DATA_PATH=${DATA_PATH:-$root}
-mkdir -p "$here/candidate" "$here/baseline"
+mkdir -p "$here/this_pr" "$here/baseline"
 
-leg() {  # leg <name> <checkout>
-    local name=$1 dir=$2 before after log
+leg() {  # leg <name> <checkout> <log folder>
+    local name=$1 dir=$2 folder=$3 before after log
     before=$(ls "$dir/logs" 2>/dev/null | sort || true)
     echo "=== $(date -u +%FT%TZ) $name leg in $dir"
     (cd "$dir" && torchrun --standalone --nproc_per_node=8 train_gpt.py)
     after=$(ls "$dir/logs" | sort)
     log=$(comm -13 <(echo "$before") <(echo "$after") | grep '\.txt$')
     [[ $(echo "$log" | wc -l) -eq 1 ]] || { echo "expected one new log in $dir/logs" >&2; exit 1; }
-    cp "$dir/logs/$log" "$here/$name/$log"
-    grep -h "val_loss" "$here/$name/$log" | tail -1
+    cp "$dir/logs/$log" "$here/$folder/$log"
+    grep -h "val_loss" "$here/$folder/$log" | tail -1
 }
 
 done_candidate=0
 done_baseline=0
 while (( done_candidate < candidate_runs || done_baseline < baseline_runs )); do
     if (( done_candidate < candidate_runs )); then
-        leg candidate "$root"
+        leg candidate "$root" this_pr
         done_candidate=$((done_candidate + 1))
     fi
     # Spread the baseline legs evenly through the candidate legs.
     if (( done_baseline < baseline_runs && done_baseline * candidate_runs < done_candidate * baseline_runs )); then
-        leg baseline "$record"
+        leg baseline "$record" baseline
         done_baseline=$((done_baseline + 1))
     fi
 done
