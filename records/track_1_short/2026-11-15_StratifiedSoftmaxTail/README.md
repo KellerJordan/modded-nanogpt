@@ -1,7 +1,22 @@
-# Stratified sampled softmax on the widest steps (candidate, not yet run on 8xH100)
+# Stratified sampled softmax on the widest steps
 
-**Status: built and CPU-tested only. No 8xH100 run exists yet. Every 8xH100 number below is an
-expectation, not a measurement.** Base: record #92 (ANVIL2), commit `4ea6b93`.
+**Result (8xH100, 18 runs + 9 same-node runs of the record, interleaved, none dropped):**
+
+| Pool | Runs | Val loss | Train time |
+| --- | --- | --- | --- |
+| This change | 18 | 3.27670 +/- 0.00114 | 39.702 +/- 0.042 s |
+| Record #92 (`4ea6b93`), same node and session | 9 | 3.27608 +/- 0.00136 | 40.235 +/- 0.017 s |
+
+- 0.533 s faster (1.32%), one-sided Welch p = 1.3e-25. Every run of this change (39.659-39.809 s) is
+  faster than every baseline run (40.200-40.257 s).
+- Mean val loss <= 3.28: t = -12.3, one-sided p = 3.5e-10. Loss change against the same-node baseline:
+  +0.62 millinats (standard error about 0.5).
+- Node: Nebius 8x H100 NVLink (80 GB), driver 580.173.02, the root `Dockerfile`, 2026-11-16. This
+  node's baseline is slower than the record's published 39.914 s; this change is below both.
+- Logs: `candidate/` and `baseline/`. Reproduce the table with `pool_statistics.py`. One smoke run
+  before the pool (3.2757, 39.748 s) was declared a functional check beforehand and is not counted.
+
+Base: record #92 (ANVIL2), commit `4ea6b93`.
 
 ## What changes
 
@@ -59,7 +74,7 @@ time, and the saving comes from the narrower set, not from where the port builds
 Not carried over from the port: there every microbatch updated one frequency count; here each GPU
 counts its own targets (an eighth of the data). The sets are built on the host here, on the GPU there.
 
-## What is not verified
+## What was not verified before the 8xH100 runs (kept for the record)
 
 - The 8-GPU code path has never run. The captured step graphs, the compiled model and the upload
   stream cannot run on one RTX 5090 or on a CPU. The first 8xH100 run is the first execution.
@@ -117,8 +132,8 @@ Suggested: the smoke run, then 10 + 5. If both rules pass, top up to 18 + 9 with
 | Rule | Status |
 | --- | --- |
 | 1. Data pipelines untouched | Yes. Only the training loss's candidate sets change. |
-| 2. Mean val loss <= 3.28 at p < 0.01 | Open: decided by the pool. This changes the ML, so it is not waived. |
+| 2. Mean val loss <= 3.28 at p < 0.01 | Yes: p = 3.5e-10 on 18 runs. |
 | 3. No extra compile flags | Yes. None added. |
-| 4. Faster than the prior record on the same hardware | Open: decided by the interleaved baseline legs. |
+| 4. Faster than the prior record on the same hardware | Yes: 39.702 s against 40.235 s for the record on the same node (and 39.914 s published). |
 | Readability | One new 150-line module, about 200 net lines added to 8 existing files, plus tests. |
 | Loss buffer (must beat a simple step decrease) | On the port, 4-5x less loss than cutting steps for the same time. The record's write-up prices a millinat at 120-250 ms; a 0.8 s saving for one millinat would clear that, if the 8xH100 numbers hold. |
