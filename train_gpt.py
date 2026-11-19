@@ -59,7 +59,7 @@ from track_1_short.config import (
     WS_POST_YARN_EXT,
     Hyperparameters,
 )
-from track_1_short.data import ScheduledBatches, cu_seqlens_rows, distributed_data_generator
+from track_1_short.data import FirstShardStart, ScheduledBatches, ValPrefetch, cu_seqlens_rows, distributed_data_generator
 from track_1_short.distributed import setup_distributed
 from track_1_short.exact_levers import LEVERS as EXACT_LEVERS, RS_EARLY
 from track_1_short.model.gpt import (
@@ -155,7 +155,7 @@ def train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, bat
     launch_reduces = functools.partial(training_manager.optimizer.launch_early_reduces,
                                        do_adam=training_manager.is_adam_step(step),
                                        table_event=row_prefetch.is_update(step)) if RS_EARLY else None
-    ngram_grad = step_graphs.backward(launch_reduces)
+    ngram_grad = step_graphs.backward(launch_reduces, do_adam=training_manager.is_adam_step(step))
     ngram_table.accumulate_grad(ngram_slots, step_graphs.hold_ngram_grad(
         ngram_grad, pending=len(ngram_table.pending), event_this_step=row_prefetch.is_update(step)))
     sampled_softmax.mark_readers_done()
@@ -182,9 +182,10 @@ def main():
     batch_tokens = [s.batch_size // env.world_size for s in TRAINING_STAGES] + [val_tokens_per_rank]
     batch_staging = PinnedBatchStaging(max(batch_tokens), max(map(cu_seqlens_rows, batch_tokens)), env.device)
 
-    def train_loader():
+    def train_loader(first_shard: FirstShardStart | None = None):
         return distributed_data_generator(
             args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, batch_staging,
+            first_shard=first_shard,
         )
 
     def val_loader():
@@ -385,15 +386,26 @@ def main():
     ########################################
     #        Training and validation       #
     ########################################
-    batches = ScheduledBatches(train_loader(), training_schedule, steps=range(training_schedule.total_steps))
+    # The first shard's read starts at the clock start (FirstShardStart.start below), not at step 0's batch.
+    first_shard = FirstShardStart(args.train_files)
+    batches = ScheduledBatches(train_loader(first_shard), training_schedule, steps=range(training_schedule.total_steps))
     row_prefetch = RowPrefetch(ngram_table, value_embed_pull, batches, range(training_schedule.total_steps),
                                is_update_step, prefetch_staging)
 
-    # The canonical mask is only needed by the final validation, so rank 0 builds it in a child
-    # process while we train, and model.canon_mask stays all-zero == no masking until then, which
-    # is what the intermediate validations run with. Only the buffer is allocated here; the build
-    # is started below the clock, so its whole cost -- not just its use -- lands in the timed region.
-    canon_mask_builder = BackgroundCanonicalMask(model.vocab_size, owner=env.master_process, print0=print0)
+    # The canonical mask is only needed by the final validation, so every rank builds its own copy in a
+    # child process while we train and uploads it once no intermediate validation is left, and
+    # model.canon_mask stays all-zero == no masking until then, which is what the intermediate validations
+    # run with. Only the buffer is allocated here; the build is started below the clock, so its whole
+    # cost -- not just its use -- lands in the timed region.
+    canon_mask_builder = BackgroundCanonicalMask(model.vocab_size, owner=True, print0=print0)
+    # The mask's upload may start after this step's training step: the last intermediate validation is behind.
+    canon_upload_from = max((s for s in range(training_schedule.total_steps) if s % args.val_loss_every == 0),
+                            default=0) if args.val_loss_every > 0 else 0
+
+    # The final validation's batches, read and prepared on the host by a background thread from mid-run
+    # (inside the timed region, overlapped with training; data.py ValPrefetch). Pinned buffers allocated here.
+    val_prefetch = ValPrefetch(args.val_files, args.val_batch_size, args.val_tokens, env.device)
+    val_prefetch_at = training_schedule.total_steps // 2
 
     # No cyclic GC inside the timed loop: a multi-ms generation-2 pause on one rank stalls every rank at
     # the next collective. What survives until now is frozen out of all future scans; the garbage the
@@ -407,15 +419,15 @@ def main():
     uncompiled_model.limit_yarn_rebuild(max_step_tokens)
 
     training_time_ms = 0
-    # Start the clock on every rank at once (PRs #390/#391): rank 0 alone runs the canonical-mask setup
-    # above, so without this barrier the ranks reach the clock at different times and a rank's clock
-    # would run while it waits for another rank's pre-clock work.
+    # Start the clock on every rank at once (PRs #390/#391): without this barrier the ranks reach the
+    # clock at different times and a rank's clock would run while it waits for another rank's pre-clock work.
     barrier_start = time.perf_counter()
     dist.barrier()
     print0(f"[barrier] rank 0 waited {1000 * (time.perf_counter() - barrier_start):.1f} ms before the clock start", console=True)
     # start the clock
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+    first_shard.start()  # on the clock: reads the head of the first shard while the work below runs
     canon_mask_builder.start()
     # Prefix-token table build, inside the timed region. The tokenizer was loaded at import
     # (get_encoding is cached in tiktoken's registry), so this pays only the table construction,
@@ -434,6 +446,9 @@ def main():
             # The deferred gathers land first: validation reads the banks and, at the last step, ships
             # into them.
             if last_step:
+                # First, so the host waits on nothing before it: the prefetched val batches' async H2Ds,
+                # queued on the stream (reading nothing training writes).
+                val_batches = val_prefetch.batches()
                 # The final fp8 refresh is skipped, not moved off the clock: its one consumer is a
                 # training forward, and the run ends after this validation.
                 deferred_gathers.flush_final()
@@ -441,8 +456,8 @@ def main():
                 # reader -- the decontraction norms of the ship below, then the validation.
                 training_manager.optimizer.land_bf16_replicas()
                 training_manager.apply_final_ws_ext()
-                # Both on the clock: the wait in case the build is somehow not done, and the copy
-                # and broadcast of the result because they are part of the mask's cost.
+                # Both on the clock: the wait in case the build is somehow not done, and the (normally
+                # already finished) async upload, which the val forwards are ordered after by an event.
                 canon_mask_builder.wait()
                 canon_mask_builder.collect(model.canon_mask)
                 # On the clock: evaluate (and keep) the tail-averaged weights, not the final iterate.
@@ -460,15 +475,20 @@ def main():
             # below lands each batch's rows again (same routes, no new exchange) right before its forward.
             assert args.val_tokens % args.val_batch_size == 0
             val_steps = args.val_tokens // args.val_batch_size
-            val_loader_iter = val_loader()
-            val_batches = [next(val_loader_iter) for _ in range(val_steps)]
-            del val_loader_iter
+            if not last_step:
+                val_loader_iter = val_loader()
+                val_batches = [next(val_loader_iter) for _ in range(val_steps)]
+                del val_loader_iter
+            assert len(val_batches) == val_steps
             val_pulls = ngram_table.eval_pulls([batch.ngram_ids for batch in val_batches])
             for pull in val_pulls:
                 ngram_table.land(pull)
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
+            if last_step:
+                # Off the clock: unpin the mask's host buffer, and check every rank uploaded the same mask.
+                canon_mask_builder.release(model.canon_mask)
             model.eval()
             val_loss = 0
             uncompiled_model.cplm_diag.zero_()
@@ -508,6 +528,10 @@ def main():
         train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, batches, deferred_gathers,
                    step, uncompiled_model.lm_head_f8_col, prefetch_next=step + 1 < training_schedule.total_steps)
         tail_averages.tick(step)
+        if step >= canon_upload_from:
+            canon_mask_builder.poll_upload(model.canon_mask)
+        if step == val_prefetch_at:
+            val_prefetch.start()
 
         # logging, thinned to every PRINT_EVERY steps and the last two
         if (step + 1) % PRINT_EVERY == 0 or step + 1 >= training_schedule.total_steps - 1:

@@ -156,3 +156,65 @@ def transpose_add(src: torch.Tensor, dst: torch.Tensor):
         num_warps=8,
         num_stages=2,
     )
+
+
+# -----------------------------------------------------------------------------
+# Tied-gradient fold (Adam steps while embed and lm_head are tied):
+#   lm_acc (N, M) = bf16(bf16(lm_acc + lm_g) + bf16(emb_acc + emb_g).T)
+# What it replaces: the second-microbatch accumulation `lm_acc += lm_g`, `emb_acc += emb_g` (the Adam
+# accumulators' _foreach_add_ in step_graphs.py) followed by transpose_add(emb_acc, lm_acc) (optim/anvil.py).
+# Same three roundings in the same order, so bit-exact: each sum of two bf16 values is computed in fp32 and
+# rounded once to bf16 (as torch's bf16 add and Triton's bf16 add both do; for two bf16 operands the fp32 sum
+# rounded to bf16 equals the correctly rounded bf16 sum). Traffic: 4 reads + 1 write of a 77 MB tensor
+# instead of 6 reads + 3 writes. emb_acc is NOT updated (while tied nothing reads embed.grad but this fold).
+
+@triton.jit
+def _tied_grad_fold_kernel(
+    emb_acc_ptr, emb_g_ptr, lm_acc_ptr, lm_g_ptr,
+    M, N,
+    emb_acc_s0, emb_acc_s1, emb_g_s0, emb_g_s1,
+    lm_acc_s0, lm_acc_s1, lm_g_s0, lm_g_s1,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # embed side (M, N), coalesced
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    ea = tl.load(emb_acc_ptr + offs_m[:, None] * emb_acc_s0 + offs_n[None, :] * emb_acc_s1, mask=mask, other=0.0)
+    eg = tl.load(emb_g_ptr + offs_m[:, None] * emb_g_s0 + offs_n[None, :] * emb_g_s1, mask=mask, other=0.0)
+    e = (ea.to(tl.float32) + eg.to(tl.float32)).to(tl.bfloat16, fp_downcast_rounding="rtne")
+
+    # lm_head side (N, M), coalesced
+    mask_T = (offs_n[:, None] < N) & (offs_m[None, :] < M)
+    lm_ptrs = lm_acc_ptr + offs_n[:, None] * lm_acc_s0 + offs_m[None, :] * lm_acc_s1
+    la = tl.load(lm_ptrs, mask=mask_T, other=0.0)
+    lg = tl.load(lm_g_ptr + offs_n[:, None] * lm_g_s0 + offs_m[None, :] * lm_g_s1, mask=mask_T, other=0.0)
+    lsum = (la.to(tl.float32) + lg.to(tl.float32)).to(tl.bfloat16, fp_downcast_rounding="rtne")
+    out = (lsum.to(tl.float32) + tl.trans(e).to(tl.float32)).to(tl.bfloat16, fp_downcast_rounding="rtne")
+    tl.store(lm_ptrs, out, mask=mask_T)
+
+
+def tied_grad_fold(emb_acc: torch.Tensor, emb_g: torch.Tensor, lm_acc: torch.Tensor, lm_g: torch.Tensor):
+    """lm_acc = (lm_acc + lm_g) + (emb_acc + emb_g).T, each add rounded to bf16 in that order (see above).
+    emb_acc, emb_g are (M, N); lm_acc, lm_g are (N, M); all bf16. emb_acc is left as it was."""
+    assert emb_acc.ndim == 2 and emb_acc.shape == emb_g.shape
+    M, N = emb_acc.shape
+    assert lm_acc.shape == (N, M) and lm_g.shape == (N, M), f"lm_head grads {lm_acc.shape}/{lm_g.shape} vs embed ({M}, {N})"
+    for t in (emb_acc, emb_g, lm_acc, lm_g):
+        assert t.dtype == torch.bfloat16, f"tied_grad_fold is bf16-only (got {t.dtype})"
+    BLOCK_M, BLOCK_N = 64, 128  # transpose_add's tiles (record #360)
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    _tied_grad_fold_kernel[grid](
+        emb_acc, emb_g, lm_acc, lm_g,
+        M, N,
+        emb_acc.stride(0), emb_acc.stride(1), emb_g.stride(0), emb_g.stride(1),
+        lm_acc.stride(0), lm_acc.stride(1), lm_g.stride(0), lm_g.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=8,
+        num_stages=2,
+    )

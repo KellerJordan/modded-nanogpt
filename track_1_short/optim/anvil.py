@@ -11,7 +11,7 @@ from track_1_short.model.moe import MOE_ANVIL_MARGIN
 from track_1_short.perf.bank_scalars import BankScalarStaging
 from track_1_short.perf.kernels import anvil_opt as _ok
 from track_1_short.perf.kernels.polar_express import XTX, XXT, ba_plus_cAA
-from track_1_short.perf.kernels.transpose import transpose_add, transpose_copy
+from track_1_short.perf.kernels.transpose import tied_grad_fold, transpose_add, transpose_copy
 from track_1_short.perf.replicated_adam import ReplicatedAdam
 
 # The row-sparse updates run at value_embeds' place in work_order (value_embeds is one of them; step()
@@ -318,6 +318,8 @@ class AnvilAndAdam:
 
         # Embed/lm_head tying state
         self.split_embed = False
+        # (emb_acc, emb_g, lm_acc, lm_g) handed over by StepGraphs.backward on a tied Adam step (tied_grad_fold)
+        self.pending_tied_fold = None
         self._lm_head_param = self._param_by_label.get("lm_head")
         self._embed_param = self._param_by_label.get("embed")
 
@@ -535,6 +537,7 @@ class AnvilAndAdam:
     def reset(self):
         """Reset ANVIL velocity/lane state and split_embed state (called on training reset)."""
         self.split_embed = False
+        self.pending_tied_fold = None
         for param, p_cfg in self.param_cfgs.items():
             if p_cfg.optim == "anvil":
                 p_state = self.param_states[param]
@@ -621,10 +624,16 @@ class AnvilAndAdam:
         if param.grad is None or label in self.replicated_labels:
             return
 
-        # lm_head when tied: aggregate embed.grad.T (tiled Triton transpose-add)
+        # lm_head when tied: aggregate embed.grad.T (tiled Triton transpose-add). When StepGraphs.backward left the
+        # two accumulators' second-microbatch adds pending, one kernel does those adds and this transpose-add.
         if label == "lm_head" and do_adam and not self.split_embed:
             embed_param = self._embed_param
-            if embed_param is not None and embed_param.grad is not None:
+            if self.pending_tied_fold is not None:
+                emb_acc, emb_g, lm_acc, lm_g = self.pending_tied_fold
+                assert lm_acc is param.grad and emb_acc is embed_param.grad, "tied fold: accumulators are not the live grads"
+                tied_grad_fold(emb_acc, emb_g, lm_acc, lm_g)
+                self.pending_tied_fold = None
+            elif embed_param is not None and embed_param.grad is not None:
                 transpose_add(embed_param.grad, param.grad)
 
         # Skip embed when tied (copied from lm_head after gather)
@@ -760,6 +769,7 @@ class AnvilAndAdam:
             fut.wait()
 
         self._reduce_futures.clear()
+        assert self.pending_tied_fold is None, "tied-gradient fold handed over but never run (lm_head reduce skipped?)"
 
         # Clear grads for updated params
         for param, p_cfg in self.param_cfgs.items():

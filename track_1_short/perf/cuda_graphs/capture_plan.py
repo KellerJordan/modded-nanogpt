@@ -26,7 +26,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from track_1_short.config import BLOCK_SIZE, VIRTUAL_SEQ_CAP
+from track_1_short.config import BLOCK_SIZE, VIRTUAL_SEQ_CAP, short_bwd_window_tokens
 from track_1_short.data import cu_seqlens_rows
 
 # Untimed warmup steps allowed (record #360's _CF_MAX). The count is printed every run; a schedule
@@ -43,6 +43,7 @@ class StepGraphKey(NamedTuple):
     candidates: int        # sampled-softmax candidate count P, 0 = full softmax
     ws_short: int          # attention windows, in tokens
     ws_long: int
+    ws_short_bwd: int      # the short layers' attention backward window, in tokens (truncated attention backward)
     max_seq_len: int       # longest attention segment
 
 
@@ -57,6 +58,7 @@ def step_graph_key(schedule, candidate_counts: list[int], step: int, world_size:
         candidates=candidate_counts[step],
         ws_short=stage.window_sizes[0] * BLOCK_SIZE,
         ws_long=stage.window_sizes[1] * BLOCK_SIZE,
+        ws_short_bwd=short_bwd_window_tokens(stage),
         max_seq_len=min(stage.train_max_seq_len, VIRTUAL_SEQ_CAP),
     )
 

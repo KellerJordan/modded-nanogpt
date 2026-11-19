@@ -147,6 +147,7 @@ class ForwardScheduleConfig:
     prefix_weight: torch.Tensor
     ws_short: int
     ws_long: int
+    ws_short_bwd: int  # the short layers' attention backward window (truncated attention backward); training only
     train_max_seq_len: int  # longest attention segment in a training batch
     # Training only: the candidate set when this step's loss is a sampled softmax; None = full softmax.
     sampled_loss: SampledLoss | None = None
@@ -607,6 +608,9 @@ class GPT(MoEMixin, nn.Module):
         ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
         # sliding-window sizes and key shift: the long windows get the partial key offset
         bm_sizes = [ws_long if i in LONG_WINDOW_LAYERS else ws_short for i in range(self.num_layers)]
+        # Truncated attention backward on the short layers (training only; validation has no backward).
+        ws_short_bwd = schedule_cfg.ws_short_bwd if self.training else ws_short
+        bm_sizes_bwd = [ws_long if i in LONG_WINDOW_LAYERS else ws_short_bwd for i in range(self.num_layers)]
         key_offset = [i in LONG_WINDOW_LAYERS for i in range(self.num_layers)]
 
         # FP8 is training-only; validation runs the bf16 path.
@@ -752,6 +756,7 @@ class GPT(MoEMixin, nn.Module):
                     sa_lambdas=sa_lambdas[i],
                     seqlens=seqlens,
                     bm_size=bm_sizes[i],
+                    bm_size_bwd=bm_sizes_bwd[i],
                     yarn=yarn,
                     key_offset=key_offset[i],
                     aux_v=aux_v,

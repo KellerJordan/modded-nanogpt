@@ -40,6 +40,68 @@ def load_flash_attn3():
 flash_attn_interface = load_flash_attn3()
 
 
+class FlashAttnVarlenTruncBwd(torch.autograd.Function):
+    """FA3 varlen causal sliding-window attention whose backward runs a narrower left window (PR #371's
+    truncated attention backward, as a per-layer window instead of per-head calibration).
+
+    The forward is FlashAttnVarlenFunc's (same custom op, same arguments). The backward is FA3's backward
+    with window_size_left=window_bwd: the kernel recomputes P = exp(S - LSE) from the forward's LSE and
+    D = rowsum(dO * O) from the forward's output, so a smaller window only drops the distant key tiles'
+    terms (no renormalization). The gradient is biased; window_bwd == window is exactly FA3's backward.
+    Both windows are Python ints, fixed per compiled graph / CUDA-graph key (StepGraphKey.ws_short_bwd).
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, cu_seqlens, max_seqlen, softmax_scale, window, window_bwd):
+        out, softmax_lse, *_ = flash_attn_interface._flash_attn_forward(
+            q, k, v,
+            None, None,  # k_new, v_new
+            None,  # qv
+            None,  # out
+            cu_seqlens, cu_seqlens,
+            None,  # cu_seqlens_k_new
+            None, None,  # seqused_q, seqused_k
+            max_seqlen, max_seqlen,
+            None, None, None,  # page_table, kv_batch_idx, leftpad_k
+            None, None, None,  # rotary_cos/sin, seqlens_rotary
+            None, None, None,  # q/k/v descale
+            softmax_scale,
+            causal=True,
+            window_size_left=window,
+            window_size_right=0,
+            attention_chunk=0,
+            softcap=0.0,
+            num_splits=1,
+            pack_gqa=None,
+            sm_margin=0,
+        )
+        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens)
+        ctx.max_seqlen = max_seqlen
+        ctx.softmax_scale = softmax_scale
+        ctx.window_bwd = window_bwd
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        q, k, v, out, softmax_lse, cu_seqlens = ctx.saved_tensors
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        flash_attn_interface._flash_attn_backward(
+            dout, q, k, v, out, softmax_lse,
+            cu_seqlens, cu_seqlens,
+            None, None,  # seqused_q, seqused_k
+            ctx.max_seqlen, ctx.max_seqlen,
+            dq, dk, dv,
+            ctx.softmax_scale,
+            True,  # causal
+            ctx.window_bwd,
+            0,  # window_size_right
+            0.0,  # softcap
+            False,  # deterministic
+            0,  # sm_margin
+        )
+        return dq, dk, dv, None, None, None, None, None
+
+
 class Yarn(nn.Module):
     """RoPE cos/sin tables for one head width, rescaled (YaRN) whenever its layers' window grows.
 
@@ -130,6 +192,8 @@ class AttnArgs:
     # A 0-D gain folded into the output projection with sa_lambdas[1]: the layer's residual post-lambda,
     # so the residual add takes the attention output as is (perf/residual_fusion.py). None = no gain.
     o_gain: torch.Tensor | None = None
+    # The attention backward's left window (truncated attention backward); None = bm_size, the exact backward.
+    bm_size_bwd: int | None = None
 
 
 class CausalSelfAttention(nn.Module):
@@ -225,9 +289,14 @@ class CausalSelfAttention(nn.Module):
             q, k, v_fa = q[0], k[0], v[0]
         else:
             v_fa = v
-        y = flash_attn_interface.flash_attn_varlen_func(q, k, v_fa, cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+        bm_size_bwd = attn_args.bm_size_bwd
+        if self.training and bm_size_bwd is not None and bm_size_bwd < bm_size:
+            # Truncated attention backward: same forward, the backward skips keys beyond bm_size_bwd.
+            y = FlashAttnVarlenTruncBwd.apply(q, k, v_fa, seqlens, max_len, yarn.attn_scale, bm_size, bm_size_bwd)
+        else:
+            y = flash_attn_interface.flash_attn_varlen_func(q, k, v_fa, cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                                            max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                                            causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         y = y.view(*lead, T, H, self.v_dim)
         # Gated XSA (arXiv:2603.09078) with learnable strength: subtract per-head fraction tanh(α)
         # of y aligned with v̂. Non-paired only (v shape doesn't line up for paired layers).

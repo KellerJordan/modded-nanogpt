@@ -5,7 +5,7 @@ from collections.abc import Callable
 import torch
 import torch.distributed as dist
 
-from track_1_short.config import BLOCK_SIZE, VIRTUAL_SEQ_CAP
+from track_1_short.config import BLOCK_SIZE, VIRTUAL_SEQ_CAP, short_bwd_window_tokens
 from track_1_short.model.gpt import ForwardScheduleConfig
 from track_1_short.ngram_table import NGRAM_ADAM_PERIOD4_START
 from track_1_short.optim.anvil import RAIL_ENGAGE_STEP, RAIL_FAST_BETA, RAIL_FAST_WEIGHT, AnvilAndAdam, AnvilBank
@@ -168,6 +168,7 @@ class TrainingManager():
             prefix_weight = self.prefix_weight,
             ws_short = self.ws_short * BLOCK_SIZE,
             ws_long = self.ws_long * BLOCK_SIZE,
+            ws_short_bwd = self.ws_short_bwd,
             # The loader cuts documents longer than VIRTUAL_SEQ_CAP into attention segments.
             train_max_seq_len = min(self.train_max_seq_len, VIRTUAL_SEQ_CAP),
             sampled_loss = sampled_loss,
@@ -193,6 +194,7 @@ class TrainingManager():
 
         self.train_max_seq_len = stage.train_max_seq_len
         self.ws_long = new_ws_long
+        self.ws_short_bwd = short_bwd_window_tokens(stage)
         self.mtp_weights = self.schedule.mtp_weights[step]
         self.prefix_weight = self.schedule.prefix_weights[step]
 
@@ -237,6 +239,7 @@ class TrainingManager():
 
         stage, _ = self.schedule.lookup(0)
         self.ws_short, self.ws_long = stage.window_sizes
+        self.ws_short_bwd = short_bwd_window_tokens(stage)
         self.train_max_seq_len = stage.train_max_seq_len
         for yarn in (self.model.yarn, self.model.yarn_paired_head, self.model.yarn_wide):
             yarn.reset()
