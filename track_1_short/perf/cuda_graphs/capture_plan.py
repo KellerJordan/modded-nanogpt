@@ -43,7 +43,7 @@ class StepGraphKey(NamedTuple):
     candidates: int        # sampled-softmax candidate count P, 0 = full softmax
     ws_short: int          # attention windows, in tokens
     ws_long: int
-    ws_short_bwd: int      # the short layers' attention backward window, in tokens (truncated attention backward)
+    ws_short_bwd: int      # short layers' attention backward window
     max_seq_len: int       # longest attention segment
 
 

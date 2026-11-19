@@ -20,28 +20,15 @@ from track_1_short.canonical_mask_build import build_canonical_mask
 
 
 class BackgroundCanonicalMask:
-    """Builds the canonical mask concurrently with training, in a forked child process.
+    """Builds the canonical mask concurrently with training, in a spawned child process.
 
     The build is a few seconds of pure-Python work, so running it in a thread would hold the GIL
-    and throttle the training loop's kernel launches. A forked child has its own interpreter and
-    only computes, writing the result into shared memory.
-
-    The child is a fresh interpreter started with posix_spawn (vfork + exec), not os.fork(): forking this
-    process copies its page tables (GBs of mappings: pinned rings, CUDA), measured at ~60 ms of every rank's
-    host time at the clock start, while a spawn returns in about a millisecond. The child imports numpy and
-    tiktoken itself (~0.2-0.5 s more child time, all of it on the clock and overlapped with training) and
-    writes the mask into a /dev/shm file that this process maps shared (the same pages, page-locked here).
-
-    Every rank builds its own copy (the build is deterministic, so the bytes are identical) and
-    uploads it to the device mid-run: poll_upload(), called between training steps, notices the
-    finished child and queues the H2D in chunks on a side stream, one chunk per call. At the tail,
-    collect() only makes the current stream wait on the upload's event: no blocking copy, no
-    broadcast, no device sync. release() unregisters the pinned buffer after the clock stops.
+    and throttle the training loop's kernel launches. A spawned child has its own interpreter and
+    only computes, writing the result into shared memory. posix_spawn, not os.fork(): forking copies
+    this process's page tables (~60 ms on the clock). Every rank builds and uploads its own copy.
     """
 
-    # H2D chunks of the upload, one per poll_upload() call (i.e. per training step): ~32 MB each, so
-    # one step's copy never hogs the copy engine the batch and row uploads also use.
-    UPLOAD_CHUNKS = 10
+    UPLOAD_CHUNKS = 10  # H2D chunks, one per poll_upload() call
 
     def __init__(self, vocab_size: int, owner: bool, print0):
         self.vocab_size = vocab_size
@@ -52,7 +39,7 @@ class BackgroundCanonicalMask:
         self.next_chunk = 0
         self.path = None
         if owner:
-            # A named tmpfs file, mapped MAP_SHARED here and by the spawned child: both see the same pages.
+            # /dev/shm file shared with the child
             nbytes = vocab_size * (vocab_size // 8)
             fd, self.path = tempfile.mkstemp(prefix="canon_mask_", dir="/dev/shm")
             try:
@@ -60,11 +47,9 @@ class BackgroundCanonicalMask:
             finally:
                 os.close(fd)
             self.buf = torch.from_file(self.path, shared=True, size=nbytes, dtype=torch.uint8).view(vocab_size, vocab_size // 8)
-            self.ranks = tiktoken.get_encoding("gpt2")._mergeable_ranks  # inline fallback only; also warms tiktoken's cache file
-            # Page-lock the buffer so that the H2D is a true async DMA (from pageable memory it would be
-            # staged and block the host). Registering is itself slow, which is why it belongs here,
-            # before the clock. The mapping is MAP_SHARED, so the child still writes to these same
-            # pages and the fork stays safe.
+            self.ranks = tiktoken.get_encoding("gpt2")._mergeable_ranks  # inline fallback
+            # Page-lock the buffer so that the H2D is a true async DMA. Registering is itself slow,
+            # which is why it belongs here, before the clock.
             cudart = torch.cuda.cudart()
             err = cudart.cudaHostRegister(self.buf.data_ptr(), self.buf.nbytes, 0)
             self.pinned = err == cudart.cudaError.success
@@ -75,13 +60,12 @@ class BackgroundCanonicalMask:
             self.uploaded = torch.cuda.Event()
 
     def start(self):
-        """On the clock: spawn the builder (python -m track_1_short.canonical_mask_build <path> <vocab_size>)."""
         if self.buf is None:
             return
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         env = dict(os.environ)
         env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-        # The child must not touch CUDA or NCCL; nothing it imports does, but hide the devices anyway.
+        # the child must not touch CUDA
         env["CUDA_VISIBLE_DEVICES"] = ""
         self.pid = os.posix_spawn(sys.executable, [sys.executable, "-m", "track_1_short.canonical_mask_build",
                                                    self.path, str(self.vocab_size)], env)
@@ -94,8 +78,7 @@ class BackgroundCanonicalMask:
             np.copyto(self.buf.numpy(), build_canonical_mask(self.vocab_size, self.ranks))
 
     def poll_upload(self, out: Tensor):
-        """Between training steps (eager, never under capture): once the child is done, queue the next
-        chunk of the H2D into `out` on the side stream. Never blocks: a WNOHANG reap and async copies."""
+        """Between steps: once the child is done, queue the next H2D chunk into `out`. Never blocks."""
         if self.buf is None or self.next_chunk >= self.UPLOAD_CHUNKS:
             return
         if self.pid is not None:
@@ -108,8 +91,6 @@ class BackgroundCanonicalMask:
     def _upload_chunk(self, out: Tensor):
         if self.next_chunk == 0:
             self.out = out
-            # Order the writes after whatever the device has queued so far (nothing reads `out`
-            # until the final validation, but this costs no host time).
             self.stream.wait_stream(torch.cuda.current_stream())
         assert out is self.out
         rows = self.vocab_size
@@ -122,7 +103,7 @@ class BackgroundCanonicalMask:
             self.uploaded.record(self.stream)
 
     def wait(self, timeout=60.0):
-        """Block until the mask is ready. Called from the timed region; a no-op once poll_upload reaped it."""
+        """Block until the mask is ready. Called from the timed region."""
         if self.pid is None:
             return
         deadline = time.perf_counter() + timeout
@@ -135,7 +116,6 @@ class BackgroundCanonicalMask:
         self._reaped(reaped[1])
 
     def _unlink(self):
-        """Drop the /dev/shm name once the child is reaped (the mapping keeps the pages until release)."""
         if self.path is not None:
             try:
                 os.unlink(self.path)
@@ -144,8 +124,7 @@ class BackgroundCanonicalMask:
             self.path = None
 
     def collect(self, out: Tensor):
-        """On the clock: finish queueing the upload if poll_upload has not, then make the current stream
-        wait for it. No host sync; every rank holds its own identical copy, so there is no broadcast."""
+        """Finish queueing the upload and make the current stream wait for it. No host sync."""
         assert self.pid is None, "collect before wait"
         if self.buf is None:
             return
@@ -154,10 +133,9 @@ class BackgroundCanonicalMask:
         torch.cuda.current_stream().wait_event(self.uploaded)
 
     def release(self, out: Tensor):
-        """After the clock stops: unpin and drop the host buffer, and check that every rank holds the
-        same mask (row and column popcount-weighted sums; a mismatch is fatal)."""
+        """Off the clock: release the host buffer and check that every rank holds the same mask."""
         if self.buf is not None:
-            self.uploaded.synchronize()  # the H2D reads the buffer until here
+            self.uploaded.synchronize()
             if self.pinned:
                 torch.cuda.cudart().cudaHostUnregister(self.buf.data_ptr())
         self._unlink()

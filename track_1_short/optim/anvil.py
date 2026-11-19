@@ -318,7 +318,7 @@ class AnvilAndAdam:
 
         # Embed/lm_head tying state
         self.split_embed = False
-        # (emb_acc, emb_g, lm_acc, lm_g) handed over by StepGraphs.backward on a tied Adam step (tied_grad_fold)
+        # (emb_acc, emb_g, lm_acc, lm_g) from StepGraphs.backward for tied_grad_fold
         self.pending_tied_fold = None
         self._lm_head_param = self._param_by_label.get("lm_head")
         self._embed_param = self._param_by_label.get("embed")
@@ -624,8 +624,7 @@ class AnvilAndAdam:
         if param.grad is None or label in self.replicated_labels:
             return
 
-        # lm_head when tied: aggregate embed.grad.T (tiled Triton transpose-add). When StepGraphs.backward left the
-        # two accumulators' second-microbatch adds pending, one kernel does those adds and this transpose-add.
+        # lm_head when tied: aggregate embed.grad.T (tiled Triton transpose-add)
         if label == "lm_head" and do_adam and not self.split_embed:
             embed_param = self._embed_param
             if self.pending_tied_fold is not None:

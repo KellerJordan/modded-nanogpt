@@ -119,7 +119,7 @@ class StepGraphs:
                  ngram_table: NgramTable, value_embeds: ValueEmbedPull, max_step_tokens: int,
                  device: torch.device):
         self.model = model  # the compiled GPT
-        self.optimizer = optimizer  # read: split_embed and the tied pair; set: pending_tied_fold
+        self.optimizer = optimizer
         self.uncompiled_model = getattr(model, "_orig_mod", model)  # owns moe_bank and its gradient buffer
         self.params = list(optimizer.param_cfgs)
         self.anvil_params = {p for p, cfg in optimizer.param_cfgs.items() if cfg.optim == "anvil"}
@@ -183,9 +183,7 @@ class StepGraphs:
         """Replay the backward and set p.grad as loss.backward() would; returns the n-gram sink gradient.
         launch_reduces (EXACT_LEVERS=rsearly): called once the ANVIL banks' p.grad are set, before the Adam gradient
         accumulation below, so the reduce-scatters it launches wait for the backward alone.
-        do_adam: on an Adam step while embed and lm_head are tied, their second-microbatch accumulation is not
-        run here but handed to the optimizer (pending_tied_fold), which folds it into the transpose-add it runs
-        anyway: one kernel (perf/kernels/transpose.py tied_grad_fold), same roundings in the same order."""
+        do_adam: tied embed/lm_head accumulation is left to the optimizer (pending_tied_fold)."""
         cs = self.current
         cs.backward.replay()
         for p, grad in cs.anvil_grads:
@@ -205,7 +203,6 @@ class StepGraphs:
             lm_acc, emb_acc = self.adam_accumulators.get(lm), self.adam_accumulators.get(emb)
             if lm_acc is not None and emb_acc is not None and id(lm_acc) in pair and id(emb_acc) in pair:
                 assert opt.pending_tied_fold is None, "a tied-gradient fold was left pending by the previous step"
-                # (emb_acc, emb_g, lm_acc, lm_g): the graph's buffers stay untouched until the next replay.
                 opt.pending_tied_fold = (emb_acc, pair[id(emb_acc)][1], lm_acc, pair[id(lm_acc)][1])
                 accumulate = [(acc, grad) for acc, grad in accumulate if acc is not lm_acc and acc is not emb_acc]
         if accumulate:

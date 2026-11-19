@@ -386,24 +386,21 @@ def main():
     ########################################
     #        Training and validation       #
     ########################################
-    # The first shard's read starts at the clock start (FirstShardStart.start below), not at step 0's batch.
     first_shard = FirstShardStart(args.train_files)
     batches = ScheduledBatches(train_loader(first_shard), training_schedule, steps=range(training_schedule.total_steps))
     row_prefetch = RowPrefetch(ngram_table, value_embed_pull, batches, range(training_schedule.total_steps),
                                is_update_step, prefetch_staging)
 
-    # The canonical mask is only needed by the final validation, so every rank builds its own copy in a
-    # child process while we train and uploads it once no intermediate validation is left, and
-    # model.canon_mask stays all-zero == no masking until then, which is what the intermediate validations
-    # run with. Only the buffer is allocated here; the build is started below the clock, so its whole
-    # cost -- not just its use -- lands in the timed region.
+    # The canonical mask is only needed by the final validation, so every rank builds it in a child
+    # process while we train, and model.canon_mask stays all-zero == no masking until then, which
+    # is what the intermediate validations run with. Only the buffer is allocated here; the build
+    # is started below the clock, so its whole cost -- not just its use -- lands in the timed region.
     canon_mask_builder = BackgroundCanonicalMask(model.vocab_size, owner=True, print0=print0)
-    # The mask's upload may start after this step's training step: the last intermediate validation is behind.
+    # upload the mask after the last intermediate validation
     canon_upload_from = max((s for s in range(training_schedule.total_steps) if s % args.val_loss_every == 0),
                             default=0) if args.val_loss_every > 0 else 0
 
-    # The final validation's batches, read and prepared on the host by a background thread from mid-run
-    # (inside the timed region, overlapped with training; data.py ValPrefetch). Pinned buffers allocated here.
+    # the final validation's batches, prepared on the host from mid-run
     val_prefetch = ValPrefetch(args.val_files, args.val_batch_size, args.val_tokens, env.device)
     val_prefetch_at = training_schedule.total_steps // 2
 
@@ -427,7 +424,7 @@ def main():
     # start the clock
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    first_shard.start()  # on the clock: reads the head of the first shard while the work below runs
+    first_shard.start()
     canon_mask_builder.start()
     # Prefix-token table build, inside the timed region. The tokenizer was loaded at import
     # (get_encoding is cached in tiktoken's registry), so this pays only the table construction,
@@ -446,8 +443,6 @@ def main():
             # The deferred gathers land first: validation reads the banks and, at the last step, ships
             # into them.
             if last_step:
-                # First, so the host waits on nothing before it: the prefetched val batches' async H2Ds,
-                # queued on the stream (reading nothing training writes).
                 val_batches = val_prefetch.batches()
                 # The final fp8 refresh is skipped, not moved off the clock: its one consumer is a
                 # training forward, and the run ends after this validation.
@@ -456,8 +451,8 @@ def main():
                 # reader -- the decontraction norms of the ship below, then the validation.
                 training_manager.optimizer.land_bf16_replicas()
                 training_manager.apply_final_ws_ext()
-                # Both on the clock: the wait in case the build is somehow not done, and the (normally
-                # already finished) async upload, which the val forwards are ordered after by an event.
+                # Both on the clock: the wait in case the build is somehow not done, and the upload
+                # because it is part of the mask's cost.
                 canon_mask_builder.wait()
                 canon_mask_builder.collect(model.canon_mask)
                 # On the clock: evaluate (and keep) the tail-averaged weights, not the final iterate.
@@ -487,7 +482,6 @@ def main():
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
             if last_step:
-                # Off the clock: unpin the mask's host buffer, and check every rank uploaded the same mask.
                 canon_mask_builder.release(model.canon_mask)
             model.eval()
             val_loss = 0

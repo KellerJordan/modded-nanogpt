@@ -1,6 +1,4 @@
-"""The canonical mask's build (record #350; see canonical_mask.py), without torch: the background builder is a
-fresh interpreter spawned by BackgroundCanonicalMask.start and runs this module, so it imports only numpy and
-tiktoken."""
+"""The canonical mask's build (see canonical_mask.py), torch-free: the spawned builder runs this module."""
 import sys
 import unicodedata
 
@@ -121,7 +119,6 @@ def build_canonical_mask(vocab_size: int, ranks: dict | None = None) -> np.ndarr
 
 
 if __name__ == "__main__":
-    # The spawned builder (canonical_mask.BackgroundCanonicalMask.start): build the mask and write it into the shared file.
     _path, _vocab_size = sys.argv[1], int(sys.argv[2])
     _mask = build_canonical_mask(_vocab_size)
     _out = np.memmap(_path, dtype=np.uint8, mode="r+", shape=_mask.shape)

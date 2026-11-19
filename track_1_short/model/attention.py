@@ -41,15 +41,7 @@ flash_attn_interface = load_flash_attn3()
 
 
 class FlashAttnVarlenTruncBwd(torch.autograd.Function):
-    """FA3 varlen causal sliding-window attention whose backward runs a narrower left window (PR #371's
-    truncated attention backward, as a per-layer window instead of per-head calibration).
-
-    The forward is FlashAttnVarlenFunc's (same custom op, same arguments). The backward is FA3's backward
-    with window_size_left=window_bwd: the kernel recomputes P = exp(S - LSE) from the forward's LSE and
-    D = rowsum(dO * O) from the forward's output, so a smaller window only drops the distant key tiles'
-    terms (no renormalization). The gradient is biased; window_bwd == window is exactly FA3's backward.
-    Both windows are Python ints, fixed per compiled graph / CUDA-graph key (StepGraphKey.ws_short_bwd).
-    """
+    """FA3 varlen sliding-window attention whose backward uses a narrower left window (PR #371)."""
 
     @staticmethod
     def forward(ctx, q, k, v, cu_seqlens, max_seqlen, softmax_scale, window, window_bwd):
@@ -192,7 +184,7 @@ class AttnArgs:
     # A 0-D gain folded into the output projection with sa_lambdas[1]: the layer's residual post-lambda,
     # so the residual add takes the attention output as is (perf/residual_fusion.py). None = no gain.
     o_gain: torch.Tensor | None = None
-    # The attention backward's left window (truncated attention backward); None = bm_size, the exact backward.
+    # Attention backward's left window; None = bm_size (exact).
     bm_size_bwd: int | None = None
 
 
@@ -291,7 +283,6 @@ class CausalSelfAttention(nn.Module):
             v_fa = v
         bm_size_bwd = attn_args.bm_size_bwd
         if self.training and bm_size_bwd is not None and bm_size_bwd < bm_size:
-            # Truncated attention backward: same forward, the backward skips keys beyond bm_size_bwd.
             y = FlashAttnVarlenTruncBwd.apply(q, k, v_fa, seqlens, max_len, yarn.attn_scale, bm_size, bm_size_bwd)
         else:
             y = flash_attn_interface.flash_attn_varlen_func(q, k, v_fa, cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,

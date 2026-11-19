@@ -159,14 +159,8 @@ def transpose_add(src: torch.Tensor, dst: torch.Tensor):
 
 
 # -----------------------------------------------------------------------------
-# Tied-gradient fold (Adam steps while embed and lm_head are tied):
-#   lm_acc (N, M) = bf16(bf16(lm_acc + lm_g) + bf16(emb_acc + emb_g).T)
-# What it replaces: the second-microbatch accumulation `lm_acc += lm_g`, `emb_acc += emb_g` (the Adam
-# accumulators' _foreach_add_ in step_graphs.py) followed by transpose_add(emb_acc, lm_acc) (optim/anvil.py).
-# Same three roundings in the same order, so bit-exact: each sum of two bf16 values is computed in fp32 and
-# rounded once to bf16 (as torch's bf16 add and Triton's bf16 add both do; for two bf16 operands the fp32 sum
-# rounded to bf16 equals the correctly rounded bf16 sum). Traffic: 4 reads + 1 write of a 77 MB tensor
-# instead of 6 reads + 3 writes. emb_acc is NOT updated (while tied nothing reads embed.grad but this fold).
+# Tied-gradient fold: lm_acc = bf16(bf16(lm_acc + lm_g) + bf16(emb_acc + emb_g).T), bit-exact with the
+# two accumulator adds followed by transpose_add. emb_acc is not updated.
 
 @triton.jit
 def _tied_grad_fold_kernel(
@@ -199,14 +193,12 @@ def _tied_grad_fold_kernel(
 
 
 def tied_grad_fold(emb_acc: torch.Tensor, emb_g: torch.Tensor, lm_acc: torch.Tensor, lm_g: torch.Tensor):
-    """lm_acc = (lm_acc + lm_g) + (emb_acc + emb_g).T, each add rounded to bf16 in that order (see above).
-    emb_acc, emb_g are (M, N); lm_acc, lm_g are (N, M); all bf16. emb_acc is left as it was."""
     assert emb_acc.ndim == 2 and emb_acc.shape == emb_g.shape
     M, N = emb_acc.shape
     assert lm_acc.shape == (N, M) and lm_g.shape == (N, M), f"lm_head grads {lm_acc.shape}/{lm_g.shape} vs embed ({M}, {N})"
     for t in (emb_acc, emb_g, lm_acc, lm_g):
         assert t.dtype == torch.bfloat16, f"tied_grad_fold is bf16-only (got {t.dtype})"
-    BLOCK_M, BLOCK_N = 64, 128  # transpose_add's tiles (record #360)
+    BLOCK_M, BLOCK_N = 64, 128
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _tied_grad_fold_kernel[grid](
         emb_acc, emb_g, lm_acc, lm_g,

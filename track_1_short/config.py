@@ -48,13 +48,11 @@ class TrainingStage:
     # Prefix-token-prediction loss weight, stepped: the stage's steps split into equal parts, one weight each.
     prefix_weights: tuple[float, ...]
     duration: float | None = None  # fraction of num_scheduled_iterations; None for the extension stage
-    # Truncated attention backward (PR #371's second half): the short-window layers' backward window in
-    # block units, smaller than window_sizes[0]; None = the exact backward (the forward window).
+    # Truncated attention backward (PR #371): short layers' backward window in blocks; None = exact.
     bwd_window_short: int | None = None
 
 
 def short_bwd_window_tokens(stage: TrainingStage) -> int:
-    """The short-window layers' attention backward window in tokens: the forward window unless the stage truncates it."""
     ws_short = stage.window_sizes[0]
     if stage.bwd_window_short is not None:
         assert 1 <= stage.bwd_window_short <= ws_short, stage
@@ -92,13 +90,12 @@ TRAINING_STAGES = [
     TrainingStage(duration=STAGE_DURATIONS[0], train_max_seq_len=896, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
                   mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0], prefix_weights=(0.25,)),
     TrainingStage(duration=STAGE_DURATIONS[1], train_max_seq_len=2048, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
-                  bwd_window_short=2,  # truncated attention backward: 384 -> 256 tokens
+                  bwd_window_short=2,  # 384 -> 256 tokens
                   mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0], prefix_weights=(0.20, 0.15, 0.10, 0.05)),
     TrainingStage(duration=STAGE_DURATIONS[2] - TAPER_DURATION, train_max_seq_len=3072, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
-                  bwd_window_short=3,  # truncated attention backward: 640 -> 384 tokens
+                  bwd_window_short=3,  # 640 -> 384 tokens
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weights=(0.0,)),
-    # terminal batch taper: 24 -> 20, lr_mul scaled by sqrt(20/24). The taper and the extension (the last ~80
-    # steps) run the exact attention backward.
+    # terminal batch taper: 24 -> 20, lr_mul scaled by sqrt(20/24)
     TrainingStage(duration=TAPER_DURATION, train_max_seq_len=3072, batch_size=TAPER_BATCH_UNITS * 2048 * 8, window_sizes=(5, 11),
                   lr_mul=1.73 * (TAPER_BATCH_UNITS / 24) ** 0.5,
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weights=(0.0,)),
