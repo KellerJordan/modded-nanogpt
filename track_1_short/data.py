@@ -46,17 +46,79 @@ def pread_parallel(fd: int, out: np.ndarray, offset: int, nbytes: int) -> int:
         return sum(pool.map(read_range, edges, edges[1:]))
 
 
-def _load_data_shard(file: Path):
+def _load_data_shard(file: Path, prefix_tokens: int | None = None, pin_memory: bool = False):
     header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
     assert header[0] == 20240520, "magic number mismatch in the data .bin file"
     assert header[1] == 1, "unsupported version"
     num_tokens = int(header[2]) # number of tokens (claimed)
+    if prefix_tokens is not None:
+        assert num_tokens > prefix_tokens, f"shard {file} holds {num_tokens} tokens, the prefix needs more than {prefix_tokens}"
+        num_tokens = prefix_tokens
     with file.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=pin_memory)
         # straight into the array: avoids a bytes->array copy (@YouJiacheng)
         nbytes = pread_parallel(f.fileno(), tokens.numpy(), HEADER_BYTES, 2 * num_tokens)
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
+
+
+# Leading tokens of the first shard read before its first batch; the rest streams in (ShardRead).
+FIRST_SHARD_SYNC_TOKENS = 8_000_000
+PARTIAL_INDEX_TOKENS = 6_000_000
+
+
+class ShardRead:
+    """A shard's tokens, possibly still being read: tokens[:readable] are final; wait() for the rest."""
+    def __init__(self, tokens: Tensor, readable: int, thread: threading.Thread | None = None):
+        self.tokens = tokens
+        self.readable = readable
+        self.thread = thread
+        self.error: BaseException | None = None
+
+    def wait(self):
+        if self.thread is not None:
+            self.thread.join()
+            self.thread = None
+            if self.error is not None:
+                raise RuntimeError("background read of the training shard failed") from self.error
+            self.readable = self.tokens.numel()
+        return self.tokens
+
+
+def _read_shard(file: Path, sync_tokens: int | None = None) -> ShardRead:
+    """Read a shard into pageable memory; with sync_tokens, a background thread reads all but the head."""
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2]) # number of tokens (claimed)
+    tokens = torch.empty(num_tokens, dtype=torch.uint16)
+    arr = tokens.numpy()
+    f = file.open("rb", buffering=0)
+    head = num_tokens if sync_tokens is None else min(sync_tokens, num_tokens)
+    try:
+        # straight into the array: avoids a bytes->array copy (@YouJiacheng)
+        nbytes = pread_parallel(f.fileno(), arr[:head], HEADER_BYTES, 2 * head)
+        assert nbytes == 2 * head, "number of tokens read does not match header"
+    except BaseException:
+        f.close()
+        raise
+    if head == num_tokens:
+        f.close()
+        return ShardRead(tokens, num_tokens)
+
+    def read_rest():
+        try:
+            n = pread_parallel(f.fileno(), arr[head:], HEADER_BYTES + 2 * head, 2 * (num_tokens - head))
+            assert n == 2 * (num_tokens - head), "number of tokens read does not match header"
+        except BaseException as e:
+            read.error = e
+        finally:
+            f.close()
+
+    read = ShardRead(tokens, head, threading.Thread(target=read_rest))
+    read.thread.start()
+    return read
+
 
 BOS_ID = 50256
 
@@ -80,22 +142,38 @@ def cu_seqlens_rows(tokens_per_rank: int) -> int:
     return TRAIN_MAX_NUM_DOCS.get(tokens_per_rank, next_multiple_of_n(tokens_per_rank // 300, n=128))
 
 class Shard:
-    def __init__(self, tokens: Tensor, world_size: int = 1):
-        self.tokens = tokens
+    def __init__(self, read: ShardRead, world_size: int = 1):
+        self.read = read
+        self.tokens = tokens = read.tokens
         self.size = tokens.numel()
         self.world_size = world_size
         self.i = 0
 
         # Partial index now, full index async
-        self.bos_idx = (tokens[:6_000_000] == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        assert read.readable >= min(PARTIAL_INDEX_TOKENS, self.size), "partial BOS index past the bytes read"
+        self.bos_idx = np.flatnonzero(tokens.numpy()[:PARTIAL_INDEX_TOKENS] == BOS_ID).astype(np.int64, copy=False)
         self._full_idx = None
+        self._scan_error: BaseException | None = None
         self._ready = threading.Event()
         self._loader_thread = threading.Thread(target=self._scan)
         self._loader_thread.start()
 
     def _scan(self):
-        self._full_idx = (self.tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        try:
+            self.read.wait()
+            self._full_idx = np.flatnonzero(self.tokens.numpy() == BOS_ID).astype(np.int64, copy=False)
+        except BaseException as e:
+            self._scan_error = e
         self._ready.set()
+
+    def _wait_full(self):
+        self._ready.wait()
+        if self._scan_error is not None:
+            raise RuntimeError("full BOS index of the training shard failed") from self._scan_error
+        self._maybe_switch()
+
+    def readable_end(self) -> int:
+        return self.size if self.bos_idx is self._full_idx else self.read.readable
 
     def _maybe_switch(self):
         # Switch to full index as soon as async scan completes
@@ -113,6 +191,10 @@ class Shard:
         for r in range(self.world_size):
             cur_len = 0
             while cur_len <= num_tokens_local:
+                if idx + 1 >= n and self.bos_idx is not self._full_idx:
+                    # partial index exhausted: wait for the full one so batches do not depend on scan timing
+                    self._wait_full()
+                    n = len(self.bos_idx)
                 if idx >= n:
                     raise StopIteration("Insufficient BOS ahead; hit tail of shard.")
                 cur = self.bos_idx[idx]
@@ -129,21 +211,42 @@ class Shard:
         return starts, ends
 
     @staticmethod
-    def load_async(file: Path, world_size: int = 1):
+    def load_async(file: Path, world_size: int = 1, sync_tokens: int | None = None):
         """Returns getter function for async shard loading"""
         result = {}
         ready = threading.Event()
         def load():
-            tokens = _load_data_shard(file)
-            result['shard'] = Shard(tokens, world_size)
+            try:
+                result['shard'] = Shard(_read_shard(file, sync_tokens=sync_tokens), world_size)
+            except BaseException as e:
+                result['error'] = e
             ready.set()
         thread = threading.Thread(target=load)
         thread.start()
         def get():
             ready.wait()
             thread.join()
+            if 'error' in result:
+                raise RuntimeError(f"loading {file} failed") from result['error']
             return result['shard']
         return get
+
+
+class FirstShardStart:
+    """The first training shard, read from the clock start (start()) rather than at the first batch."""
+    def __init__(self, filename_pattern: str):
+        self.files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
+        if not self.files:
+            raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
+        self._get = None
+
+    def start(self):
+        if self._get is None:
+            self._get = Shard.load_async(self.files[0], dist.get_world_size(), sync_tokens=FIRST_SHARD_SYNC_TOKENS)
+
+    def get(self) -> "Shard":
+        self.start()
+        return self._get()
 
 def split_attention_segments(cum_lengths: Tensor, cap: int) -> Tensor:
     """Document ends (cumulative) -> attention-segment ends, with a boundary every `cap` tokens inside
@@ -152,8 +255,86 @@ def split_attention_segments(cum_lengths: Tensor, cap: int) -> Tensor:
             for end in (*range(start + cap, stop, cap), stop)]
     return torch.tensor(ends, dtype=cum_lengths.dtype)
 
+def _unaligned_slice(tokens: Tensor, pos: int, rank: int, num_tokens_local: int):
+    pos_local = pos + rank * num_tokens_local
+    buf = tokens[pos_local: pos_local + num_tokens_local + 1]
+    _inputs = buf[:-1].view(num_tokens_local, )
+    _targets = buf[1:].view(num_tokens_local, )
+
+    cum_lengths = torch.nonzero(_inputs == BOS_ID)[:, 0]
+    return _inputs, _targets, cum_lengths
+
+def _host_batch(_inputs: Tensor, _targets: Tensor, cum_lengths: Tensor, num_tokens_local: int, max_num_docs: int):
+    _cum_lengths = torch.full((max_num_docs,), num_tokens_local)
+    _cum_lengths[0] = 0
+    _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths
+
+    # Cast to int32 on CPU before transfer to avoid dtype conversion during .to()
+    _inputs = _inputs.to(dtype=torch.int32)
+    _targets = _targets.to(dtype=torch.int64)
+    _cum_lengths = _cum_lengths.to(dtype=torch.int32)
+    _ngram_ids = ngram_row_ids(_inputs)
+    return _inputs, _targets, _cum_lengths, _ngram_ids
+
+class ValPrefetch:
+    """The final validation's batches (same as the unaligned val loader's), prepared by a background thread."""
+
+    def __init__(self, filename_pattern: str, num_tokens: int, val_tokens: int, device: torch.device):
+        self.rank, world_size = dist.get_rank(), dist.get_world_size()
+        assert num_tokens % world_size == 0, "Batch size must be divisible by world size"
+        assert val_tokens % num_tokens == 0
+        files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
+        if not files:
+            raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
+        self.file, self.device = files[0], device
+        self.num_tokens, self.val_tokens = num_tokens, val_tokens
+        self.num_tokens_local = num_tokens // world_size
+        self.max_num_docs = cu_seqlens_rows(self.num_tokens_local)
+        pinned = lambda n, dtype: torch.empty(n, dtype=dtype, pin_memory=True)
+        ntl = self.num_tokens_local
+        self.host = [(pinned(ntl, torch.int32), pinned(ntl, torch.int64), pinned(self.max_num_docs, torch.int32),
+                      pinned(2 * ntl, torch.int32)) for _ in range(val_tokens // num_tokens)]
+        self.thread = None
+        self.error = None
+
+    def start(self):
+        assert self.thread is None
+        self.thread = threading.Thread(target=self._prepare, daemon=True)
+        self.thread.start()
+
+    def _prepare(self):
+        try:
+            tokens = _load_data_shard(self.file, prefix_tokens=self.val_tokens + 1, pin_memory=False)
+            for b, host in enumerate(self.host):
+                _inputs, _targets, cum_lengths = _unaligned_slice(tokens, b * self.num_tokens, self.rank, self.num_tokens_local)
+                for buf, t in zip(host, _host_batch(_inputs, _targets, cum_lengths, self.num_tokens_local, self.max_num_docs)):
+                    assert buf.shape == t.shape and buf.dtype == t.dtype, f"{t.dtype}{tuple(t.shape)} != {buf.dtype}{tuple(buf.shape)}"
+                    buf.copy_(t)
+        except BaseException as e:
+            self.error = e
+
+    def batches(self) -> list[Batch]:
+        """Wait for the host prep and queue the batches' H2D copies."""
+        if self.thread is None:
+            self.start()
+        self.thread.join()
+        if self.error is not None:
+            raise RuntimeError("validation prefetch failed") from self.error
+        out = []
+        for _inputs, _targets, _cum_lengths, _ngram_ids in self.host:
+            out.append(Batch(
+                inputs=_inputs.to(self.device, non_blocking=True),
+                targets=_targets.to(self.device, non_blocking=True),
+                cum_seqlens=_cum_lengths.to(self.device, non_blocking=True),
+                ngram_ids=_ngram_ids.to(self.device, non_blocking=True),
+                ngram_ids_cpu=_ngram_ids.numpy(),
+                targets_cpu=_targets,
+                inputs_cpu=_inputs.numpy(),
+            ))
+        return out
+
 def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, staging: PinnedBatchStaging,
-                               align_to_bos: bool = True):
+                               align_to_bos: bool = True, first_shard: FirstShardStart | None = None):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
     # staging: the pinned slots every batch's H2D copies go through (perf/pinned_batches.py)
     rank = dist.get_rank()
@@ -165,11 +346,17 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
 
     file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
-    tokens = _load_data_shard(next(file_iter))
     if align_to_bos:
-        shard = Shard(tokens, world_size)
+        first_file = next(file_iter)
+        if first_shard is not None:
+            assert first_shard.files[0] == first_file, "first_shard is not this loader's first file"
+            shard = first_shard.get()
+        else:
+            shard = Shard(_read_shard(first_file, sync_tokens=FIRST_SHARD_SYNC_TOKENS), world_size)
+        tokens = shard.tokens
         next_shard_getter = Shard.load_async(next(file_iter), world_size)
     else:
+        tokens = _load_data_shard(next(file_iter))
         pos = 0  # for unaligned case
 
     while True:
@@ -190,6 +377,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
                     next_shard_getter = None  # no more shards to preload
                 continue
 
+            assert int(end_idxs[-1]) <= shard.readable_end(), "batch reads training-shard bytes not yet read"
             buf = torch.cat([tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
             _inputs = buf[:-1]
             _targets = buf[1:]
@@ -203,24 +391,10 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             if pos + num_tokens + 1 >= len(tokens):  # should not occur for val data
                 tokens, pos = _load_data_shard(next(file_iter)), 0
 
-            pos_local = pos + rank * num_tokens_local
-            buf = tokens[pos_local: pos_local + num_tokens_local + 1]
-            _inputs = buf[:-1].view(num_tokens_local, )
-            _targets = buf[1:].view(num_tokens_local, )
-
-            cum_lengths = torch.nonzero(_inputs == BOS_ID)[:, 0]
+            _inputs, _targets, cum_lengths = _unaligned_slice(tokens, pos, rank, num_tokens_local)
             pos += num_tokens
 
-
-        _cum_lengths = torch.full((max_num_docs,), num_tokens_local)
-        _cum_lengths[0] = 0
-        _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths
-
-        # Cast to int32 on CPU before transfer to avoid dtype conversion during .to()
-        _inputs = _inputs.to(dtype=torch.int32)
-        _targets = _targets.to(dtype=torch.int64)
-        _cum_lengths = _cum_lengths.to(dtype=torch.int32)
-        _ngram_ids = ngram_row_ids(_inputs)
+        _inputs, _targets, _cum_lengths, _ngram_ids = _host_batch(_inputs, _targets, cum_lengths, num_tokens_local, max_num_docs)
         inputs, targets, cum_seqlens, ngram_ids = staging.upload(_inputs, _targets, _cum_lengths, _ngram_ids)
 
         new_params = yield Batch(

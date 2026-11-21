@@ -15,14 +15,21 @@ Scales, all per-tensor fp32 (the caller in model/gpt.py owns and refreshes them)
   grad   static 2^-6 (e5m2) for the incoming gradient
   dpre   delayed, like post, from the backward epilogue
 
+The two fp8 training rows (forward with the relu^2 / e4m3 epilogue, backward emitting dpre) run on the Gluon
+G3 kernels of mlp_g3.py once prime_stage_cache() has verified, bit for bit, that they reproduce this Triton
+kernel; the Triton kernel below stays the reference, the bf16 (validation) path and the fallback.
+
 Provenance: bf16 kernel by @andrewbriand, @jrauvola; full-fp8 MLP from record #360 (ANVIL2).
 """
+import os
+
 import torch
 import triton
 import triton.language as tl
 from triton.runtime.errors import OutOfResources
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from track_1_short.perf.kernels import mlp_g3 as _g3
 from track_1_short.perf.kernels.transpose import transpose_copy
 
 # Weight scales lag a step (see quantize_mlp_weights_dual), so they keep 12% headroom.
@@ -241,6 +248,17 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=N
     use_fp8 = b_f8 is not None
     FORWARD = aux is None
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    # G3 path (Gluon) for the two fp8 training rows. Every condition is trace-time, and _g3_ok was decided ONCE (eagerly)
+    # by prime_stage_cache, so here it is read-only. Everything else goes through the Triton kernel below.
+    if FORWARD and use_fp8 and emit_f8 and emit_t and not store_pre and not store_post_bf \
+            and _g3._g3_eligible(True, a_f8, b_f8, None, dequant_scale_ptr, post_scale, post_amax):
+        post_f8, post_t = torch.ops.nanogpt.lrs_g3_fwd(a_f8, b_f8, dequant_scale_ptr, post_scale, post_amax)
+        return None, None, post_f8, post_t
+    if (not FORWARD) and use_fp8 and dpre_scale is not None \
+            and _g3._g3_eligible(False, a_f8, b_f8, aux, dequant_scale_ptr, post_scale, dpre_amax):
+        dpre_f8, dpre_t = torch.ops.nanogpt.lrs_g3_bwd(a_f8, b_f8, aux, dequant_scale_ptr, post_scale, dpre_scale,
+                                                       dpre_amax)
+        return dpre_f8, dpre_t
     # One tile shape for both passes: the backward measured 0.3824 ms at 128x256, 0.4102 ms transposed.
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 256
@@ -318,10 +336,91 @@ def linear_relu_square(a, b, aux=None, a_f8=None, b_f8=None, dequant_scale_ptr=N
         _lrs_stage_cache[key] = num_stages
     return (c, aux_out, aux_f8, aux_t) if FORWARD else (c_f8, c_t)
 
+def _g3_compare_with_triton(dev, nsm):
+    """Compile the two G3 kernels and compare them BIT FOR BIT with the Triton path on a small but non-degenerate
+    problem (forward and backward, row and transposed outputs + amax). True iff everything matches."""
+    _g3._G3_NUM_SMS[0] = nsm
+    g = torch.Generator(device=dev)
+    g.manual_seed(1234)
+    M, N, K = 256, 512, 768
+    e4, e5 = torch.float8_e4m3fn, torch.float8_e5m2
+    x = (torch.randn(M, K, device=dev, generator=g) * 6).clamp(-448, 448).to(e4)
+    w = (torch.randn(N, K, device=dev, generator=g) * 6).clamp(-448, 448).to(e4)
+    w2 = (torch.randn(N, K, device=dev, generator=g) * 6).clamp(-448, 448).to(e4)
+    gr = (torch.randn(M, K, device=dev, generator=g) * 6).clamp(-57344, 57344).to(e5)
+    dq = torch.full((1,), 1.0 / 400.0, device=dev)
+    dqb = torch.full((), 1.0 / 400.0, device=dev)
+    a_bf, b_bf = torch.zeros(M, K, device=dev, dtype=torch.bfloat16), torch.zeros(N, K, device=dev, dtype=torch.bfloat16)
+    ps0 = torch.ones((), device=dev)
+    amax_t = torch.zeros(1, device=dev)
+    _g3._g3_ok[0] = False                   # so that linear_relu_square takes the pure Triton path below
+    linear_relu_square(a_bf, b_bf, a_f8=x, b_f8=w, emit_f8=True, emit_t=True, dequant_scale_ptr=dq, post_scale=ps0,
+                       post_amax=amax_t, store_pre=False, store_post_bf=False)
+    ps = (amax_t[0] * 1.03 / 448.0).clone().reshape(())
+    amax_t.zero_()
+    _, _, pf_t, pt_t = linear_relu_square(a_bf, b_bf, a_f8=x, b_f8=w, emit_f8=True, emit_t=True,
+                                          dequant_scale_ptr=dq, post_scale=ps, post_amax=amax_t, store_pre=False,
+                                          store_post_bf=False)
+    amax_g = torch.zeros(1, device=dev)
+    pf_g, pt_g = torch.ops.nanogpt.lrs_g3_fwd(x, w, dq, ps, amax_g)
+    ok = (torch.equal(pf_t.view(torch.uint8), pf_g.view(torch.uint8))
+          and torch.equal(pt_t.view(torch.uint8), pt_g.view(torch.uint8)) and torch.equal(amax_t, amax_g))
+    dsc0 = torch.full((), 0.015625, device=dev)
+    damax_t = torch.zeros(1, device=dev)
+    linear_relu_square(gr.to(torch.bfloat16), w2.to(torch.bfloat16), aux=pf_t, a_f8=gr, b_f8=w2, dequant_scale_ptr=dqb,
+                       post_scale=ps, dpre_scale=dsc0, dpre_amax=damax_t)
+    dsc = (damax_t[0] * 1.25 / 57344.0).clone().reshape(())
+    damax_t.zero_()
+    df_t, dt_t = linear_relu_square(gr.to(torch.bfloat16), w2.to(torch.bfloat16), aux=pf_t, a_f8=gr, b_f8=w2,
+                                    dequant_scale_ptr=dqb, post_scale=ps, dpre_scale=dsc, dpre_amax=damax_t)
+    damax_g = torch.zeros(1, device=dev)
+    df_g, dt_g = torch.ops.nanogpt.lrs_g3_bwd(gr, w2, pf_t, dqb, ps, dsc, damax_g)
+    ok = ok and (torch.equal(df_t.view(torch.uint8), df_g.view(torch.uint8))
+                 and torch.equal(dt_t.view(torch.uint8), dt_g.view(torch.uint8)) and torch.equal(damax_t, damax_g))
+    torch.cuda.synchronize(dev)
+    return bool(ok)
+
+
+def _g3_prime_base(dev, nsm):
+    """Decide _g3_ok: G3 is on only if Gluon imports, the GPU is Hopper, and the compiled G3 kernels reproduce the
+    Triton path bit for bit. Eager, once: writes only _G3_NUM_SMS / _g3_ok / G3_FALLBACK_REASON (never under compile).
+    Any exception => stay on Triton. Every fallback is printed on rank 0."""
+    _g3._g3_ok[0] = False
+    reason = None
+    if not _g3._HAVE_GLUON:
+        reason = f"Gluon is not importable ({_g3._GLUON_IMPORT_ERROR})"
+    elif torch.cuda.get_device_capability(dev)[0] != 9:
+        reason = "the GPU is not Hopper (sm_90)"
+    else:
+        try:
+            _g3._g3_ok[0] = _g3_compare_with_triton(dev, nsm)
+            if not _g3._g3_ok[0]:
+                reason = "outputs differ from the Triton kernel"
+        except Exception as _e:
+            _g3._g3_ok[0] = False
+            reason = f"{type(_e).__name__}: {str(_e)[:200]}"
+    _g3.G3_FALLBACK_REASON = reason
+    if reason is not None and int(os.environ.get("RANK", "0")) == 0:
+        print(f"[linear_relu_square] G3 (Gluon) disabled, using the Triton kernel: {reason}", flush=True)
+
+
+def _g3_prime(dev, nsm):
+    """Start-up check of the Gluon path (eager, called by prime_stage_cache): G3 against the Triton kernel, then, if G3
+    passed, the ping-pong forward against G3. Sets G3_ACTIVE / G3PP_ACTIVE and the matching *_FALLBACK_REASON."""
+    _g3._G3_PP[0] = 0                       # G3 is compared against the Triton kernel on its own
+    _g3_prime_base(dev, nsm)
+    _g3.G3_ACTIVE = bool(_g3._g3_ok[0])
+    if _g3.G3_ACTIVE:
+        _g3._g3pp_selfcheck(dev)            # sets _G3_PP[0], G3PP_ACTIVE, G3PP_FALLBACK_REASON
+    else:
+        _g3.G3PP_ACTIVE, _g3.G3PP_FALLBACK_REASON = False, "G3 is off"
+
+
 def prime_stage_cache():
     """Resolve num_stages for every linear_relu_square variant training reaches, by launching each
     once on one-tile inputs (shared-memory pressure depends only on the variant, not on M/N/K).
-    Call once, before torch.compile traces the model."""
+    Call once, before torch.compile traces the model. It also runs the Gluon start-up checks
+    (_g3_prime), which set mlp_g3.G3_ACTIVE / G3PP_ACTIVE."""
     dev = torch.device("cuda")
     M, N, K = (128, 256, 128)  # one (BLOCK_M, BLOCK_N) tile, one fp8 K-block
     num_sms = torch.cuda.get_device_properties(dev).multi_processor_count
@@ -341,6 +440,7 @@ def prime_stage_cache():
                     "post_scale": one, "dpre_scale": one, "dpre_amax": amax}):  # fp8 backward
         linear_relu_square(a, b, **kwargs)
     torch.cuda.synchronize(dev)
+    _g3_prime(dev, num_sms)
 
 
 # -----------------------------------------------------------------------------
@@ -365,6 +465,31 @@ wg1_f8_op = _f8_mm_op("wg1_f8", transpose_b=True, fast_accum=False)   # dW1 = dp
 dx_f8_op = _f8_mm_op("dx_f8", transpose_b=False, fast_accum=False)    # dx  = dpre_f8 @ w1_f8_col
 
 
+# EXACT_LEVERS=bankinplace: a weight gradient written straight into matrix `index` of the bank's gradient buffer
+# (bank_grad.flatten(0, 1)[index]), the dense twin of moe_mlp.dw_into_bank. wg_f8_into is wg1_f8 / wg2_f8 with out=
+# (the same cuBLASLt call); mul_into is the folded dW2's product, one bf16 rounding as before.
+@torch.library.custom_op("nanogpt::wg_f8_into", mutates_args={"bank_grad"})
+def wg_f8_into(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: torch.Tensor, bank_grad: torch.Tensor,
+               index: int) -> None:
+    torch._scaled_mm(a, b.T, out_dtype=torch.bfloat16, scale_a=a_scale, scale_b=b_scale, use_fast_accum=False,
+                     out=bank_grad.flatten(0, 1)[index])
+
+
+@wg_f8_into.register_fake
+def _(a, b, a_scale, b_scale, bank_grad, index) -> None:
+    return None
+
+
+@torch.library.custom_op("nanogpt::mul_into", mutates_args={"bank_grad"})
+def mul_into(src: torch.Tensor, scale: torch.Tensor, bank_grad: torch.Tensor, index: int) -> None:
+    torch.mul(src, scale, out=bank_grad.flatten(0, 1)[index])
+
+
+@mul_into.register_fake
+def _(src, scale, bank_grad, index) -> None:
+    return None
+
+
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     """relu(x @ W1.T)^2 @ W2 as one autograd op. x is the [T, 768] bf16 normed residual; W1/W2 are
     [H, 768] bf16 bank slices. Called with only (x, W1, W2) it runs the bf16 forward (validation, under
@@ -377,11 +502,15 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
       post_scale/amax, dpre_scale/amax  the delayed activation scales and their amax slots
       p_fold              the residual post-lambda folded into the down-projection scale (w2_scale
                           and dq_bwd), or None. It rides along only so its gradient can be returned.
+      bank_grad, bank_slot  EXACT_LEVERS=bankinplace: the bank's persistent gradient buffer [slots, 2, H, 768] and
+                          this MLP's slot. dW1 / dW2 are written into bank_grad[slot, 0] / [slot, 1] and autograd
+                          gets None for W1 / W2, so nothing stacks the bank's gradient (moe_mlp.dw_into_bank).
     """
     @staticmethod
     def forward(ctx, x, W1, W2, W1_f8=None, dequant_scale=None, x_f8=None, W2_f8=None, w2_scale=None,
                 post_scale=None, post_amax=None, w2_f8_row=None, dq_bwd=None, x_f8_t=None, x_scale=None,
-                w1_f8_col=None, w1_scale=None, g_scale=None, dpre_scale=None, dpre_amax=None, p_fold=None):
+                w1_f8_col=None, w1_scale=None, g_scale=None, dpre_scale=None, dpre_amax=None, p_fold=None,
+                bank_grad=None, bank_slot=None):
         x_flat = x.view((-1, x.shape[-1]))
         if W1_f8 is None:  # validation: nothing saved, the backward below is fp8-only
             _, post, _, _ = linear_relu_square(x_flat, W1)
@@ -395,9 +524,11 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         x3 = torch.ops.nanogpt.dp_f8(post_f8, W2_f8, post_scale, w2_scale)
         # Intermediates go through save_for_backward: stashing them on ctx inside the compiled
         # subgraph pins them past their last use (+3.3 MB). The optional p_fold is trace-time constant.
-        ctx.save_for_backward(*((x, W1, W2) + ((p_fold,) if p_fold is not None else ())))
+        ctx.save_for_backward(*((x, W1, W2) + ((p_fold,) if p_fold is not None else ())
+                                + ((bank_grad,) if bank_grad is not None else ())))
         # Persistent caches and scales are kept by name.
         ctx.fold_p = p_fold is not None
+        ctx.bank_slot = bank_slot if bank_grad is not None else None
         ctx.post_f8, ctx.post_t, ctx.post_scale = post_f8, post_t, post_scale
         ctx.w2_f8_row, ctx.dq_bwd, ctx.x_f8_t, ctx.x_scale = w2_f8_row, dq_bwd, x_f8_t, x_scale
         ctx.w1_f8_col, ctx.w1_scale, ctx.g_scale = w1_f8_col, w1_scale, g_scale
@@ -410,11 +541,17 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         st = ctx.saved_tensors
         x, W2 = st[0], st[2]
         p_fold = st[3] if ctx.fold_p else None
+        slot = ctx.bank_slot   # EXACT_LEVERS=bankinplace: dW1 / dW2 go to bank_grad's matrices 2 * slot, 2 * slot + 1
+        bank_grad = st[-1] if slot is not None else None
         g_flat = grad_output.view((-1, grad_output.shape[-1]))
 
         # 1. Quantize the incoming gradient (one pass, both layouts), then dW2 = post^T @ g.
         g_f8, g_f8_t = quantize_dual_layout_fused(g_flat, ctx.g_scale, fmt=torch.float8_e5m2)
-        dW2 = torch.ops.nanogpt.wg2_f8(ctx.post_t, g_f8_t, ctx.post_scale, ctx.g_scale)
+        if slot is not None and not ctx.fold_p:
+            torch.ops.nanogpt.wg_f8_into(ctx.post_t, g_f8_t, ctx.post_scale, ctx.g_scale, bank_grad, 2 * slot + 1)
+            dW2 = None
+        else:
+            dW2 = torch.ops.nanogpt.wg2_f8(ctx.post_t, g_f8_t, ctx.post_scale, ctx.g_scale)
 
         # 2. Post-lambda folded into the down-projection scale: the forward computed out = post @ (p * W2),
         # so dW2 above is d/d(p*W2). Then dL/dW2 = p * dW2 and dL/dp = <dW2, W2>, an [H, 768] dot that
@@ -422,15 +559,23 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         grad_p = None
         if ctx.fold_p:
             grad_p = (dW2.float() * W2.float()).sum().to(p_fold.dtype)
-            dW2 = dW2 * p_fold
+            if slot is not None:
+                torch.ops.nanogpt.mul_into(dW2, p_fold, bank_grad, 2 * slot + 1)
+                dW2 = None
+            else:
+                dW2 = dW2 * p_fold
 
         # 3. dpre in e5m2 (both layouts, from the kernel epilogue), then dW1 and dx.
         dpre_f8, dpre_t = linear_relu_square(
             g_flat, W2, aux=ctx.post_f8, a_f8=g_f8, b_f8=ctx.w2_f8_row,
             dequant_scale_ptr=ctx.dq_bwd, post_scale=ctx.post_scale,
             dpre_scale=ctx.dpre_scale, dpre_amax=ctx.dpre_amax)
-        dW1 = torch.ops.nanogpt.wg1_f8(dpre_t, ctx.x_f8_t, ctx.dpre_scale, ctx.x_scale)
+        if slot is not None:
+            torch.ops.nanogpt.wg_f8_into(dpre_t, ctx.x_f8_t, ctx.dpre_scale, ctx.x_scale, bank_grad, 2 * slot)
+            dW1 = None
+        else:
+            dW1 = torch.ops.nanogpt.wg1_f8(dpre_t, ctx.x_f8_t, ctx.dpre_scale, ctx.x_scale)
         dx = torch.ops.nanogpt.dx_f8(dpre_f8, ctx.w1_f8_col, ctx.dpre_scale, ctx.w1_scale)
 
-        # One slot per forward input: (x, W1, W2), 16 fp8 args, p_fold.
-        return (dx.view(x.shape), dW1, dW2) + (None,) * 16 + (grad_p,)
+        # One slot per forward input: (x, W1, W2), 16 fp8 args, p_fold (, bank_grad, bank_slot).
+        return (dx.view(x.shape), dW1, dW2) + (None,) * 16 + (grad_p,) + ((None, None) if slot is not None else ())
