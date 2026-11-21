@@ -128,16 +128,6 @@ There is no toggle. To get the exact-only arm, set `bwd_window_short=None` for s
 
 After all runs, the comments and docstrings in the code were shortened; no code changed. Every changed `.py` file has the same AST (docstrings stripped) as the commit that produced the logs (`1e508b7`), so the code embedded in the logs is that commit's, with longer comments.
 
-## Tried, not included (same node and setup, all on #397)
-
-| change | time | loss | why dropped |
-|---|---|---|---|
-| sampled softmax through the batch-20 taper | −0.37 s | +6 mnat | loss |
-| no dense MLP on layer 4 | −1.2 s | +7.5 mnat | the loss costs more steps than it saves |
-| #403 stratified sampled softmax, ported onto #397 | −0.29 s | +2.5 mnat | loss |
-| momentum cooldown 50 → 100 steps | 0 | 0 | neutral |
-| slimmer refactor of this PR (about 500 fewer lines, no `tied_grad_fold`), another node | −0.45 s vs #397 (n=6 vs 3) | +2.4 mnat vs #397 | inconclusive at this n |
-
 ## Where the time goes now (torch.profiler, CUPTI started before graph capture as in #396)
 
 The GPU is 96–98% busy in every stage. Gaps between graph replays total ~0.1 ms/step, and the host is never late. The 3–5 ms/step outside the forward and backward graphs is GPU work:
