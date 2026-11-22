@@ -11,10 +11,15 @@ flush() then waits each gather right before ITS OWN consumer, and the fp8 refres
 end of the optimizer step, runs in two halves around the waits:
 
     wait qk_bank, vo_bank gathers  ->  refresh the attention fp8 caches (model.quantize_attn_fp8)
+    wait the experts' fp8 gathers  ->  build their column-major cache (model.build_moe_cols)
     complete value_embeds' replica land (perf/value_embed_pull.py; its row exchange was served in the
                                          event's optimizer step)
     wait mlp_bank gather            ->  refresh the MLP fp8 caches and, after an Adam step, the lm_head
                                         fp8 copies (model.quantize_mlp_fp8)
+
+The experts (moe_bank) are different from the dense banks: their owners quantize the updated shard right after
+its update (inside the optimizer step) and what is gathered is the e4m3 rows and the scales, not the bf16 bank.
+The bf16 replica is gathered, blocking, only before its full readers (AnvilAndAdam.land_bf16_replicas).
 
 Ordering contract. Between the end of step s's optimizer and flush(), nothing may read a bank's full
 replica or the peers' rows of the value_embeds replica. The readers, all after flush():
@@ -22,7 +27,8 @@ replica or the peers' rows of the value_embeds replica. The readers, all after f
   - the training forward and backward of step s+1 (bf16 bank slices, the value_embeds replica)
   - the sampled-softmax row gather of step s+1 (reads the lm_head fp8 copy the refresh writes)
   - validation: the forward, value_embeds' gather_replica, and at the end the tail-average ship, whose
-    decontraction norms read every full bank and whose gathers write them
+    decontraction norms read every full bank and whose gathers write them (moe_bank's bf16 replica
+    first lands through land_bf16_replicas)
   - the checkpoint's state_dict
 What does run in between reads neither a full bank nor the value_embeds replica's peer rows:
   - the tail-average ticks (tail_average.py): only this rank's own shard, which the in-place all-gather
@@ -49,7 +55,9 @@ from track_1_short.perf.value_embed_pull import ValueEmbedPull
 
 ATTN_BANK_LABELS = ("qk_bank", "vo_bank")
 BANK_LABELS = (*ATTN_BANK_LABELS, "mlp_bank")  # work order
-DEFERRED_LABELS = frozenset(BANK_LABELS)
+# The experts' fp8 rows and scales (AnvilAndAdam.step, Fp8RefreshGraphs.publish_moe).
+MOE_LABELS = ("moe_bank", "moe_scales")
+DEFERRED_LABELS = frozenset((*BANK_LABELS, *MOE_LABELS))
 
 
 class DeferredGathers:
@@ -82,6 +90,11 @@ class DeferredGathers:
         self._wait(ATTN_BANK_LABELS)
         if refresh_lm is not None:
             self.fp8_refresh.refresh_attn()
+        # The experts' rows and scales are queued ahead of mlp_bank's gather: the column-major cache is built from the
+        # gathered rows while that gather still runs.
+        self._wait(MOE_LABELS)
+        if refresh_lm is not None:
+            self.fp8_refresh.refresh_moe_cols()
         self.value_embeds.complete_land()
         self._wait(BANK_LABELS)
         if refresh_lm is not None:
@@ -91,5 +104,6 @@ class DeferredGathers:
         """Before the final validation: wait everything, and drop the owed fp8 refresh -- its only
         consumer is a training forward, and none follows."""
         self.refresh_lm = None
+        self._wait(MOE_LABELS)
         self._wait(BANK_LABELS)
         self.value_embeds.complete_land()

@@ -8,9 +8,9 @@ code on the same buffers, so the timed run only replays:
   - optimizer tail graphs (optimizer_graphs.py): captured at the top of the second warmup step, self-checked
     in that step's optimizer.
   - fp8 refresh graphs (fp8_refresh_graphs.py): captured once the MLP's exact-scale bootstrap is over (the
-    captured body is the delayed-scale path), after which each of the three graphs (attention; MLP
-    without / with lm_head) self-checks at a later refresh. That needs later warmup steps of both
-    parities: the refresh after an Adam (odd) step includes lm_head, the one after an even step does not.
+    captured body is the delayed-scale path), after which each of the five graphs (attention; MLP
+    without / with lm_head; the experts' local quantize and column-cache build) self-checks at a later
+    refresh. That needs later warmup steps of both parities: the refresh after an Adam (odd) step includes lm_head, the one after an even step does not.
 The two tail captures run at the top of a warmup position, right after DeferredGathers.flush, so no
 collective still reads a buffer their warm iterations touch.
 
@@ -26,7 +26,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from track_1_short.config import BLOCK_SIZE, VIRTUAL_SEQ_CAP
+from track_1_short.config import BLOCK_SIZE, VIRTUAL_SEQ_CAP, short_bwd_window_tokens
 from track_1_short.data import cu_seqlens_rows
 
 # Untimed warmup steps allowed (record #360's _CF_MAX). The count is printed every run; a schedule
@@ -43,6 +43,7 @@ class StepGraphKey(NamedTuple):
     candidates: int        # sampled-softmax candidate count P, 0 = full softmax
     ws_short: int          # attention windows, in tokens
     ws_long: int
+    ws_short_bwd: int      # short layers' attention backward window
     max_seq_len: int       # longest attention segment
 
 
@@ -57,6 +58,7 @@ def step_graph_key(schedule, candidate_counts: list[int], step: int, world_size:
         candidates=candidate_counts[step],
         ws_short=stage.window_sizes[0] * BLOCK_SIZE,
         ws_long=stage.window_sizes[1] * BLOCK_SIZE,
+        ws_short_bwd=short_bwd_window_tokens(stage),
         max_seq_len=min(stage.train_max_seq_len, VIRTUAL_SEQ_CAP),
     )
 

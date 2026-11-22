@@ -17,12 +17,15 @@ Why it is faster:
        top of E             upload the want lists (pinned rings, H2D on the compute stream); count
                             exchanges (gloo, CPU tensors, async)
        after E's forward    wait for the counts (long done); id all_to_alls (NCCL stream, under the backward)
-       E's optimizer step   at value_embeds' place in the scatter order: E's gradient exchanges (NCCL,
-                            queued behind the bank reduce-scatters);
-                            at value_embeds' place in the work order: value_embeds' shard merge + Adam, the
-                            n-gram per-row merge + Adam, then serve the post-update rows (row all_to_alls,
-                            async: queued ahead of the mlp_bank gather);
-                            Phase 3, after the lm_head gather: the n-gram cache write
+       E's optimizer step   once the dense collectives of the attention banks and small params are
+                            launched: the n-gram gradient exchange (its own NCCL communicator), then the
+                            big dense reduce-scatters (lm_head, mlp_bank) queued behind it on that
+                            communicator, then value_embeds' gradient exchange (default communicator);
+                            at value_embeds' place in the work order: the n-gram per-row merge + Adam,
+                            then its post-update rows served (row all_to_all, async, behind the
+                            reduce-scatters on the n-gram communicator), then the same for value_embeds
+                            (default communicator, ahead of the mlp_bank gather);
+                            Phase 3, after the lm_head gather: the n-gram cache is complete
        top of E+1           value_embeds' replica write, with the deferred bank gathers
                             (perf/deferred_gathers.py)
   3. Steps E+1 .. E+k do no exchange at all: one searchsorted maps their n-gram row ids to cache slots,
@@ -34,13 +37,15 @@ batches ahead of the step being trained.
 
 Ordering and race contracts:
   - Collectives are issued only by the main thread, in the same order on every rank (every rank runs
-    the same step logic over the same step sequence), value_embeds' before the n-gram table's at each
-    stage. The prep thread runs pure numpy on arrays the loader created and never mutates, and at most
-    one build is in flight.
-  - The n-gram cache is overwritten only by a land: in Phase 3 of an event's optimizer step -- the
-    event's forward and backward, the last readers of the old cycle, are queued before it on the same
-    stream -- or by an eval pull, after which the next training step re-lands the live cycle
-    (NgramTable.restore_cache) before its forward. An eval never writes the value_embeds replica.
+    the same step logic over the same step sequence), on each communicator: the n-gram table's row and
+    gradient exchanges and the late reduce-scatters share one (NgramTable.group), value_embeds' and the
+    other dense collectives the default one. The prep thread runs pure numpy on arrays the loader created
+    and never mutates, and at most one build is in flight.
+  - The n-gram cache is overwritten only by a land: the peers' rows are received into it from the moment
+    the event's optimizer step serves (the event's forward and backward, the last readers of the old
+    cycle, are queued before that collective), and this rank's own block is written in Phase 3, after
+    which the cycle is live -- or by an eval pull, after which the next training step re-lands the live
+    cycle (NgramTable.restore_cache) before its forward. An eval never writes the value_embeds replica.
   - The pulls serve rows after the event's Adam updates, on the same stream, so they are post-update.
   - A started land is completed before anything reads the rows it writes: the n-gram cache in Phase 3
     of the same optimizer step, the value_embeds replica by DeferredGathers.flush before the next forward.
@@ -52,12 +57,14 @@ Deviations from record #360 (the rest follows its schedule and kernels):
   - The event's gradients reuse the pulls' routes: the gradient rows of a cycle are exactly the rows
     it pulled, so the counts and ids exchanged for the pull already say who sends what to whom. #360
     re-ran the count and id exchanges for the gradient (grad_start / grad_share): fewer collectives here.
-  - The n-gram owner merges each row's gradient entries through a 42 MB row -> entry claim map into an
-    [entries, 768] buffer (perf/kernels/ngram_adam.py), where #360 scatters into a dense 16.2 GB
-    [V/world, 768] gradient buffer: the same launches and atomics, without the memory this run's
-    peak cannot spare. The lazy second-moment replay, its pass over the next cycle's own rows, and the
-    fused Triton row update are #360's. The n-gram table is not in the checkpoint, so #360's dense replay
-    before a checkpointing validation (bgpull_dense_gather) has no counterpart.
+  - The gradients go out as fp16 views of the compact buffer (no send copy) and the n-gram owner merges
+    each row's entries in a fixed order, fused into the Adam update (perf/kernels/ngram_adam.py), where
+    #360 scatters bf16 atomics into a dense 16.2 GB [V/world, 768] gradient buffer: no gradient buffer, no
+    atomics, and the bits do not depend on arrival order. The lazy second-moment replay, its pass over the
+    next cycle's own rows, and the per-row update are #360's. The n-gram table is not in the checkpoint,
+    so #360's dense replay before a checkpointing validation (bgpull_dense_gather) has no counterpart.
+  - The pull's all_to_all writes the cache itself (no receive buffer, no copies), and the n-gram exchanges
+    ride a high-priority NCCL communicator of their own.
   - After an eval pull the whole live cycle is re-landed along its existing routes, instead of
     #360's fresh synchronous fill of the cycle's remaining steps. Only an intermediate validation
     (config.val_loss_every > 0) evaluates mid-cycle: the record run validates only at the end, as #360.
@@ -225,14 +232,19 @@ class RowPrefetch:
             self.prep_pending = (event, self.staging.prep.submit(cycle_wants, self._batches(cycle),
                                                                  self.value_embeds.want_rows))
 
-    def serve_next_cycle(self):
-        """Right after the event's table updates: serve the post-update rows and start the row exchanges."""
+    def serve_ngram(self):
+        """Right after the event's n-gram update: serve the post-update rows and start the row exchange."""
+        if self.next_pull is None:
+            return
+        self.ngram.start_land(self.next_pull.ngram)
+        # Behind the serve, so it delays neither exchange; it writes no row they read.
+        self.ngram.bring_current(self.next_pull.ngram)
+
+    def serve_value_embeds(self):
+        """Right after the event's value_embeds update: serve the post-update rows and start the row exchange."""
         if self.next_pull is None:
             return
         self.value_embeds.start_land(self.next_pull.value_embeds)
-        self.ngram.start_land(self.next_pull.ngram)
-        # Behind the serves, so it delays neither exchange; it writes no row they read.
-        self.ngram.bring_current(self.next_pull.ngram)
 
     def land_next_cycle(self):
         """Phase 3 of an event's optimizer step: the pulled n-gram rows go into the cache and become live.
@@ -271,15 +283,20 @@ class CycleEvent:
     weight_decay: float
     eps: float
 
-    def launch(self):
-        self.prefetch.value_embeds.send_grads()
+    def launch_ngram(self):
         self.prefetch.ngram.send_grads()
+
+    def launch_value_embeds(self):
+        self.prefetch.value_embeds.send_grads()
         self.prefetch.value_embeds.zero_sent_grads()
 
     def update(self):
-        self.prefetch.value_embeds.adam_update()
+        # The n-gram table first: its gradient exchange was launched first and it is the long chain
+        # (merge + Adam -> serve -> land).
         self.prefetch.ngram.adam_update(self.step, self.lr, self.weight_decay, self.eps)
-        self.prefetch.serve_next_cycle()
+        self.prefetch.serve_ngram()
+        self.prefetch.value_embeds.adam_update()
+        self.prefetch.serve_value_embeds()
 
     def finish(self):
         self.prefetch.land_next_cycle()
