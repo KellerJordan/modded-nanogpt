@@ -62,14 +62,79 @@ _GRAM_CFG = {
 }
 
 
-def gram_tall(X, out):
-    """out = X^T X (symmetric), X [B, M, K]."""
+@triton.jit
+def _xtx_copy_kernel(
+    A_ptr, C_ptr, COPY_ptr,
+    M, K, num_gram,
+    a_stride_b, a_stride_r, a_stride_c,
+    c_stride_b, c_stride_r, c_stride_c,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr, LOWER_UPPER: tl.constexpr,
+):
+    """polar_express.XTX_kernel, line for line, for pid < num_gram; the CTAs past that range copy A into COPY
+    (same layout), one [BLOCK_SIZE_M, K] strip each. That replaces the separate memcpy the defensive-copy rule of
+    baddbmm costs, on SMs the Gram leaves idle, with the Gram CTAs' code path untouched."""
+    pid = tl.program_id(axis=0)
+    if pid >= num_gram:
+        cpid = pid - num_gram
+        n_rb = tl.cdiv(M, BLOCK_SIZE_M)
+        cb = cpid // n_rb
+        rb = cpid % n_rb
+        rows = rb * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        rmask = rows < M
+        for k0 in range(0, K, BLOCK_SIZE_K):
+            cols = k0 + tl.arange(0, BLOCK_SIZE_K)
+            cm = rmask[:, None] & (cols[None, :] < K)
+            offs = cb * a_stride_b + rows[:, None] * a_stride_r + cols[None, :] * a_stride_c
+            tl.store(COPY_ptr + offs, tl.load(A_ptr + offs, mask=cm, other=0.0), mask=cm)
+        return
+    batch_idx, k_idx, n_idx = _pe._pid_to_block(pid, K, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
+    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= k_idx)
+    skip_block_above_diag = (LOWER_UPPER != 0) and (k_idx + BLOCK_SIZE_M <= n_idx)
+    if skip_block_below_diag or skip_block_above_diag:
+        return
+    A_ptr += batch_idx * a_stride_b
+    C_ptr += batch_idx * c_stride_b
+    offs_k = (k_idx + tl.arange(0, BLOCK_SIZE_M)) % K
+    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % K
+    offs_m = tl.arange(0, BLOCK_SIZE_K)
+    at_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
+    a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_n[None, :] * a_stride_c)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for m in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
+        m_remaining = M - m * BLOCK_SIZE_K
+        at = tl.load(at_ptrs, mask=offs_m[:, None] < m_remaining, other=0.0)
+        a = tl.load(a_ptrs, mask=offs_m[:, None] < m_remaining, other=0.0)
+        accumulator = tl.dot(at.T, a, accumulator)
+        at_ptrs += BLOCK_SIZE_K * a_stride_r
+        a_ptrs += BLOCK_SIZE_K * a_stride_r
+    out_dtype = C_ptr.dtype.element_ty
+    output = accumulator.to(out_dtype)
+    offs_ck = k_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C_ptr + (offs_ck[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
+    c_mask = (offs_ck[:, None] < K) & (offs_cn[None, :] < K)
+    tl.store(c_ptrs, output, mask=c_mask)
+    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_ck[None, :] * c_stride_c)
+    c_mask_t = (offs_cn[:, None] < K) & (offs_ck[None, :] < K)
+    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
+
+
+def gram_tall(X, out, copy=None):
+    """out = X^T X (symmetric), X [B, M, K]; with `copy`, also copy = X (bitwise)."""
     B, M, K = X.shape
     bm, bn, bk, nw, ns = _GRAM_CFG[("XTX", K)]
-    _pe.XTX_kernel[(B * triton.cdiv(K, bm) * triton.cdiv(K, bn),)](
-        A_ptr=X, C_ptr=out, M=M, K=K, a_stride_b=X.stride(0), a_stride_r=X.stride(1), a_stride_c=X.stride(2),
-        c_stride_b=out.stride(0), c_stride_r=out.stride(1), c_stride_c=out.stride(2),
-        BLOCK_SIZE_M=bm, BLOCK_SIZE_N=bn, BLOCK_SIZE_K=bk, GROUP_SIZE_M=8, LOWER_UPPER=1, num_stages=ns, num_warps=nw)
+    n_gram = B * triton.cdiv(K, bm) * triton.cdiv(K, bn)
+    grid = (n_gram,)
+    common = dict(M=M, K=K, a_stride_b=X.stride(0), a_stride_r=X.stride(1), a_stride_c=X.stride(2),
+                  c_stride_b=out.stride(0), c_stride_r=out.stride(1), c_stride_c=out.stride(2),
+                  BLOCK_SIZE_M=bm, BLOCK_SIZE_N=bn, BLOCK_SIZE_K=bk, GROUP_SIZE_M=8, LOWER_UPPER=1, num_stages=ns, num_warps=nw)
+    if copy is None:
+        _pe.XTX_kernel[grid](A_ptr=X, C_ptr=out, **common)
+    else:
+        assert copy.is_contiguous() and X.is_contiguous() and copy.shape == X.shape
+        assert X.stride(0) == copy.stride(0) and X.stride(1) == copy.stride(1) and X.stride(2) == copy.stride(2)
+        _xtx_copy_kernel[(n_gram + B * triton.cdiv(M, bm),)](A_ptr=X, C_ptr=out, COPY_ptr=copy, num_gram=n_gram, **common)
     return out
 
 
@@ -163,20 +228,20 @@ def poly_gram(A, alpha, beta, out):
 
 
 @torch.compile(dynamic=False, fullgraph=True)
-def gram_norm(X, A):
+def gram_norm(X, A, margin: float = 1.05):
     """The stock normalization of the cascade, verbatim: unit-ish Frobenius scale from the Gram trace."""
     tr = A.diagonal(dim1=-2, dim2=-1).float().sum(-1)[..., None, None]
-    d = tr.sqrt() * 1.05 + 1e-6
+    d = tr.sqrt() * margin + 1e-6
     X = (X.float() / d).bfloat16()
     A = (A.float() / d.square()).bfloat16()
     return X, A
 
 
 @torch.compile(dynamic=False, fullgraph=True)
-def gram_norm_dup(X, A):
+def gram_norm_dup(X, A, margin: float = 1.05):
     """gram_norm that also returns a second copy of the normalized X (one more store in the same kernel)."""
     tr = A.diagonal(dim1=-2, dim2=-1).float().sum(-1)[..., None, None]
-    d = tr.sqrt() * 1.05 + 1e-6
+    d = tr.sqrt() * margin + 1e-6
     X = (X.float() / d).bfloat16()
     A = (A.float() / d.square()).bfloat16()
     return X, A, X.clone()
@@ -226,29 +291,34 @@ def gemm_xb_add(X, B, out, alpha, BM=128, BN=128, BK=64, num_warps=4, num_stages
     return out
 
 
-def polar(X, split_baddbmm, maps):
-    """The stock cascade from the Gram on. Same GEMM numerics everywhere: tall -> fused bmm+add (verified bitwise equal to
-    the pair in offline tests); wide -> the stock cuBLAS baddbmm, minus its defensive-copy kernel (the Gram kernel writes that copy)."""
+def polar(X, split_baddbmm, maps, margin: float = 1.05):
+    """The stock cascade from the Gram on. Same GEMM numerics everywhere: tall split -> fused bmm+add (verified bitwise
+    equal to the pair in offline tests); tall non-split and wide -> the stock cuBLAS baddbmm, minus its defensive-copy
+    kernel (the Gram kernel writes that copy)."""
     is_tall = X.size(-2) > X.size(-1)
     n = min(X.size(-1), X.size(-2))
     A = torch.empty((*X.shape[:-2], n, n), device=X.device, dtype=X.dtype)
     if is_tall:
         gram_tall(X, A)
-        X, A = gram_norm(X, A)
-        B = torch.empty_like(A)
-        C = torch.empty_like(X)
+        if split_baddbmm:
+            X, A = gram_norm(X, A, margin)
+            B = torch.empty_like(A)
+            C = torch.empty_like(X)
+        else:
+            X, A, C = gram_norm_dup(X, A, margin)
+            B = torch.empty_like(A)
         for k, (a, b, c) in enumerate(maps):
             if k > 0:
-                gram_tall(X, A)
+                gram_tall(X, A, copy=None if split_baddbmm else C)
             poly_gram(A, c, b, B)
             if split_baddbmm:
                 gemm_xb_add(X, B, C, a)
             else:
-                torch.baddbmm(X, X, B, beta=a, out=C)
+                torch.baddbmm(C, X, B, beta=a, out=C)
             X, C = C, X
     else:
         gram_wide(X, A)
-        X, A, C = gram_norm_dup(X, A)
+        X, A, C = gram_norm_dup(X, A, margin)
         B = torch.empty_like(A)
         for k, (a, b, c) in enumerate(maps):
             if k > 0:

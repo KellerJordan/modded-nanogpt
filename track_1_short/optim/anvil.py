@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor, nn
 
+from track_1_short.exact_levers import B3_OPT, MOE_ANVIL_OPT
 from track_1_short.model.moe import MOE_ANVIL_MARGIN
 from track_1_short.perf.bank_scalars import BankScalarStaging
 from track_1_short.perf.kernels import anvil_opt as _ok
@@ -82,8 +83,8 @@ def anvil_cascade(grad_chunk: torch.Tensor, velocity: torch.Tensor, momentum_t: 
     ANVIL_MAPS. momentum_t, fast_beta_t and fast_weight_t are 0-D device tensors (AnvilBank), so
     per-step changes never recompile and a captured graph reads their current values.
 
-    margin replaces FROBENIUS_MARGIN in the normalization: the expert bank (moe_bank) runs this cascade at its own
-    margin; every other bank runs the fused kernels of anvil_opt at FROBENIUS_MARGIN (see anvil_bank_update).
+    margin replaces FROBENIUS_MARGIN in the normalization: the expert bank (moe_bank) runs at its own margin
+    (via anvil_opt when MOE_ANVIL_OPT is set, or this fallback cascade otherwise; see anvil_bank_update).
     """
     grad_chunk = grad_chunk.float()
     momentum = momentum_t.to(grad_chunk.dtype)
@@ -210,7 +211,7 @@ class AnvilBank:
     beta2: float          # the equalizer's EMA decay
     split_baddbmm: bool
     red_dim: int
-    margin: float         # the cascade's Frobenius margin (only moe_bank's anvil_cascade reads it)
+    margin: float         # the cascade's Frobenius margin (1.1 for moe_bank, FROBENIUS_MARGIN elsewhere)
 
     def mutated(self) -> dict[str, Tensor]:
         """What the update writes."""
@@ -879,28 +880,57 @@ class AnvilAndAdam:
         eq_scale = lane_gain * (pre_norm / post_norm.clamp_min_(1e-10))
         return v_chunk.mul_(eq_scale.type_as(v_chunk))
 
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _equalize_and_decay_update(p, mantissa, v_chunk, lane_energy, beta2, red_dim, wd_tensor, lr_tensor, gate_src):
+        """Fused lane equalizer + sign-aligned cautious decay update without writing v_chunk back."""
+        assert p.dtype == mantissa.dtype == torch.uint16
+        lane_power = v_chunk.float().square().mean(dim=red_dim, keepdim=True)
+        lane_len = v_chunk.size(red_dim)
+        pre_norm = lane_power.sum(dim=(-2, -1), keepdim=True).mul_(lane_len).sqrt_()
+        lane_energy.lerp_(lane_power.to(dtype=lane_energy.dtype), 1 - beta2)
+        lane_gain = lane_energy.clamp_min(1e-10).rsqrt_()
+        post_power = (lane_power * lane_len) * lane_gain.float().square()
+        post_norm = post_power.sum(dim=(-2, -1), keepdim=True).sqrt_()
+        eq_scale = lane_gain * (pre_norm / post_norm.clamp_min_(1e-10))
+        update = (v_chunk * eq_scale.type_as(v_chunk)).float()
+        wd_factor, lr_factor = wd_tensor.to(torch.float32), lr_tensor.to(torch.float32)
+        p_precise_raw = (p.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
+        p_precise = p_precise_raw.view(torch.float32)
+        aligned = (gate_src.float() * p_precise) >= 0
+        p_precise.copy_(p_precise - (p_precise * aligned * wd_factor * lr_factor) - (update * lr_factor))
+        p.copy_((p_precise_raw >> 16).to(torch.uint16))
+        mantissa.copy_(p_precise_raw.to(torch.uint16))
+
 
 def anvil_bank_update(bank: AnvilBank):
     """One bank's ANVIL update, from its reduce-scattered gradient (the body the optimizer-tail graphs capture)."""
     # 1. Twin-rail Nesterov momentum + ANVIL whitening cascade
-    if bank.label != "moe_bank":
+    if bank.label != "moe_bank" or MOE_ANVIL_OPT:
         # The same arithmetic as anvil_cascade, byte for byte (anvil_opt.py): the rails, the Nesterov blend and the
         # bf16 cast in one pass, then the cascade from the Gram on.
         x = torch.empty_like(bank.grad)
         _ok.pre_fused(bank.grad, bank.velocity, x, bank.momentum, bank.fast_beta, bank.fast_weight)
-        v_chunk = _ok.polar(x, bank.split_baddbmm, ANVIL_MAPS)
+        v_chunk = _ok.polar(x, bank.split_baddbmm, ANVIL_MAPS, margin=bank.margin)
     else:
-        # The expert bank runs its own margin; the fused kernels above bake FROBENIUS_MARGIN.
+        # With MOE_ANVIL_OPT disabled, the expert bank runs anvil_cascade at its own margin.
         v_chunk = anvil_cascade(
             bank.grad, bank.velocity, bank.momentum,
             split_baddbmm=bank.split_baddbmm,
             fast_beta_t=bank.fast_beta, fast_weight_t=bank.fast_weight,
             margin=bank.margin,
         )
-    # 2. Equalize per-lane update energy
-    v_chunk = AnvilAndAdam._rail_equalizer(v_chunk, bank.lane_energy, bank.beta2, bank.red_dim)
-    # 3. Update the parameter in place, with weight decay gated on the slow rail's sign. eff_lr is per
-    #    matrix: MLP c_proj gets 2x, frozen matrices 0.
-    AnvilAndAdam._sign_aligned_decay_update(
-        bank.p_slice.view(torch.uint16), bank.mantissa, v_chunk, bank.eff_wd, bank.eff_lr, bank.velocity[1],
-    )
+    if B3_OPT:
+        # 2+3. Fused per-lane energy equalizer + sign-aligned cautious decay update.
+        AnvilAndAdam._equalize_and_decay_update(
+            bank.p_slice.view(torch.uint16), bank.mantissa, v_chunk, bank.lane_energy,
+            bank.beta2, bank.red_dim, bank.eff_wd, bank.eff_lr, bank.velocity[1],
+        )
+    else:
+        # 2. Equalize per-lane update energy
+        v_chunk = AnvilAndAdam._rail_equalizer(v_chunk, bank.lane_energy, bank.beta2, bank.red_dim)
+        # 3. Update the parameter in place, with weight decay gated on the slow rail's sign. eff_lr is per
+        #    matrix: MLP c_proj gets 2x, frozen matrices 0.
+        AnvilAndAdam._sign_aligned_decay_update(
+            bank.p_slice.view(torch.uint16), bank.mantissa, v_chunk, bank.eff_wd, bank.eff_lr, bank.velocity[1],
+        )

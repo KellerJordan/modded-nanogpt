@@ -30,6 +30,7 @@ import triton.language as tl
 from torch import Tensor
 
 from track_1_short.config import COPY_TOKEN_ID
+from track_1_short.exact_levers import CPLM_BF16
 from track_1_short.perf.kernels import sampled_head
 from track_1_short.perf.kernels.cross_entropy import (
     CE_KERNEL_BLOCK_SIZE,
@@ -129,7 +130,7 @@ def _copy_bwd_dq_kernel(Q, K, DOC, TOK, TGT, DSTART, LSE, GP, DROW, DQ, N, L, LB
             gm += tl.where(hit, gp[:, None], 0.0)
         ds = a * (gm - drow[:, None])
         dq += tl.dot(ds.to(k.dtype), k)
-    tl.store(DQ + offs_m[:, None] * D + offs_d[None, :], dq * scale)
+    tl.store(DQ + offs_m[:, None] * D + offs_d[None, :], (dq * scale).to(DQ.dtype.element_ty))
 
 
 @triton.jit
@@ -166,7 +167,7 @@ def _copy_bwd_dk_kernel(Q, K, DOC, TOK, TGT, DEND, LSE, GP, DROW, DK, N, L, LB, 
             gm += tl.where(hit, gp[:, None], 0.0)
         ds = a * (gm - drow[:, None])
         dk += tl.dot(tl.trans(ds.to(q.dtype)), q)
-    tl.store(DK + offs_n[:, None] * D + offs_d[None, :], dk * scale)
+    tl.store(DK + offs_n[:, None] * D + offs_d[None, :], (dk * scale).to(DK.dtype.element_ty))
 
 
 def _copy_tiles(D):
@@ -206,8 +207,8 @@ def cplm_copy_bwd(q: Tensor, k: Tensor, doc: Tensor, tok: Tensor, tgt: Tensor, d
     BM, BN, nw, ns = _copy_tiles(D)
     q, k, gP, drow = q.contiguous(), k.contiguous(), gP.contiguous(), drow.contiguous()
     doc, tok, tgt, dstart, dend = (t.contiguous() for t in (doc, tok, tgt, dstart, dend))
-    dq = torch.empty((N, D), dtype=torch.float32, device=q.device)
-    dk = torch.empty_like(dq)
+    dq = torch.empty((N, D), dtype=q.dtype if CPLM_BF16 else torch.float32, device=q.device)
+    dk = torch.empty((N, D), dtype=k.dtype if CPLM_BF16 else torch.float32, device=k.device)
     _copy_bwd_dq_kernel[(N // BM,)](q, k, doc, tok, tgt, dstart, LSE, gP, drow, dq, N, L, LB, D ** -0.5,
                                     D=D, BM=BM, BN=BN, NK=NK, num_warps=nw, num_stages=ns)
     _copy_bwd_dk_kernel[(N // BN,)](q, k, doc, tok, tgt, dend, LSE, gP, drow, dk, N, L, LB, D ** -0.5,
@@ -217,6 +218,8 @@ def cplm_copy_bwd(q: Tensor, k: Tensor, doc: Tensor, tok: Tensor, tgt: Tensor, d
 
 @cplm_copy_bwd.register_fake
 def _(q, k, doc, tok, tgt, dstart, dend, LSE, gP, drow, L, LB):
+    if CPLM_BF16:
+        return q.new_empty(q.shape, dtype=q.dtype), k.new_empty(k.shape, dtype=k.dtype)
     return q.new_empty(q.shape, dtype=torch.float32), q.new_empty(q.shape, dtype=torch.float32)
 
 
@@ -235,7 +238,7 @@ def _copy_backward(ctx, gP, gA, gLSE):
     drow = (gP * P).sum(0) + gA * A  # d loss / d (log-normalizer), per row
     ds0 = A * (gA - drow)            # sink score gradient
     dq, dk = torch.ops.nanogpt.cplm_copy_bwd(q, k, doc, tok, tgt, dstart, dend, LSE, gP, drow, ctx.L, ctx.LB)
-    return dq.to(q.dtype), dk.to(k.dtype), ds0, None, None, None, None, None, None, None
+    return (dq if CPLM_BF16 else dq.to(q.dtype)), (dk if CPLM_BF16 else dk.to(k.dtype)), ds0, None, None, None, None, None, None, None
 
 
 cplm_copy_fwd.register_autograd(_copy_backward, setup_context=_copy_setup_context)

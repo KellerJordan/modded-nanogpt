@@ -29,6 +29,7 @@ import triton.language as tl
 from triton.runtime.errors import OutOfResources
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from track_1_short.exact_levers import B3_OPT
 from track_1_short.perf.kernels import mlp_g3 as _g3
 from track_1_short.perf.kernels.transpose import transpose_copy
 
@@ -202,9 +203,18 @@ def _quantize_weights_dual_kernel(w_ptr, row_ptr, col_ptr, scale_ptr, partial_am
     tl.store(col_ptr + layer * H * D + offs_d[:, None] * H + offs_h[None, :], tl.trans(q), mask=mask_t)
     tl.store(partial_amax_ptr + layer * num_tiles + tile, tl.max(tl.max(tl.abs(v), axis=1), axis=0))
 
+@triton.jit
+def _reduce_weight_scales_kernel(partial_amax_ptr, scales_ptr, num_tiles: tl.constexpr,
+                                 SCALE_MUL: tl.constexpr, BLOCK: tl.constexpr):
+    layer = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    vals = tl.load(partial_amax_ptr + layer * num_tiles + offs, mask=offs < num_tiles, other=0.0)
+    tl.store(scales_ptr + layer, tl.maximum(tl.max(vals, axis=0) * SCALE_MUL, 1e-12))
+
 def quantize_weights_dual_ntiles(H: int, D: int) -> int:
-    """Partial-amax slots per layer: one per tile of _quantize_weights_dual_kernel's 64x64 grid."""
-    return triton.cdiv(H, 64) * triton.cdiv(D, 64)
+    """Partial-amax slots per layer: one per tile of _quantize_weights_dual_kernel's grid."""
+    block = 128 if B3_OPT else 64
+    return triton.cdiv(H, block) * triton.cdiv(D, block)
 
 def quantize_mlp_weights_dual(bank: torch.Tensor, scales: torch.Tensor, partial_amax: torch.Tensor,
                               row: torch.Tensor, col_t: torch.Tensor, update_scales: bool):
@@ -215,15 +225,23 @@ def quantize_mlp_weights_dual(bank: torch.Tensor, scales: torch.Tensor, partial_
     from the previous call's per-tile amaxes: the scale lags a step, which takes the reduction off
     the critical path and is loss-neutral because the weights move <<1% per step."""
     L, H, D = bank.shape
-    BLOCK_H = BLOCK_D = 64
+    BLOCK_H = BLOCK_D = 128 if B3_OPT else 64
     num_tiles_d = triton.cdiv(D, BLOCK_D)
     num_tiles = triton.cdiv(H, BLOCK_H) * num_tiles_d
     assert partial_amax.shape == (L, num_tiles)
     if update_scales:
-        torch.clamp(partial_amax.amax(dim=1) * (WEIGHT_SCALE_HEADROOM / 448.0), min=1e-12, out=scales)
+        if B3_OPT:
+            _reduce_weight_scales_kernel[(L,)](
+                partial_amax, scales, num_tiles=num_tiles,
+                SCALE_MUL=WEIGHT_SCALE_HEADROOM / 448.0,
+                BLOCK=triton.next_power_of_2(num_tiles), num_warps=1,
+            )
+        else:
+            torch.clamp(partial_amax.amax(dim=1) * (WEIGHT_SCALE_HEADROOM / 448.0), min=1e-12, out=scales)
     _quantize_weights_dual_kernel[(L, num_tiles)](
         bank, row, col_t, scales, partial_amax, bank.stride(0), bank.stride(1), bank.stride(2), H=H, D=D,
-        num_tiles_d=num_tiles_d, num_tiles=num_tiles, BLOCK_H=BLOCK_H, BLOCK_D=BLOCK_D, num_warps=4, num_stages=2)
+        num_tiles_d=num_tiles_d, num_tiles=num_tiles, BLOCK_H=BLOCK_H, BLOCK_D=BLOCK_D,
+        num_warps=8 if B3_OPT else 4, num_stages=2)
 
 
 # -----------------------------------------------------------------------------

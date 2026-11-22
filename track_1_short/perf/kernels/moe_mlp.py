@@ -37,6 +37,8 @@ import triton.language as tl
 from triton.runtime.errors import OutOfResources
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from track_1_short.exact_levers import MOE_G3_BWD_PTX
+
 BLOCK_M, BLOCK_N, BLOCK_K = 128, 256, 128
 # G3 (Gluon, warp-specialized) for the grouped "up" GEMM: checked bit for bit against the Triton grouped_lrs_kernel at
 # start-up (prime_grouped_stage_cache(g3_k=...)); measured ~1.2-1.3x faster.  If moe_g3 or Gluon are missing, or the check
@@ -322,7 +324,7 @@ def grouped_dw_kernel(a_desc, b_desc, c_desc, offs_ptr, scale_a_ptr, scale_b_ptr
         c_desc.store([offs_cm, offs_bn + BLOCK_SIZE_N // 2], acc1.to(tl.bfloat16))
 
 
-DW_BLOCK_M, DW_BLOCK_N = 128, 256
+DW_BLOCK_M, DW_BLOCK_N = (128, 128) if MOE_G3_BWD_PTX else (128, 256)
 
 
 def _grouped_weight_grad_impl(a_t, b_t, offs, scale_a, scale_b, n_experts, out, acc_flag):

@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.distributed as dist
 
+from track_1_short.exact_levers import TAIL_OPT
 from track_1_short.ngram_table import NGRAM_ADAM_PERIOD4_START
 from track_1_short.perf.kernels.lerp import lerp_upcast_
 
@@ -113,6 +114,18 @@ class TailAverages:
         for divisible in {buf.numel() % 16 == 0 for buf in bufs}:
             scratch = torch.zeros(65536 if divisible else 65537, dtype=torch.float32, device=bufs[0].device)
             lerp_upcast_(scratch, scratch.bfloat16(), 0.5)
+        if TAIL_OPT:
+            # Pre-warm ship() ATen kernels (norm, lerp, copy_, mul_, where) so CUDA lazy module loading
+            # does not land on the clock at the end of training.
+            dev = bufs[0].device
+            avg = torch.ones(16, dtype=torch.float32, device=dev)
+            s_fp32 = torch.ones(16, dtype=torch.float32, device=dev)
+            s_bf16 = torch.ones(16, dtype=torch.bfloat16, device=dev)
+            norms = torch.stack([s_bf16.float().norm(), s_fp32.float().norm()])
+            _ = torch.where(norms > 0, norms / norms, torch.ones_like(norms)).tolist()
+            for shard in (s_bf16, s_fp32):
+                shard.copy_(torch.lerp(shard.float(), avg, 0.5).to(shard.dtype))
+                shard.mul_(1.0)
 
     def _param(self, label: str):
         return self.optimizer._param_by_label[label]
