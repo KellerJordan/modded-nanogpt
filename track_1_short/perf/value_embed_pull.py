@@ -33,8 +33,9 @@ Invariants:
 The owner merge and the replica land are row-scatter kernels (perf/kernels/row_scatter.py), as in #360.
 Deviations from record #360: the gradient reuses the pull's routes (as the n-gram table does, instead of
 #360's second count/id exchange: fewer collectives); the taken rows are zeroed at the event, once every
-gradient exchange is launched, rather than at the next step's top; the warmup runs this same path instead
-of an unarmed dense one (untimed).
+gradient exchange is launched, rather than at the next step's top, by a row-zero kernel (zero_rows) that
+reads the int32 want list as it is; the payload is sent as views of the compact buffer; the warmup runs
+this same path instead of an unarmed dense one (untimed).
 
 Provenance: record #360 (ANVIL2): `_VembPull`, `vesp_rows_from_mask`, `vesp_merge_gradients`,
 `vepull_land`, `vepull_dense_gather`, `_velite_buf` / `ve_lite_prepare`.
@@ -45,7 +46,7 @@ import torch.distributed as dist
 from torch import Tensor, nn
 
 from track_1_short.optim.anvil import AnvilAndAdam
-from track_1_short.perf.kernels.row_scatter import scatter_add_rows, scatter_copy_rows
+from track_1_short.perf.kernels.row_scatter import scatter_add_rows, scatter_copy_rows, zero_rows
 from track_1_short.perf.kernels.value_embed import GRAD_DTYPE
 from track_1_short.sharded_rows import RowOwners, RowPull
 
@@ -143,21 +144,21 @@ class ValueEmbedPull:
         assert self.param.grad is None, "value_embeds got a dense gradient"
         pull = self.live
         compact = self.grad_accum.index_select(0, pull.want)
-        wire = torch.cat([compact[:pull.lo], compact[pull.hi:]])
-        received, work = self.owners.send_grads(pull, wire)
-        self.grads_in_flight = (compact[pull.lo:pull.hi], received, work, wire)
+        # The peers' blocks go out as views of `compact`: no send copy.
+        received, work = self.owners.send_grads(pull, compact)
+        self.grads_in_flight = (compact[pull.lo:pull.hi], received, work)
 
     @torch.no_grad()
     def zero_sent_grads(self):
         """Event, after every gradient exchange is launched (so it delays none of them): zero the rows
         send_grads took out of grad_accum, for the next cycle."""
-        self.grad_accum.index_fill_(0, self.live.want.long(), 0)
+        zero_rows(self.grad_accum, self.live.want)
 
     @torch.no_grad()
     def adam_update(self):
         """Event, part 2 (collective with send_grads): rebuild this rank's dense gradient shard and run
         value_embeds' Adam on it."""
-        own_grad, received, work, _ = self.grads_in_flight
+        own_grad, received, work = self.grads_in_flight
         self.grads_in_flight = None
         work.wait()
         pull, first = self.live, self.owners.first_row

@@ -14,8 +14,10 @@ import triton
 import triton.language as tl
 from torch import nn
 
+from track_1_short.exact_levers import B3_OPT
+
 # Partial amaxes per layer: the amax pass splits each layer's packed rows over this many programs.
-AMAX_PARTS = 32
+AMAX_PARTS = 64 if B3_OPT else 32
 
 
 @triton.jit
@@ -27,6 +29,7 @@ def _packed_batched_matrix_amax_partial_kernel(
     SECOND_STRIDE_B: tl.constexpr,
     NUM_PARTS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    SINGLE_LOAD: tl.constexpr,
 ):
     """Amax over a logical row-pack without materializing the concatenation."""
     batch = tl.program_id(0)
@@ -38,17 +41,22 @@ def _packed_batched_matrix_amax_partial_kernel(
         indices = start + offsets
         valid = indices < total_elements
         in_first = indices < FIRST_ELEMENTS
-        first_values = tl.load(first + batch * FIRST_STRIDE_B + indices, mask=valid & in_first, other=0.0)
         second_indices = tl.maximum(indices - FIRST_ELEMENTS, 0)
-        second_values = tl.load(second + batch * SECOND_STRIDE_B + second_indices, mask=valid & ~in_first, other=0.0)
-        values = first_values.to(tl.float32) + second_values.to(tl.float32)
+        if SINGLE_LOAD:
+            ptrs = tl.where(in_first, first + batch * FIRST_STRIDE_B + indices,
+                            second + batch * SECOND_STRIDE_B + second_indices)
+            values = tl.load(ptrs, mask=valid, other=0.0).to(tl.float32)
+        else:
+            first_values = tl.load(first + batch * FIRST_STRIDE_B + indices, mask=valid & in_first, other=0.0)
+            second_values = tl.load(second + batch * SECOND_STRIDE_B + second_indices, mask=valid & ~in_first, other=0.0)
+            values = first_values.to(tl.float32) + second_values.to(tl.float32)
         local_amax = tl.maximum(local_amax, tl.abs(values))
     tl.store(partial_amax + batch * NUM_PARTS + part, tl.max(local_amax, axis=0))
 
 
 @triton.jit
 def _quantize_dual_layout_packed_batched_kernel(
-    first, second, row, transposed, scale_ptr,
+    first, second, row, transposed, scale_ptr, partial_amax_ptr,
     M, N,
     FIRST_ROWS: tl.constexpr,
     FIRST_STRIDE_B: tl.constexpr,
@@ -57,6 +65,9 @@ def _quantize_dual_layout_packed_batched_kernel(
     TRANSPOSED_STRIDE_B: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NUM_PARTS: tl.constexpr,
+    NUM_PARTS_POW2: tl.constexpr,
+    FUSE_SCALE: tl.constexpr,
 ):
     """Quantize a logical row-pack directly from its two source allocations: one read of each source,
     two fp8 writes (row-major, and transposed via a register-tile tl.trans)."""
@@ -71,7 +82,15 @@ def _quantize_dual_layout_packed_batched_kernel(
     source_ptrs = tl.where(in_first, first + batch * FIRST_STRIDE_B + first_offsets,
                            second + batch * SECOND_STRIDE_B + second_offsets)
     values = tl.load(source_ptrs, mask=valid, other=0.0).to(tl.float32)
-    scaled = values / tl.load(scale_ptr + batch)
+    if FUSE_SCALE:
+        pa_offs = tl.arange(0, NUM_PARTS_POW2)
+        pa = tl.load(partial_amax_ptr + batch * NUM_PARTS + pa_offs, mask=pa_offs < NUM_PARTS, other=0.0)
+        s = tl.maximum(tl.max(pa, axis=0), 1.0e-12) * (1.0 / 448.0)
+        if (tl.program_id(0) == 0) & (tl.program_id(1) == 0):
+            tl.store(scale_ptr + batch, s)
+    else:
+        s = tl.load(scale_ptr + batch)
+    scaled = values / s
     quantized = tl.maximum(tl.minimum(scaled, 448.0), -448.0).to(tl.float8e4nv)
     tl.store(row + batch * ROW_STRIDE_B + offs_m[:, None] * N + offs_n[None, :], quantized, mask=valid)
     transposed_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)
@@ -96,19 +115,22 @@ def quantize_dual_layout_packed_batched(first, second, scales, partial_amax, row
         first, second, partial_amax,
         FIRST_ELEMENTS=first_rows * N, SECOND_ELEMENTS=second_rows * N,
         FIRST_STRIDE_B=first.stride(0), SECOND_STRIDE_B=second.stride(0),
-        NUM_PARTS=num_parts, BLOCK_SIZE=2048, num_stages=1, num_warps=8,
+        NUM_PARTS=num_parts, BLOCK_SIZE=2048, SINGLE_LOAD=B3_OPT, num_stages=1, num_warps=8,
     )
-    # Exact-current scale: amax / 448, no headroom.
-    torch.mul(partial_amax.amax(dim=1).clamp_(min=1.0e-12), 1.0 / 448.0, out=scales)
-    block_m, block_n = 64, 128
+    if not B3_OPT:
+        # Exact-current scale: amax / 448, no headroom.
+        torch.mul(partial_amax.amax(dim=1).clamp_(min=1.0e-12), 1.0 / 448.0, out=scales)
+    block_m, block_n = (128, 128) if B3_OPT else (64, 128)
     grid = (triton.cdiv(total_rows, block_m), triton.cdiv(N, block_n), B)
     _quantize_dual_layout_packed_batched_kernel[grid](
-        first, second, row, transposed, scales,
+        first, second, row, transposed, scales, partial_amax,
         total_rows, N,
         FIRST_ROWS=first_rows,
         FIRST_STRIDE_B=first.stride(0), SECOND_STRIDE_B=second.stride(0),
         ROW_STRIDE_B=row.stride(0), TRANSPOSED_STRIDE_B=transposed.stride(0),
-        BLOCK_M=block_m, BLOCK_N=block_n, num_stages=2, num_warps=8,
+        BLOCK_M=block_m, BLOCK_N=block_n,
+        NUM_PARTS=num_parts, NUM_PARTS_POW2=triton.next_power_of_2(num_parts), FUSE_SCALE=B3_OPT,
+        num_stages=2, num_warps=8,
     )
     return row, transposed
 

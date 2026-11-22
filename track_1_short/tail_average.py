@@ -9,12 +9,13 @@ shrinks norms, and the model was trained at the un-averaged scale).
 
   accumulator         weights              ticks                          ship
   tail-ema            lm_head, embed       Adam steps, last 298           lerp(final, ema, 0.65)
-  tail-avg            vo_bank, mlp_bank    every 4th step, last 250       replaced by the average
+  tail-avg            vo_bank, mlp_bank,   every 4th step, last 250       replaced by the average
+                      moe_bank
   value-embed-avg     value_embeds         its update events, last 250    replaced by the average
-  bank-blend          qk/vo/mlp banks      every 4th step, last 298       lerp(current, ema, B)
+  bank-blend          qk/vo/mlp/moe banks  every 4th step, last 298       lerp(current, ema, B)
 
-bank-blend ships last, so on vo/mlp it blends into the tail average. Its B is 0.55, lowered by a
-Richardson correction on vo/mlp: a seeded EMA lags the final iterate, and
+bank-blend ships last, so on vo/mlp/moe it blends into the tail average. Its B is 0.55, lowered by a
+Richardson correction on vo/mlp/moe: a seeded EMA lags the final iterate, and
 (1-B)*A + B*X + w*(A - X) == lerp(A, X, B - w).
 """
 import math
@@ -24,6 +25,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.distributed as dist
 
+from track_1_short.exact_levers import TAIL_OPT
 from track_1_short.ngram_table import NGRAM_ADAM_PERIOD4_START
 from track_1_short.perf.kernels.lerp import lerp_upcast_
 
@@ -46,7 +48,7 @@ BANK_BLEND_RATE = 2.0 / (BANK_BLEND_WINDOW // BANK_BLEND_PERIOD + 1)
 BANK_BLEND = 0.55
 RICHARDSON_W = 0.2007
 
-DECONTRACTION_LABELS = ("embed", "lm_head", "mlp_bank", "qk_bank", "vo_bank")
+DECONTRACTION_LABELS = ("embed", "lm_head", "mlp_bank", "qk_bank", "vo_bank", "moe_bank")
 
 
 @dataclass
@@ -89,14 +91,14 @@ class TailAverages:
         self.accumulators = [
             TailAccumulator("tail-ema", ("lm_head", "embed"), TAIL_EMA_WINDOW, tail_ema_rate,
                             {"lm_head": TAIL_EMA_BLEND, "embed": TAIL_EMA_BLEND}),
-            TailAccumulator("tail-avg", ("vo_bank", "mlp_bank"), TAIL_AVG_WINDOW,
+            TailAccumulator("tail-avg", ("vo_bank", "mlp_bank", "moe_bank"), TAIL_AVG_WINDOW,
                             lambda s, n: TAIL_AVG_RATE if (n - 1 - s) % TAIL_AVG_PERIOD == 0 else None,
-                            {"vo_bank": None, "mlp_bank": None}),
-            TailAccumulator("bank-blend", ("qk_bank", "vo_bank", "mlp_bank"), BANK_BLEND_WINDOW,
+                            {"vo_bank": None, "mlp_bank": None, "moe_bank": None}),
+            TailAccumulator("bank-blend", ("qk_bank", "vo_bank", "mlp_bank", "moe_bank"), BANK_BLEND_WINDOW,
                             # every BANK_BLEND_PERIOD-th step, plus the final two so the last iterate is always in
                             lambda s, n: BANK_BLEND_RATE if s % BANK_BLEND_PERIOD == 1 or s >= n - 2 else None,
                             {"qk_bank": BANK_BLEND, "vo_bank": BANK_BLEND - RICHARDSON_W,
-                             "mlp_bank": BANK_BLEND - RICHARDSON_W}),
+                             "mlp_bank": BANK_BLEND - RICHARDSON_W, "moe_bank": BANK_BLEND - RICHARDSON_W}),
             TailAccumulator("value-embed-avg", ("value_embeds",), VALUE_EMBED_AVG_WINDOW,
                             lambda s, n: VALUE_EMBED_AVG_RATE if value_embed_updates(s) else None,
                             {"value_embeds": None}),
@@ -112,6 +114,18 @@ class TailAverages:
         for divisible in {buf.numel() % 16 == 0 for buf in bufs}:
             scratch = torch.zeros(65536 if divisible else 65537, dtype=torch.float32, device=bufs[0].device)
             lerp_upcast_(scratch, scratch.bfloat16(), 0.5)
+        if TAIL_OPT:
+            # Pre-warm ship() ATen kernels (norm, lerp, copy_, mul_, where) so CUDA lazy module loading
+            # does not land on the clock at the end of training.
+            dev = bufs[0].device
+            avg = torch.ones(16, dtype=torch.float32, device=dev)
+            s_fp32 = torch.ones(16, dtype=torch.float32, device=dev)
+            s_bf16 = torch.ones(16, dtype=torch.bfloat16, device=dev)
+            norms = torch.stack([s_bf16.float().norm(), s_fp32.float().norm()])
+            _ = torch.where(norms > 0, norms / norms, torch.ones_like(norms)).tolist()
+            for shard in (s_bf16, s_fp32):
+                shard.copy_(torch.lerp(shard.float(), avg, 0.5).to(shard.dtype))
+                shard.mul_(1.0)
 
     def _param(self, label: str):
         return self.optimizer._param_by_label[label]

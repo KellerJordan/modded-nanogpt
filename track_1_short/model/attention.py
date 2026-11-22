@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
+from track_1_short.exact_levers import FA3_NO_SELECT
 from track_1_short.perf.kernels.qkv_rope import PackedFP8QKV, qk_norm_rope_forward
 
 # Record #360's FA3 build, patched to take unequal query/key and value head widths ((64, 128) and
@@ -37,6 +38,60 @@ def load_flash_attn3():
 
 
 flash_attn_interface = load_flash_attn3()
+
+
+class FlashAttnVarlenTruncBwd(torch.autograd.Function):
+    """FA3 varlen sliding-window attention whose backward uses a narrower left window (PR #371)."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, cu_seqlens, max_seqlen, softmax_scale, window, window_bwd):
+        out, softmax_lse, *_ = flash_attn_interface._flash_attn_forward(
+            q, k, v,
+            None, None,  # k_new, v_new
+            None,  # qv
+            None,  # out
+            cu_seqlens, cu_seqlens,
+            None,  # cu_seqlens_k_new
+            None, None,  # seqused_q, seqused_k
+            max_seqlen, max_seqlen,
+            None, None, None,  # page_table, kv_batch_idx, leftpad_k
+            None, None, None,  # rotary_cos/sin, seqlens_rotary
+            None, None, None,  # q/k/v descale
+            softmax_scale,
+            causal=True,
+            window_size_left=window,
+            window_size_right=0,
+            attention_chunk=0,
+            softcap=0.0,
+            num_splits=1,
+            pack_gqa=None,
+            sm_margin=0,
+        )
+        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens)
+        ctx.max_seqlen = max_seqlen
+        ctx.softmax_scale = softmax_scale
+        ctx.window_bwd = window_bwd
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        q, k, v, out, softmax_lse, cu_seqlens = ctx.saved_tensors
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        flash_attn_interface._flash_attn_backward(
+            dout, q, k, v, out, softmax_lse,
+            cu_seqlens, cu_seqlens,
+            None, None,  # seqused_q, seqused_k
+            ctx.max_seqlen, ctx.max_seqlen,
+            dq, dk, dv,
+            ctx.softmax_scale,
+            True,  # causal
+            ctx.window_bwd,
+            0,  # window_size_right
+            0.0,  # softcap
+            False,  # deterministic
+            0,  # sm_margin
+        )
+        return dq, dk, dv, None, None, None, None, None
 
 
 class Yarn(nn.Module):
@@ -123,13 +178,14 @@ class AttnArgs:
     bm_size: int
     yarn: Yarn
     key_offset: bool
-    attn_gate_w: torch.Tensor | None
     aux_v: torch.Tensor | None  # added to V; full head width (num_heads * head_dim) on every layer
     xsa_alpha: torch.Tensor | None
     train_max_seq_len: torch.Tensor
     # A 0-D gain folded into the output projection with sa_lambdas[1]: the layer's residual post-lambda,
     # so the residual add takes the attention output as is (perf/residual_fusion.py). None = no gain.
     o_gain: torch.Tensor | None = None
+    # Attention backward's left window; None = bm_size (exact).
+    bm_size_bwd: int | None = None
 
 
 class CausalSelfAttention(nn.Module):
@@ -165,7 +221,7 @@ class CausalSelfAttention(nn.Module):
         assert T % 16 == 0
         H = self.num_heads
         # unpack attention args
-        aux_v, attn_gate_w = attn_args.aux_v, attn_args.attn_gate_w
+        aux_v = attn_args.aux_v
         sa_lambdas, key_offset = attn_args.sa_lambdas, attn_args.key_offset
         seqlens, bm_size = attn_args.seqlens, attn_args.bm_size
         train_max_seq_len, yarn = attn_args.train_max_seq_len, attn_args.yarn
@@ -173,6 +229,11 @@ class CausalSelfAttention(nn.Module):
         # The partial key offset shifts a key's non-rotating dims, so only a head with some can carry it.
         assert not key_offset or self.qk_dim > Yarn.ROTARY_DIM
 
+        # EXACT_LEVERS=fa3copy: training keeps q, k, v as the kernel's [tokens, heads, dim] tensors and hands them to FA3
+        # as they are. A q[None] ... q[0] round trip costs nothing forward, but the backward of the select materializes
+        # dq / dk (and dv on three layers) into a fresh buffer: a copy kernel after every FA3 backward.
+        batched = not (FA3_NO_SELECT and qkv_fp8 is not None)
+        lead = (B,) if batched else ()
         # QK norm @Grad62304977 and rotary run in the projection's epilogue on both paths.
         if qkv_fp8 is not None:
             weight_f8, weight_f8_t, weight_scale, x_scale, grad_scale, x_f8, x_f8_t = qkv_fp8
@@ -183,7 +244,8 @@ class CausalSelfAttention(nn.Module):
                 yarn.factor1[:T], yarn.factor2[:T], H,
                 self.paired, key_offset, Yarn.ROTARY_DIM, x_f8, x_f8_t,
             )
-            q, k, v = q[None], k[None], v[None]
+            if batched:
+                q, k, v = q[None], k[None], v[None]
         else:
             # Validation (no_grad): a bf16 projection and the forward norm/rotary kernel.
             qkv_weight = sa_lambdas[0] * torch.cat((qk_w, v_w)).type_as(x)
@@ -200,7 +262,7 @@ class CausalSelfAttention(nn.Module):
         # A narrower V takes the leading v_dim dims of each head of aux_v: the same as adding at full
         # width and dropping the rest.
         if aux_v is not None:
-            aux_v = aux_v.view(B, T, H, self.head_dim)[..., :self.v_dim]
+            aux_v = aux_v.view(*lead, T, H, self.head_dim)[..., :self.v_dim]
         if not self.paired:
             if aux_v is not None:
                 v = v + aux_v
@@ -208,26 +270,32 @@ class CausalSelfAttention(nn.Module):
             # Paired heads: adjacent heads' queries attend to each other's keys. Two copies of the
             # input stream are interleaved (q, k already are, by the norm/rotary kernel), which
             # doubles each sequence's length and halves the effective window.
-            v = v.reshape(B, T * 2, H // 2, self.v_dim)
+            v = v.reshape(*lead, T * 2, H // 2, self.v_dim)
             if aux_v is not None:
                 v = v + aux_v.reshape(v.shape)
             seqlens = 2 * seqlens
             max_len = 2 * max_len
 
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
-        y = y.view(B, T, H, self.v_dim)
+        if batched:
+            q, k, v_fa = q[0], k[0], v[0]
+        else:
+            v_fa = v
+        bm_size_bwd = attn_args.bm_size_bwd
+        if self.training and bm_size_bwd is not None and bm_size_bwd < bm_size:
+            y = FlashAttnVarlenTruncBwd.apply(q, k, v_fa, seqlens, max_len, yarn.attn_scale, bm_size, bm_size_bwd)
+        else:
+            y = flash_attn_interface.flash_attn_varlen_func(q, k, v_fa, cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                                            max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                                            causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+        y = y.view(*lead, T, H, self.v_dim)
         # Gated XSA (arXiv:2603.09078) with learnable strength: subtract per-head fraction tanh(α)
         # of y aligned with v̂. Non-paired only (v shape doesn't line up for paired layers).
         if attn_args.xsa_alpha is not None and not self.paired:
             dot = (y * v).sum(-1, keepdim=True)
             denom = v.square().sum(-1, keepdim=True).clamp_min(1e-8)
-            alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(B, T, H, 1)
+            alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(*lead, T, H, 1)
             y = y - alpha * (dot / denom) * v
-        if attn_gate_w is not None:
-            y = y * attn_gate_w.type_as(y).view(B, T, H, 1)
         y = y.contiguous().view(B, T, H * self.v_dim) # re-assemble all head outputs side by side
         # The output scale rounds to bf16 in the one product with O, with or without o_gain.
         o_scale = sa_lambdas[1] if attn_args.o_gain is None else sa_lambdas[1] * attn_args.o_gain

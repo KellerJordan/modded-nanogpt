@@ -3,8 +3,9 @@ import copy
 from collections.abc import Callable
 
 import torch
+import torch.distributed as dist
 
-from track_1_short.config import BLOCK_SIZE, VIRTUAL_SEQ_CAP
+from track_1_short.config import BLOCK_SIZE, VIRTUAL_SEQ_CAP, short_bwd_window_tokens
 from track_1_short.model.gpt import ForwardScheduleConfig
 from track_1_short.ngram_table import NGRAM_ADAM_PERIOD4_START
 from track_1_short.optim.anvil import RAIL_ENGAGE_STEP, RAIL_FAST_BETA, RAIL_FAST_WEIGHT, AnvilAndAdam, AnvilBank
@@ -46,8 +47,11 @@ class TrainingManager():
            event; step() itself never sees its gradient. Its betas and wd_mul follow the cadence
            (value_embed_betas_and_wd_mul)
     """
-    def __init__(self, model, schedule: TrainingSchedule, bank_update: Callable[[AnvilBank], None]):
-        """bank_update: how the optimizer runs each ANVIL bank's update (AnvilBankGraphs.update)."""
+    def __init__(self, model, schedule: TrainingSchedule, bank_update: Callable[[AnvilBank], None],
+                 moe_publish: Callable[[], list], late_group: dist.ProcessGroup | None = None):
+        """bank_update: how the optimizer runs each ANVIL bank's update (AnvilBankGraphs.update).
+        moe_publish: the expert bank's fp8 publication after its update (Fp8RefreshGraphs.publish_moe).
+        late_group: the n-gram table's communicator, where the big reduce-scatters queue (optim/anvil.py)."""
         self.model = model
         self.schedule = schedule
 
@@ -58,6 +62,8 @@ class TrainingManager():
             "qk_bank":        {"optim": "anvil",   "comms": "sharded",    "adam_betas": None},
             "vo_bank":        {"optim": "anvil",   "comms": "sharded",    "adam_betas": None},
             "mlp_bank":       {"optim": "anvil",   "comms": "sharded",    "adam_betas": None},
+            "moe_bank":       {"optim": "anvil",   "comms": "sharded",    "adam_betas": None},
+            "moe_router":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 1.0,  "wd_mul": 0.0},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
@@ -80,30 +86,47 @@ class TrainingManager():
             "_mudd_gate_scale": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
         })
 
+        # ---- CPLM parameters (PR #379): replicated Adam like the other small heads. The copy pointer's q/k bank and sink
+        # key at lr_mul 1; the sink key and the q gain without weight decay.
+        self.param_table.update({
+            "copy_qk_bank": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99]},
+            "copy_k_sink":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "wd_mul": 0.0},
+            "copy_qk_gain": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "wd_mul": 0.0},
+        })
+
         # NCCL runs one stream in enqueue order and future.wait() is a stream wait, so scatter_order is
         # the comms schedule (record #360). The replicated params are all-reduced as one flat buffer ahead
-        # of all of these (perf/replicated_adam.py); their entries here only name them.
+        # of all of these (perf/replicated_adam.py); their entries here only name them. The labels in
+        # optim/anvil.py RS_LATE_LABELS (mlp_bank, lm_head, moe_bank) are launched later than their place here, behind
+        # the n-gram gradient exchange, in work_order's order; value_embeds' entry only names the sparse tables.
+        # moe_bank sits after embed; moe_router (replicated) and the CPLM parameters (replicated) are named last.
         self.scatter_order = [
             "qk_bank", "vo_bank", "mlp_bank",
             "value_embeds",  # the row-sparse gradient exchanges of both tables (optim/anvil.py SparseUpdate)
-            "lm_head", "embed",
+            "lm_head", "embed", "moe_bank",
             "scalars", "smear_gate", "ve_gate_bank", "post_lambdas", "resid_lambdas",
             "mudd_w1", "mudd_w2", "mudd_w2g", "mudd_b2", "mudd_gate_w1", "mudd_gate_w2", "mudd_gate_b2",
-            "_mudd_gate_scale",
+            "_mudd_gate_scale", "moe_router", "copy_qk_bank", "copy_k_sink", "copy_qk_gain",
         ]
         # work_order is the compute schedule (record #360):
         # - qk_bank and vo_bank first: their gathers are the first ones the next step's fp8 refresh waits
         #   for (perf/deferred_gathers.py), and Phase 3's lm_head wait queues behind only these two
+        # - value_embeds next: both tables' row-sparse updates, then their row serves, queued ahead of the
+        #   mlp_bank gather. The n-gram table is the long chain of the step (gradient exchange -> merge +
+        #   Adam -> pull) and its update runs the moment its gradients land: only the two attention banks
+        #   (tiny compute, reduce-scatters that finish first) go before it, and the rest of the dense work
+        #   (lm_head, the fused scalars, mlp_bank, the lm_head -> embed copy) runs while the pull is in flight
         # - lm_head must complete before embed sync (when tied)
-        # - value_embeds: both tables' row-sparse updates, then their row serves, queued ahead of the
-        #   mlp_bank gather
-        # - the replicated params (one fused update at the first of them), then mlp_bank, the largest
-        #   gather, last
+        # - the replicated params (one fused update at the first of them, the MoE router and the CPLM pointer among
+        #   them: the position of the latter is free, they sit after resid_lambdas), then the
+        #   experts' update and fp8 publication before mlp_bank's, so their rows land first and the column-major
+        #   cache is built while mlp_bank's gather (the largest, last) still runs
+        # The reduce-scatters of RS_LATE_LABELS (lm_head, moe_bank, mlp_bank) queue in this order.
         self.work_order = [
-            "qk_bank", "vo_bank", "lm_head", "embed", "value_embeds",
+            "qk_bank", "vo_bank", "value_embeds", "lm_head", "embed",
             "scalars", "smear_gate", "ve_gate_bank", "mudd_b2", "mudd_gate_b2", "_mudd_gate_scale",
-            "post_lambdas", "resid_lambdas", "mudd_w2", "mudd_w2g", "mudd_gate_w2", "mudd_w1", "mudd_gate_w1",
-            "mlp_bank",
+            "post_lambdas", "resid_lambdas", "copy_qk_bank", "copy_k_sink", "copy_qk_gain", "mudd_w2", "mudd_w2g", "mudd_gate_w2", "mudd_w1", "mudd_gate_w1",
+            "moe_router", "moe_bank", "mlp_bank",
         ]
 
         self.adam_defaults = adam_defaults = dict(
@@ -127,6 +150,8 @@ class TrainingManager():
             adam_defaults=adam_defaults,
             anvil_defaults=anvil_defaults,
             bank_update=bank_update,
+            moe_publish=moe_publish,
+            late_group=late_group,
         )
 
         # Split embed from lm_head at the extension stage (on an odd step so Adam updates)
@@ -143,6 +168,7 @@ class TrainingManager():
             prefix_weight = self.prefix_weight,
             ws_short = self.ws_short * BLOCK_SIZE,
             ws_long = self.ws_long * BLOCK_SIZE,
+            ws_short_bwd = self.ws_short_bwd,
             # The loader cuts documents longer than VIRTUAL_SEQ_CAP into attention segments.
             train_max_seq_len = min(self.train_max_seq_len, VIRTUAL_SEQ_CAP),
             sampled_loss = sampled_loss,
@@ -168,6 +194,7 @@ class TrainingManager():
 
         self.train_max_seq_len = stage.train_max_seq_len
         self.ws_long = new_ws_long
+        self.ws_short_bwd = short_bwd_window_tokens(stage)
         self.mtp_weights = self.schedule.mtp_weights[step]
         self.prefix_weight = self.schedule.prefix_weights[step]
 
@@ -212,6 +239,7 @@ class TrainingManager():
 
         stage, _ = self.schedule.lookup(0)
         self.ws_short, self.ws_long = stage.window_sizes
+        self.ws_short_bwd = short_bwd_window_tokens(stage)
         self.train_max_seq_len = stage.train_max_seq_len
         for yarn in (self.model.yarn, self.model.yarn_paired_head, self.model.yarn_wide):
             yarn.reset()

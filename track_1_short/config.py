@@ -22,8 +22,9 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule: the base step count of the main stages (SCHEDULE_GROWTH_STEPS are added on top), then
-    # the extension stage. The override is for step-count sweeps (record #360's KX_STEPS).
-    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "1122"))
+    # the extension stage. The override is for step-count sweeps (the sweeps of record #360).
+    # 981 scheduled + SCHEDULE_GROWTH_STEPS (52) + num_extension_iterations (20) = 1053 steps in all.
+    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "981"))
     num_extension_iterations: int = 20
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -47,6 +48,16 @@ class TrainingStage:
     # Prefix-token-prediction loss weight, stepped: the stage's steps split into equal parts, one weight each.
     prefix_weights: tuple[float, ...]
     duration: float | None = None  # fraction of num_scheduled_iterations; None for the extension stage
+    # Truncated attention backward (PR #371): short layers' backward window in blocks; None = exact.
+    bwd_window_short: int | None = None
+
+
+def short_bwd_window_tokens(stage: TrainingStage) -> int:
+    ws_short = stage.window_sizes[0]
+    if stage.bwd_window_short is not None:
+        assert 1 <= stage.bwd_window_short <= ws_short, stage
+        ws_short = stage.bwd_window_short
+    return ws_short * BLOCK_SIZE
 
 
 # Stage lengths as fractions of num_scheduled_iterations (normalized to sum to 1). The last entry is
@@ -58,6 +69,9 @@ TAPER_DURATION = 0.06
 # the batch-24 stage (index 2), which keeps every later boundary's Adam-step (odd/even) parity.
 SCHEDULE_GROWTH_STEPS = 52
 SCHEDULE_GROWTH_STAGE = 2
+# The CPLM <copy> gate (perf/kernels/cplm.py) is the vocabulary's first padding row, so lm_head needs no new row;
+# the sampled softmax always keeps it in its candidate set (sampled_softmax.py).
+COPY_TOKEN_ID = 50257
 # Attention window sizes are counted in blocks of this many tokens (record #360).
 BLOCK_SIZE = 128
 # Documents may run to 3072 tokens in the last stages, but attention segments are cut at this many
@@ -76,8 +90,10 @@ TRAINING_STAGES = [
     TrainingStage(duration=STAGE_DURATIONS[0], train_max_seq_len=896, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
                   mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0], prefix_weights=(0.25,)),
     TrainingStage(duration=STAGE_DURATIONS[1], train_max_seq_len=2048, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
+                  bwd_window_short=2,  # 384 -> 256 tokens
                   mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0], prefix_weights=(0.20, 0.15, 0.10, 0.05)),
     TrainingStage(duration=STAGE_DURATIONS[2] - TAPER_DURATION, train_max_seq_len=3072, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
+                  bwd_window_short=3,  # 640 -> 384 tokens
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weights=(0.0,)),
     # terminal batch taper: 24 -> 20, lr_mul scaled by sqrt(20/24)
     TrainingStage(duration=TAPER_DURATION, train_max_seq_len=3072, batch_size=TAPER_BATCH_UNITS * 2048 * 8, window_sizes=(5, 11),

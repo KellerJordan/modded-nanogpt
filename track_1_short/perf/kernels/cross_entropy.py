@@ -14,6 +14,10 @@ log-sum-exp uses the fixed maximum A instead of an online row max (see the kerne
 Softcap z = A * sigmoid((logit + B) / C) with (A, B, C) = (23, 5, 7.5): the same constants are
 spelled in model/gpt.py's eval loss; they must move together.
 
+ce_fwd_bwd_lut_kernel is the same kernel with 256-entry tables (every element is a function of its e4m3 byte): it
+runs whenever n_rows % 8 == 0, produces byte-identical losses and gradients, and is the base source the CPLM
+kernel (perf/kernels/cplm.py) patches.
+
 Provenance: fused CE kernel from the master track; e4m3 logits, fp16 sigma, fixed-max LSE, cached
 fp8 lm_head from record #360 (ANVIL2).
 """
@@ -314,6 +318,331 @@ def compile_ce_kernel(vocab_size: int):
 
 ce_fwd_bwd_kernel = compile_ce_kernel(CE_KERNEL_VOCAB_SIZE)
 
+# ---- the same kernel with 256-entry tables ---------------------------------------------------------------------------------------------
+# ce_fwd_bwd_kernel spends its time on per-element arithmetic (~27 instructions per element: two cvt, tanh, two exp, a dozen flops), not on the
+# 1.4 GB it moves.  Every element is a function of its e4m3 CODE BYTE alone (plus the row's lse and S_w in the second pass), so 256 table
+# entries per row replace 14336..50304 evaluations.  Same signature as ce_fwd_bwd_kernel, same arithmetic per entry, same summation order: byte-identical results.
+CE_LUT_KERNEL_SOURCE = r"""
+// ---------------------------------------------------------------------------------------------------------------------------------
+// ce_fwd_bwd_lut_kernel: ce_fwd_bwd_kernel with the per-element transcendental math replaced by 256-entry tables.
+// Every element of a row is a pure function of its e4m3 logit CODE BYTE (sigmoid cache, exp(z - A)) and, in the second pass, of the row's
+// lse and S_w: at most 256 distinct values per row. The first pass sums e_term[byte] in the SAME per-thread order as the original (thread t,
+// load i, lane k), so the block sum, lse, loss and every gradient byte are bit-identical to ce_fwd_bwd_kernel (checked byte for byte on random
+// logits -- realistic and uniform over all 256 codes -- for every vocabulary the trainer runs). The second pass builds the row's 256 gradient
+// bytes once (one table entry per thread) and each element is then a table lookup. Tables are replicated 32x so that lane l always reads bank l.
+// 8 rows per CTA; the next row is pulled into L2 by one bulk prefetch while the current one is processed (registers hold only the current row),
+// and the sparse target corrections are stored one barrier later so that they land after the bulk stores of their row.
+// ---------------------------------------------------------------------------------------------------------------------------------
+struct __align__(8) ce_u32x2 { unsigned int x, y; };
+
+__device__ __forceinline__ unsigned long long ce_policy_evict_first() {
+    unsigned long long p;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(p));
+    return p;
+}
+__device__ __forceinline__ ce_u32x2 ce_ldg_stream(const unsigned char* p, unsigned long long pol) {
+    ce_u32x2 r;
+    asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.v2.u32 {%0, %1}, [%2], %3;" : "=r"(r.x), "=r"(r.y) : "l"(p), "l"(pol));
+    return r;
+}
+__device__ __forceinline__ void ce_stg_u32x2(unsigned char* p, unsigned int x, unsigned int y) {
+    asm volatile("st.global.v2.u32 [%0], {%1, %2};" :: "l"(p), "r"(x), "r"(y) : "memory");
+}
+// fp32 value of the fp16-rounded sigmoid cache entry for an e4m3 logit byte, exactly as the per-element code computed it
+__device__ __forceinline__ float ce_sigmoid_of_byte(unsigned int b, float inv_C, float B_div_C) {
+    float tmp = ce_e4m3_logit_to_f32((unsigned char)b);
+    tmp = sigmoid(tmp * inv_C + B_div_C);
+    __half h = __float2half(tmp);
+    return __half2float(h);
+}
+
+#ifndef CE_ROWS_PER_CTA
+#define CE_ROWS_PER_CTA 8
+#endif
+#ifndef CE_MINB
+#define CE_MINB 3
+#endif
+
+extern "C"
+__global__ void __launch_bounds__(BLOCK_SIZE, CE_MINB)
+ce_fwd_bwd_lut_kernel(
+    const CE_IN_T* __restrict__ logits,
+    const int64_t* __restrict__ targets,
+    const float* __restrict__ mtp_weights,
+    const int64_t* __restrict__ prefix_targets,
+    const float* __restrict__ prefix_weight_ptr,
+    float* __restrict__ losses,
+    unsigned char* grad_input,
+    int batch_size,
+    int n_predict,
+    double A_param,
+    double B_param,
+    double C_param,
+    double grad_s_param)
+{
+  static_assert(BLOCK_SIZE == 256, "one table entry per thread");
+  constexpr int VEC_WIDTH = 8;
+  constexpr int NUM_FULL_LOADS = VOCAB_SIZE / (BLOCK_SIZE * VEC_WIDTH);
+  constexpr int NUM_LOADS = CEIL_DIV(VOCAB_SIZE, BLOCK_SIZE * VEC_WIDTH);
+  constexpr int R = CE_ROWS_PER_CTA;
+
+  const float A = (float)A_param;
+  const float B = (float)B_param;
+  const float C = (float)C_param;
+  const float grad_s = (float)grad_s_param;
+  const float pw = prefix_weight_ptr[0];
+  const unsigned long long pol_stream = ce_policy_evict_first();
+
+  extern __shared__ float ce_smem[];
+  float* lut_e = ce_smem;                                  // [256 bytes][32 replicas]  exp(A*s - A)
+  uint4* lut_g4 = (uint4*)(ce_smem + 256 * 32);            // [256 bytes][32 replicas]  gradient byte of this row (low byte of each word)
+  float* lut_sf = ce_smem + 2 * 256 * 32;                  // [256]  fp32 value of the fp16 sigmoid cache entry
+  __shared__ float block_sums[BLOCK_SIZE / 32];
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const long long row0 = (long long)blockIdx.x * R;
+  const long long NOT_IN_BATCH = (long long)(-9223372036854775807LL - 1LL);
+
+  const float inv_C = 1 / C;
+  const float B_div_C = B * inv_C;
+
+  float w0 = 0.f, w1 = 0.f, w2 = 0.f;
+  if (n_predict > 0) w0 = mtp_weights[0];
+  if (n_predict > 1) w1 = mtp_weights[1];
+  if (n_predict > 2) w2 = mtp_weights[2];
+
+  // warp 0, lane l<n_predict: targets[row + l] (NOT_IN_BATCH past the end); lane n_predict: the prefix target; other lanes -1
+  auto load_tg = [&](long long row) -> long long {
+    long long t = -1;
+    if (lane < n_predict) { t = NOT_IN_BATCH; if (row + lane < batch_size) t = targets[row + lane]; }
+    else if (lane == n_predict) { t = prefix_targets[row]; }
+    return t;
+  };
+
+  ce_u32x2 rv[NUM_LOADS];
+  long long cur_ptgt, cur_tg;
+  unsigned int cur_tbyte = 0;
+  {
+    const unsigned char* rp = logits + row0 * VOCAB_SIZE;
+    #pragma unroll
+    for (int i = 0; i < NUM_LOADS; i++) {
+      int idx = i * BLOCK_SIZE * VEC_WIDTH + tid * VEC_WIDTH;
+      rv[i] = {0u, 0u};
+      if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) rv[i] = ce_ldg_stream(rp + idx, pol_stream);
+    }
+    cur_ptgt = prefix_targets[row0];
+    cur_tg = load_tg(row0);
+    if (warp == 0 && cur_tg >= 0 && cur_tg < VOCAB_SIZE) cur_tbyte = rp[cur_tg];
+  }
+  {
+    float sf = ce_sigmoid_of_byte(tid, inv_C, B_div_C);
+    lut_sf[tid] = sf;
+    float tmp = A * sf;
+    float e = __expf(tmp - A);
+    #pragma unroll
+    for (int q = 0; q < 32; q++) lut_e[tid * 32 + ((q + lane) & 31)] = e;
+  }
+  __syncthreads();
+
+  const unsigned char* lut_g_lane = (const unsigned char*)lut_g4 + lane * 4;
+
+  unsigned char* pending_ptr = nullptr;   // deferred sparse correction
+  unsigned char pending_val = 0;
+
+  for (int j = 0; j < R; j++) {
+    const long long row = row0 + j;
+    unsigned char* gp = grad_input + row * VOCAB_SIZE;
+
+    const bool has_next = (j + 1 < R);
+    const long long nrow = row + 1;
+    long long ntg = -1, nptgt = -1;
+    if (j > 0) {   // this row's logits were prefetched into L2 one row ago
+      const unsigned char* rp_ = logits + row * VOCAB_SIZE;
+      #pragma unroll
+      for (int i = 0; i < NUM_LOADS; i++) {
+        int idx = i * BLOCK_SIZE * VEC_WIDTH + tid * VEC_WIDTH;
+        rv[i] = {0u, 0u};
+        if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) rv[i] = ce_ldg_stream(rp_ + idx, pol_stream);
+      }
+    }
+    if (has_next) {
+      if (tid == 0) asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, %2;" :: "l"(logits + nrow * VOCAB_SIZE), "r"((unsigned)VOCAB_SIZE), "l"(pol_stream) : "memory");
+      nptgt = prefix_targets[nrow];
+      ntg = load_tg(nrow);
+    }
+
+    // pass 1: sum of exp(A*s - A) over the row, same per-thread order as the original (i outer, k inner)
+    float thread_sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < NUM_LOADS; i++) {
+      int idx = i * BLOCK_SIZE * VEC_WIDTH + tid * VEC_WIDTH;
+      if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+        unsigned int w[2] = {rv[i].x, rv[i].y};
+        #pragma unroll
+        for (int kk = 0; kk < VEC_WIDTH; kk++) {
+          unsigned int b = (w[kk >> 2] >> ((kk & 3) * 8)) & 0xFFu;
+          thread_sum += lut_e[(b << 5) + lane];
+        }
+      }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+      thread_sum += __shfl_down_sync(0xFFFFFFFF, thread_sum, offset);
+    if (lane == 0) block_sums[warp] = thread_sum;
+    __syncthreads();   // block_sums ready; every thread is done with the previous row's second pass
+
+    if (pending_ptr != nullptr) { *pending_ptr = (char)pending_val; pending_ptr = nullptr; }
+
+    // the next row's target logit byte (its target indices arrived long ago)
+    unsigned int ntbyte = 0;
+    if (has_next && warp == 0 && ntg >= 0 && ntg < VOCAB_SIZE) ntbyte = logits[nrow * VOCAB_SIZE + ntg];
+
+    float block_sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < BLOCK_SIZE / 32; i++) block_sum += block_sums[i];
+    const float lse = A + __logf(block_sum);
+
+    float S_w = 0.0f;
+    if (n_predict > 0) S_w += w0;
+    if (n_predict > 1) S_w += w1;
+    if (n_predict > 2) S_w += w2;
+    if (cur_ptgt >= 0) S_w += pw;
+
+    {   // gradient byte of every possible logit byte for THIS row (one entry per thread)
+      float sigmoid_u = lut_sf[tid];
+      float z = A * sigmoid_u;
+      float p = __expf(z - lse);
+      float term1 = S_w * p;
+      float term2 = 0.0f;
+      float grad_z = term1 - term2;
+      float gx = (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
+      unsigned int gb = (unsigned int)f32x2_to_fp8_e5m2x2(gx, 0.0f) & 0xFFu;
+      uint4 v4 = make_uint4(gb, gb, gb, gb);
+      #pragma unroll
+      for (int q = 0; q < 8; q++) lut_g4[tid * 8 + ((q + lane) & 7)] = v4;
+    }
+
+    if (warp == 0) {   // loss and sparse correction, lanes 0..n_predict (the same arithmetic as ce_fwd_bwd_kernel's thread 0 / correction threads)
+      float sfl = lut_sf[cur_tbyte];
+      float z_t = A * sfl;
+      float diff = lse - z_t;
+      float wgt = (lane < n_predict) ? ((lane == 0) ? w0 : ((lane == 1) ? w1 : w2)) : pw;
+      const bool in_b = cur_tg != NOT_IN_BATCH;
+      bool okl = (lane <= n_predict) && cur_tg >= 0 && cur_tg < VOCAB_SIZE;
+      float total_loss = 0.0f;
+      for (int kk = 0; kk <= n_predict; kk++) {
+        float d = __shfl_sync(0xFFFFFFFF, diff, kk);
+        float w = __shfl_sync(0xFFFFFFFF, wgt, kk);
+        bool ok = __shfl_sync(0xFFFFFFFF, (int)okl, kk) != 0;
+        if (ok) total_loss += w * d;
+      }
+      if (lane == 0) losses[row] = total_loss;
+
+      int64_t t0 = __shfl_sync(0xFFFFFFFF, cur_tg, 0);
+      int64_t t1 = __shfl_sync(0xFFFFFFFF, cur_tg, 1);
+      int64_t t2 = __shfl_sync(0xFFFFFFFF, cur_tg, 2);
+      bool is_pfx = (lane == n_predict) && (cur_ptgt >= 0) && (pw > 0.0f);
+      if (((lane < n_predict) && in_b) || is_pfx) {
+        int64_t target = is_pfx ? cur_ptgt : cur_tg;
+        float sigmoid_u = sfl;
+        float z = A * sigmoid_u;
+        float p = __expf(z - lse);
+        float term1 = S_w * p;
+        float term2 = 0.0f;
+        if (0 < n_predict && (row + 0) < batch_size && t0 == target) term2 += w0;
+        if (1 < n_predict && (row + 1) < batch_size && t1 == target) term2 += w1;
+        if (2 < n_predict && (row + 2) < batch_size && t2 == target) term2 += w2;
+        if (cur_ptgt >= 0 && cur_ptgt == target) term2 += pw;
+        float grad_z = term1 - term2;
+        float grad_x = (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
+        auto result_tmp = f32_to_fp8_e5m2_fast(grad_x);
+        auto result = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
+        if (target >= 0 && target < VOCAB_SIZE) { pending_ptr = gp + target; pending_val = (unsigned char)result; }
+      }
+    }
+    __syncthreads();   // table ready
+
+    // pass 2: gradient byte = table[logit byte]
+    #pragma unroll
+    for (int i = 0; i < NUM_LOADS; i++) {
+      int idx = i * BLOCK_SIZE * VEC_WIDTH + tid * VEC_WIDTH;
+      if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+        unsigned int w[2] = {rv[i].x, rv[i].y};
+        unsigned int o[2];
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+          unsigned int g0 = lut_g_lane[((w[h]      ) & 0xFFu) << 7];
+          unsigned int g1 = lut_g_lane[((w[h] >>  8) & 0xFFu) << 7];
+          unsigned int g2 = lut_g_lane[((w[h] >> 16) & 0xFFu) << 7];
+          unsigned int g3 = lut_g_lane[((w[h] >> 24)        ) << 7];
+          o[h] = g0 | (g1 << 8) | (g2 << 16) | (g3 << 24);
+        }
+        ce_stg_u32x2(gp + idx, o[0], o[1]);
+      }
+    }
+    if (has_next) {
+      cur_tg = ntg; cur_ptgt = nptgt; cur_tbyte = ntbyte;
+    }
+  }
+  __syncthreads();   // all bulk stores of the last row precede its correction
+  if (pending_ptr != nullptr) { *pending_ptr = (char)pending_val; pending_ptr = nullptr; }
+}
+"""
+
+CE_LUT_ROWS = 8
+CE_LUT_SMEM = (2 * 256 * 32 + 256) * 4
+
+def _ce_lut_minb(vocab: int) -> int:
+    """Resident CTAs per SM the register budget is sized for: the rows being processed live in registers, so wide vocabularies get fewer, fatter CTAs."""
+    return 3 if vocab <= 14336 else (2 if vocab <= 24576 else 1)
+
+def _ce_lut_compile(vocab: int):
+    """ce_fwd_bwd_lut_kernel for rows of `vocab` logits (8 rows per CTA; shared memory CE_LUT_SMEM)."""
+    _pre = CE_KERNEL_SOURCE.split('extern "C"')[0]     # the sigmoid / fp8 helpers, shared verbatim with ce_fwd_bwd_kernel
+    _src = (f"\n#define CE_MINB {_ce_lut_minb(vocab)}\nconstexpr int VOCAB_SIZE = {vocab};\nconstexpr int BLOCK_SIZE = {CE_KERNEL_BLOCK_SIZE};\n"
+            + _pre + CE_LUT_KERNEL_SOURCE)
+    _k = torch.cuda._compile_kernel(_src, "ce_fwd_bwd_lut_kernel", compute_capability="90",
+                                    cuda_include_dirs=CUDA_INCLUDE_DIRS, nvcc_options=["-lineinfo", "--use_fast_math"])
+    _k.set_shared_memory_config(CE_LUT_SMEM)
+    return _k
+
+ce_fwd_bwd_lut_kernel = _ce_lut_compile(CE_KERNEL_VOCAB_SIZE)
+
+
+def check_ce_lut_matches_plain(kernel_lut, kernel_plain, vocab: int, n_rows: int = 64, n_predict: int = 3, seed: int = 4242) -> bool:
+    """Run the plain and the LUT kernel (both compiled for `vocab`) on the same random e4m3 logits and compare losses and
+    gradient bytes bit for bit. Logits are drawn both realistically (a few sigma around 0) and uniformly over all 256 codes.
+    Eager, GPU only; not called at import (the LUT kernel is the sole numerics-relevant claim of this file, this is how
+    to re-verify it)."""
+    dev = torch.device("cuda")
+    g = torch.Generator(device=dev)
+    g.manual_seed(seed)
+    assert n_rows % CE_LUT_ROWS == 0
+    ok = True
+    for mode in ("realistic", "uniform"):
+        if mode == "realistic":
+            logits = (torch.randn(n_rows, vocab, device=dev, generator=g) * 4.0).clamp(-448, 448).to(torch.float8_e4m3fn)
+        else:
+            logits = torch.randint(0, 256, (n_rows, vocab), device=dev, generator=g, dtype=torch.uint8)
+            logits = torch.where((logits & 0x7F) == 0x7F, logits & 0x80, logits).view(torch.float8_e4m3fn)   # no NaN codes
+        targets = torch.randint(0, vocab, (n_rows,), device=dev, generator=g, dtype=torch.int64)
+        prefix = torch.randint(-1, vocab, (n_rows,), device=dev, generator=g, dtype=torch.int64)
+        mtp = torch.tensor([1.0, 0.5, 0.25][:n_predict], device=dev)
+        pw = torch.full((1,), 0.3, device=dev)
+        outs = []
+        for kern, grid, smem in ((kernel_plain, n_rows, vocab * 2), (kernel_lut, n_rows // CE_LUT_ROWS, CE_LUT_SMEM)):
+            losses = torch.zeros(n_rows, device=dev)
+            grad = torch.zeros((n_rows, vocab), dtype=torch.float8_e5m2, device=dev)
+            kern((grid, 1, 1), (CE_KERNEL_BLOCK_SIZE, 1, 1),
+                 (logits.view(torch.uint8), targets, mtp, prefix, pw, losses, grad, n_rows, n_predict,
+                  SOFTCAP_A, SOFTCAP_B, SOFTCAP_C, 1.0), shared_mem=smem)
+            torch.cuda.synchronize(dev)
+            outs.append((losses, grad.view(torch.uint8)))
+        ok = ok and torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
+    return bool(ok)
+
+
 @torch.library.custom_op("nanogpt::ce_fwd_bwd", mutates_args={"losses", "grad_input"})
 def ce_fwd_bwd(
     logits: torch.Tensor,
@@ -332,6 +661,16 @@ def ce_fwd_bwd(
 ) -> None:
     # prefix_weight is a 1-element fp32 device tensor the kernel reads, so the per-step schedule
     # value never becomes a graph constant (a Python float would recompile at every change).
+    if n_rows % CE_LUT_ROWS == 0:
+        # 256-entry-table kernel, byte-identical to the plain one (see CE_LUT_KERNEL_SOURCE)
+        ce_fwd_bwd_lut_kernel(
+            (n_rows // CE_LUT_ROWS, 1, 1),
+            (CE_KERNEL_BLOCK_SIZE, 1, 1),
+            (logits, targets, mtp_weights, prefix_targets, prefix_weight, losses, grad_input,
+             n_rows, n_predict, A, B, C, grad_s),
+            shared_mem=CE_LUT_SMEM,
+        )
+        return
     ce_fwd_bwd_kernel(
         (n_rows, 1, 1),
         (CE_KERNEL_BLOCK_SIZE, 1, 1),
@@ -372,7 +711,7 @@ def _ce_backward_gemms(grad_input, w_f8_row, x_f8, x_s, w_s, grad_s):
     transpose_copy(x_f8, x_f8_T)  # (768, n_rows) row-major
 
     grad_input_T = torch.empty((n_cols, n_rows), dtype=grad_input.dtype, device=grad_input.device)
-    transpose_copy(grad_input, grad_input_T)  # (n_cols, n_rows) row-major
+    transpose_copy(grad_input, grad_input_T)  # (n_cols, n_rows) row-major; transpose_copy picks its big tile by size
 
     grad_w = torch._scaled_mm(
         x_f8_T, grad_input_T.T,    # (768, n_rows) row-major @ (n_rows, n_cols) column-major view

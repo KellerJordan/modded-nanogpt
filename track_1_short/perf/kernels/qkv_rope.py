@@ -115,9 +115,23 @@ def qk_norm_rope_forward(qk, factor1, factor2, num_heads, rotary_dim, paired, ke
     return out_q, out_k
 
 
+@triton.jit
+def _flip_adjacent_pairs(t, BLOCK_T: tl.constexpr, BLOCK_QK: tl.constexpr):
+    """t[:, d ^ 1] as a register permutation (bit-exact: tl.flip swaps the 16-bit patterns)."""
+    return tl.reshape(tl.flip(tl.reshape(t, (BLOCK_T, BLOCK_QK // 2, 2)), dim=2), (BLOCK_T, BLOCK_QK))
+
+
 # The QK-norm/rotary backward, the V gradient and the dual-layout e4m3 quantize of both, in one kernel
 # per attention layer. The grid is head-fastest so factor1/factor2 are read about once instead of once
 # per head. The axis=1 reductions are bit-identical under any BLOCK_T: BLOCK_T only grows dim 0.
+# Two memory-system choices took the kernel from 1.8 to 2.9 TB/s on the wide layers, against an earlier
+# spelling of the same arithmetic (expression for expression):
+#  * factor2 is loaded CONTIGUOUSLY and swapped in registers. Gathering it at `offs_d ^ 1` gave Triton a
+#    layout whose 32 lanes sit on 32 different token rows (one 2-byte load from 32 distinct 128 B lines per
+#    instruction) plus a smem layout conversion; swapping after a vector load is a pure permutation.
+#  * every load (x, grad, grad_next, grad_v, f1, f2) is issued up front, before the first dependent op and
+#    store, so a CTA keeps all of its ~56 KB in flight. The reduction layouts (and so the fp32 summation
+#    order of both axis=1 sums) are unchanged: identical output bytes.
 @triton.jit
 def _qkv_norm_rope_pack_fp8_backward_kernel(
     grad_q, grad_k, grad_v, qk, factor1, factor2,
@@ -148,7 +162,6 @@ def _qkv_norm_rope_pack_fp8_backward_kernel(
     offs_d = tl.arange(0, BLOCK_QK)
     token_mask = token < tokens
     qk_mask = token_mask[:, None] & (offs_d[None, :] < qk_dim)
-    offs_flip = offs_d ^ 1
 
     if PAIRED:
         output_token = 2 * token + logical_head // (num_heads // 2)
@@ -159,22 +172,42 @@ def _qkv_norm_rope_pack_fp8_backward_kernel(
         output_head = logical_head
         factor_offset = 0
 
-    f1 = tl.load(factor1 + token[:, None] * factor_stride_t + factor_offset + offs_d[None, :],
-                 mask=qk_mask, other=0.0).to(tl.float32)
-    f2_flip = tl.load(factor2 + token[:, None] * factor_stride_t + factor_offset + offs_flip[None, :],
-                      mask=qk_mask, other=0.0).to(tl.float32)
+    factor_ptrs = token[:, None] * factor_stride_t + factor_offset + offs_d[None, :]
+
+    # ---- every load, issued before any math or store ----
+    f1 = tl.load(factor1 + factor_ptrs, mask=qk_mask, other=0.0).to(tl.float32)
+    f2 = tl.load(factor2 + factor_ptrs, mask=qk_mask, other=0.0)
     scale = tl.load(grad_scale_ptr)
+    x0 = tl.load(qk + token[:, None] * stride_qkt + logical_head * stride_qkh + offs_d[None, :],
+                 mask=qk_mask, other=0.0)
+    grad0 = tl.load(grad_q + output_token[:, None] * stride_grad_q_t + output_head * stride_grad_q_h + offs_d[None, :],
+                    mask=qk_mask, other=0.0)
+    x1 = tl.load(qk + token[:, None] * stride_qkt + (logical_head + num_heads) * stride_qkh + offs_d[None, :],
+                 mask=qk_mask, other=0.0)
+    grad1 = tl.load(grad_k + output_token[:, None] * stride_grad_k_t + output_head * stride_grad_k_h + offs_d[None, :],
+                    mask=qk_mask, other=0.0)
+    if KEY_OFFSET:
+        next_token = tl.minimum(token + 1, tokens - 1)
+        grad_next_raw = tl.load(
+            grad_k + next_token[:, None] * stride_grad_k_t + output_head * stride_grad_k_h + offs_d[None, :],
+            mask=qk_mask & (token[:, None] < tokens - 1), other=0.0,
+        )
+    offs_v = tl.arange(0, BLOCK_V)
+    v_mask = token_mask[:, None] & (offs_v[None, :] < v_dim)
+    grad_v_raw = tl.load(grad_v + token[:, None] * stride_grad_v_t + logical_head * stride_grad_v_h + offs_v[None, :],
+                         mask=v_mask, other=0.0)
+
+    f2_flip = _flip_adjacent_pairs(f2, BLOCK_T, BLOCK_QK).to(tl.float32)
 
     for qk_kind in tl.static_range(2):
         input_head = logical_head + qk_kind * num_heads
-        x = tl.load(qk + token[:, None] * stride_qkt + input_head * stride_qkh + offs_d[None, :],
-                    mask=qk_mask, other=0.0).to(tl.float32)
         if qk_kind == 0:
-            grad_ptr = grad_q + output_token[:, None] * stride_grad_q_t + output_head * stride_grad_q_h + offs_d[None, :]
+            x = x0.to(tl.float32)
+            grad = grad0
         else:
-            grad_ptr = grad_k + output_token[:, None] * stride_grad_k_t + output_head * stride_grad_k_h + offs_d[None, :]
-        grad = tl.load(grad_ptr, mask=qk_mask, other=0.0)
-        grad_flip = tl.reshape(tl.flip(tl.reshape(grad, (BLOCK_T, BLOCK_QK // 2, 2)), dim=2), (BLOCK_T, BLOCK_QK))
+            x = x1.to(tl.float32)
+            grad = grad1
+        grad_flip = _flip_adjacent_pairs(grad, BLOCK_T, BLOCK_QK)
         grad = grad.to(tl.float32)
         grad_flip = grad_flip.to(tl.float32)
 
@@ -182,11 +215,7 @@ def _qkv_norm_rope_pack_fp8_backward_kernel(
         normalized = x * rstd[:, None]
         grad_normalized = f1 * grad + f2_flip * grad_flip
         if KEY_OFFSET and qk_kind == 1:
-            next_token = tl.minimum(token + 1, tokens - 1)
-            grad_next = tl.load(
-                grad_k + next_token[:, None] * stride_grad_k_t + output_head * stride_grad_k_h + offs_d[None, :],
-                mask=qk_mask & (token[:, None] < tokens - 1), other=0.0,
-            ).to(tl.float32)
+            grad_next = grad_next_raw.to(tl.float32)
             stationary_grad = tl.where(token[:, None] == 0, grad + grad_next, grad_next)
             grad_normalized = tl.where(offs_d[None, :] >= rotary_dim, stationary_grad, grad_normalized)
         correction = tl.sum(grad_normalized * normalized, axis=1) / qk_dim
@@ -198,15 +227,19 @@ def _qkv_norm_rope_pack_fp8_backward_kernel(
         tl.store(grad_transposed + feature[:, None] * tokens + token[None, :], tl.trans(q),
                  mask=(offs_d[:, None] < qk_dim) & token_mask[None, :])
 
-    offs_v = tl.arange(0, BLOCK_V)
-    v_mask = token_mask[:, None] & (offs_v[None, :] < v_dim)
-    grad_v_value = tl.load(grad_v + token[:, None] * stride_grad_v_t + logical_head * stride_grad_v_h + offs_v[None, :],
-                           mask=v_mask, other=0.0).to(tl.float32)
+    grad_v_value = grad_v_raw.to(tl.float32)
     qv = (grad_v_value / scale).to(tl.float8e4nv)
     v_feature = 2 * num_heads * qk_dim + logical_head * v_dim + offs_v
     tl.store(grad_row + token[:, None] * qkv_dim + v_feature[None, :], qv, mask=v_mask)
     tl.store(grad_transposed + v_feature[:, None] * tokens + token[None, :], tl.trans(qv),
              mask=(offs_v[:, None] < v_dim) & token_mask[None, :])
+
+
+def _check_bwd_factors(factor1, factor2):
+    """What the backward kernel covers: the pair swap is a 16-bit permutation of a contiguous-in-d factor row."""
+    ok = (factor1.stride(1) == 1 and factor2.stride(1) == 1
+          and factor1.dtype == factor2.dtype and factor2.element_size() == 2)
+    assert ok, "the QKV backward kernel needs 16-bit factor tables that are contiguous along the head dim"
 
 
 def _scaled_mm_bf16(a, b, scale_a, scale_b, fast_accum):
@@ -260,6 +293,7 @@ class PackedFP8QKVFunction(torch.autograd.Function):
         grad_f8_t = torch.empty((qkv_dim, tokens), device=qk.device, dtype=torch.float8_e4m3fn)
         # Feature rows run BLOCK_T bytes; 32 keeps every transposed store on a full 32 B sector.
         block_t = 32
+        _check_bwd_factors(factor1, factor2)
         _qkv_norm_rope_pack_fp8_backward_kernel[(num_heads, triton.cdiv(tokens, block_t))](
             grad_q, grad_k, grad_v, qk, factor1, factor2, grad_f8, grad_f8_t, grad_scale,
             tokens=tokens, num_heads=num_heads, qk_dim=qk_dim, rotary_dim=ctx.rotary_dim,
