@@ -33,19 +33,23 @@
 
 ## Method
 
-Naive Scalable-Softmax ($\tau_t = s \log(t+1)$) degrades packed sliding-window training (`3.2786`, worse than baseline) because global stream position ignores document resets and sliding-window truncation. Instead, we compute each token's exact visible context length inside its document and attention window:
+Naive Scalable-Softmax ($\tau_t = s \log(t+1)$) degrades packed sliding-window training (`3.2786`, worse than baseline) because global stream position ignores document resets and sliding-window truncation. Instead, we compute each token's exact visible context length inside its document and attention window (letting $\mathrm{pos}(t) = t - t_{\mathrm{doc}}(t) + 1$):
 
-$$N_{\text{vis}}(t) = \min\big(t - \text{doc\_start}(t) + 1,\; W_{\ell}\big)$$
+```math
+N_{\mathrm{vis}}(t, \ell) = \min\bigl(\mathrm{pos}(t),\ W_\ell\bigr)
+```
 
-(with $2\times$ visible length on paired-head layers `0, 2, 5`), center it around $\log N_0 = 5.5$ so short-window/early tokens can soften ($\tau < 1$) while long-window tokens sharpen ($\tau > 1$), and scale queries by:
+(and $\min(2\,\mathrm{pos}(t),\ W_\ell)$ on paired-head layers `0, 2, 5`), center it around $\log N_0 = 5.5$ so short-window/early tokens can soften ($\tau < 1$) while long-window tokens sharpen ($\tau > 1$), and scale queries by:
 
-$$\tau_{\ell,h}(t) = \max\big(0.25,\; 1 + s_{\ell,h} (\log N_{\text{vis}}(t) - 5.5)\big)$$
+```math
+\tau_{\ell,h}(t) = \max\Bigl(0.25,\ 1 + s_{\ell,h}\bigl(\log N_{\mathrm{vis}}(t, \ell) - 5.5\bigr)\Bigr)
+```
 
 initialized at $s_{\ell,h} = 0$ (exact identity $\tau = 1$ at step 0), trained with replicated Adam (`lr_mul = 0.5, wd_mul = 0.0`).
 
 ### Zero-HBM-Overhead Triton Fusion
-- **1-launch binary-search `compute_ssmax_log_n` (`qkv_rope.py`):** computes centered $\log N_{\text{vis}}$ for short, paired-short, and long windows once per forward pass from `cu_seqlens` and an address-stable 3-element `_ssmax_cap` buffer (updated in-place across schedule window transitions for CUDA-graph safety).
-- **Fused forward + exact algebraic backward (`qkv_rope.py`):** forward multiplies normalized rotated queries by $\tau$ in registers before `out_q` store; backward exploits the exact identity $\sum_d (g_q \cdot \hat{y}) = \sum_d (g_{\text{norm}} \cdot \hat{x})$ — which is **already computed** for QK-RMSNorm's `correction` term — accumulating per-block $\partial L / \partial s_{\ell,h}$ deterministically with zero atomics and zero extra HBM passes over Q/K/V.
+- **1-launch binary-search `compute_ssmax_log_n` (`qkv_rope.py`):** computes centered $\log N_{\mathrm{vis}}$ for short, paired-short, and long windows once per forward pass from `cu_seqlens` and an address-stable 3-element `_ssmax_cap` buffer (updated in-place across schedule window transitions for CUDA-graph safety).
+- **Fused forward + exact algebraic backward (`qkv_rope.py`):** forward multiplies normalized rotated queries by $\tau$ in registers before `out_q` store; backward exploits the exact identity $\sum_d (g_q \cdot \hat{y}) = \sum_d (g_{\mathrm{norm}} \cdot \hat{x})$ — which is **already computed** for QK-RMSNorm's `correction` term — accumulating per-block $\partial \mathcal{L} / \partial s_{\ell,h}$ deterministically with zero atomics and zero extra HBM passes over Q/K/V.
 - **Mechanistic behavior:** across 6 independent matched-step runs, `250/252` (`99.2%`) heads learn strictly positive slopes, with long-window layers `L3` (`+0.101`) and `L10` (`+0.090`) learning ~2.5× larger slopes than short-window layers (`+0.035 – +0.073`).
 
 ---
