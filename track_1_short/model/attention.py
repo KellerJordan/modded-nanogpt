@@ -130,6 +130,9 @@ class AttnArgs:
     # A 0-D gain folded into the output projection with sa_lambdas[1]: the layer's residual post-lambda,
     # so the residual add takes the attention output as is (perf/residual_fusion.py). None = no gain.
     o_gain: torch.Tensor | None = None
+    # Centered Bias-Aware SSMax (fused into QK-norm + RoPE with zero extra HBM traffic on Q/K/V).
+    log_n: torch.Tensor | None = None
+    ssmax_s: torch.Tensor | None = None
 
 
 class CausalSelfAttention(nn.Module):
@@ -182,6 +185,7 @@ class CausalSelfAttention(nn.Module):
                 x_scale, grad_scale,
                 yarn.factor1[:T], yarn.factor2[:T], H,
                 self.paired, key_offset, Yarn.ROTARY_DIM, x_f8, x_f8_t,
+                attn_args.log_n, attn_args.ssmax_s,
             )
             q, k, v = q[None], k[None], v[None]
         else:
@@ -193,6 +197,7 @@ class CausalSelfAttention(nn.Module):
             v = v.view(B, T, H, self.v_dim)
             q, k = qk_norm_rope_forward(
                 qk[0], yarn.factor1[:T], yarn.factor2[:T], H, Yarn.ROTARY_DIM, self.paired, key_offset,
+                attn_args.log_n, attn_args.ssmax_s,
             )
             q, k = q[None], k[None]
         max_len = train_max_seq_len if self.training else self.val_max_seq_len
