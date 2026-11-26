@@ -22,6 +22,7 @@ from track_1_short.perf.kernels.mlp import (
     quantize_weights_dual_ntiles,
 )
 from track_1_short.perf.kernels.ngram_embed import ngram_embedding
+from track_1_short.perf.kernels.qkv_rope import compute_ssmax_log_n
 from track_1_short.perf.kernels.sampled_cross_entropy import SampledSoftcappedCrossEntropy
 from track_1_short.perf.kernels.value_embed import value_embed_lookup
 from track_1_short.perf.residual_fusion import rms_norm_with_head, scale, scale_add
@@ -365,6 +366,16 @@ class GPT(nn.Module):
             )
         )
 
+        # Window/doc-aware centered Bias-Aware SSMax: 1 learned fp32 slope per attention head (+42 scalars).
+        self.ssmax_scale = nn.Parameter(torch.zeros(len(ATTN_LAYERS), self.num_heads))
+        # Address-stable [ws_short, ws_short, ws_long] window cap buffer updated in-place across schedule stages.
+        self.register_buffer("_ssmax_cap", torch.full((3,), 1e9, device=self.device), persistent=False)
+
+    def update_ssmax_window(self, ws_short_tok: int, ws_long_tok: int):
+        """Update SSMax window caps in-place (address-stable for sealed CUDA graphs)."""
+        ws_s, ws_l = float(ws_short_tok), float(ws_long_tok)
+        self._ssmax_cap.copy_(torch.tensor((ws_s, ws_s, ws_l), dtype=torch.float32))
+
     def init_mudd(self, num_layers: int, model_dim: int):
         """
         Multiway Dynamic Dense Connections @lishengping. https://arxiv.org/abs/2502.12170
@@ -570,6 +581,10 @@ class GPT(nn.Module):
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
         smear_lambda = self.scalars[2 * self.num_layers]
         skip_lambda = self.scalars[2 * self.num_layers + 1]
+        ssmax_s_by_layer = [None] * self.num_layers
+        for layer, s_row in zip(ATTN_LAYERS, self.ssmax_scale.unbind(0)):
+            ssmax_s_by_layer[layer] = s_row
+        log_n_short, log_n_short_paired, log_n_long = compute_ssmax_log_n(seqlens, input_seq.size(0), self._ssmax_cap)
         resid_lambdas_attn = self.resid_lambdas[:, 0].bfloat16().unbind(0)
         resid_lambdas_mlp  = self.resid_lambdas[:, 1].bfloat16().unbind(0)
         post_lambdas_attn = self.post_lambdas[:, 0].bfloat16().unbind(0)
@@ -695,10 +710,13 @@ class GPT(nn.Module):
 
                 if i in WIDE_QK_LAYERS:
                     yarn = self.yarn_wide
+                    log_n_i = log_n_long
                 elif i in PAIRED_HEAD_LAYERS:
                     yarn = self.yarn_paired_head
+                    log_n_i = log_n_short_paired
                 else:
                     yarn = self.yarn
+                    log_n_i = log_n_short
                 attn_args = AttnArgs(
                     sa_lambdas=sa_lambdas[i],
                     seqlens=seqlens,
@@ -711,6 +729,8 @@ class GPT(nn.Module):
                     train_max_seq_len=train_max_seq_len,
                     # The post-lambda rides the output projection, except on the MUDD layer (mu[9] is per-token).
                     o_gain=post_lambdas_attn[i] if mu is None else None,
+                    log_n=log_n_i,
+                    ssmax_s=ssmax_s_by_layer[i],
                 )
                 qk_w, v_w, o_w = attn_weights[i]
                 attn_out = self.attn[str(i)](attn_in_normed, attn_args, qk_w, v_w, o_w, qkv_fp8)

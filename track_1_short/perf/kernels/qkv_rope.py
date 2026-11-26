@@ -1,11 +1,12 @@
-"""Fused QK-norm + RoPE for attention, and the packed FP8 QKV projection.
+"""Fused QK-norm + RoPE + centered Bias-Aware SSMax for attention, and packed FP8 QKV projection.
 
 What it replaces: the aten chain  qkv = x @ W.T -> split -> rms_norm(q), rms_norm(k) -> rotary -> FA3.
 Why it is faster: Q, K and V come from ONE fp8 GEMM against a packed [Q; K; V] weight cache
-(perf/kernels/fp8_attention_quant.py), and the QK rms-norm (@Grad62304977) and rotary run as one
-Triton pass that writes the separate Q and K tensors FA3 reads. In the backward, the norm/rotary
+(perf/kernels/fp8_attention_quant.py), and the QK rms-norm (@Grad62304977), rotary, and query-side
+window/doc-aware Bias-Aware SSMax scaling tau = max(0.25, 1 + s_h * (log N_vis - 5.5)) run as one
+Triton pass that writes the separate Q and K tensors FA3 reads. In the backward, the norm/rotary/SSMax
 gradient, the V gradient and their dual-layout e4m3 quantize are one kernel.
-Invariants: the norm/rotary math runs in fp32 with eps 1.1920928955078125e-7 (F.rms_norm's fp32 eps),
+Invariants: the norm/rotary/SSMax math runs in fp32 with eps 1.1920928955078125e-7 (F.rms_norm's fp32 eps),
 and the QK gradient is rounded to bf16 before the fp8 cast, matching the aten chain these replace.
 Q and K keep the layer's own head width (64 or 128): FA3 reads them unpadded.
 
@@ -16,10 +17,65 @@ import torch
 import triton
 import triton.language as tl
 
+SSMAX_LOG_CENTER = 5.5
+
+
+@triton.jit
+def _ssmax_log_n_kernel(
+    seqlens_ptr,
+    cap_ptr,
+    out_short_ptr, out_paired_ptr, out_long_ptr,
+    tokens: tl.constexpr,
+    num_seqlens: tl.constexpr,
+    N_ITERS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    LOG_CENTER: tl.constexpr,
+):
+    token = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    mask = token < tokens
+
+    # Exact upper-bound binary search: largest seqlens[i] <= token.
+    lo = tl.zeros((BLOCK_T,), dtype=tl.int32)
+    hi = tl.full((BLOCK_T,), num_seqlens - 1, dtype=tl.int32)
+    for _ in tl.static_range(N_ITERS):
+        mid = (lo + hi) >> 1
+        val = tl.load(seqlens_ptr + mid, mask=mask, other=0)
+        go_right = val <= token
+        lo = tl.where(go_right, mid + 1, lo)
+        hi = tl.where(go_right, hi, mid)
+    seg_id = tl.maximum(lo - 1, 0)
+    doc_start = tl.load(seqlens_ptr + seg_id, mask=mask, other=0)
+
+    cap_s = tl.load(cap_ptr + 0).to(tl.float32)
+    cap_p = tl.load(cap_ptr + 1).to(tl.float32)
+    cap_l = tl.load(cap_ptr + 2).to(tl.float32)
+
+    pos = tl.maximum(1.0, token.to(tl.float32) - doc_start.to(tl.float32) + 1.0)
+    tl.store(out_short_ptr + token, tl.log(tl.minimum(pos, cap_s)) - LOG_CENTER, mask=mask)
+    tl.store(out_paired_ptr + token, tl.log(tl.minimum(pos * 2.0, cap_p)) - LOG_CENTER, mask=mask)
+    tl.store(out_long_ptr + token, tl.log(tl.minimum(pos, cap_l)) - LOG_CENTER, mask=mask)
+
+
+def compute_ssmax_log_n(seqlens, tokens: int, cap):
+    """Fused 1-launch doc/window-aware centered log N_vis for short, paired-short, and long layers."""
+    num_seqlens = seqlens.shape[0]
+    out_short = torch.empty((tokens,), device=seqlens.device, dtype=torch.float32)
+    out_paired = torch.empty((tokens,), device=seqlens.device, dtype=torch.float32)
+    out_long = torch.empty((tokens,), device=seqlens.device, dtype=torch.float32)
+    block_t = 256
+    n_iters = max(1, (num_seqlens - 1).bit_length() + 1)
+    _ssmax_log_n_kernel[(triton.cdiv(tokens, block_t),)](
+        seqlens, cap, out_short, out_paired, out_long,
+        tokens=tokens, num_seqlens=num_seqlens, N_ITERS=n_iters, BLOCK_T=block_t,
+        LOG_CENTER=SSMAX_LOG_CENTER,
+    )
+    return out_short, out_paired, out_long
+
 
 @triton.jit
 def _qk_norm_rope_forward_kernel(
     qk, factor1, factor2, out_q, out_k,
+    log_n_ptr, ssmax_s_ptr,
     rows: tl.constexpr,
     num_heads: tl.constexpr,
     heads2: tl.constexpr,
@@ -82,11 +138,17 @@ def _qk_norm_rope_forward_kernel(
         y = tl.where(shift, x_previous * previous_rstd[:, None], y)
 
     output_ptrs = output_token[:, None] * stride_out_t + output_head[:, None] * qk_dim + offs_d[None, :]
-    tl.store(out_q + output_ptrs, y, mask=mask & (input_head[:, None] < num_heads))
-    tl.store(out_k + output_ptrs, y, mask=mask & (input_head[:, None] >= num_heads))
+    is_q = input_head < num_heads
+    row_q_mask = (offs_m < rows) & is_q
+    log_n = tl.load(log_n_ptr + token, mask=row_q_mask, other=0.0).to(tl.float32)
+    s_h = tl.load(ssmax_s_ptr + logical_head, mask=row_q_mask, other=0.0).to(tl.float32)
+    tau = tl.maximum(0.25, 1.0 + s_h * log_n)
+    tl.store(out_q + output_ptrs, y * tau[:, None], mask=mask & is_q[:, None])
+    tl.store(out_k + output_ptrs, y, mask=mask & (~is_q[:, None]))
 
 
-def qk_norm_rope_forward(qk, factor1, factor2, num_heads, rotary_dim, paired, key_offset, num_warps=2):
+def qk_norm_rope_forward(qk, factor1, factor2, num_heads, rotary_dim, paired, key_offset,
+                         log_n, ssmax_s, num_warps=2):
     """(q, k), each [tokens, heads, qk_dim] ([2 * tokens, heads / 2, qk_dim] when paired), from the
     packed [tokens, 2 * heads, qk_dim] QK projection. Dims from `rotary_dim` on are stationary (they are
     what the key offset shifts). Forward only: validation calls it directly, and the fp8 training path
@@ -104,7 +166,7 @@ def qk_norm_rope_forward(qk, factor1, factor2, num_heads, rotary_dim, paired, ke
     out_k = torch.empty(output_shape, device=qk.device, dtype=qk.dtype)
     rows = tokens * heads2
     _qk_norm_rope_forward_kernel[(triton.cdiv(rows, block_m),)](
-        qk, factor1, factor2, out_q, out_k,
+        qk, factor1, factor2, out_q, out_k, log_n, ssmax_s,
         rows=rows, num_heads=num_heads, heads2=heads2,
         qk_dim=qk_dim, rotary_dim=rotary_dim,
         stride_qkt=qk.stride(0), stride_qkh=qk.stride(1),
@@ -115,14 +177,16 @@ def qk_norm_rope_forward(qk, factor1, factor2, num_heads, rotary_dim, paired, ke
     return out_q, out_k
 
 
-# The QK-norm/rotary backward, the V gradient and the dual-layout e4m3 quantize of both, in one kernel
+# The QK-norm/rotary/SSMax backward, the V gradient and the dual-layout e4m3 quantize of both, in one kernel
 # per attention layer. The grid is head-fastest so factor1/factor2 are read about once instead of once
 # per head. The axis=1 reductions are bit-identical under any BLOCK_T: BLOCK_T only grows dim 0.
 @triton.jit
 def _qkv_norm_rope_pack_fp8_backward_kernel(
     grad_q, grad_k, grad_v, qk, factor1, factor2,
     grad_row, grad_transposed, grad_scale_ptr,
+    log_n_ptr, ssmax_s_ptr, grad_ssmax_s_ptr,
     tokens: tl.constexpr,
+    num_blocks: tl.constexpr,
     num_heads: tl.constexpr,
     qk_dim: tl.constexpr,
     rotary_dim: tl.constexpr,
@@ -144,7 +208,8 @@ def _qkv_norm_rope_pack_fp8_backward_kernel(
     BLOCK_V: tl.constexpr,
 ):
     logical_head = tl.program_id(0)
-    token = tl.program_id(1) * BLOCK_T + tl.arange(0, BLOCK_T)
+    pid_t = tl.program_id(1)
+    token = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
     offs_d = tl.arange(0, BLOCK_QK)
     token_mask = token < tokens
     qk_mask = token_mask[:, None] & (offs_d[None, :] < qk_dim)
@@ -189,8 +254,19 @@ def _qkv_norm_rope_pack_fp8_backward_kernel(
             ).to(tl.float32)
             stationary_grad = tl.where(token[:, None] == 0, grad + grad_next, grad_next)
             grad_normalized = tl.where(offs_d[None, :] >= rotary_dim, stationary_grad, grad_normalized)
-        correction = tl.sum(grad_normalized * normalized, axis=1) / qk_dim
-        dx = rstd[:, None] * (grad_normalized - normalized * correction[:, None])
+        dot_unscaled = tl.sum(grad_normalized * normalized, axis=1)
+        correction = dot_unscaled / qk_dim
+        if qk_kind == 0:
+            # Exact algebraic identity: sum_d(grad * y_unscaled) == sum_d(grad_normalized * normalized).
+            log_n = tl.load(log_n_ptr + token, mask=token_mask, other=0.0).to(tl.float32)
+            s_h = tl.load(ssmax_s_ptr + logical_head).to(tl.float32)
+            raw_tau = 1.0 + s_h * log_n
+            tau = tl.maximum(0.25, raw_tau)
+            d_tau = tl.where(token_mask & (raw_tau > 0.25), dot_unscaled, 0.0)
+            tl.store(grad_ssmax_s_ptr + logical_head * num_blocks + pid_t, tl.sum(d_tau * log_n, axis=0))
+            dx = (rstd * tau)[:, None] * (grad_normalized - normalized * correction[:, None])
+        else:
+            dx = rstd[:, None] * (grad_normalized - normalized * correction[:, None])
         # Round to bf16 first: the aten chain materialized the QK gradient in bf16 before the fp8 cast.
         q = (dx.to(tl.bfloat16).to(tl.float32) / scale).to(tl.float8e4nv)
         feature = input_head * qk_dim + offs_d
@@ -215,14 +291,15 @@ def _scaled_mm_bf16(a, b, scale_a, scale_b, fast_accum):
 
 
 class PackedFP8QKVFunction(torch.autograd.Function):
-    """q, k, v = norm + rotary of x @ (sa_lambda * [Wq; Wk; Wv]).T, as one fp8 GEMM off the cached packed weight.
+    """q, k, v = norm + rotary + SSMax of x @ (sa_lambda * [Wq; Wk; Wv]).T, as one fp8 GEMM off the cached packed weight.
 
     The activation arrives already quantized (`x_f8`, `x_f8_t`): layers that read the same attention
     input quantize it once and share it (see GPT.forward). `x` itself only receives the gradient.
     """
     @staticmethod
     def forward(ctx, x, qk_weight, v_weight, weight_f8, weight_f8_t, weight_scale, qkv_scale,
-                x_scale, grad_scale, factor1, factor2, num_heads, paired, key_offset, rotary_dim, x_f8, x_f8_t):
+                x_scale, grad_scale, factor1, factor2, num_heads, paired, key_offset, rotary_dim, x_f8, x_f8_t,
+                log_n, ssmax_s):
         qk_dim = qk_weight.shape[0] // (2 * num_heads)
         v_dim = v_weight.shape[0] // num_heads
         qk_features = 2 * num_heads * qk_dim
@@ -238,9 +315,9 @@ class PackedFP8QKVFunction(torch.autograd.Function):
             qk_flat, v_flat = qkv[:, :qk_features], qkv[:, qk_features:]
         qk = qk_flat.view(-1, 2 * num_heads, qk_dim)
         v = v_flat.view(-1, num_heads, v_dim)
-        q, k = qk_norm_rope_forward(qk, factor1, factor2, num_heads, rotary_dim, paired, key_offset)
+        q, k = qk_norm_rope_forward(qk, factor1, factor2, num_heads, rotary_dim, paired, key_offset, log_n, ssmax_s)
         ctx.save_for_backward(qk_weight, v_weight, x_f8_t, weight_f8_t, scaled_weight_scale,
-                              qkv_scale, x_scale, grad_scale, qk, factor1, factor2)
+                              qkv_scale, x_scale, grad_scale, qk, factor1, factor2, log_n, ssmax_s)
         ctx.input_shape = x.shape
         ctx.num_heads, ctx.v_dim = num_heads, v_dim
         ctx.paired, ctx.key_offset, ctx.rotary_dim = paired, key_offset, rotary_dim
@@ -249,7 +326,7 @@ class PackedFP8QKVFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_q, grad_k, grad_v):
         (qk_weight, v_weight, x_f8_t, weight_f8_t, scaled_weight_scale, qkv_scale,
-         x_scale, grad_scale, qk, factor1, factor2) = ctx.saved_tensors
+         x_scale, grad_scale, qk, factor1, factor2, log_n, ssmax_s) = ctx.saved_tensors
         num_heads, v_dim = ctx.num_heads, ctx.v_dim
         grad_v = grad_v.reshape(-1, num_heads, v_dim)
         tokens, heads2, qk_dim = qk.shape
@@ -260,9 +337,12 @@ class PackedFP8QKVFunction(torch.autograd.Function):
         grad_f8_t = torch.empty((qkv_dim, tokens), device=qk.device, dtype=torch.float8_e4m3fn)
         # Feature rows run BLOCK_T bytes; 32 keeps every transposed store on a full 32 B sector.
         block_t = 32
-        _qkv_norm_rope_pack_fp8_backward_kernel[(num_heads, triton.cdiv(tokens, block_t))](
+        num_blocks = triton.cdiv(tokens, block_t)
+        grad_ssmax_s_buf = torch.empty((num_heads, num_blocks), device=qk.device, dtype=torch.float32)
+        _qkv_norm_rope_pack_fp8_backward_kernel[(num_heads, num_blocks)](
             grad_q, grad_k, grad_v, qk, factor1, factor2, grad_f8, grad_f8_t, grad_scale,
-            tokens=tokens, num_heads=num_heads, qk_dim=qk_dim, rotary_dim=ctx.rotary_dim,
+            log_n, ssmax_s, grad_ssmax_s_buf,
+            tokens=tokens, num_blocks=num_blocks, num_heads=num_heads, qk_dim=qk_dim, rotary_dim=ctx.rotary_dim,
             v_dim=v_dim, qkv_dim=qkv_dim,
             stride_qkt=qk.stride(0), stride_qkh=qk.stride(1), factor_stride_t=factor1.stride(0),
             stride_grad_q_t=grad_q.stride(0), stride_grad_q_h=grad_q.stride(1),
@@ -272,15 +352,17 @@ class PackedFP8QKVFunction(torch.autograd.Function):
             BLOCK_QK=triton.next_power_of_2(qk_dim), BLOCK_V=triton.next_power_of_2(v_dim),
             num_warps=4 if qk_dim <= 64 else 8,
         )
+        grad_ssmax_s = grad_ssmax_s_buf.sum(dim=1)
         grad_weight = _scaled_mm_bf16(grad_f8_t, x_f8_t.T, grad_scale, x_scale, False)
         grad_input = _scaled_mm_bf16(grad_f8, weight_f8_t.T, grad_scale, scaled_weight_scale, False)
         # .to(qkv_scale.dtype): qkv_scale is an fp32 scalar while the weights are bf16, and autograd
         # checks the outgoing gradient's dtype.
         grad_qkv_scale = (grad_weight * torch.cat((qk_weight, v_weight))).sum().to(qkv_scale.dtype)
         grad_qk_weight, grad_v_weight = grad_weight.split((2 * num_heads * qk_dim, num_heads * v_dim))
-        # One slot per forward argument; only x, the two weights and qkv_scale carry gradients.
+        # One slot per forward argument; only x, the two weights, qkv_scale, and ssmax_s carry gradients.
         return (grad_input.view(ctx.input_shape), grad_qk_weight * qkv_scale, grad_v_weight * qkv_scale,
-                None, None, None, grad_qkv_scale, None, None, None, None, None, None, None, None, None, None)
+                None, None, None, grad_qkv_scale, None, None, None, None, None, None, None, None, None, None,
+                None, grad_ssmax_s)
 
 
 PackedFP8QKV = PackedFP8QKVFunction.apply

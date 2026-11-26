@@ -78,6 +78,7 @@ class TrainingManager():
             "mudd_gate_w2": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1},
             "mudd_gate_b2": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
             "_mudd_gate_scale": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.1, "wd_mul": 0.0},
+            "ssmax_scale":      {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.5, "wd_mul": 0.0},
         })
 
         # NCCL runs one stream in enqueue order and future.wait() is a stream wait, so scatter_order is
@@ -87,7 +88,7 @@ class TrainingManager():
             "qk_bank", "vo_bank", "mlp_bank",
             "value_embeds",  # the row-sparse gradient exchanges of both tables (optim/anvil.py SparseUpdate)
             "lm_head", "embed",
-            "scalars", "smear_gate", "ve_gate_bank", "post_lambdas", "resid_lambdas",
+            "scalars", "ssmax_scale", "smear_gate", "ve_gate_bank", "post_lambdas", "resid_lambdas",
             "mudd_w1", "mudd_w2", "mudd_w2g", "mudd_b2", "mudd_gate_w1", "mudd_gate_w2", "mudd_gate_b2",
             "_mudd_gate_scale",
         ]
@@ -101,7 +102,7 @@ class TrainingManager():
         #   gather, last
         self.work_order = [
             "qk_bank", "vo_bank", "lm_head", "embed", "value_embeds",
-            "scalars", "smear_gate", "ve_gate_bank", "mudd_b2", "mudd_gate_b2", "_mudd_gate_scale",
+            "scalars", "ssmax_scale", "smear_gate", "ve_gate_bank", "mudd_b2", "mudd_gate_b2", "_mudd_gate_scale",
             "post_lambdas", "resid_lambdas", "mudd_w2", "mudd_w2g", "mudd_gate_w2", "mudd_w1", "mudd_gate_w1",
             "mlp_bank",
         ]
@@ -136,6 +137,7 @@ class TrainingManager():
 
     def apply_final_ws_ext(self):
         self.ws_long = self.schedule.ws_post_yarn_ext
+        self.model.update_ssmax_window(self.ws_short * BLOCK_SIZE, self.ws_long * BLOCK_SIZE)
 
     def get_forward_args(self, sampled_loss: SampledLoss | None = None):
         return ForwardScheduleConfig(
@@ -165,6 +167,8 @@ class TrainingManager():
             self.model.yarn_wide.apply(self.ws_long * BLOCK_SIZE, new_ws_long * BLOCK_SIZE)
             for yarn in (self.model.yarn, self.model.yarn_paired_head):
                 yarn.apply(old_ws_short * BLOCK_SIZE, self.ws_short * BLOCK_SIZE)
+        if new_ws_long != self.ws_long or self.ws_short != old_ws_short:
+            self.model.update_ssmax_window(self.ws_short * BLOCK_SIZE, new_ws_long * BLOCK_SIZE)
 
         self.train_max_seq_len = stage.train_max_seq_len
         self.ws_long = new_ws_long
@@ -215,6 +219,7 @@ class TrainingManager():
         self.train_max_seq_len = stage.train_max_seq_len
         for yarn in (self.model.yarn, self.model.yarn_paired_head, self.model.yarn_wide):
             yarn.reset()
+        self.model.update_ssmax_window(self.ws_short * BLOCK_SIZE, self.ws_long * BLOCK_SIZE)
 
     def get_state(self):
         return copy.deepcopy(self.optimizer.state_dict())

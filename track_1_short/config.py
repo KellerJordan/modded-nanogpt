@@ -54,9 +54,9 @@ class TrainingStage:
 STAGE_DURATIONS = [0.2854, 0.3209, 0.3931]
 STAGE_DURATIONS = [d / sum(STAGE_DURATIONS) for d in STAGE_DURATIONS]
 TAPER_DURATION = 0.06
-# Record #360 grew its run by 52 steps without re-deriving the fractions: the extra steps all go to
-# the batch-24 stage (index 2), which keeps every later boundary's Adam-step (odd/even) parity.
-SCHEDULE_GROWTH_STEPS = 52
+# Record #360 grew its run by 52 steps in the batch-24 stage (index 2); centered Bias-Aware SSMax
+# trims 12 of those steps (keeping exact mod-4 n-gram/Adam boundary parity).
+SCHEDULE_GROWTH_STEPS = 40
 SCHEDULE_GROWTH_STAGE = 2
 # Attention window sizes are counted in blocks of this many tokens (record #360).
 BLOCK_SIZE = 128
