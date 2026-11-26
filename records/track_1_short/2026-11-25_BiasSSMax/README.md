@@ -1,8 +1,8 @@
-# NanoGPT Speedrun Track 1 Record Candidate: Window/Doc-Aware Centered Bias-Aware SSMax
+# NanoGPT Speedrun Track 1 Record Candidate: Centered Mask-Aware SSMax
 
-**Paper & Companion Repo:** [*Improving Out-of-Distribution Generalization with Bias-Aware Softmax Scaling and Barrier-FoX: From 200-Digit Arithmetic Circuits to Sub-40s 8×H100 LLM Training*](https://github.com/FeSens/Bias-Aware-Softmax-Scaling) ([PDF](https://github.com/FeSens/Bias-Aware-Softmax-Scaling/blob/main/paper/main.pdf))
+**Paper & Companion Repo:** [*Improving Out-of-Distribution Generalization with Mask-Aware Softmax Scaling and Barrier-FoX: From 200-Digit Arithmetic Circuits to Sub-40s 8×H100 LLM Training*](https://github.com/FeSens/Mask-Aware-Softmax-Scaling) ([PDF](https://github.com/FeSens/Mask-Aware-Softmax-Scaling/blob/main/paper/main.pdf))
 
-**Summary:** Adds **+42 fp32 scalars** (one learned per-head slope $s_h$ across the 7 attention layers) implementing window- and document-aware centered Scalable-Softmax (**Bias-Aware SSMax**), fused directly into `qkv_rope.py`'s QK-Norm + RoPE forward/backward Triton kernels (+72 ms total kernel cost, +0 MiB peak allocated VRAM, **+138 / -26 lines across 5 files, 0 changes to `train_gpt.py`**). The improved sample efficiency and variance stability allow trimming 12 steps from the batch-24 Stage-2 growth schedule (`SCHEDULE_GROWTH_STEPS: 52 -> 40`, preserving exact mod-4 n-gram/Adam boundary parity), cutting **`-0.477 s` (`40.454 s -> 39.977 s`, `-1.18%`)** on `8x NVIDIA H100 80GB HBM3` while clearing the `3.28` gate with **`p = 1.26e-6`** (`0/10` runs above `3.2784`).
+**Summary:** Adds **+42 fp32 scalars** (one learned per-head slope $s_h$ across the 7 attention layers) implementing window- and document-aware centered Scalable-Softmax (**Mask-Aware SSMax**), fused directly into `qkv_rope.py`'s QK-Norm + RoPE forward/backward Triton kernels (+72 ms total kernel cost, +0 MiB peak allocated VRAM, **+138 / -26 lines across 5 files, 0 changes to `train_gpt.py`**). The improved sample efficiency and variance stability allow trimming 12 steps from the batch-24 Stage-2 growth schedule (`SCHEDULE_GROWTH_STEPS: 52 -> 40`, preserving exact mod-4 n-gram/Adam boundary parity), cutting **`-0.477 s` (`40.454 s -> 39.977 s`, `-1.18%`)** on `8x NVIDIA H100 80GB HBM3` while clearing the `3.28` gate with **`p = 1.26e-6`** (`0/10` runs above `3.2784`).
 
 ---
 
@@ -15,7 +15,7 @@
 | Arm | Runs (`n`) | Steps | Wall Time (`train_time`) | Final `val_loss` | Range | Runs `> 3.28` | One-Sided `p (< 3.28)` |
 |---|---:|---:|---:|---:|---|---:|---:|
 | **`HEAD` (`4ea6b93`, `G=52`, interleaved)** | 10 | 1194 | `40.454 ± 0.024 s` | `3.27610 ± 0.00281` | `3.2736 – 3.2832` | 1 / 10 | `8.78e-4` |
-| **This PR (`Bias-Aware SSMax`, `G=40`)** | **10** | **1182** | **`39.977 ± 0.020 s`** | **`3.27738 ± 0.00079`** | **`3.2760 – 3.2784`** | **0 / 10** | **`1.26e-6`** (`t = -10.43`) |
+| **This PR (`Mask-Aware SSMax`, `G=40`)** | **10** | **1182** | **`39.977 ± 0.020 s`** | **`3.27738 ± 0.00079`** | **`3.2760 – 3.2784`** | **0 / 10** | **`1.26e-6`** (`t = -10.43`) |
 | `HEAD @ G=40` (step-cut-only control, no SSMax) | 5 | 1182 | `39.905 ± 0.011 s` | `3.27998 ± 0.00389` | `3.2768 – 3.2865` | 2 / 5 | `4.96e-1` (**FAIL**) |
 
 ### Rule Compliance Verification
@@ -27,7 +27,7 @@
 - **Discretionary Rule 2 (Outperforms a simple step-count decrease at equivalent loss):** **PASS** — proven three independent ways:
   1. **Direct matched-step control (`G=40`, 1182 steps, same machine):** Simply cutting 12 steps from `HEAD` (`HEAD @ G=40`, `n=5`) degrades `val_loss` to **`3.27998 ± 0.00389`** (`2/5` runs above `3.28`, `p(<3.28) = 0.496`, fails Rule 2!), whereas our PR at the exact same `1182` steps achieves **`3.27738 ± 0.00079`** (**`-2.60 mnat` better**, one-sided MW-U `p = 0.063`, **4.9× tighter variance**), for only `+72 ms` kernel cost (`~426 ms` ML gain minus `72 ms` kernel = **`~354 ms` net matched-loss win**).
   2. **Implied exchange rate vs `HEAD @ G=52`:** `477 ms / 1.28 mnat = 373 ms / millinat` (`> 2.2×` ANVIL2's `164 ms / millinat` marginal step-cut slope; `Δval = +0.00128` is not statistically significant, `p = 0.195`).
-  3. **Matched-step `G=52` (1194 steps) development ablations (27 runs on Modal `8×H100`/`8×H200`):** Centered Bias-Aware SSMax (`lr_mul = 0.5`, `n = 4`: `3.27430 ± 0.00099`; pooled low-LR `lr_mul in {0.25, 0.5}`, `n = 6`: `3.27437 ± 0.00089`) beats interleaved `base` (`n = 7`: `3.27614 ± 0.00222`) by **`-1.84 mnat`** (one-sided Welch `p = 0.046`, MW-U `p = 0.044`; pooled `n = 6` one-sided Welch `p = 0.044`, MW-U `p = 0.031`) and beats naive unclamped vanilla SSMax (`vssmax`, `n = 2`: `3.27855 ± 0.00092`) by **`-4.25 mnat`** (one-sided Welch `p = 0.014`, two-sided `p = 0.027`), proving document-boundary + sliding-window clamping is essential.
+  3. **Matched-step `G=52` (1194 steps) development ablations (27 runs on Modal `8×H100`/`8×H200`):** Centered Mask-Aware SSMax (`lr_mul = 0.5`, `n = 4`: `3.27430 ± 0.00099`; pooled low-LR `lr_mul in {0.25, 0.5}`, `n = 6`: `3.27437 ± 0.00089`) beats interleaved `base` (`n = 7`: `3.27614 ± 0.00222`) by **`-1.84 mnat`** (one-sided Welch `p = 0.046`, MW-U `p = 0.044`; pooled `n = 6` one-sided Welch `p = 0.044`, MW-U `p = 0.031`) and beats naive unclamped vanilla SSMax (`vssmax`, `n = 2`: `3.27855 ± 0.00092`) by **`-4.25 mnat`** (one-sided Welch `p = 0.014`, two-sided `p = 0.027`), proving document-boundary + sliding-window clamping is essential.
 
 ---
 
